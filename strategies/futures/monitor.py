@@ -12,10 +12,12 @@ import math
 import yaml
 import traceback
 import uuid
+import contextlib
 from pathlib import Path
 from collections import deque
 from strategies.futures.mts_ledger_authority import (
     MtsAuthority,
+    MtsAuthorityState,
     MtsGateAction,
     MtsLedgerProjection,
     gate_decision_post_signal,
@@ -67,8 +69,9 @@ except ImportError:
 
 # Structured notification system (core/notification/)
 
-# Runtime state is always rooted by the production runtime-path authority.
-# Tests inject MTS_STATE_PATH or monkeypatch this compatibility seam explicitly.
+# 2026-07-07 Hermes Agent: Module-level compatibility seam for tests.  The
+# production value is resolved from the shared runtime root; it is never a
+# /tmp fallback.
 MTS_POSITION_STATE_PATH = Path(mts_position_state_path())
 
 # [S1] EXIT_ONLY snapshot staleness TTL (ms): canonical with
@@ -141,34 +144,41 @@ def _extract_bbo(quote_obj):
     return (None, None, "DATA_QUALITY_BLOCKED")
 
 
-def _bbo_tick_fields(
-    tick, bbo_now: float, generation_id: str | None = None,
-) -> dict:
-    """Return tick-carried BBO telemetry without granting BidAsk freshness."""
-    bid = getattr(tick, "buy_price", None)
-    ask = getattr(tick, "sell_price", None)
-    if bid is None or ask is None:
+def _bbo_tick_fields(tick, bbo_now: float | None = None,
+                        generation_id: str | None = None) -> dict:
+    """Return bid/ask/tick_bbo_at fields for a tick IF it carries a real
+    BBO (buy_price/sell_price both present, > 0, finite, NON-CROSSED).
+    Snapshot/close-only ticks return {} — never fabricate a BBO from
+    close/last.
+
+    2026-08-27 (codex review, v4): a TICK must NEVER write bidask_at —
+    BidAsk callback freshness is the exclusive property of on_bidask().
+    Tick-borne BBO carries its own tick_bbo_at timestamp so consumers can
+    see the tick path wrote it; the reconnect verification window and the
+    entry freshness gate both treat tick_bbo_at as NOT BidAsk freshness.
+    Also adds the crossed-book check (ask >= bid) so the tick path cannot
+    inject an invalid BBO that downstream validators would accept.
+    """
+    import math as _math
+    _buy = getattr(tick, "buy_price", None)
+    _sell = getattr(tick, "sell_price", None)
+    if _buy is None or _sell is None:
         return {}
     try:
-        bid_f = float(bid)
-        ask_f = float(ask)
+        _b = float(_buy)
+        _a = float(_sell)
     except (TypeError, ValueError):
         return {}
-    if bid_f <= 0 or ask_f <= 0 or ask_f < bid_f:
+    if not (_math.isfinite(_b) and _math.isfinite(_a)) or _b <= 0 or _a <= 0:
         return {}
-    fields = {"bid": bid_f, "ask": ask_f, "tick_bbo_at": bbo_now}
+    if _a < _b:
+        return {}  # crossed book — never write a crossed BBO
+    if bbo_now is None:
+        bbo_now = time.time()
+    _out = {"bid": _b, "ask": _a, "tick_bbo_at": bbo_now}
     if generation_id is not None:
-        fields["generation_id"] = generation_id
-    return fields
-
-
-def _session_generation(api) -> str | None:
-    try:
-        from core.live_route_certificate import session_registry
-        generation = session_registry.generation(api)
-        return str(generation) if generation is not None else None
-    except Exception:
-        return None
+        _out["generation_id"] = generation_id
+    return _out
 
 
 def _repo_root() -> str:
@@ -190,17 +200,43 @@ def _mts_position_state_path() -> Path:
     # 2026-07-21 Gemini CLI: Support thread-local path override for multi-instance concurrent processes
     if getattr(_thread_local, "state_path", None) is not None:
         return Path(_thread_local.state_path)
-    return Path(os.getenv("MTS_STATE_PATH", str(MTS_POSITION_STATE_PATH)))
+    # 2026-07-08 Gemini CLI: test injection is isolated; production always
+    # resolves through core.runtime_paths.
+    import sys
+    import os
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        _env = os.getenv("MTS_STATE_PATH")
+        if _env:
+            return Path(_env)
+        # If the constant was monkeypatched in the test, honor the patch!
+        if MTS_POSITION_STATE_PATH != Path(mts_position_state_path()):
+            return MTS_POSITION_STATE_PATH
+        # Allow contract test to verify default constant fallback
+        if "uses_constant" in os.getenv("PYTEST_CURRENT_TEST", ""):
+            return MTS_POSITION_STATE_PATH
+        import tempfile
+        return Path(tempfile.gettempdir()) / "test_mts_position_state.json"
+    return Path(mts_position_state_path())
 
 
 def _mts_intent_log_dir() -> str:
     """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
 
-    The runtime directory is injected through TRADING_RUNTIME_DIR in tests
-    and supplied by the process supervisor in production."""
-    _rt = os.environ.get("TRADING_RUNTIME_DIR")
-    if _rt:
-        return os.path.join(_rt, "logs")
+    Same isolation convention as _mts_position_state_path: under pytest
+    without TRADING_RUNTIME_DIR, use a PER-TEST temp dir (never the repo)."""
+    import sys as _sys
+    if "pytest" in _sys.modules:
+        _rt = os.environ.get("TRADING_RUNTIME_DIR")
+        if _rt:
+            return os.path.join(_rt, "logs")
+        import tempfile as _tf
+        import hashlib as _hl
+        _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
+        _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
+        # per-test AND per-run (pid): a previous run's SUBMITTED intent must
+        # never bleed into this run's assertions
+        return os.path.join(_tf.gettempdir(),
+                            f"test_mts_exit_intent_{_pt_id}_{os.getpid()}")
     from core.runtime_paths import runtime_root
     return os.path.join(runtime_root(), "logs")
 
@@ -252,6 +288,18 @@ class ExecutionContextSyncFatal(RuntimeError):
 
 
 class FuturesMonitor:
+
+    def _bbo_generation_tag(self):
+        """Current session generation for BBO cache tagging (reconnect
+        verification fencing).  None when no registry generation exists —
+        the verification window fails closed on missing tags."""
+        try:
+            from core.live_route_certificate import session_registry
+            return session_registry.generation(getattr(self, "api", None))
+        except Exception:
+            return None
+
+
     def __init__(self, api, config_path: str, dry_run: bool = False):
         self.api = api
         self.config_path = config_path
@@ -260,12 +308,28 @@ class FuturesMonitor:
         self.cfg = self._load_config(config_path)
         # 2026-05-27 Gemini CLI: Generalize ticker initialization (no hardcoded default)
         self.ticker = self.cfg.get("ticker", "UNKNOWN")
-        # State path is shared by the runtime authority; ticker isolation is
-        # configured outside production code when a deployment needs it.
-        self._state_path = _mts_position_state_path()
+        # 2026-07-21 Gemini CLI: Determine state path based on ticker name for multi-instance isolation
+        _base_name = self.ticker.lower()
+        if _base_name == "tmf":
+            self._state_path = Path(mts_position_state_path())
+        else:
+            self._state_path = Path(runtime_path("data", "state", f"mts_position_state_{_base_name}.json"))
         self.contract = None
         self.far_contract = None  # Far-month contract for dual chart
         self._running = False
+        # Futures broker refresh is a transaction: one in-flight update/list
+        # pair may publish one generation, while a timed-out worker keeps the
+        # lock until it really finishes.  This prevents overlapping
+        # update_status calls and pre/post mixed snapshots.
+        self._broker_refresh_lock = threading.Lock()
+        self._futures_refresh_generation = 0
+        self._last_futures_refresh = None
+        self._futures_refresh_timeout_s = 3.0
+        # Order-capable channels remain blocked until the first successful
+        # broker refresh. A late/failed refresh must not leave a LIVE_READY
+        # OrderManager able to submit against an uncertain SDK cache.
+        self._broker_refresh_channel_state = "UNCERTAIN"
+        self._broker_refresh_channel_history = []
 
         # Far-month tick-based bar accumulation (independent from near-month)
         self._far_tick_bars_deque = deque(maxlen=300)
@@ -300,9 +364,6 @@ class FuturesMonitor:
         # fail-closed adapter gate explicitly, then persist/transition code
         # can propagate LIVE_READY before any order is attempted.
         self.client._execution_context = None
-        # The adapter is the lowest live send boundary; inject the monitor's
-        # fresh broker snapshot provider instead of allowing route-local truth.
-        self.client._broker_snapshot_provider = self._capture_post_startup_snapshot
 
         # [ThetaGate] Latest router decision — consumed by options monitor
         # to check theta_allowed flag before entering theta positions.
@@ -383,10 +444,8 @@ class FuturesMonitor:
         # (three-state FLAT/OPEN/UNKNOWN). Bootstrap reads the ledger once;
         # afterwards only NEW bytes are tail-read (never a per-tick full scan).
         self._ledger_projection = MtsLedgerProjection(
-            path=os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                "logs", "mts_trade_fills.jsonl",
-            ),
+            path=os.environ.get("MTS_FILL_LOG_PATH")
+            or runtime_logs("mts_trade_fills.jsonl"),
             source="PAPER",
         )
         self._ledger_projection_sync_ts = 0.0
@@ -454,6 +513,15 @@ class FuturesMonitor:
                     f"data failed to load for ticker '{self.ticker}'. Silent start with missing data is blocked to prevent data pollution."
                 )
 
+        # Research dynamics: dz / spread_slope / velocity_ema features.
+        # Best-effort — absence only leaves research columns NULL.
+        try:
+            from strategies.futures.mts.spread_dynamics import \
+                SpreadDynamicsCalculator
+            self._spread_dynamics = SpreadDynamicsCalculator()
+        except Exception:
+            self._spread_dynamics = None
+
         # 2026-07-14 Gemini CLI: Initialize MTF snapshot cache for ADR-009 Phase 1
         self._current_mtf_snapshot = MtfSnapshot()
 
@@ -462,7 +530,7 @@ class FuturesMonitor:
         """Get initial balance dynamically. Day and night sessions share the same capital.
 
         Check order:
-        1. State file (/tmp/mts_position_state.json) if exists and valid.
+        1. Canonical runtime state file if it exists and is valid.
         2. Master config (config/futures.yaml) to keep day/night in sync.
         3. Local session config execution.initial_balance fallback.
         """
@@ -595,6 +663,11 @@ class FuturesMonitor:
                                                                   with_effective_mode)
                                 _api = getattr(self, "api", None)
                                 _issuer = CertificateIssuer()
+                                # [F1] bind the login-created registry generation
+                                # into the quarantined context before certification.
+                                # The post-startup gate reads the durable ctx, so
+                                # certification must never run with session_id=None.
+                                self._bind_session_generation()
                                 _cert, _cert_failures = (
                                     certify_route(
                                         _api,
@@ -613,13 +686,6 @@ class FuturesMonitor:
                                           f"reasons={_cert_failures or ['NO_CERTIFICATE']} "
                                           f"— live orders blocked")
                                 else:
-                                    # [post_startup session gate; D1] bind the
-                                    # registry-bound generation into the
-                                    # QUARANTINED ctx BEFORE certification —
-                                    # the post_startup gate validates
-                                    # generation/session/snapshot consistency
-                                    # before ANY LIVE_READY transition
-                                    self._bind_session_generation()
                                     if not self._confirm_session_generation():
                                         # [D1 race guard] the registry generation
                                         # changed since binding (logout/relogin):
@@ -776,6 +842,8 @@ class FuturesMonitor:
             broker = self.client if self.live_trading else None
             self.order_mgr = OrderManager(mode=_om_mode, broker_adapter=broker,
                                           execution_context=getattr(self, '_execution_context', None))
+            self._set_broker_refresh_channel_state(
+                getattr(self, "_broker_refresh_channel_state", "UNCERTAIN"))
             # [S0] registry injected BEFORE any order path (not lazily)
             self._gateway()
             if _om_mode == "paper":
@@ -956,6 +1024,80 @@ class FuturesMonitor:
             "Close": [r["close"] for r in records],
             "Volume": [r["volume"] for r in records],
         }, index=[r["ts"] for r in records])
+
+    def _get_hvwap_regime_prewarm_bars(self, decision_ts):
+        """Load only the immediately prior session's completed 5m bars.
+
+        This buffer is exclusively for the 60m regime builder.  It is never
+        merged into the current-session deque used by VWAP/15m/5m logic.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                to_epoch_secs, vwap_session_bounds,
+            )
+            _dts = to_epoch_secs(decision_ts)
+            if _dts is None:
+                return []
+            _current_label, _current_start = vwap_session_bounds(_dts)
+            _prior_label, _prior_start = vwap_session_bounds(_current_start - 1.0)
+            if _prior_label == _current_label:
+                _prior_label, _prior_start = vwap_session_bounds(_current_start - 86400.0)
+            _cache_key = (_current_start, _prior_label, bool(self.live_trading))
+            if getattr(self, "_hvwap_regime_prewarm_key", None) == _cache_key:
+                return list(getattr(self, "_hvwap_regime_prewarm_bars", []))
+
+            from pathlib import Path
+            _tag = "_LIVE" if self.live_trading else "_PAPER"
+            _base = Path(runtime_logs("market_data"))
+            _paths = sorted(_base.glob(f"{self.ticker}_*{_tag}_indicators.csv"))
+            if not _paths:
+                self._hvwap_regime_prewarm_key = _cache_key
+                self._hvwap_regime_prewarm_bars = []
+                return []
+            _rows = {}
+            for _path in _paths:
+                try:
+                    _df = pd.read_csv(_path)
+                    _ts_col = "timestamp" if "timestamp" in _df.columns else "ts"
+                    if _ts_col not in _df.columns:
+                        continue
+                    _df["timestamp"] = pd.to_datetime(_df[_ts_col], errors="coerce")
+                    _df = _df.dropna(subset=["timestamp"])
+                    _close = "close" if "close" in _df.columns else "Close"
+                    _volume = "volume" if "volume" in _df.columns else "Volume"
+                    if _close not in _df.columns or _volume not in _df.columns:
+                        continue
+                    for _, _row in _df.iterrows():
+                        _ts = float(_row["timestamp"].timestamp())
+                        if not (_prior_start <= _ts < _current_start and _ts <= _dts):
+                            continue
+                        if int(_ts) % 300 != 0:
+                            continue
+                        _rows[int(_ts)] = (_row, _close, _volume)
+                except Exception:
+                    continue
+            _out = []
+            for _ts_int in sorted(_rows):
+                _row, _close, _volume = _rows[_ts_int]
+                try:
+                    _out.append({
+                        "ts": _row["timestamp"],
+                        "open": float(_row.get("open", _row.get("Open", _row[_close]))),
+                        "high": float(_row.get("high", _row.get("High", _row[_close]))),
+                        "low": float(_row.get("low", _row.get("Low", _row[_close]))),
+                        "close": float(_row[_close]),
+                        "volume": float(_row[_volume]),
+                    })
+                except (TypeError, ValueError):
+                    continue
+            self._hvwap_regime_prewarm_key = _cache_key
+            self._hvwap_regime_prewarm_bars = _out
+            return list(_out)
+        except Exception as _exc:
+            logger.warning("[HVWAP] prior-session regime prewarm unavailable: %s", _exc)
+            self._hvwap_regime_prewarm_key = None
+            self._hvwap_regime_prewarm_bars = []
+            return []
 
     def _bars_time_aligned(self, tx_bars, df_5m):
         """Check that the latest TX bar and MXF 5m bar share the same timestamp bucket.
@@ -1243,6 +1385,26 @@ class FuturesMonitor:
                 self._canonical_far_codes.add("MXF" + _f0[3:])
             elif _f0.startswith("MXF"):
                 self._canonical_far_codes.add("TMF" + _f0[3:])
+
+        # Telemetry-only startup snapshot: records the resolver decision once
+        # before subscriptions begin.  No gate or dispatch behavior changes.
+        try:
+            self._append_mts_event(
+                "MTS_ACTIVE_PAIR_SNAPSHOT",
+                near_contract_code=_c0,
+                far_contract_code=_f0,
+                near_delivery_date=getattr(self.contract, "delivery_date", None),
+                far_delivery_date=getattr(self.far_contract, "delivery_date", None),
+                canonical_near_aliases=sorted(self._canonical_near_codes),
+                canonical_far_aliases=sorted(self._canonical_far_codes),
+                resolver_ready_monotonic_ns=time.monotonic_ns(),
+                subscription_generation=getattr(
+                    getattr(self, "_quote_guard", None), "generation", None),
+                session_identity=getattr(
+                    getattr(self, "_execution_context", None), "session_id", None),
+            )
+        except Exception:
+            pass
 
         
         # 2026-06-24 Gemini CLI: Pre-fill near/far contract prices from snapshots at startup to prevent identical execution prices on first manual trade.
@@ -1776,6 +1938,8 @@ class FuturesMonitor:
         """[GSD Fix] Check if MXF contract has rolled over and re-subscribe if needed."""
         if not self.api or self.dry_run or not self.contract:
             return
+
+        from core.broker.shioaji_compat import safe_subscribe
         
         try:
             current_code = self.contract.code
@@ -1826,14 +1990,22 @@ class FuturesMonitor:
                     self.api.quote.unsubscribe(self.contract, quote_type='tick')
                 except Exception as e:
                     console.print(f"[dim]Unsubscribe old {current_code}: {e}[/dim]")
+                try:
+                    self.api.quote.unsubscribe(self.contract, quote_type='bidask')
+                except Exception as e:
+                    console.print(f"[dim]Unsubscribe old {current_code} bidask: {e}[/dim]")
                 
                 # Switch to new contract
                 self.contract = first_contract
                 self._last_contract_code = first_contract.code
                 
                 # Re-subscribe to new contract
-                self.api.quote.subscribe(first_contract, quote_type='tick')
-                console.print(f"[bold green]✅ Re-subscribed to {first_contract.code}[/bold green]")
+                safe_subscribe(self.api, first_contract, quote_type='tick')
+                safe_subscribe(self.api, first_contract, quote_type='bidask')
+                if self.far_contract is not None:
+                    safe_subscribe(self.api, self.far_contract, quote_type='tick')
+                    safe_subscribe(self.api, self.far_contract, quote_type='bidask')
+                console.print(f"[bold green]✅ Re-subscribed to {first_contract.code} tick+bidask[/bold green]")
                 
                 # Reset tick timestamp to force immediate data freshness check
                 self.last_tick_at = time.time()
@@ -1843,9 +2015,14 @@ class FuturesMonitor:
                 console.print(f"[dim]⚠️ Contract {current_code} is correct but no ticks, re-subscribing...[/dim]")
                 try:
                     self.api.quote.unsubscribe(self.contract, quote_type='tick')
+                    self.api.quote.unsubscribe(self.contract, quote_type='bidask')
                     time.sleep(0.5)
-                    self.api.quote.subscribe(self.contract, quote_type='tick')
-                    console.print(f"[dim]✅ Re-subscription complete[/dim]")
+                    safe_subscribe(self.api, self.contract, quote_type='tick')
+                    safe_subscribe(self.api, self.contract, quote_type='bidask')
+                    if self.far_contract is not None:
+                        safe_subscribe(self.api, self.far_contract, quote_type='tick')
+                        safe_subscribe(self.api, self.far_contract, quote_type='bidask')
+                    console.print(f"[dim]✅ Re-subscription complete (tick+bidask)[/dim]")
                 except Exception as e:
                     console.print(f" [yellow]⚠️ Re-subscription failed: {e}[/yellow] ")
         except Exception as e:
@@ -2133,7 +2310,17 @@ class FuturesMonitor:
         Model C requires. Flag-gated (data/model_c_canary.flag) exactly like
         the tick path; _extract_bbo enforces BBO_VALID-only consumption.
         Never falls back to last/close or buy_price/sell_price.
+
+        2026-08-27 (codex review, v4): this is the ONLY writer of
+        bidask_at / bidask_received_at — Tick-borne BBO must not advance
+        BidAsk freshness (tick path writes tick_bbo_at instead).  The
+        reconnect verification window reads last_bidask_receive_monotonic
+        for per-leg BidAsk callback liveness.
         """
+        # 2026-08-27: per-leg BidAsk callback liveness (monotonic) — ONLY
+        # on_bidask advances this; ticks cannot fake BidAsk freshness.
+        _bidask_recv_now = time.monotonic()
+        self._last_bidask_receive_monotonic = _bidask_recv_now
         # Cache real BBO for both legs regardless of the Model C canary.  Policy J
         # and post-trade replay need this evidence even while Model C is disabled.
         try:
@@ -2147,11 +2334,21 @@ class FuturesMonitor:
                         else None)
                 if _key:
                     _slot = self.market_data.setdefault(_key, {})
+                    # 2026-08-27 (reconnect verification): tag the BBO cache
+                    # with the CURRENT session generation so the post-reconnect
+                    # verification window can reject stale-generation slots
+                    # (_bbo_matches_generation in main.py).
+                    _gen_id = None
+                    try:
+                        from core.live_route_certificate import session_registry
+                        _gen_id = session_registry.generation(self.api)
+                    except Exception:
+                        pass
                     _slot.update({"bid": _bbo_cache[0], "ask": _bbo_cache[1],
-                                  "bidask_at": time.time(), "bidask_exchange_ts": getattr(bidask, "datetime", None)})
-                    _generation_id = _session_generation(getattr(self, "api", None))
-                    if _generation_id is not None:
-                        _slot["generation_id"] = _generation_id
+                                  "bidask_at": time.time(),
+                                  "bidask_received_at": _bidask_recv_now,
+                                  "bidask_exchange_ts": getattr(bidask, "datetime", None),
+                                  "generation_id": _gen_id})
                     # [S2 repair] dedicated EXIT_ONLY BBO evidence cache —
                     # immutable-per-update; written ONLY here (validated
                     # BidAskFOPv1/on_bidask).  Ticks never create or
@@ -2235,23 +2432,9 @@ class FuturesMonitor:
                 self._mc_bidask_err_log = True
                 logger.warning("[MODEL_C] on_bidask error: %r",
                                _sys.exc_info()[1])
-        # also refresh market_data bid/ask caches used by downstream consumers
-        try:
-            _bid = float(getattr(bidask, "bid_price", [None])[0] if hasattr(getattr(bidask, "bid_price", None), "__getitem__") else getattr(bidask, "bid_price", None))
-            _ask = float(getattr(bidask, "ask_price", [None])[0] if hasattr(getattr(bidask, "ask_price", None), "__getitem__") else getattr(bidask, "ask_price", None))
-            if _bid and _ask and _bid > 0 and _ask > 0:
-                _code2 = str(getattr(bidask, "code", "") or "")
-                _k = _code2
-                if _code2 and _code2 in getattr(self, "_canonical_near_codes", set()):
-                    _k = str(getattr(self, "ticker", "TMF"))
-                elif _code2 and _code2 in getattr(self, "_canonical_far_codes", set()):
-                    _k = str(getattr(self, "ticker", "TMF")) + "_FAR"
-                if _k:
-                    self.market_data.setdefault(_k, {})["bid"] = _bid
-                    self.market_data.setdefault(_k, {})["ask"] = _ask
-                    self.market_data.setdefault(_k, {})["bidask_at"] = time.time()
-        except Exception:
-            pass
+        # The validated block above is the sole market_data BBO writer.
+        # Do not add a raw bid_price/ask_price fallback here: it would bypass
+        # validation, canonical routing, and generation fencing.
 
     def on_tick(self, exchange, tick):
         self.last_tick_at = time.time()
@@ -2298,9 +2481,9 @@ class FuturesMonitor:
                     if _now_t - getattr(self, "_f_shadow_state_ts", 0) > 1.0:
                         _t_st = time.time()
                         try:
-                            with open(MTS_POSITION_STATE_PATH) as _fst:
+                            with open(_mts_position_state_path()) as _fst:
                                 self._f_shadow_state = json.load(_fst)
-                                self._f_shadow_state_mtime = os.path.getmtime(MTS_POSITION_STATE_PATH)
+                                self._f_shadow_state_mtime = os.path.getmtime(_mts_position_state_path())
                         except Exception:
                             self._f_shadow_state = {}
                         self._f_shadow_state_ts = _now_t
@@ -2490,14 +2673,13 @@ class FuturesMonitor:
         if getattr(tick, 'close', None) and float(tick.close) > 0:
             _p = float(tick.close)
             _t_code = getattr(tick, 'code', None)
+            _bbo_now = time.time()
             _tick_info = {
                 "close": _p,
                 "datetime": getattr(tick, 'datetime', None),
                 "local_arrival_at": self.last_tick_at,
+                **_bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag()),
             }
-            _tick_info.update(_bbo_tick_fields(
-                tick, self.last_tick_at,
-                _session_generation(getattr(self, "api", None))))
             if _t_code:
                 self.market_data[_t_code] = _tick_info
             
@@ -2586,6 +2768,7 @@ class FuturesMonitor:
                 _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
                 _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
                 
+                self._mts_tag_bar_session(_rt_bar)
                 self._mts_tick(enriched_bar=_rt_bar)
             return
 
@@ -2627,38 +2810,37 @@ class FuturesMonitor:
         # 2026-06-24 Gemini CLI: Maintain near/far/code-specific market data caches for spread execution price integrity.
         # 2026-07-31 Antigravity P0 Guard Phase 2: Gate NEAR slot updates strictly on is_primary tick.
         # Prevent far-month/secondary ticks from contaminating NEAR bid/ask/close cache at Line 1693.
+        _bbo_now = time.time()
+        _bbo_fields = _bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag())
         if is_primary:
-            _near_tick_info = {
+            self.market_data[self.ticker] = {
                 "close": price, 
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
+                # 2026-06-26 Gemini CLI: cache bid/ask prices (real BBO only)
+                **_bbo_fields,
             }
-            _near_tick_info.update(_bbo_tick_fields(
-                tick, self.last_tick_at,
-                _session_generation(getattr(self, "api", None))))
-            self.market_data[self.ticker] = _near_tick_info
-            self.market_data[f"{self.ticker}_NEAR"] = _near_tick_info
-        elif is_far_tick:
-            _far_tick_info = {
-                "close": float(getattr(tick, 'close', price) or price),
-                "datetime": tick.datetime,
-                "local_arrival_at": time.time(),
-            }
-            _far_tick_info.update(_bbo_tick_fields(
-                tick, self.last_tick_at,
-                _session_generation(getattr(self, "api", None))))
-            self.market_data[f"{self.ticker}_FAR"] = _far_tick_info
-
-        if getattr(tick, 'code', None):
-            _code_tick_info = {
+            self.market_data[f"{self.ticker}_NEAR"] = {
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
+                **_bbo_fields,
             }
-            _code_tick_info.update(_bbo_tick_fields(
-                tick, self.last_tick_at,
-                _session_generation(getattr(self, "api", None))))
-            self.market_data[tick.code] = _code_tick_info
+        elif is_far_tick:
+            self.market_data[f"{self.ticker}_FAR"] = {
+                "close": float(getattr(tick, 'close', price) or price),
+                "datetime": tick.datetime,
+                "local_arrival_at": time.time(),
+                **_bbo_fields,
+            }
+
+        if getattr(tick, 'code', None):
+            self.market_data[tick.code] = {
+                "close": price,
+                "datetime": tick.datetime,
+                "local_arrival_at": time.time(),
+                **_bbo_fields,
+            }
 
         # Only count volume for primary ticker to keep indicators accurate
         vol = int(getattr(tick, "volume", 0)) if is_primary else 0        
@@ -2773,6 +2955,7 @@ class FuturesMonitor:
             _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
             _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
 
+            self._mts_tag_bar_session(_rt_bar)
             self._mts_tick(enriched_bar=_rt_bar)
 
         cb = self.client._tick_callbacks.get(tick.code)
@@ -2798,17 +2981,22 @@ class FuturesMonitor:
         ts_int = int(tick_ts.timestamp() / 300) * 300
 
         # 2026-06-24 Gemini CLI: Maintain far/code-specific market data caches for spread execution price integrity.
-        _far_tick_info = {
+        _bbo_now = time.time()
+        _bbo_fields = _bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag())
+        self.market_data[f"{self.ticker}_FAR"] = {
             "close": price,
             "datetime": tick.datetime,
             "local_arrival_at": time.time(),
+            # 2026-06-26 Gemini CLI: cache bid/ask prices (real BBO only)
+            **_bbo_fields,
         }
-        _far_tick_info.update(_bbo_tick_fields(
-            tick, self.last_tick_at,
-            _session_generation(getattr(self, "api", None))))
-        self.market_data[f"{self.ticker}_FAR"] = _far_tick_info
         if getattr(tick, 'code', None):
-            self.market_data[tick.code] = _far_tick_info
+            self.market_data[tick.code] = {
+                "close": price,
+                "datetime": tick.datetime,
+                "local_arrival_at": time.time(),
+                **_bbo_fields,
+            }
 
         # [Debug] Periodic far tick log (every 30s)
         now_s = time.time()
@@ -3190,12 +3378,12 @@ class FuturesMonitor:
             return {"source": "unavailable", "capture_error": True}
         try:
             try:
-                _pos_rows = _api.list_positions(_acct)
+                _pos_rows = _api.list_positions(account=_acct)
             except TypeError:
                 # same SDK signature quirk the preflight guards against
                 _pos_rows = _api.list_positions()
             try:
-                _trades_rows = _api.list_trades(_acct)
+                _trades_rows = _api.list_trades(account=_acct)
             except TypeError:
                 _trades_rows = _api.list_trades()
             for _p in (_pos_rows or []):
@@ -3272,10 +3460,6 @@ class FuturesMonitor:
                                    evidence: str = "",
                                    expected_legs=None,
                                    attested_at: str = "") -> tuple:
-        # The reconciled-position lifecycle has no operator exit-only mode.
-        return None, "EXIT_ONLY_INGRESS_REMOVED"
-        # Legacy body below is unreachable and remains only as migration
-        # context until old persisted command records are retired.
         """RECONCILED_EXIT_ONLY attestation flow (P0 completion).
 
         Hard requirement: operator attestation (who/when/evidence, no
@@ -3345,38 +3529,120 @@ class FuturesMonitor:
             "live": bool(
                 (getattr(self, "live_trading", False)
                  and not getattr(self, "dry_run", False))
-                ),
+                or _gw_mode == "reconciled_exit_only"),
             "mode": _gw_mode,
             "live_order_allowed": getattr(_ctx, "live_order_allowed", False),
+            "capability": getattr(_ctx, "exit_only_capability", None),
+            "hydrated_position": getattr(self, "_exit_only_position", None),
+            "strategy_reconciliation_id": getattr(
+                strategy, "_reconciliation_id", None),
+            "near_code": getattr(
+                getattr(self, "contract", None), "code", None),
+            "far_code": getattr(
+                getattr(self, "far_contract", None), "code", None),
+            "bbo_slots": self._exit_only_bbo_slots(),
             "position_has_position": \
                 self._exit_only_position_has_position(),
-            # Only a monitor that has entered the live startup path exposes
-            # this invariant.  Test/paper helpers without the marker must
-            # not be mistaken for an unhydrated live process.
-            "startup_not_ready": (
-                hasattr(self, "_canonical_holding_hydrated")
-                and not bool(self._canonical_holding_hydrated)),
-            "pending_order": bool(getattr(
-                getattr(self, "order_mgr", None), "active_orders", {})),
-            # Certificate transition already seals these facts in the
-            # immutable context; the gateway still rejects an explicit
-            # failed fact supplied by callers.
-            "identity_ok": True,
-            "route_ok": True,
-            "session_ok": True,
         }
 
-    def _authorize_intent(self, action, strategy_name, strategy_obj=None):
-        """[S0] single authorize entry: every MTS order path (auto,
-        manual, emergency) authorizes through the gateway policy.
+    def _mts_quarantine_exit_proof(self, strategy, sname, action):
+        """[QUARANTINE_EXIT 2026-08-18] Pre-submit FRESH broker-truth
+        recheck for a snapshot-bound remaining-leg exit while
+        LIVE_QUARANTINED.  Returns the per-order proof dict, or None
+        (zero submit) on any fail-closed condition: capture failure,
+        flat terminal, ambiguous legs, released contract back at broker,
+        session mismatch, missing recovery identity."""
+        _ctx = getattr(self, "_execution_context", None)
+        if getattr(_ctx, "effective_mode", "") != "live_quarantined":
+            return None
+        if sname not in ("MTS_RELEASE", "MTS_EXIT"):
+            return None
+        if (getattr(strategy, "_broker_recovery_source", None)
+                != "broker_reconciliation"):
+            return None
+        _snap = self._capture_post_startup_snapshot()
+        if (_snap.get("fetch_status") or {}).get("capture") != "OK":
+            return None
+        _codes = {str(getattr(self.contract, "code", "")),
+                  str(getattr(self.far_contract, "code", ""))}
+        _rows = [p for p in (_snap.get("positions") or [])
+                 if p.get("account") == "futures"
+                 and p.get("code") in _codes
+                 and type(p.get("quantity")) is int
+                 and p.get("quantity", 0) > 0]
+        if len(_rows) != 1:
+            return None  # flat terminal / ambiguous — no proof
+        _row = _rows[0]
+        _code = str(_row.get("code") or "")
+        _side_text = str(_row.get("direction") or "").lower()
+        if "sell" in _side_text or "short" in _side_text:
+            _side = "SHORT"
+        elif "buy" in _side_text or "long" in _side_text:
+            _side = "LONG"
+        else:
+            return None
+        _rel_str = getattr(strategy, "_released_leg", None)
+        if _rel_str not in ("near", "far"):
+            return None
+        _near_code = str(getattr(self.contract, "code", ""))
+        _far_code = str(getattr(self.far_contract, "code", ""))
+        _released_code = _near_code if _rel_str == "near" else _far_code
+        _remaining_code = _far_code if _rel_str == "near" else _near_code
+        if _code != _remaining_code:
+            return None  # snapshot remaining leg != strategy remaining leg
+        if _released_code in {r.get("code") for r in _rows}:
+            return None  # released contract back at broker — contradiction
+        _snap_sess = _snap.get("session_id")
+        if not _snap_sess or _snap_sess != getattr(_ctx, "session_id", ""):
+            return None
+        _hash = _snap.get("canonical_input_hash")
+        _recovery_oid = getattr(strategy, "_broker_recovery_order_id", None)
+        if not _hash or not _recovery_oid:
+            return None
+        # ── order binding (2026-08-18 review): the proof authorizes ONLY
+        # the remaining-leg closing order.  A RELEASE_* order targets the
+        # RELEASED contract (already gone at the broker) → never bound.
+        _action_u = str(action or "").upper()
+        if "RELEASE_NEAR" in _action_u:
+            _order_code = _near_code
+        elif "RELEASE_FAR" in _action_u:
+            _order_code = _far_code
+        elif _action_u == "EXIT":
+            _order_code = _remaining_code
+        else:
+            return None
+        if _order_code != _remaining_code:
+            return None  # released-leg order — zero submit
+        _order_side = "SELL" if _side == "LONG" else "BUY"
+        _order_qty = _row.get("quantity")
+        return {
+            "strategy": sname,
+            "contract": _code,
+            "side": _side,
+            "qty": _order_qty,
+            "order_symbol": _order_code,
+            "order_side": _order_side,
+            "order_qty": _order_qty,
+            "snapshot_hash": _hash,
+            "recovery_order_id": _recovery_oid,
+            "session": getattr(strategy, "_position_session_type", None),
+        }
 
-        Reconciliation hydration is a startup invariant, not an exit
-        capability or a retryable authorization side path.
-        """
+    def _authorize_intent(self, action, strategy_name, strategy_obj=None,
+                          quarantine_exit_proof=None):
+        """[S0] single authorize entry: every MTS order path (auto,
+        manual, emergency) authorizes through the gateway policy."""
         _gw = self._gateway()
-        return _gw.authorize_intent(
+        _auth = self._gateway_authority(strategy_obj)
+        if quarantine_exit_proof is not None:
+            _auth = dict(_auth)
+            _auth["quarantine_exit_proof"] = quarantine_exit_proof
+        _ok, _binding, _reason = _gw.authorize_intent(
             action=action, strategy=strategy_name,
-            authority=self._gateway_authority(strategy_obj))
+            authority=_auth)
+        if _ok and _binding is not None:
+            self._exit_only_decision_binding = _binding
+        return _ok, _binding, _reason
 
     def _quarantine_mts_exit_leg_failure(self, *, trade_id, leg, reason):
         """[S0] a combined-exit leg failed (GatewaySubmitError):
@@ -3812,10 +4078,6 @@ class FuturesMonitor:
         return False
 
     def _hydrate_exit_only_position(self):
-        # Removed: canonical broker reconciliation hydrates the strategy
-        # position directly before evaluation.
-        return None
-        # Legacy capability hydration body is unreachable during migration.
         """Hydrate the managed exit-only position from the active capability.
 
         Only when RECONCILED_EXIT_ONLY is effective; paper/normal live is
@@ -4080,85 +4342,12 @@ class FuturesMonitor:
         return True
 
     def _process_reconciled_exit_attestation_command(self) -> bool:
-        # Removed: reconciled positions use the normal live lifecycle.  Do
-        # not consume, transform, or execute legacy exit-only commands.
+        """[EXIT_ONLY flow removed 2026-08-14] the operator
+        attestation flow no longer exists as an execution mode —
+        the command is NEVER consumed and no EXIT_ONLY capability
+        can be authorized through it (fail-closed: a legacy pending
+        command stays untouched)."""
         return False
-        # Legacy parser below is unreachable during migration.
-        """Consume the sanctioned, one-shot reconciled-exit request.
-
-        The command can only invoke the existing operator-attestation
-        builder.  That builder takes a read-only broker snapshot, binds the
-        exact trade/legs/provenance, and persists ``reconciled_exit_only``;
-        this ingress never creates or submits an order directly.
-        """
-        _path = Path(runtime_path(
-            "commands", "reconciled_exit_attestation.json"))
-        _processing = Path(str(_path) + ".processing")
-        if not _path.exists() and not _processing.exists():
-            return False
-        if _path.exists():
-            try:
-                _path.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(_path, _processing)
-            except OSError:
-                return False
-        try:
-            _raw = json.loads(_processing.read_text(encoding="utf-8"))
-        except Exception:
-            _raw = None
-        try:
-            _processing.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        _allowed = {"command_id", "action", "created_at", "operator",
-                    "trade_id", "evidence", "expected_legs"}
-        _valid = (isinstance(_raw, dict)
-                  and not (set(_raw) - _allowed)
-                  and isinstance(_raw.get("command_id"), str)
-                  and bool(_raw.get("command_id"))
-                  and _raw.get("action") == "ATTEST_EXIT_ONLY"
-                  and isinstance(_raw.get("created_at"), int)
-                  and not isinstance(_raw.get("created_at"), bool)
-                  and abs(time.time() * 1000 - _raw["created_at"]) <= 60_000
-                  and isinstance(_raw.get("operator"), str)
-                  and bool(_raw.get("operator"))
-                  and isinstance(_raw.get("trade_id"), str)
-                  and bool(_raw.get("trade_id"))
-                  and isinstance(_raw.get("evidence"), str)
-                  and bool(_raw.get("evidence"))
-                  and isinstance(_raw.get("expected_legs"), list)
-                  and len(_raw.get("expected_legs")) == 2)
-        if _valid:
-            for _leg in _raw["expected_legs"]:
-                if (not isinstance(_leg, dict)
-                        or set(_leg) - {"symbol", "side", "remaining_qty"}
-                        or not isinstance(_leg.get("symbol"), str)
-                        or not _leg.get("symbol")
-                        or str(_leg.get("side", "")).lower()
-                        not in ("buy", "sell")
-                        or type(_leg.get("remaining_qty")) is not int
-                        or _leg["remaining_qty"] <= 0):
-                    _valid = False
-                    break
-        if not _valid:
-            if isinstance(_raw, dict):
-                self._append_mts_event(
-                    "OPERATOR_ATTESTATION_REJECTED",
-                    command_id=_raw.get("command_id", ""),
-                    reason="ATTESTATION_COMMAND_INVALID")
-            return True
-
-        _record, _reason = self._operator_attest_exit_only(
-            operator=_raw["operator"], trade_id=_raw["trade_id"],
-            evidence=_raw["evidence"],
-            expected_legs=_raw["expected_legs"])
-        if _reason:
-            self._append_mts_event(
-                "OPERATOR_ATTESTATION_REJECTED",
-                command_id=_raw["command_id"], reason=_reason,
-                trade_id=_raw["trade_id"])
-        return True
     def _clear_mts_entry_reconcile_intents(self, trade_id: str) -> bool:
         """Resolve only the incident intent bound to the reconciled trade.
 
@@ -4395,6 +4584,9 @@ class FuturesMonitor:
                     "PartiallyFailed"}
         out = []
         for t in raw_trades or []:
+            _order = getattr(t, "order", None)
+            _contract = getattr(t, "contract", None) or getattr(
+                _order, "contract", None)
             st = getattr(t, "status", None)
             _inner = getattr(st, "status", None)
             name = (getattr(_inner, "name", None)
@@ -4407,10 +4599,10 @@ class FuturesMonitor:
             if name in terminal:
                 continue
             row = {
-                "order_id": str(getattr(getattr(t, "order", None), "id", "")),
+                "order_id": str(getattr(_order, "id", "") or
+                                  getattr(t, "id", "")),
                 "code": str(getattr(t, "code", "")
-                             or getattr(getattr(getattr(t, "order", None),
-                                                 "contract", None), "code", "")),
+                             or getattr(_contract, "code", "")),
                 "status": name,
             }
             # Preserve the historical shape when SDK identity fields are not
@@ -4418,11 +4610,12 @@ class FuturesMonitor:
             # supplied by Shioaji for watchdog matching.
             for key, value in (
                     ("broker_order_id", getattr(t, "id", None)
-                     or getattr(t, "broker_order_id", None)),
+                     or getattr(t, "broker_order_id", None)
+                     or getattr(_order, "id", None)),
                     ("ordno", getattr(t, "ordno", None)
-                     or getattr(getattr(t, "order", None), "ordno", None)),
+                     or getattr(_order, "ordno", None)),
                     ("seqno", getattr(t, "seqno", None)
-                     or getattr(getattr(t, "order", None), "seqno", None))):
+                     or getattr(_order, "seqno", None))):
                 if value not in (None, ""):
                     row[key] = str(value)
             _action = (getattr(t, "action", None)
@@ -4543,7 +4736,8 @@ class FuturesMonitor:
                             source="live_broker_watchdog"))
 
     @staticmethod
-    def _normalize_snapshot_trades(raw_trades) -> list:
+    def _normalize_snapshot_trades(raw_trades, *, observation_type="REFRESHED_TRADE",
+                                   snapshot_generation=None, observed_at=None) -> list:
         """Return JSON-safe terminal broker receipts for local backfill.
 
         ``list_trades`` is the broker's authoritative read path when a live
@@ -4551,55 +4745,412 @@ class FuturesMonitor:
         facts; never persist the SDK object (which can contain account/CA
         details or enum values that are not JSON serializable).
         """
+        def _get(obj, key, default=None):
+            if isinstance(obj, dict):
+                return obj[key] if key in obj else default
+            return getattr(obj, key, default)
+
+        def _enum_text(value):
+            if value is None:
+                return None
+            name = _get(value, "name")
+            val = _get(value, "value")
+            text = name or val or value
+            return str(text).split(".")[-1]
+
+        def _json_value(value):
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            if isinstance(value, dict):
+                return {str(k): _json_value(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_json_value(v) for v in value]
+            return {key: _json_value(_get(value, key)) for key in (
+                "deal_id", "trade_id", "fill_id", "exchange_seq", "price",
+                "avg_price", "quantity", "qty", "ordno")
+                    if _get(value, key) is not None}
+
         out = []
         for trade in raw_trades or []:
-            broker_order = getattr(trade, "order", None)
-            status = getattr(trade, "status", None)
-            nested = getattr(status, "status", None)
+            broker_order = _get(trade, "order")
+            status = _get(trade, "status")
+            contract = _get(trade, "contract") or _get(broker_order, "contract")
+            nested = _get(status, "status")
             raw_status = nested if nested is not None else status
             if isinstance(raw_status, dict):
                 raw_status = raw_status.get("status")
-            status_name = (getattr(raw_status, "name", None)
-                           or getattr(raw_status, "value", None)
-                           or str(raw_status or ""))
-            status_name = str(status_name).split(".")[-1]
+            status_name = _enum_text(raw_status) or ""
+            _trade_action = _get(trade, "action") or _get(broker_order, "action")
+            _direction = _enum_text(_trade_action)
+            broker_order_id = (_get(broker_order, "id") or
+                               _get(status, "id") or _get(trade, "id"))
+            requested_qty = _get(broker_order, "quantity")
+            if requested_qty is None:
+                requested_qty = _get(status, "order_quantity")
+            filled_qty = _get(status, "deal_quantity")
+            cancelled_qty = _get(status, "cancel_quantity")
+            deals = _get(status, "deals")
+            if deals is None:
+                deals = _get(trade, "deals")
+            deals = [_json_value(deal) for deal in deals] if isinstance(
+                deals, (list, tuple)) else []
             row = {
-                "id": getattr(trade, "id", None)
-                      or getattr(trade, "broker_order_id", None)
-                      or getattr(trade, "exchange_order_id", None)
-                      or getattr(broker_order, "id", None),
-                "broker_order_id": getattr(trade, "broker_order_id", None)
-                                   or getattr(broker_order, "id", None),
-                "ordno": getattr(trade, "ordno", None)
-                        or getattr(broker_order, "ordno", None),
-                "seqno": getattr(trade, "seqno", None)
-                        or getattr(broker_order, "seqno", None),
-                "code": getattr(trade, "code", None),
+                "id": broker_order_id,
+                "broker_order_id": broker_order_id,
+                "status_id": _get(status, "id"),
+                "ordno": _get(broker_order, "ordno"),
+                "seqno": _get(broker_order, "seqno"),
+                "code": _get(contract, "code"),
+                "direction": (str(_direction).lower() if _direction is not None else None),
                 "status": status_name,
-                "price": getattr(status, "price", None)
-                         or getattr(trade, "price", None),
-                "avg_price": getattr(status, "avg_price", None)
-                             or getattr(trade, "avg_price", None),
-                "quantity": getattr(status, "quantity", None)
-                            or getattr(trade, "quantity", None),
-                "filled_quantity": getattr(status, "filled_quantity", None)
-                                   or getattr(trade, "filled_quantity", None),
-                "deals": [],
+                "broker_status": status_name,
+                "status_code": _get(status, "status_code"),
+                "price": _get(status, "price"),
+                "avg_price": _get(status, "avg_price"),
+                "quantity": requested_qty,
+                "requested_qty": requested_qty,
+                "filled_quantity": filled_qty,
+                "filled_qty": filled_qty,
+                "cancelled_qty": cancelled_qty,
+                "ts": _get(trade, "ts") if _get(trade, "ts") is not None else _get(status, "ts"),
+                "deals": deals,
+                "observation_type": observation_type,
+                "observed_at": observed_at or int(time.time() * 1000),
+                "snapshot_generation": snapshot_generation,
+                "source_status": status_name,
+                "normalization_result": "ACCEPTED",
+                "rejection_reason": None,
             }
-            deals = getattr(status, "deals", None) or getattr(trade, "deals", None) or []
-            for deal in deals if isinstance(deals, (list, tuple)) else []:
-                if isinstance(deal, dict):
-                    out_deal = dict(deal)
-                else:
-                    out_deal = {
-                        key: getattr(deal, key, None)
-                        for key in ("deal_id", "trade_id", "fill_id",
-                                    "exchange_fill_id", "exchange_seq",
-                                    "price", "avg_price", "quantity", "qty",
-                                    "ordno")
-                    }
-                row["deals"].append(out_deal)
             out.append(row)
+        return out
+
+    def _set_broker_refresh_channel_state(self, state: str) -> None:
+        """Propagate refresh certainty to every order-capable channel."""
+        _state = state if state in ("HEALTHY", "UNCERTAIN") else "UNCERTAIN"
+        self._broker_refresh_channel_state = _state
+        _history = getattr(self, "_broker_refresh_channel_history", None)
+        if _history is None:
+            _history = []
+            self._broker_refresh_channel_history = _history
+        _history.append(_state)
+        try:
+            self._append_mts_event(
+                "REFRESH_CHANNEL_STATE",
+                state=_state,
+                observation_type="REFRESH_CHANNEL",
+                normalization_result="ACCEPTED")
+        except Exception:
+            pass
+        _manager = getattr(self, "order_mgr", None)
+        _setter = getattr(_manager, "set_broker_refresh_channel_state", None)
+        if callable(_setter):
+            _setter(_state)
+        elif _manager is not None:
+            _manager._broker_refresh_channel_state = _state
+
+    def _refresh_futures_trade_view(self, api, account):
+        """Run one bounded, single-flight update_status -> list_trades pair.
+
+        A timeout does not cancel the SDK call; the worker owns the lock until
+        it exits, so a later refresh cannot overlap it.  The caller receives
+        no rows unless both calls completed successfully.
+        """
+        lock = getattr(self, "_broker_refresh_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._broker_refresh_lock = lock
+        if api is None or account is None or getattr(api, "is_connected", True) is False:
+            self._set_broker_refresh_channel_state("UNCERTAIN")
+            result = {"state": "REFRESH_SKIPPED_DISCONNECTED", "rows": [],
+                      "snapshot_generation": None, "elapsed_ms": 0,
+                      "trades_count": 0}
+            self._record_refresh_telemetry(result)
+            return result
+        if not lock.acquire(blocking=False):
+            self._set_broker_refresh_channel_state("UNCERTAIN")
+            result = {"state": "REFRESH_SKIPPED_INFLIGHT", "rows": [],
+                      "snapshot_generation": None, "elapsed_ms": 0,
+                      "trades_count": 0}
+            self._record_refresh_telemetry(result)
+            return result
+        done = threading.Event()
+        box = {}
+        started = time.monotonic()
+        generation = None
+
+        def _worker():
+            try:
+                # Keep the transaction exact: a TypeError from the SDK is an
+                # exception state, not permission to issue a second refresh
+                # through a different overload.
+                api.update_status(account=account)
+                rows = api.list_trades()
+                if rows is None:
+                    raise RuntimeError("list_trades returned None")
+                box["rows"] = list(rows)
+                box["state"] = "REFRESH_SUCCEEDED"
+            except Exception as exc:
+                box["state"] = "REFRESH_EXCEPTION"
+                box["error"] = type(exc).__name__
+            finally:
+                done.set()
+                lock.release()
+
+        self._set_broker_refresh_channel_state("UNCERTAIN")
+        self._record_refresh_telemetry({"state": "REFRESH_STARTED",
+                                        "elapsed_ms": 0,
+                                        "trades_count": 0})
+        threading.Thread(target=_worker, daemon=True).start()
+        timeout = float(getattr(self, "_futures_refresh_timeout_s", 3.0) or 3.0)
+        if not done.wait(timeout=max(0.1, timeout)):
+            self._set_broker_refresh_channel_state("UNCERTAIN")
+            result = {"state": "REFRESH_TIMEOUT_UNCERTAIN", "rows": [],
+                      "snapshot_generation": None,
+                      "elapsed_ms": int((time.monotonic() - started) * 1000),
+                      "trades_count": 0}
+            self._record_refresh_telemetry(result)
+            return result
+        elapsed = int((time.monotonic() - started) * 1000)
+        if box.get("state") != "REFRESH_SUCCEEDED":
+            self._set_broker_refresh_channel_state("UNCERTAIN")
+            result = {"state": "REFRESH_EXCEPTION", "rows": [],
+                      "snapshot_generation": None, "elapsed_ms": elapsed,
+                      "trades_count": 0, "error": box.get("error")}
+            self._record_refresh_telemetry(result)
+            return result
+        self._futures_refresh_generation = int(
+            getattr(self, "_futures_refresh_generation", 0) or 0) + 1
+        generation = f"futures-{time.time_ns()}-{self._futures_refresh_generation}"
+        rows = box.get("rows") or []
+        _status_distribution = {}
+        for _row in rows:
+            _status = getattr(getattr(_row, "status", None), "status", None)
+            if _status is None:
+                _status = getattr(_row, "status", None)
+            _name = getattr(_status, "name", None) or getattr(
+                _status, "value", None) or str(_status or "UNKNOWN")
+            _name = str(_name).split(".")[-1]
+            _status_distribution[_name] = _status_distribution.get(_name, 0) + 1
+        result = {"state": "REFRESH_SUCCEEDED", "rows": rows,
+                  "snapshot_generation": generation, "elapsed_ms": elapsed,
+                  "trades_count": len(rows),
+                  "observed_at": int(time.time() * 1000),
+                  "status_distribution": _status_distribution,
+                  "raw_count": len(rows), "normalized_count": len(rows),
+                  "rejected_count": 0, "rejection_reasons": {}}
+        self._set_broker_refresh_channel_state("HEALTHY")
+        self._record_refresh_telemetry(result)
+        try:
+            self._append_mts_event(
+                "REFRESH_COMPLETED",
+                snapshot_generation=generation,
+                account_type="futures",
+                elapsed_ms=elapsed,
+                trades_count=len(rows),
+                status_distribution=_status_distribution,
+                raw_count=len(rows), normalized_count=len(rows),
+                rejected_count=0, rejection_reasons={})
+        except Exception:
+            pass
+        self._last_futures_refresh = dict(result, rows=None)
+        return result
+
+    def _record_refresh_telemetry(self, result):
+        self._last_futures_refresh = dict(result, rows=None)
+        try:
+            self._append_mts_event(result.get("state", "REFRESH_EXCEPTION"),
+                                   snapshot_generation=result.get("snapshot_generation"),
+                                   account_type="futures",
+                                   elapsed_ms=result.get("elapsed_ms", 0),
+                                   trades_count=result.get("trades_count", 0),
+                                   status_distribution=result.get(
+                                       "status_distribution", {}),
+                                   raw_count=result.get("raw_count", 0),
+                                   normalized_count=result.get(
+                                       "normalized_count", 0),
+                                   rejected_count=result.get(
+                                       "rejected_count", 0),
+                                   rejection_reasons=result.get(
+                                       "rejection_reasons", {}),
+                                   forder_count=getattr(
+                                       self, "_forder_callback_count", 0),
+                                   fdeal_count=getattr(
+                                       self, "_fdeal_callback_count", 0),
+                                   callback_exception_count=getattr(
+                                       self, "_callback_exception_count", 0),
+                                   last_order_callback_at=getattr(
+                                       self, "_last_order_callback_at", None),
+                                   last_fdeal_callback_at=getattr(
+                                       self, "_last_fdeal_callback_at", None),
+                                   callback_registration_generation=getattr(
+                                       self, "_callback_registration_generation", None),
+                                   error=result.get("error"))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _normalize_order_deal_records(raw_records) -> list:
+        """Normalize Shioaji ``order_deal_records`` terminal deal rows.
+
+        ``list_trades()`` is an active-order view and can be empty after a
+        fill.  Shioaji's historical receipt API returns nested
+        ``(OrderState, OrderEventDict)`` tuples; only FuturesDeal/FDEAL rows
+        are terminal fill evidence.  FuturesOrder/FORDER rows are deliberately
+        ignored here and remain the responsibility of the active-order path.
+        """
+        out = []
+        for item in raw_records or []:
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                continue
+            state, payload = item[0], item[1]
+            _name = getattr(state, "name", None)
+            _value = getattr(state, "value", None)
+            if not (_name == "FuturesDeal" or _value == "FDEAL"
+                    or str(_name or _value or "").split(".")[-1] == "FuturesDeal"):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            _broker_id = (payload.get("trade_id") or payload.get("id")
+                          or payload.get("broker_order_id"))
+            _price = payload.get("price")
+            _qty = payload.get("quantity") or payload.get("qty")
+            if not _broker_id or _price is None or not _qty:
+                continue
+            _code = str(payload.get("full_code") or payload.get("code") or "")
+            _delivery = str(payload.get("delivery_month") or "")
+            # Shioaji may return the product code plus a numeric delivery
+            # month rather than the monitor's canonical TMFH6/TMFI6 code.
+            if _code and _delivery.isdigit() and len(_delivery) == 6:
+                _month = int(_delivery[-2:])
+                if _month in range(1, 13) and _code == "TMF":
+                    _code = f"{_code}{chr(64 + _month)}{_delivery[-3]}"
+            _deal = {
+                "trade_id": str(_broker_id),
+                "broker_trade_id": str(_broker_id),
+                "exchange_fill_id": str(_broker_id),
+                "exchange_seq": payload.get("exchange_seq"),
+                "price": _price,
+                "quantity": _qty,
+                "ordno": payload.get("ordno"),
+                "deal_ts": payload.get("ts"),
+            }
+            out.append({
+                "id": str(_broker_id),
+                "broker_order_id": str(_broker_id),
+                "ordno": payload.get("ordno"),
+                "seqno": payload.get("seqno"),
+                "code": _code,
+                "delivery_month": _delivery,
+                "direction": payload.get("action"),
+                "status": "Filled",
+                "price": _price,
+                "quantity": _qty,
+                "filled_quantity": _qty,
+                "trade_id": str(_broker_id),
+                "ts": payload.get("ts"),
+                "deals": [_deal],
+            })
+        return out
+
+    @staticmethod
+    def _normalize_order_state_records(raw_records) -> list:
+        """Normalize Shioaji ``order_deal_records`` FORDER rows into
+        trade-shaped terminal ORDER receipts.
+
+        FDEAL rows are fills (fills ledger); FORDER rows carry the order's
+        own nested status (``payload['status'].status``) plus optional
+        deals.  The nested status is authoritative for the terminal ORDER
+        state; deals embedded in the order snapshot feed the same
+        identity-deduped fill path.  A row without an order identity is
+        skipped (never a synthetic order).
+        """
+        out = []
+        for item in raw_records or []:
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                continue
+            state, payload = item[0], item[1]
+            _name = getattr(state, "name", None)
+            _value = getattr(state, "value", None)
+            if not (_name == "FuturesOrder" or _value == "FORDER"
+                    or str(_name or _value or "").split(".")[-1]
+                    == "FuturesOrder"):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            _order = payload.get("order")
+            if not isinstance(_order, dict):
+                _order = payload
+            _broker_id = (_order.get("id") or _order.get("broker_order_id")
+                          or payload.get("trade_id") or payload.get("id"))
+            if not _broker_id:
+                continue
+            # nested order status: payload["status"] may be an OrderState
+            # object (status.status -> enum) or a dict with its own status
+            _st = payload.get("status")
+            _inner = getattr(_st, "status", None)
+            if isinstance(_inner, dict):
+                _inner = _inner.get("status")
+            _raw = (_inner if _inner is not None
+                    else (_st.get("status") if isinstance(_st, dict) else _st))
+            _status_name = (getattr(_raw, "name", None)
+                            or getattr(_raw, "value", None)
+                            or (_raw if isinstance(_raw, str) else None)
+                            or str(_raw or ""))
+            _status_name = str(_status_name).split(".")[-1]
+            _contract = payload.get("contract")
+            if not isinstance(_contract, dict):
+                _contract = {}
+            _code = str(payload.get("full_code")
+                        or _contract.get("code") or payload.get("code") or "")
+            _delivery = str(_contract.get("delivery_month")
+                            or payload.get("delivery_month") or "")
+            if _code and _delivery.isdigit() and len(_delivery) == 6:
+                _month = int(_delivery[-2:])
+                if _month in range(1, 13) and _code == "TMF":
+                    _code = f"{_code}{chr(64 + _month)}{_delivery[-3]}"
+            _price = (payload.get("price") or payload.get("avg_price")
+                      or _order.get("price") or _order.get("avg_price"))
+            _qty = (payload.get("quantity") or payload.get("filled_quantity")
+                    or _order.get("quantity") or _order.get("filled_quantity"))
+            _action = payload.get("action") or _order.get("action")
+            _deals = payload.get("deals")
+            _normalized_deals = []
+            for _d in _deals if isinstance(_deals, list) else []:
+                if not isinstance(_d, dict):
+                    continue
+                _did = (_d.get("deal_id") or _d.get("trade_id")
+                        or _d.get("fill_id"))
+                if not _did:
+                    continue
+                _dp = _d.get("price") or _d.get("avg_price")
+                _dq = _d.get("quantity") or _d.get("qty")
+                if _dp is None or not _dq:
+                    continue
+                _normalized_deals.append({
+                    "deal_id": str(_did),
+                    "trade_id": str(_did),
+                    "broker_trade_id": str(_did),
+                    "exchange_fill_id": str(_did),
+                    "exchange_seq": _d.get("exchange_seq"),
+                    "price": _dp,
+                    "quantity": _dq,
+                    "ordno": _d.get("ordno") or _order.get("ordno"),
+                })
+            out.append({
+                "id": str(_broker_id),
+                "broker_order_id": str(_broker_id),
+                "ordno": _order.get("ordno"),
+                "seqno": _order.get("seqno"),
+                "code": _code,
+                "direction": _action,
+                "status": _status_name or "Unknown",
+                "price": _price,
+                "avg_price": _price,
+                "quantity": _qty,
+                "filled_quantity": _qty,
+                "ts": payload.get("ts"),
+                "deals": _normalized_deals,
+            })
         return out
 
     def _capture_post_startup_snapshot(self) -> dict:
@@ -4638,7 +5189,15 @@ class FuturesMonitor:
                     if _acct is None:
                         continue
                     try:
-                        _rows = _api.list_positions(_acct)
+                        try:
+                            _rows = _api.list_positions(account=_acct)
+                        except TypeError:
+                            # Some Shioaji-compatible adapters expose the
+                            # account as a positional-only parameter.  Keep
+                            # the same compatibility contract as the
+                            # standalone preflight rather than marking a
+                            # valid capture as failed.
+                            _rows = _api.list_positions(_acct)
                     except Exception as exc:
                         errors[f"positions:{_tag}"] = \
                             f"{type(exc).__name__}: {exc}"
@@ -4647,7 +5206,9 @@ class FuturesMonitor:
                         self._normalize_snapshot_positions(_rows, _tag))
             else:
                 errors["capture"] = "api has no list_positions"
-            # open orders: list_trades, drop terminal states
+            # open orders: futures uses one transactional refresh.  Do not
+            # call list_trades once per account: the no-arg Shioaji stream is
+            # account-wide and doing so duplicated PendingSubmit rows.
             if hasattr(_api, "list_trades"):
                 for _tag, _acct in (("stock", getattr(_api, "stock_account",
                                                       None)),
@@ -4655,24 +5216,100 @@ class FuturesMonitor:
                                         _api, "futopt_account", None))):
                     if _acct is None:
                         continue
+                    if _tag == "futures":
+                        _refresh = self._refresh_futures_trade_view(_api, _acct)
+                        _rows = _refresh.get("rows") or []
+                        if _refresh.get("state") == "REFRESH_SUCCEEDED":
+                            _generation = _refresh.get("snapshot_generation")
+                            _observed_at = _refresh.get("observed_at")
+                            open_orders.extend(
+                                self._normalize_snapshot_orders(_rows))
+                            broker_trades.extend(
+                                self._normalize_snapshot_trades(
+                                    _rows,
+                                    observation_type="REFRESHED_TRADE",
+                                    snapshot_generation=_generation,
+                                    observed_at=_observed_at))
+                        else:
+                            errors["refresh:futures"] = _refresh.get("state")
+                        continue
                     try:
                         try:
+                            # Shioaji 1.7's no-argument stream is the current
+                            # broker order view.  The account-scoped overload
+                            # can retain stale PendingSubmit rows on Mini;
+                            # prefer no-arg and use account only for SDKs that
+                            # reject the no-argument form.
                             _rows = _api.list_trades() or []
                         except TypeError:
-                            _rows = _api.list_trades(_acct) or []
+                            try:
+                                _rows = _api.list_trades(account=_acct) or []
+                            except TypeError:
+                                _rows = _api.list_trades(_acct) or []
                     except Exception as exc:
                         errors[f"open_orders:{_tag}"] = \
                             f"{type(exc).__name__}: {exc}"
                         _rows = []
                     open_orders.extend(self._normalize_snapshot_orders(_rows))
-                    broker_trades.extend(self._normalize_snapshot_trades(_rows))
+                    broker_trades.extend(self._normalize_snapshot_trades(
+                        _rows, observation_type="REFRESHED_TRADE"))
             else:
                 errors["capture"] = "api has no list_trades"
+            # Historical terminal receipts are separate from list_trades.
+            # Reconcile them by broker identity, but never treat them as open
+            # orders.  A missing/failed history query is observable and keeps
+            # the existing active-order evidence path intact.
+            _futopt_acct = getattr(_api, "futopt_account", None)
+            if hasattr(_api, "order_deal_records") and _futopt_acct is not None:
+                try:
+                    try:
+                        _deal_rows = _api.order_deal_records(
+                            account=_futopt_acct)
+                    except TypeError:
+                        _deal_rows = _api.order_deal_records()
+                    _deal_rows_normalized = self._normalize_order_deal_records(
+                        _deal_rows)
+                    for _row in _deal_rows_normalized:
+                        if isinstance(_row, dict):
+                            _row.update({
+                                "observation_type": "ORDER_DEAL_RECORD",
+                                "observed_at": int(time.time() * 1000),
+                                "snapshot_generation": (
+                                    (getattr(self, "_last_futures_refresh", None)
+                                     or {}).get("snapshot_generation")),
+                                "source_status": _row.get("status"),
+                                "normalization_result": "ACCEPTED",
+                                "rejection_reason": None,
+                            })
+                    broker_trades.extend(_deal_rows_normalized)
+                    # FORDER rows: nested ORDER status receipts (terminal
+                    # order state + optional deals) — reconciled beside
+                    # FDEAL fill receipts (P0-B, no callback-only).
+                    _state_rows = self._normalize_order_state_records(_deal_rows)
+                    for _row in _state_rows:
+                        if isinstance(_row, dict):
+                            _row.update({
+                                "observation_type": "ORDER_DEAL_RECORD",
+                                "observed_at": int(time.time() * 1000),
+                                "snapshot_generation": (
+                                    (getattr(self, "_last_futures_refresh", None)
+                                     or {}).get("snapshot_generation")),
+                                "source_status": _row.get("status"),
+                                "normalization_result": "ACCEPTED",
+                                "rejection_reason": None,
+                            })
+                    broker_trades.extend(_state_rows)
+                except Exception as exc:
+                    errors["order_deal_records"] = (
+                        f"{type(exc).__name__}: {exc}")
             # margin: api.margin(futopt_account) — the authenticated
             # futures margin (NOT an attribute on the account object)
             if hasattr(_api, "margin") and _acct is not None:
                 try:
-                    _m = _api.margin(_acct)
+                    try:
+                        _m = _api.margin(account=_acct)
+                    except TypeError:
+                        _m = _api.margin(_acct)
                     _avail = getattr(_m, "available_margin", None)
                     if _avail is None:
                         _avail = getattr(_m, "deposit_balance", None)
@@ -4704,23 +5341,31 @@ class FuturesMonitor:
             "account_identity_hash": acct_hash,
             "session_id": session_id,
             "captured_at": captured_at,
+            "snapshot_generation": (
+                (getattr(self, "_last_futures_refresh", None) or {}).get(
+                    "snapshot_generation")),
+            "refresh_state": (
+                (getattr(self, "_last_futures_refresh", None) or {}).get(
+                    "state")),
             "positions": positions,
             "open_orders": open_orders,
             "position_covered_orders": covered,
             "broker_trades": broker_trades,
             "available_margin": margin,
             "canonical_input_hash": None,
-            # list_trades() has no historical-period scope and [] is not
-            # authoritative proof that no trades exist.
-            "fetch_status": {
-                "capture": "OK" if not errors else "FAIL",
-                "trades": ("OK" if broker_trades else "UNAVAILABLE"),
-            },
+            "fetch_status": {"capture": "OK" if not errors else "FAIL"},
             "errors": errors,
         }
         blob = _json.dumps(payload, sort_keys=True, ensure_ascii=False,
                            default=str)
         payload["canonical_input_hash"] = _hl.sha256(blob.encode()).hexdigest()
+        # A successful snapshot is the authoritative boundary for repairing
+        # local lifecycle rows.  This also covers startup/watchdog captures
+        # where no strategy tick has run yet.
+        try:
+            self._reconcile_local_orders_from_snapshot(payload)
+        except Exception:
+            pass
         return payload
 
     def _reconcile_local_orders_from_snapshot(self, snapshot) -> int:
@@ -4738,190 +5383,438 @@ class FuturesMonitor:
         manager = getattr(self, "order_mgr", None)
         if manager is None or not hasattr(manager, "reconcile_broker_state"):
             return 0
-        result = manager.reconcile_broker_state(
-            filled_trades=snapshot.get("broker_trades") or [],
-            source="live_broker_reconcile",
-            reason="callback_gap_snapshot",
-        )
-        stale_changed = self._reconcile_stale_active_mts_orders(snapshot)
+        try:
+            result = manager.reconcile_broker_state(
+                filled_trades=snapshot.get("broker_trades") or [],
+                source="live_broker_reconcile",
+                reason="callback_gap_snapshot",
+            )
+        except ValueError as _fill_ve:
+            _oid = "unknown"
+            _m = re.search(r"for\s+(\S+)", str(_fill_ve))
+            if _m:
+                _oid = _m.group(1)
+            self._emit_fill_rejected(order_id=_oid, reason=str(_fill_ve))
+            result = {"reconciled": []}
         reconciled = result.get("reconciled") or []
-        changed = sum(1 for item in reconciled if item.get("fills_added") or item.get("action") == "reconciled")
-        if (changed or stale_changed) and hasattr(self, "_save_orders_file_wrapper"):
+        position_result = manager.reconcile_position_covered_orders(
+            snapshot.get("positions") or [],
+            captured_at=snapshot.get("captured_at"),
+        )
+        try:
+            pending_changed = manager.reconcile_pending_terminal(
+                snapshot, source="live_broker_reconcile",
+                reason="callback_gap_snapshot_terminal")
+        except Exception:
+            pending_changed = []
+        # [RECONCILE-RULE 2026-08-19] Broker-confirmed leg-lock retirement:
+        # a lock carrying a broker_order_id the broker shows NEITHER as an
+        # open order NOR backed by a position is stale — retire it (terminal)
+        # and append to the manifest.  Only runs here (capture=OK, source
+        # live_broker) so an UNCERTAIN/failed query never mutates locks.
+        try:
+            lock_changed = self._reconcile_leg_locks_from_snapshot(snapshot)
+        except Exception:
+            lock_changed = 0
+        changed = sum(1 for item in reconciled
+                      if item.get("fills_added") or item.get("action") == "reconciled")
+        changed += len(position_result.get("reconciled") or [])
+        changed += len(pending_changed)
+        if changed and hasattr(self, "_save_orders_file_wrapper"):
             self._save_orders_file_wrapper()
-        return changed + stale_changed
-
-    def _run_broker_reconciliation_detector(self, snapshot) -> None:
-        """Run the read-only broker/ledger drift detector on each capture.
-
-        Broker terminal evidence is handed to the existing OrderManager
-        reconciliation callback; this method never talks to the broker or
-        writes a ledger row directly.  A failed capture is passed as
-        ``None`` so the detector emits an explicit fail-closed event rather
-        than treating an empty result as proof of no drift.
-        """
+        # P0-B: broker-confirmed MTS release fills must close the
+        # lifecycle even without the streaming callback.  Best-effort;
+        # exactly-once via sync_release SINGLE_LEG guard + fills ledger.
         try:
-            from core.broker_reconciliation_detector import (
-                detect_broker_reconciliation)
-            ledger_path = Path(runtime_logs("mts_trade_fills.jsonl"))
-            rows = []
-            if ledger_path.is_file():
-                for line in ledger_path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        item = json.loads(line)
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(item, dict):
-                        rows.append(item)
-            capture_ok = ((snapshot or {}).get("fetch_status") or {}).get(
-                "capture") == "OK"
-            trade_evidence_ok = ((snapshot or {}).get("fetch_status") or {}).get("trades", "OK") == "OK"
-            broker_trades = ((snapshot or {}).get("broker_trades")
-                             if capture_ok and trade_evidence_ok else None)
-
-            def _side(row):
-                value = str(row.get("direction") or row.get("side")
-                            or row.get("action") or "").lower()
-                return "LONG" if any(x in value for x in ("buy", "long")) \
-                    else "SHORT" if any(x in value for x in ("sell", "short")) \
-                    else value.upper()
-
-            broker_legs = []
-            for row in (snapshot or {}).get("positions") or []:
-                if row.get("account") == "futures" and int(
-                        row.get("quantity", 0) or 0) != 0:
-                    broker_legs.append({
-                        "code": row.get("code"), "side": _side(row),
-                        "qty": abs(int(row.get("quantity"))),
-                        "avg_cost": row.get("avg_cost"),
-                    })
-            holding = getattr(getattr(self, "_execution_context", None),
-                              "canonical_holding", None) or {}
-            canonical_legs = holding.get("canonical_legs") or []
-            trade_id = str(holding.get("trade_id") or "")
-            manager = getattr(self, "order_mgr", None)
-
-            def _repair(fill):
-                if manager is not None and hasattr(
-                        manager, "reconcile_broker_state"):
-                    manager.reconcile_broker_state(
-                        filled_trades=[{"id": fill.get("broker_order_id"),
-                                        "status": "Filled",
-                                        "code": fill.get("instrument_code"),
-                                        "deals": [fill]}],
-                        source="periodic_broker_reconcile",
-                        reason="detector_missing_fill")
-
-            def _emit(event):
-                self._append_mts_event(
-                    event.code, detail=event.detail,
-                    trade_id=event.trade_id, order_id=event.order_id)
-
-            detect_broker_reconciliation(
-                broker_trades=broker_trades, ledger_rows=rows,
-                broker_legs=broker_legs, canonical_legs=canonical_legs,
-                trade_id=trade_id, repair_fill=_repair, emit=_emit)
-        except Exception as exc:
-            logger.warning("[BROKER_RECONCILIATION_DETECTOR_ERROR] %s", exc)
-
-    def _reconcile_stale_active_mts_orders(self, snapshot) -> int:
-        """Terminalize stale, unfilled MTS orders only after broker absence.
-
-        ``list_trades`` is a successful read even when it returns no rows.  In
-        that case a sufficiently old local MTS order with broker identity and
-        no local fills can be proven absent from the broker snapshot.  A
-        failed/ambiguous capture returns without mutation, preserving the
-        pending gate (fail-closed).
-        """
-        if ((snapshot or {}).get("source") != "live_broker"
-                or ((snapshot or {}).get("fetch_status") or {}).get("capture")
-                != "OK"):
-            return 0
-        manager = getattr(self, "order_mgr", None)
-        if manager is None or not hasattr(manager, "reject"):
-            return 0
-
-        try:
-            _params = ((getattr(self, "cfg", {}) or {}).get("mts", {})
-                       .get("params", {}) or {})
-            _threshold = float(_params.get("stale_active_order_secs", 300.0))
-            if _threshold <= 0:
-                return 0
-        except (TypeError, ValueError, AttributeError):
-            _threshold = 300.0
-
-        def _values(row):
-            if isinstance(row, dict):
-                return {str(row.get(key)) for key in (
-                    "id", "order_id", "exchange_order_id", "broker_order_id",
-                    "ordno", "seqno") if row.get(key) not in (None, "", "None")}
-            return {str(getattr(row, key, None)) for key in (
-                "id", "order_id", "exchange_order_id", "broker_order_id",
-                "ordno", "seqno") if getattr(row, key, None) not in (None, "", "None")}
-
-        broker_ids = set()
-        for _row in ((snapshot.get("open_orders") or [])
-                     + (snapshot.get("broker_trades") or [])):
-            broker_ids.update(_values(_row))
-
-        _terminal = {"filled", "cancelled", "rejected", "expired"}
-        _strategies = {"MTS_ENTRY", "MTS_MANUAL", "MTS_RELEASE", "MTS_EXIT"}
-        _now = datetime.now()
-        changed = 0
-        active = getattr(manager, "active_orders", {}) or {}
-        active = list(active.values()) if isinstance(active, dict) else list(active)
-        for _order in active:
-            if str(getattr(_order, "strategy", "") or "") not in _strategies:
-                continue
-            _status = getattr(getattr(_order, "status", None), "value",
-                              getattr(_order, "status", ""))
-            if str(_status).lower() in _terminal:
-                continue
-            try:
-                if int(getattr(_order, "filled_quantity", 0) or 0) != 0:
-                    continue
-            except (TypeError, ValueError):
-                continue
-            if getattr(_order, "fills", None):
-                continue
-            _order_ids = _values(_order)
-            _broker_identity = {
-                value for value in _order_ids
-                if value not in {str(getattr(_order, "order_id", None))}
-            }
-            if not _broker_identity or _broker_identity & broker_ids:
-                continue
-            _created = getattr(_order, "created_at", None)
-            try:
-                _age = ((_now - _created).total_seconds()
-                        if isinstance(_created, datetime)
-                        else time.time() - float(_created))
-            except (TypeError, ValueError):
-                continue
-            if _age <= _threshold:
-                continue
-
-            try:
-                manager.reject(
-                    _order.order_id,
-                    reason="BROKER_NOT_FOUND",
-                    source="live_broker_reconcile",
-                )
-                changed += 1
-                try:
-                    self._append_mts_event(
-                        "MTS_STALE_ACTIVE_ORDER_BROKER_NOT_FOUND",
-                        order_id=_order.order_id,
-                        broker_order_id=getattr(_order, "broker_order_id", None),
-                        age_secs=round(_age, 1),
-                    )
-                except Exception:
-                    pass
-            except Exception as _exc:
-                logger.warning(
-                    "[MTS_STALE_RECONCILE] local terminalization failed "
-                    "for %s: %s", getattr(_order, "order_id", None), _exc,
-                )
+            self._close_mts_lifecycle_from_reconciled_fills(
+                result, manager, snapshot)
+        except Exception:
+            pass
         return changed
+
+
+
+    def _reconcile_leg_locks_from_snapshot(self, snapshot) -> int:
+        """[RECONCILE-RULE 2026-08-19] Retire broker-confirmed-stale leg locks.
+
+        A leg lock that carries a broker_order_id which the successful broker
+        snapshot shows NEITHER as an open order NOR backed by a position is
+        stale: the broker no longer has the order and has no position behind
+        it.  Mark RETIRED_UNRESOLVED (terminal for _leg_lock_check) and append
+        a two-phase manifest record (prepared -> committed/retracted).  Locks WITHOUT broker identity OR with an empty
+        contract are never guessed (fail-closed).  Already-terminal locks are
+        skipped.  Caller guarantees
+        capture=OK + source=live_broker — this method itself re-checks both.
+        Returns the number of locks retired.
+        """
+        if not snapshot or snapshot.get("source") != "live_broker":
+            return 0
+        if ((snapshot.get("fetch_status") or {}).get("capture") != "OK"):
+            return 0
+        try:
+            _open_ids = set()
+            for _oo in (snapshot.get("open_orders") or []):
+                for _k in ("id", "broker_order_id", "exchange_order_id"):
+                    _v = str(_oo.get(_k) or "")
+                    if _v:
+                        _open_ids.add(_v)
+            _pos_codes = set()
+            for _p in (snapshot.get("positions") or []):
+                _c = str(_p.get("code") or "")
+                if _c:
+                    _pos_codes.add(_c)
+            _retired = []
+            # [AUDIT-2026-08-20] ONE exclusive flock across read -> decide ->
+            # manifest -> write.  The previous _leg_lock_load()/_leg_lock_save()
+            # pair each grabbed their own flock and released it, so a
+            # concurrent writer could add an active lock between them and have
+            # it clobbered by this stale dict (duplicate-order barrier loss).
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                for _lid, _lock in _locks.items():
+                    _bid = str(_lock.get("broker_order_id") or "")
+                    if not _bid:
+                        continue  # no broker identity -> never guess (rule 3)
+                    _st = str(_lock.get("status") or "").upper()
+                    if _st in ("FILLED", "CANCELLED", "REJECTED", "CANCELED",
+                               "EXPIRED", "RETIRED_UNRESOLVED",
+                               "BROKER_NOT_FOUND", "BROKER_RECONCILED"):
+                        continue  # already terminal
+                    if _bid in _open_ids:
+                        continue  # broker still has the open order -> keep lock
+                    _ct = str(_lock.get("contract") or "")
+                    # [AUDIT-2026-08-20] Empty contract = incomplete identity:
+                    # the old `if _ct and _ct in _pos_codes` silently failed for
+                    # empty contract and could retire a lock the broker may
+                    # still back.  Never guess (rule 3).
+                    if not _ct:
+                        continue
+                    if _ct in _pos_codes:
+                        continue  # broker still has the position -> keep lock
+                    _lock["status"] = "RETIRED_UNRESOLVED"
+                    _lock["terminal"] = "BROKER_RECONCILED"
+                    _lock["retirement_resolution"] = "BROKER_RECONCILED"
+                    _lock["retired_by"] = "snapshot_reconcile"
+                    _lock["retired_at"] = datetime.now().isoformat()
+                    _retired.append({
+                        "lock_id": _lid,
+                        "trade_id": _lock.get("trade_id"),
+                        "contract": _ct,
+                        "closing_side": _lock.get("closing_side"),
+                        "broker_order_id": _bid,
+                        "snapshot_generation": snapshot.get("snapshot_generation"),
+                        "captured_at": snapshot.get("captured_at"),
+                    })
+                if not _retired:
+                    return 0
+                # [AUDIT-2026-08-20] Manifest BEFORE lock mutation: a
+                # retirement must never lack audit evidence.  If the manifest
+                # cannot be written, nothing is retired and no success is
+                # reported.
+                #
+                # [REVIEW-2026-08-20] Two-phase manifest: the manifest append
+                # and the lock write are not atomic.  The manifest therefore
+                # records stage="prepared" first; only a stage="committed"
+                # record (appended AFTER the lock write succeeds) makes the
+                # retirement true.  If the lock write fails, a stage=
+                # "retracted" record is appended and LEG_LOCK_RECONCILE_
+                # LOCK_WRITE_FAILED fires — the audit trail never claims a
+                # retirement that did not happen.  If the commit record itself
+                # cannot be appended (lock already retired), COMMIT_FAILED
+                # fires instead of failing silently.
+                try:
+                    import json as _json
+                    _m_path = os.path.join(
+                        os.path.dirname(self._leg_lock_path()),
+                        "mts_leg_locks_reconcile_manifest.jsonl")
+                    with open(_m_path, "a", encoding="utf-8") as _mf:
+                        for _r in _retired:
+                            _mf.write(_json.dumps(
+                                dict(_r, stage="prepared"),
+                                ensure_ascii=False, default=str) + "\n")
+                except Exception:
+                    self._append_mts_event(
+                        "LEG_LOCK_RECONCILE_MANIFEST_FAILED",
+                        reason="LEG_LOCK_RECONCILE_MANIFEST_FAILED",
+                        contract=None,
+                        detail="manifest write failed; locks NOT retired")
+                    return 0
+                try:
+                    self._leg_lock_write(_locks)
+                except Exception:
+                    # Lock write failed after prepared: roll the manifest back
+                    # with a retracted record so no phantom retirement stands.
+                    try:
+                        import json as _json_r
+                        with open(_m_path, "a", encoding="utf-8") as _mf:
+                            for _r in _retired:
+                                _mf.write(_json_r.dumps({
+                                    "lock_id": _r.get("lock_id"),
+                                    "broker_order_id": _r.get("broker_order_id"),
+                                    "stage": "retracted",
+                                    "reason": "lock_write_failed",
+                                    "retracted_at": datetime.now().isoformat(),
+                                }, ensure_ascii=False, default=str) + "\n")
+                    except Exception:
+                        pass  # retraction is best-effort; failure event below
+                    self._append_mts_event(
+                        "LEG_LOCK_RECONCILE_LOCK_WRITE_FAILED",
+                        reason="LEG_LOCK_RECONCILE_LOCK_WRITE_FAILED",
+                        contract=None,
+                        detail="lock write failed after manifest prepared; "
+                               "manifest retracted, locks NOT retired")
+                    return 0
+                try:
+                    import json as _json_c
+                    with open(_m_path, "a", encoding="utf-8") as _mf:
+                        for _r in _retired:
+                            _mf.write(_json_c.dumps({
+                                "lock_id": _r.get("lock_id"),
+                                "broker_order_id": _r.get("broker_order_id"),
+                                "stage": "committed",
+                                "committed_at": datetime.now().isoformat(),
+                            }, ensure_ascii=False, default=str) + "\n")
+                except Exception:
+                    # Lock IS retired but the commit record could not be
+                    # appended.  The prepared record still proves intent;
+                    # surface the inconsistency instead of hiding it.
+                    self._append_mts_event(
+                        "LEG_LOCK_RECONCILE_COMMIT_FAILED",
+                        reason="LEG_LOCK_RECONCILE_COMMIT_FAILED",
+                        contract=None,
+                        detail="lock retired but manifest commit record "
+                               "failed; prepared record remains")
+            for _r in _retired:
+                self._append_mts_event(
+                    "LEG_LOCK_RETIRED_BY_SNAPSHOT",
+                    reason="LEG_LOCK_RETIRED_BY_SNAPSHOT",
+                    contract=_r.get("contract"),
+                    trade_id=_r.get("trade_id"),
+                    broker_order_id=_r.get("broker_order_id"))
+            return len(_retired)
+        except Exception:
+            return 0
+
+    def _lookup_reconciled_order(self, manager, order_id):
+        """Resolve a reconciled order from active or completed collections."""
+        if not order_id or manager is None:
+            return None
+        try:
+            _o = manager.get_order(order_id)
+            if _o is not None:
+                return _o
+        except Exception:
+            pass
+        for _o in (getattr(manager, "completed", None) or []):
+            if getattr(_o, "order_id", None) == order_id:
+                return _o
+        return None
+
+    def _close_mts_lifecycle_from_reconciled_fills(self, result, manager,
+                                                   snapshot) -> int:
+        """[P0-B] Broker-confirmed fills must close the MTS lifecycle even
+        when the streaming callback was missed (no callback-only
+        assumption).
+
+        ``manager.reconcile_broker_state`` already applied identity-deduped
+        fills (fills_added > 0).  Only a FULLY FILLED MTS release order
+        (OrderStatus.FILLED and filled_quantity >= quantity) is
+        authoritative fill evidence: advance the strategy to SINGLE_LEG via
+        ``sync_release`` exactly once — its SINGLE_LEG phase guard plus the
+        fills-ledger RELEASE row make repeats no-ops.  Partial fills stay
+        pending (no early lifecycle advance).  Never synthesizes an
+        order or a leg; a failed capture never reaches here (the caller
+        returns before reconciling).  Also never resends/cancels: this is
+        strictly read-only broker evidence consumption.
+        """
+        _strat = getattr(self, "_mts_strategy", None)
+        if _strat is None:
+            try:
+                _strat = getattr(self, "_registry", None).get("tmf_spread")
+            except Exception:
+                _strat = None
+        if _strat is None or not hasattr(_strat, "sync_release"):
+            return 0
+        _near_code = str(getattr(
+            getattr(self, "contract", None), "code", "") or "")
+        _far_code = str(getattr(
+            getattr(self, "far_contract", None), "code", "") or "")
+        _closed = 0
+        for _r in (result.get("reconciled") or []):
+            if not _r.get("fills_added"):
+                continue
+            _order = self._lookup_reconciled_order(
+                manager, _r.get("order_id"))
+            if _order is None:
+                continue
+            if str(getattr(_order, "strategy", "")) != "MTS_RELEASE":
+                continue
+            # Terminal-fill gate (P0): only a fully FILLED order may close
+            # the release lifecycle.  A partial fill keeps the order
+            # pending — never an early single-leg release, never a hidden
+            # remaining quantity, never a premature trail.
+            from core.order_management.order import OrderStatus
+            if getattr(_order, "status", None) is not OrderStatus.FILLED:
+                continue
+            try:
+                _filled_qty = int(getattr(_order, "filled_quantity", 0) or 0)
+                _order_qty = int(getattr(_order, "quantity", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if _filled_qty < _order_qty:
+                continue
+            _symbol = str(getattr(_order, "symbol", "") or "")
+            if _symbol == _near_code:
+                _leg = "near"
+            elif _symbol == _far_code:
+                _leg = "far"
+            else:
+                continue
+            _fills = getattr(_order, "fills", None) or []
+            if not _fills:
+                continue
+            _fill = _fills[-1]
+            try:
+                _fill_price = float(getattr(_fill, "fill_price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if _fill_price <= 0:
+                continue
+            # remaining-leg price: same fallback chain as the release-fill
+            # callback (market data first, then the strategy's own entry)
+            _rem_price = 0.0
+            try:
+                _md = getattr(self, "market_data", None) or {}
+                _rem_key = (f"{self.ticker}_FAR" if _leg == "near"
+                            else f"{self.ticker}_NEAR")
+                _rem_price = float(
+                    (_md.get(_rem_key, {}) or {}).get("close") or 0.0)
+            except Exception:
+                _rem_price = 0.0
+            if _rem_price <= 0:
+                _rem_price = float(getattr(
+                    _strat,
+                    "_far_entry" if _leg == "near" else "_near_entry",
+                    0.0) or 0.0)
+            _ev_time = (getattr(_fill, "fill_time", None)
+                        or getattr(_fill, "timestamp", None))
+            try:
+                _strat.sync_release(
+                    leg=_leg, price=_rem_price,
+                    release_price=_fill_price,
+                    order_id=_r.get("order_id"),
+                    event_time=_ev_time)
+                _closed += 1
+            except Exception:
+                continue
+        return _closed
+
+    def _emit_release_telemetry(self, signal: str, strategy, bar_dict: dict) -> None:
+        """Emit RELEASE_CONDITION_MET when the strategy signals a release/exit.
+
+        Best-effort telemetry: the release condition was met by the strategy;
+        this fires before the submit attempt so a later gate rejection is
+        distinguishable from a silent non-evaluation.  Never affects orders.
+        """
+        try:
+            _release_signals = ("RELEASE_NEAR", "RELEASE_FAR", "EXIT",
+                                "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR")
+            if signal not in _release_signals:
+                return
+            _st = {}
+            try:
+                _st = getattr(strategy, "state", None) or {}
+            except Exception:
+                pass
+            self._append_mts_event(
+                "RELEASE_CONDITION_MET",
+                signal=signal,
+                trade_id=(getattr(strategy, "_trade_id", None)
+                          or getattr(strategy, "trade_id", None)),
+                release_stop=(_st.get("release_stop_points")
+                              if isinstance(_st, dict) else None),
+            )
+        except Exception:
+            pass
+
+    def _resolve_mts_local_position_qty(self):
+        """Resolve the strategy's local position quantities.
+
+        Sources in order: the strategy reference (self._mts_strategy, then the
+        strategy registry), then the persisted MTS position state file.
+        Returns (None, None) when the local position is unknown -- callers
+        must not emit divergence claims without a position source.
+        """
+        _ms = getattr(self, "_mts_strategy", None)
+        if _ms is None:
+            try:
+                _ms = getattr(self, "_registry", None).get("tmf_spread")
+            except Exception:
+                _ms = None
+        if _ms is None:
+            for _s in (getattr(self, "_strategies", {}) or {}).values():
+                _ms = _s
+                break
+        if _ms is not None:
+            try:
+                return (int(getattr(_ms, "_near_qty", 0) or 0),
+                        int(getattr(_ms, "_far_qty", 0) or 0))
+            except (TypeError, ValueError):
+                return None, None
+        try:
+            with open(_mts_position_state_path(), "r", encoding="utf-8") as _f:
+                _st = json.load(_f)
+            if _st.get("has_position"):
+                return 1, 1
+            return 0, 0
+        except Exception:
+            return None, None
+
+    def _emit_release_eval_skip_no_local_position(self, snapshot) -> None:
+        """Emit RELEASE_EVAL_SKIP_NO_LOCAL_POSITION when broker holds TMF legs
+        but the strategy sees no local position (fills gap).  Rate-limited to
+        30s.  Fail-closed: when the local position is unknown (no strategy
+        reference, no persisted state) no event is emitted.
+        """
+        try:
+            _legs = [p for p in (snapshot.get("positions") or [])
+                     if isinstance(p, dict)
+                     and str(p.get("code") or "") in ("TMFH6", "TMFI6")
+                     and int(p.get("quantity") or 0) > 0]
+            if not _legs:
+                return
+            _nq, _fq = self._resolve_mts_local_position_qty()
+            if _nq is None and _fq is None:
+                return  # unknown -- fail-closed, no divergence claim
+            if _nq > 0 or _fq > 0:
+                return
+            _now = time.monotonic()
+            if _now - getattr(self, "_release_eval_skip_last_emit", 0.0) < 30.0:
+                return
+            self._release_eval_skip_last_emit = _now
+            self._append_mts_event(
+                "RELEASE_EVAL_SKIP_NO_LOCAL_POSITION",
+                broker_legs=[f"{p.get('code')}:{p.get('direction')}:{p.get('quantity')}"
+                             for p in _legs],
+                local_near_qty=_nq,
+                local_far_qty=_fq,
+            )
+        except Exception:
+            pass
+
+    def _emit_fill_rejected(self, order_id: str, reason: str) -> None:
+        """Emit FILL_REJECTED_REMAINING when a broker fill receipt is rejected
+        locally (remaining=0).  Rate-limited to 30s.
+        """
+        try:
+            _now = time.monotonic()
+            if _now - getattr(self, "_fill_rejected_last_emit", 0.0) < 30.0:
+                return
+            self._fill_rejected_last_emit = _now
+            self._append_mts_event("FILL_REJECTED_REMAINING",
+                                   order_id=order_id, reason=reason)
+        except Exception:
+            pass
 
     def _persist_current_session_canonical(self, snapshot) -> None:
         """[P0] persist the CURRENT-session canonical artifact so the
@@ -4947,52 +5840,456 @@ class FuturesMonitor:
         except Exception:
             pass  # never block the post-startup gate on telemetry
 
+    def _write_live_session_upl(self, positions, ctx) -> None:
+        """The trading-system session's read-only list_positions().pnl,
+        written for the dashboard (which NEVER opens its own Shioaji
+        session).  Best-effort; absence only leaves the dashboard N/A."""
+        try:
+            _legs = {}
+            for p in positions or []:
+                _code = str(p.get("code") or "")
+                if _code.startswith("TMF"):
+                    # Per-field safe conversion: missing/non-numeric values
+                    # become None (reader renders N/A) — the artifact is
+                    # ALWAYS written fresh so a stale artifact can never
+                    # serve old UPL during the freshness window.
+                    def _fnum(v):
+                        if v is None:
+                            return None
+                        try:
+                            return float(v)
+                        except (TypeError, ValueError):
+                            return None
+
+                    _legs[_code] = {
+                        "direction": str(p.get("direction") or ""),
+                        "quantity": int(p.get("quantity") or 0),
+                        "avg_cost": (_fnum(p.get("avg_cost"))
+                                     if _fnum(p.get("avg_cost")) is not None
+                                     else _fnum(p.get("avg_price"))),
+                        "pnl": _fnum(p.get("pnl")),
+                    }
+            _payload = {
+                "source": "live_broker_session",
+                "session_id": getattr(ctx, "session_id", None),
+                "captured_at": int(time.time() * 1000),
+                "legs": _legs,
+                "total_pnl": sum(float(l.get("pnl") or 0)
+                                 for l in _legs.values()),
+            }
+            from core.runtime_paths import runtime_path
+            from pathlib import Path
+            _p = Path(runtime_path("exports", "trades", "live",
+                                   "diagnostics", "live_session_upl.json"))
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _p.write_text(json.dumps(_payload, default=str))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _to_epoch_ms(value):
+        """Normalize a timestamp to epoch milliseconds (decision domain).
+
+        Accepts epoch seconds (<1e11) or milliseconds (>=1e11) as int/float,
+        ISO-8601 strings, and datetime objects.  Returns None when the input
+        is missing or untrustworthy (0/NaN/parse failure) so callers stay
+        fail-closed.
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, datetime):
+            try:
+                return value.timestamp() * 1000.0
+            except Exception:
+                return None
+        if isinstance(value, (int, float)):
+            _v = float(value)
+            if _v <= 0 or _v != _v:
+                return None
+            return _v * 1000.0 if _v < 1e11 else _v
+        if isinstance(value, str):
+            _s = value.strip()
+            try:
+                _f = float(_s)
+                if _f > 0 and _f == _f:
+                    return _f * 1000.0 if _f < 1e11 else _f
+            except ValueError:
+                pass
+            try:
+                return (datetime.fromisoformat(
+                    _s.replace("Z", "+00:00")).timestamp() * 1000.0)
+            except Exception:
+                return None
+        return None
+
+    def _resolve_broker_hydration_entry_epoch(self, snapshot, legs):
+        """Resolve a broker-observed position's entry time (epoch ms),
+        bound to the CURRENT position generation.
+
+        A candidate deal/trade must match the position's code, direction,
+        quantity and — when the position carries an avg_cost — price
+        within 1% of that cost basis; a candidate MISSING a binding field
+        cannot bind (no wildcards).  Only terminal fill evidence counts
+        (Filled/PartiallyFilled status or explicit deals — a
+        PendingSubmit order row is order state, never a fill).  The
+        earliest matching timestamp is the entry time.  Without a cost
+        basis, multiple same-code/same-direction candidates cannot be
+        told apart (old generation vs current) and fail closed to None.
+        Falls back to the durable local fills ledger (ENTRY rows, same
+        binding), then the persisted state-file entry clock — only when
+        the state legs match the current generation (role + side +
+        cost).  None = no trustworthy anchor — fail-closed: Policy J
+        stays suppressed while release/ATR/emergency exits keep working.
+        """
+
+        def _norm_side(text):
+            text = str(text or "").lower()
+            if "sell" in text or "short" in text:
+                return "SHORT"
+            if "buy" in text or "long" in text:
+                return "LONG"
+            return None
+
+        def _row_side(row):
+            return _norm_side(row.get("direction") or row.get("side"))
+
+        def _ts(row):
+            return self._to_epoch_ms(
+                row.get("ts") or row.get("deal_ts") or row.get("timestamp"))
+
+        def _terminal_fill_evidence(row):
+            """Fill evidence only: fills-ledger rows, Filled/PartiallyFilled
+            statuses, or rows carrying explicit deals.  A PendingSubmit /
+            Submitted / Canceled order row is order state, never a fill."""
+            if row.get("fill_type"):
+                return True
+            _st = str(row.get("status") or "").lower()
+            if "fill" in _st:
+                return True
+            if row.get("deals"):
+                return True
+            return False
+
+        def _matches(row, code, side, qty, avg):
+            if not _terminal_fill_evidence(row):
+                return False
+            if str(row.get("code") or row.get("contract") or "") != code:
+                return False
+            if _row_side(row) != side:
+                return False
+            # Fail-closed: a candidate missing a binding field cannot be
+            # proven to belong to the current generation — no wildcards.
+            _rq = (row.get("quantity") or row.get("filled_quantity")
+                   or row.get("qty"))
+            if qty is not None:
+                if _rq is None:
+                    return False
+                try:
+                    if int(_rq) != int(qty):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            _rp = row.get("price") or row.get("avg_price")
+            if avg and avg > 0:
+                if _rp is None:
+                    return False
+                try:
+                    if abs(float(_rp) - float(avg)) / float(avg) > 0.01:
+                        return False
+                except (TypeError, ValueError, ZeroDivisionError):
+                    return False
+            return True
+
+        _best = None
+        _ambiguous = False
+        for _leg in legs or ():
+            _code = str(_leg.get("code") or "")
+            _side = _norm_side(_leg.get("direction"))
+            if not _code or _side is None:
+                continue
+            try:
+                _qty = int(_leg.get("quantity"))
+            except (TypeError, ValueError):
+                _qty = None
+            try:
+                _avg = float(_leg.get("avg_cost") or 0.0)
+            except (TypeError, ValueError):
+                _avg = 0.0
+            _cands = [
+                _row for _row in (snapshot.get("broker_trades") or [])
+                if isinstance(_row, dict)
+                and _matches(_row, _code, _side, _qty, _avg)]
+            if not _cands:
+                continue
+            if _avg <= 0 and len(_cands) > 1:
+                # no cost basis -> cannot distinguish old generation from
+                # the current one; never anchor on a guess
+                _ambiguous = True
+                continue
+            for _row in _cands:
+                _ms = _ts(_row)
+                if _ms and (_best is None or _ms < _best):
+                    _best = _ms
+        if _best is None and not _ambiguous:
+            try:
+                _rt = os.getenv("TRADING_RUNTIME_DIR")
+                _fills = os.getenv("MTS_FILL_LOG_PATH") or (
+                    os.path.join(_rt, "logs", "mts_trade_fills.jsonl")
+                    if _rt else "logs/mts_trade_fills.jsonl")
+                if os.path.exists(_fills):
+                    _fill_rows = []
+                    with open(_fills, "r", encoding="utf-8") as _f:
+                        for _line in _f:
+                            try:
+                                _r = json.loads(_line)
+                            except Exception:
+                                continue
+                            if str(_r.get("fill_type") or "") == "ENTRY":
+                                _fill_rows.append(_r)
+                    for _leg in legs or ():
+                        _code = str(_leg.get("code") or "")
+                        _side = _norm_side(_leg.get("direction"))
+                        if not _code or _side is None:
+                            continue
+                        try:
+                            _qty = int(_leg.get("quantity"))
+                        except (TypeError, ValueError):
+                            _qty = None
+                        try:
+                            _avg = float(_leg.get("avg_cost") or 0.0)
+                        except (TypeError, ValueError):
+                            _avg = 0.0
+                        _cands = [_row for _row in _fill_rows
+                                  if _matches(_row, _code, _side, _qty, _avg)]
+                        if not _cands:
+                            continue
+                        if _avg <= 0 and len(_cands) > 1:
+                            _ambiguous = True
+                            continue
+                        for _row in _cands:
+                            _ms = _ts(_row)
+                            if _ms and (_best is None or _ms < _best):
+                                _best = _ms
+            except Exception:
+                pass
+        if _best is None:
+            try:
+                with open(_mts_position_state_path(), "r",
+                          encoding="utf-8") as _f:
+                    _st = json.load(_f)
+                if _st.get("has_position"):
+                    # The persisted clock is usable only when the state file
+                    # describes the CURRENT broker generation: every position
+                    # leg maps to a near/far role whose side matches and
+                    # whose entry cost matches the broker avg_cost (1%).
+                    _near_code = str(getattr(
+                        getattr(self, "contract", None), "code", "") or "")
+                    _far_code = str(getattr(
+                        getattr(self, "far_contract", None), "code", "") or "")
+                    _gen_ok = True
+                    for _leg in legs or ():
+                        _code = str(_leg.get("code") or "")
+                        if _code == _near_code:
+                            _role = "near"
+                        elif _code == _far_code:
+                            _role = "far"
+                        else:
+                            _gen_ok = False
+                            break
+                        _pos_side = _norm_side(_leg.get("direction"))
+                        _st_side = _norm_side(_st.get(f"{_role}_side"))
+                        if _pos_side is None or _st_side != _pos_side:
+                            _gen_ok = False
+                            break
+                        try:
+                            _avg = float(_leg.get("avg_cost") or 0.0)
+                        except (TypeError, ValueError):
+                            _avg = 0.0
+                        _st_entry = _st.get(f"{_role}_entry")
+                        if _avg > 0:
+                            if _st_entry is None:
+                                _gen_ok = False
+                                break
+                            try:
+                                if (abs(float(_st_entry) - _avg) / _avg
+                                        > 0.01):
+                                    _gen_ok = False
+                                    break
+                            except (TypeError, ValueError, ZeroDivisionError):
+                                _gen_ok = False
+                                break
+                    if _gen_ok:
+                        _ms = self._to_epoch_ms(
+                            _st.get("entry_guard_start_ms")
+                            or _st.get("entry_ts_ms") or _st.get("entry_ts"))
+                        if _ms:
+                            _best = _ms
+            except Exception:
+                pass
+        return _best
+
+    def _mts_release_order_identities(self, released_code: str) -> list:
+        """Distinct broker identities of MTS_RELEASE orders for the released
+        contract.  The same broker_order_id captured twice (stale session
+        cache) dedupes to one identity; two DISTINCT identities are
+        ambiguous (fail-closed upstream — no lifecycle inference)."""
+        _ids: list = []
+        _seen: set = set()
+        _om = getattr(self, "order_mgr", None)
+        _orders: list = []
+        if _om is not None:
+            _orders += list((getattr(_om, "active_orders", {}) or {}).values())
+            _orders += list(getattr(_om, "completed", None) or [])
+        for _o in _orders:
+            try:
+                _d = _o.to_dict() if hasattr(_o, "to_dict") else dict(_o or {})
+            except Exception:
+                continue
+            if str(_d.get("strategy") or "") != "MTS_RELEASE":
+                continue
+            if str(_d.get("symbol") or "") != released_code:
+                continue
+            _bid = str(_d.get("broker_order_id")
+                       or _d.get("ordno") or _d.get("order_id") or "")
+            if not _bid:
+                continue
+            if _bid in _seen:
+                continue
+            _seen.add(_bid)
+            _ids.append({
+                "order_id": _d.get("order_id"),
+                "broker_order_id": _d.get("broker_order_id")
+                                 or _d.get("ordno"),
+                "symbol": _d.get("symbol"),
+            })
+        return _ids
+
     def _refresh_live_broker_authority(self, strategy):
         """Use the current authenticated broker snapshot as LIVE MTS truth.
 
         Callbacks and local fills are telemetry; a missing FDEAL must not
         make an actually-held spread appear FLAT.  This is read-only and is
-        never used in PAPER mode.
+        never used in PAPER or legacy EXIT_ONLY mode.
         """
-        from core.mode_transition import ModeTransitionState
-        if (not getattr(self, "live_trading", False)
-                or getattr(getattr(self, "_execution_context", None),
-                           "effective_mode", None)
-                != ModeTransitionState.LIVE_READY.value
+        # LIVE detection MUST use the ctx requested_mode (the live INTENT,
+        # set at ctx creation): the config's live_trading key is absent in
+        # futures_live.yaml (monitor defaults to False), and effective_mode
+        # is not yet LIVE_READY at startup (the certificate transition
+        # happens later).  An effective_mode/live_trading-keyed guard returns
+        # None on the first ticks, falling back to the stale fills-ledger
+        # authority and resurrecting a ghost (reason=authority_rebuild).
+        if (getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") != "live"
                 or strategy is None):
             return None
         _now = time.monotonic()
         if _now - getattr(self, "_live_broker_authority_at", 0.0) < 5.0:
             return getattr(self, "_live_broker_authority", None)
         _snap = self._capture_post_startup_snapshot()
-        self._reconcile_local_orders_from_snapshot(_snap)
-        self._run_broker_reconciliation_detector(_snap)
-        if ((_snap.get("fetch_status") or {}).get("capture") != "OK"
-                or _snap.get("open_orders")):
-            strategy._broker_truth_flat = False
+        if ((_snap.get("fetch_status") or {}).get("capture") != "OK"):
+            # An unavailable snapshot is unknown, not flat.  Revoke any
+            # earlier flat proof and keep entry fail-closed; do not mutate
+            # the strategy's known-open local state.
+            self._live_broker_flat_proven = False
+            self._set_broker_refresh_channel_state("UNCERTAIN")
+            self._broker_authority_degraded = True
+            self._broker_position_observed = True
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
             return None
+        try:
+            self._reconcile_local_orders_from_snapshot(_snap)
+        except Exception as _reconcile_exc:
+            # Local receipt replay is best-effort and cannot override a
+            # successful broker snapshot.  In particular, a duplicate FDEAL
+            # must not conceal a proven broker-flat account.
+            logger.warning(
+                "[LIVE_BROKER_AUTHORITY] local reconcile failed: %s",
+                _reconcile_exc,
+            )
+        _has_open_orders = bool(_snap.get("open_orders"))
+        # open orders leave the lifecycle unresolved for ENTRY, but they
+        # must NOT block the exit authority: when the snapshot shows both
+        # spread legs, the OPEN authority is still built below so release
+        # / trail evaluation keeps working.  open_orders keep new entries
+        # blocked via _broker_position_observed and the pending gate.
         self._persist_current_session_canonical(_snap)
         _codes = {str(getattr(self.contract, "code", "")),
                   str(getattr(self.far_contract, "code", ""))}
+        from strategies.futures.mts_ledger_authority import (
+            MtsAuthority, MtsAuthorityState)
         _rows = [p for p in (_snap.get("positions") or [])
                  if p.get("account") == "futures"
                  and p.get("code") in _codes
                  and type(p.get("quantity")) is int
                  and p.get("quantity", 0) > 0]
-        if len({p.get("code") for p in _rows}) != 2:
+        _other_futures = [p for p in (_snap.get("positions") or [])
+                          if p.get("account") == "futures"
+                          and p.get("code") not in _codes
+                          and type(p.get("quantity")) is int
+                          and p.get("quantity", 0) > 0]
+        self._write_live_session_upl(
+            _rows, getattr(self, "_execution_context", None))
+        if not _rows:
+            if _other_futures:
+                # A non-target futures position means the account is not
+                # provably flat for this MTS process.  Do not silently turn
+                # an unknown contract into FLAT authority.
+                self._broker_position_observed = True
+                self._live_broker_flat_proven = False
+                self._broker_authority_degraded = True
+                strategy._broker_truth_flat = False
+                self._live_broker_authority = None
+                self._live_broker_authority_at = _now
+                return None
+            if _has_open_orders:
+                # Stale PendingSubmit rows are session-cache residue only
+                # when every open order is explained one-to-one by a local
+                # FILLED entry (identity + symbol + direction + qty).  Any
+                # unmatched/ambiguous pending keeps the unresolved verdict.
+                _covered_flat = False
+                try:
+                    from core.broker_evidence import \
+                        open_orders_fully_covered_by_filled
+                    _om = getattr(self, "order_mgr", None)
+                    _filled_rows = []
+                    if _om is not None:
+                        _filled_rows = [
+                            _o.to_dict() for _o in _om.completed
+                            if hasattr(_o, "to_dict")]
+                    _covered_flat = open_orders_fully_covered_by_filled(
+                        _snap.get("open_orders") or [], _filled_rows)
+                except Exception:
+                    _covered_flat = False  # fail-closed: keep unresolved
+                if not _covered_flat:
+                    # open orders with NO positions: unresolved, never flat.
+                    self._broker_position_observed = True
+                    self._live_broker_flat_proven = False
+                    self._broker_authority_degraded = True
+                    strategy._broker_truth_flat = False
+                    self._live_broker_authority = None
+                    self._live_broker_authority_at = _now
+                    return None
+                # All open orders are covered by explicit local fills: the
+                # broker has no position and no unexplained pending.  Fall
+                # through to the authoritative flat evidence below.
             # A successful, empty futures snapshot is authoritative flat
             # evidence.  Capture failures return above and must not clear the
             # marker, because an unknown broker state is not flat evidence.
-            self._broker_position_observed = bool(_rows)
+            self._broker_position_observed = False
+            self._live_broker_flat_proven = True
+            self._broker_authority_degraded = False
             strategy._broker_truth_flat = True
-            self._live_broker_authority = None
+            self._live_broker_authority = MtsAuthorityState(
+                status=MtsAuthority.FLAT,
+                trade_id=None,
+                near_qty=0,
+                far_qty=0,
+                near_side=None,
+                far_side=None,
+                current_trade_id=None)
             self._live_broker_authority_at = _now
-            return None
-        _by_code = {p["code"]: p for p in _rows}
-        _near = _by_code.get(str(getattr(self.contract, "code", "")))
-        _far = _by_code.get(str(getattr(self.far_contract, "code", "")))
+            return self._live_broker_authority
         def _side(row):
             text = str(row.get("direction") or "").lower()
             if "sell" in text or "short" in text:
@@ -5000,69 +6297,191 @@ class FuturesMonitor:
             if "buy" in text or "long" in text:
                 return "LONG"
             return None
+
+        _snapshot_hash = _snap.get("canonical_input_hash")
+        _trade_id = self._stable_broker_trade_id(
+            _snap.get("account_identity_hash"), _rows)
+
+        if len(_rows) == 1:
+            # A broker-verified remaining leg is an exit-only authority.  Do
+            # not synthesize the missing leg or treat this as FLAT: the
+            # strategy must continue trailing/releasing the real position,
+            # while broker_position_observed keeps all new entries blocked.
+            _row = _rows[0]
+            _code = str(_row.get("code") or "")
+            _qty = _row.get("quantity")
+            _side_value = _side(_row)
+            try:
+                _entry = float(_row.get("avg_cost"))
+            except (TypeError, ValueError):
+                _entry = 0.0
+            if (_code not in _codes or type(_qty) is not int or _qty <= 0
+                    or _side_value is None or _entry <= 0):
+                self._broker_position_observed = True
+                self._live_broker_flat_proven = False
+                self._broker_authority_degraded = True
+                strategy._broker_truth_flat = False
+                self._live_broker_authority = None
+                self._live_broker_authority_at = _now
+                self._emit_release_eval_skip_no_local_position(_snap)
+                return None
+            _is_near = _code == str(getattr(self.contract, "code", ""))
+            _released_leg = "far" if _is_near else "near"
+            for _name, _value in (
+                    ("_near_side", _side_value if _is_near else None),
+                    ("_far_side", None if _is_near else _side_value),
+                    ("_near_qty", _qty if _is_near else 0),
+                    ("_far_qty", 0 if _is_near else _qty),
+                    ("_near_entry", _entry if _is_near else 0.0),
+                    ("_far_entry", 0.0 if _is_near else _entry),
+                    ("_trade_id", _trade_id), ("_has_position", True),
+                    ("_released_leg", _released_leg),
+                    ("_lifecycle", "SINGLE_LEG"),
+                    ("_snapshot_hash", _snapshot_hash)):
+                setattr(strategy, _name, _value)
+            # P0-A: broker-truth entry-time hydration — Policy J guard
+            # clock must never stay ENTRY_TIME_MISSING for a broker-observed
+            # position.  Broker deal/trade timestamps are truth; durable
+            # local fills / state file are fallbacks; None stays fail-closed.
+            _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _rows)
+            if _entry_ms:
+                strategy._entry_guard_start_ms = _entry_ms
+                strategy._entry_ts_ms = _entry_ms
+                try:
+                    strategy._entry_ts = datetime.fromtimestamp(_entry_ms / 1000.0)
+                except Exception:
+                    strategy._entry_ts = None
+            else:
+                # Fail-closed: a broker-valid position with no trustworthy
+                # anchor must not inherit a stale clock from a previous
+                # trade (that would bypass ENTRY_TIME_MISSING and corrupt
+                # the Policy-J guard clock).
+                strategy._entry_guard_start_ms = None
+                strategy._entry_ts_ms = None
+                strategy._entry_ts = None
+            self._broker_position_observed = True
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = False
+            strategy._broker_truth_flat = False
+            # ── broker-confirmed single-leg recovery inference (2026-08-18)
+            # 當 local fills 缺 RELEASE/FILLED, 但 canonical 證明 released
+            # contract 已不在、remaining 在 (valid side/qty/avg_cost) 且恰有
+            # 一個 current MTS_RELEASE order identity → 推導 SINGLE_LEG
+            # transition (不合成 release price/PnL) + PENDING_REANCHOR。
+            # ambiguous identity / session mismatch → fail-closed (不推導)。
+            _snap_session = _snap.get("session_id")
+            _ctx_session = getattr(getattr(self, "_execution_context", None),
+                                   "session_id", "") or ""
+            _released_code = (str(getattr(self.far_contract, "code", ""))
+                              if _code == str(getattr(self.contract, "code", ""))
+                              else str(getattr(self.contract, "code", "")))
+            _release_ids = self._mts_release_order_identities(_released_code)
+            # ── idempotence (2026-08-18 review): an already-reconciled
+            # strategy keeps its PENDING/READY status + anchor/extrema;
+            # repeated 5s-cadence refreshes never re-run the inference.
+            _already_reconciled = (
+                getattr(strategy, "_broker_recovery_source", None)
+                == "broker_reconciliation")
+            if (not _already_reconciled and len(_release_ids) == 1
+                    and _snap_session and _snap_session == _ctx_session):
+                _rel_str = ("near" if _code
+                            == str(getattr(self.far_contract, "code", ""))
+                            else "far")
+                _rid = _release_ids[0]
+                try:
+                    from strategies.plugins.futures.active.tmf_spread import (
+                        _session_label)
+                    _pos_session = (getattr(self, "session_type", None)
+                                    or _session_label())
+                except Exception:
+                    _pos_session = None
+                strategy.enter_broker_reconciled_single_leg(
+                    released_leg=_rel_str,
+                    remaining_side=_side_value,
+                    order_id=_rid.get("order_id"),
+                    broker_order_id=_rid.get("broker_order_id"),
+                    snapshot_hash=_snap.get("canonical_input_hash"),
+                    position_session=_pos_session)
+            _auth = MtsAuthorityState(
+                status=MtsAuthority.SINGLE_LEG, trade_id=_trade_id,
+                near_qty=_qty if _is_near and _side_value == "LONG" else
+                         (-_qty if _is_near else 0),
+                far_qty=_qty if (not _is_near and _side_value == "LONG") else
+                        (-_qty if not _is_near else 0),
+                near_side=_side_value if _is_near else None,
+                far_side=_side_value if not _is_near else None,
+                near_entry=_entry if _is_near else 0.0,
+                far_entry=_entry if not _is_near else 0.0,
+                current_trade_id=_trade_id)
+            self._live_broker_authority = _auth
+            self._live_broker_authority_at = _now
+            return _auth
+
+        if len({p.get("code") for p in _rows}) != 2:
+            # More than one malformed/duplicate relevant row is ambiguous;
+            # it is not safe to infer either a spread or a single leg.
+            self._broker_position_observed = True
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = True
+            strategy._broker_truth_flat = False
+            self._live_broker_authority = None
+            self._live_broker_authority_at = _now
+            self._emit_release_eval_skip_no_local_position(_snap)
+            return None
+        _by_code = {p["code"]: p for p in _rows}
+        _near = _by_code.get(str(getattr(self.contract, "code", "")))
+        _far = _by_code.get(str(getattr(self.far_contract, "code", "")))
         _near_side, _far_side = _side(_near), _side(_far)
         if _near_side is None or _far_side is None:
             # Relevant broker rows exist but are ambiguous.  Keep entry
             # blocked until a subsequent successful snapshot proves flat or
             # provides two unambiguous legs.
             self._broker_position_observed = True
+            self._live_broker_flat_proven = False
+            self._broker_authority_degraded = True
             strategy._broker_truth_flat = False
             self._live_broker_authority = None
             self._live_broker_authority_at = _now
+            self._emit_release_eval_skip_no_local_position(_snap)
             return None
-        # Reconcile the broker legs with the already-known strategy state
-        # before exposing them to evaluation.  On a cold start the broker
-        # snapshot is the authoritative source used to hydrate the empty
-        # canonical state; a populated but divergent local state is held.
-        from core.reconciliation.holding_state import reconcile_holding
-        _broker_legs = [
-            {"code": _near["code"], "side": _near_side,
-             "qty": _near["quantity"], "avg_cost": _near.get("avg_cost")},
-            {"code": _far["code"], "side": _far_side,
-             "qty": _far["quantity"], "avg_cost": _far.get("avg_cost")},
-        ]
-        if getattr(strategy, "_has_position", False):
-            _local_legs = [
-                {"code": _broker_legs[0]["code"],
-                 "side": getattr(strategy, "_near_side", ""),
-                 "qty": getattr(strategy, "_near_qty", 0),
-                 "avg_cost": getattr(strategy, "_near_entry", 0)},
-                {"code": _broker_legs[1]["code"],
-                 "side": getattr(strategy, "_far_side", ""),
-                 "qty": getattr(strategy, "_far_qty", 0),
-                 "avg_cost": getattr(strategy, "_far_entry", 0)},
-            ]
-        else:
-            _local_legs = _broker_legs
-        _decision = reconcile_holding(
-            _broker_legs, _local_legs, tick_size=1.0)
-        if not _decision.fail_closed or _decision.status.value == "RECONCILED":
-            self._canonical_holding_hydrated = True
-            strategy._broker_truth_flat = False
-        else:
-            self._canonical_holding_hydrated = False
-            self._live_broker_authority = None
-            self._live_broker_authority_at = _now
-            self._append_mts_event("RECONCILIATION_HOLD",
-                                   reason=_decision.reason,
-                                   raw_broker_legs=_decision.raw_broker_legs,
-                                   raw_local_legs=_decision.raw_local_legs)
-            return None
-        _snapshot_hash = _snap.get("canonical_input_hash")
         self._broker_position_observed = True
-        _trade_id = self._stable_broker_trade_id(
-            _snap.get("account_identity_hash"), _rows)
+        self._live_broker_flat_proven = False
+        self._broker_authority_degraded = False
+        strategy._broker_truth_flat = False
+        try:
+            _near_cost = float(_near.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            _near_cost = 0.0
+        try:
+            _far_cost = float(_far.get("avg_cost") or 0.0)
+        except (TypeError, ValueError):
+            _far_cost = 0.0
         for _name, _value in (
                 ("_near_side", _near_side), ("_far_side", _far_side),
                 ("_near_qty", _near["quantity"]),
                 ("_far_qty", _far["quantity"]),
-                ("_near_entry", _near.get("avg_cost")),
-                ("_far_entry", _far.get("avg_cost")),
+                ("_near_entry", _near_cost),
+                ("_far_entry", _far_cost),
                 ("_trade_id", _trade_id), ("_has_position", True),
                 ("_snapshot_hash", _snapshot_hash)):
             setattr(strategy, _name, _value)
-        from strategies.futures.mts_ledger_authority import (
-            MtsAuthority, MtsAuthorityState)
+        # P0-A: broker-truth entry-time hydration (see single-leg branch).
+        _entry_ms = self._resolve_broker_hydration_entry_epoch(_snap, _rows)
+        if _entry_ms:
+            strategy._entry_guard_start_ms = _entry_ms
+            strategy._entry_ts_ms = _entry_ms
+            try:
+                strategy._entry_ts = datetime.fromtimestamp(_entry_ms / 1000.0)
+            except Exception:
+                strategy._entry_ts = None
+        else:
+            # Fail-closed: a broker-valid position with no trustworthy
+            # anchor must not inherit a stale clock from a previous
+            # trade (that would bypass ENTRY_TIME_MISSING and corrupt
+            # the Policy-J guard clock).
+            strategy._entry_guard_start_ms = None
+            strategy._entry_ts_ms = None
+            strategy._entry_ts = None
         _auth = MtsAuthorityState(
             status=MtsAuthority.OPEN, trade_id=_trade_id,
             near_qty=-_near["quantity"] if _near_side == "SHORT" else _near["quantity"],
@@ -5124,25 +6543,6 @@ class FuturesMonitor:
                     guard="reconciliation", ok=False,
                     reasons=(_pending_reason,)),)), None
         snapshot = self._capture_post_startup_snapshot()
-        # Re-run sanctioned migration before the atomic-health gate and keep
-        # its evidence in the immutable context for subsequent rewrites.
-        try:
-            import dataclasses
-            from core.reconciliation.startup_migration import migrate_stale_live_context
-            from core.runtime_paths import runtime_root
-            _migrated, _migration_ctx = migrate_stale_live_context(runtime_root(), snapshot)
-            if isinstance(_migration_ctx, dict):
-                self._execution_context = dataclasses.replace(
-                    self._execution_context,
-                    canonical_holding=_migration_ctx.get("canonical_holding"),
-                )
-                self._canonical_holding_hydrated = bool(_migrated)
-        except Exception:
-            self._canonical_holding_hydrated = False
-        # Reconcile persisted local orders before the startup gate evaluates
-        # pending-entry state.  A successful broker snapshot may prove a stale
-        # submitted MTS entry absent; a failed snapshot remains fail-closed.
-        self._reconcile_local_orders_from_snapshot(snapshot)
         self._persist_current_session_canonical(snapshot)
         _ev = None
         try:
@@ -5260,16 +6660,7 @@ class FuturesMonitor:
                 octype=sj.constant.FuturesOCType.Cover,
                 account=self.api.futopt_account,
             )
-            trade = self.client.place_order(
-                self.contract,
-                action=action.value,
-                quantity=lots,
-                price=safety_price,
-                octype="Cover",
-                premise={"kind": "HOLD_LEG", "leg": "safety_stop",
-                         "side": direction, "qty": lots},
-                intent_action="EXIT_SAFETY_STOP",
-            )
+            trade = self.api.place_order(self.contract, order)
             if trade and trade.status.status != sj.constant.Status.Failed:
                 self._safety_stop_trade = trade
                 console.print(f"[bold yellow]🛡️ Safety stop placed: {action.value} @ {safety_price:.0f} ({safety_pts:.0f}pts from entry)[/bold yellow]")
@@ -5663,7 +7054,7 @@ class FuturesMonitor:
                             })
 
             # 2026-07-07 Hermes Agent: State-file fallback — read
-            # /tmp/mts_position_state.json directly as a last resort.
+            # the canonical runtime state directly as a last resort.
             # The strategy-based fallback above relies on _lifecycle_oca
             # being restored on the plugin instance, which may not have
             # happened yet after a PM2 restart. This fallback guarantees
@@ -5708,10 +7099,12 @@ class FuturesMonitor:
                 )
 
             # 2026-07-08 Gemini CLI: Use session-date-aware orders_file path with test isolation to prevent test leakage
+            import sys
             orders_dir = runtime_path("exports", "trades")
-            injected_orders_dir = os.environ.get("TRADING_TEST_EXPORT_DIR")
-            if injected_orders_dir:
-                orders_dir = injected_orders_dir
+            if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+                current_cwd = Path.cwd().resolve()
+                if (current_cwd / "RULES.md").exists() and (current_cwd / "exports").exists():
+                    orders_dir = "tests/temp_exports_trades"
             orders_file = Path(orders_dir) / f"{self.ticker}_{_date}_orders.json"
             orders_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -5746,6 +7139,42 @@ class FuturesMonitor:
                                     export_data.append(_entry)
             except Exception:
                 pass  # corrupt existing file → overwrite with fresh data
+
+            # Projection-only correction: a successful live canonical
+            # position match must not be overwritten by stale in-memory
+            # submitted rows.  This never authorizes or submits an order.
+            if getattr(self, "live_trading", False):
+                try:
+                    _canon_path = Path(runtime_path(
+                        "exports", "trades", "live", "diagnostics",
+                        "broker_snapshot_canonical.json"))
+                    _snap = json.loads(_canon_path.read_text(encoding="utf-8"))
+                    if (_snap.get("source") == "live_broker"
+                            and (_snap.get("fetch_status") or {}).get("capture") == "OK"):
+                        _pos = {}
+                        for _p in _snap.get("positions") or []:
+                            if (_p.get("account") == "futures"
+                                    and int(_p.get("quantity", 0) or 0) > 0):
+                                _side = str(_p.get("direction") or "").lower().split(".")[-1]
+                                if _side in ("buy", "sell"):
+                                    _pos[(str(_p.get("code")), _side,
+                                          int(_p.get("quantity")))] = _p
+                        for _d in export_data:
+                            _side = str(_d.get("side") or "").lower().split(".")[-1]
+                            _key = (str(_d.get("symbol") or ""), _side,
+                                    int(_d.get("quantity", 0) or 0))
+                            _p = _pos.get(_key)
+                            if _p and _d.get("status") != "filled":
+                                _d.update({
+                                    "status": "filled",
+                                    "filled_quantity": int(_p["quantity"]),
+                                    "remaining_quantity": 0,
+                                    "avg_fill_price": float(_p["avg_cost"]),
+                                    "cancelled_at": None,
+                                    "cancel_reason": None,
+                                })
+                except Exception:
+                    pass
 
             # 2026-07-07 Hermes Agent: atomic write via temp + rename.
             # Dashboard reads this file on every refresh; a direct write
@@ -5807,18 +7236,34 @@ class FuturesMonitor:
         
         try:
             import csv
+            import json
             from pathlib import Path
             from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+
+            # Restore the current session's JSON lifecycle before broker
+            # reconciliation.  The export is the durable source for orders
+            # submitted before a restart; broker truth will subsequently
+            # promote position-covered pending rows to FILLED.
+            try:
+                from core.runtime_paths import runtime_path
+                orders_file = Path(runtime_path(
+                    "exports", "trades",
+                    f"{self.ticker}_{datetime.now().strftime('%Y%m%d')}_orders.json"))
+                if orders_file.exists():
+                    saved = json.loads(orders_file.read_text(encoding="utf-8"))
+                    if isinstance(saved, list):
+                        restored = self.order_mgr.restore_orders(saved)
+                        if restored.get("active") or restored.get("completed"):
+                            console.print(
+                                f"[dim]♻️ Restored {restored.get('active', 0)} active / "
+                                f"{restored.get('completed', 0)} completed orders[/dim]"
+                            )
+            except Exception as _restore_exc:
+                console.print(f"[dim yellow]⚠️ Order JSON restore skipped: {_restore_exc}[/dim yellow]")
             
-            # Use the OrderManager's canonical session date.  Wall-clock date
-            # is wrong during the night session, when export and restore must
-            # address the same trading-session file.
-            session_date = getattr(self.order_mgr, "_session_date", None)
-            if (not isinstance(session_date, str)
-                    or not session_date.isdigit() or len(session_date) != 8):
-                from core.date_utils import get_session_date_str
-                session_date = get_session_date_str(datetime.now())
-            trades_file = Path(f"exports/trades/TMF_{session_date}_trades.csv")
+            # Find today's trades CSV
+            today = datetime.now().strftime("%Y%m%d")
+            trades_file = Path(f"exports/trades/TMF_{today}_trades.csv")
             
             if not trades_file.exists():
                 console.print("[dim]No trades file to recover orders from[/dim]")
@@ -6335,58 +7780,6 @@ class FuturesMonitor:
         self._save_orders_file_wrapper()
         return result
 
-    def _fills_bridge_mark_seen(self, order, deal_id=None, seqno=None) -> bool:
-        """Return False for a callback already seen or durably restored."""
-        if order is None or not (deal_id or seqno):
-            return True
-        if getattr(self, "_fills_bridge_seen", None) is None:
-            self._fills_bridge_seen = {}
-        for fill in getattr(order, "fills", ()):
-            if deal_id and (getattr(fill, "deal_id", None) == deal_id
-                            or getattr(fill, "broker_trade_id", None) == deal_id
-                            or getattr(fill, "exchange_fill_id", None) == deal_id):
-                return False
-            if seqno and getattr(fill, "exchange_seq", None) == seqno:
-                return False
-        key = (getattr(order, "order_id", None), deal_id or seqno)
-        if key in self._fills_bridge_seen:
-            return False
-        self._fills_bridge_seen[key] = True
-        return True
-
-    @staticmethod
-    def _normalize_order_deal_records(records):
-        """Normalize Shioaji ``(state, payload)`` deal records only.
-
-        Order-status records are deliberately excluded: terminalization must
-        be driven by a broker deal receipt, never by local inference.
-        """
-        normalized = []
-        for state, raw in records or ():
-            state_name = str(getattr(state, "name", ""))
-            state_value = str(getattr(state, "value", "")).upper()
-            if not (state_name == "FuturesDeal" or state_value == "FDEAL"
-                    or str(state) in ("FuturesDeal", "FDEAL")):
-                continue
-            payload = raw if isinstance(raw, dict) else {}
-            if not payload:
-                continue
-            identity = (payload.get("trade_id") or payload.get("deal_id")
-                        or payload.get("fill_id"))
-            if not identity:
-                continue
-            deal = dict(payload)
-            deal.setdefault("exchange_seq", payload.get("exchange_seq")
-                            or payload.get("seqno"))
-            normalized.append({
-                "id": identity,
-                "status": "Filled",
-                "code": payload.get("code"),
-                "delivery_month": payload.get("delivery_month"),
-                "deals": [deal],
-            })
-        return normalized
-
     def on_order_event(self, order_state, data) -> None:
         """Apply one Shioaji futures callback to the canonical lifecycle.
 
@@ -6429,6 +7822,38 @@ class FuturesMonitor:
         if not (is_futures_deal or is_futures_order):
             return
 
+        # Keep callback provenance separate from refreshed Trade evidence;
+        # this is intentionally metadata-only and never drives matching.
+        _callback_observation = "FDEAL_CALLBACK" if is_futures_deal else "FORDER_CALLBACK"
+        _count_attr = ("_fdeal_callback_count" if is_futures_deal
+                       else "_forder_callback_count")
+        setattr(self, _count_attr, getattr(self, _count_attr, 0) + 1)
+        _callback_at = int(time.time() * 1000)
+        setattr(self, ("_last_fdeal_callback_at" if is_futures_deal
+                       else "_last_order_callback_at"), _callback_at)
+        try:
+            self._append_mts_event(
+                _callback_observation,
+                observation_type=_callback_observation,
+                observed_at=int(time.time() * 1000),
+                snapshot_generation=(
+                    (getattr(self, "_last_futures_refresh", None) or {}).get(
+                        "snapshot_generation")),
+                source_status=state_name or state_value,
+                normalization_result="RECEIVED",
+                rejection_reason=None,
+                forder_count=getattr(self, "_forder_callback_count", 0),
+                fdeal_count=getattr(self, "_fdeal_callback_count", 0),
+                callback_exception_count=getattr(
+                    self, "_callback_exception_count", 0),
+                last_order_callback_at=getattr(
+                    self, "_last_order_callback_at", None),
+                last_fdeal_callback_at=getattr(
+                    self, "_last_fdeal_callback_at", None),
+            )
+        except Exception:
+            pass
+
         broker_order_id = (payload.get("id") or payload.get("broker_order_id")
                            or payload.get("order_id"))
         ordno = payload.get("ordno")
@@ -6442,33 +7867,48 @@ class FuturesMonitor:
             except (TypeError, ValueError):
                 return
             if fill_price <= 0 or fill_qty <= 0:
+                try:
+                    self._append_mts_event(
+                        "FDEAL_CALLBACK_REJECTED",
+                        observation_type="FDEAL_CALLBACK",
+                        normalization_result="REJECTED",
+                        rejection_reason="INVALID_PRICE_OR_QUANTITY")
+                except Exception:
+                    pass
                 return
             _deal_id = payload.get("trade_id") or payload.get("deal_id")
-            _exchange_seq = payload.get("exchange_seq")
-            if not any((_deal_id, _exchange_seq, broker_order_id, seqno, ordno)):
-                logger.warning("[FUTURES_DEAL_REJECTED] broker identity missing")
+            if not (broker_order_id or _deal_id or seqno):
+                # Fail-closed: no broker identity to correlate — never apply.
+                self._append_mts_event(
+                    "FILL_REJECTED_MISSING_BROKER_IDENTITY",
+                    reason="no broker order/deal/seq identity in deal callback",
+                )
                 return
-            _order = self.order_mgr._resolve_order(
-                None, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno
-            )
-            if _order is not None and not self._fills_bridge_mark_seen(
-                    _order, _deal_id, _exchange_seq):
-                return
+            _dedupe_order = self.order_mgr._resolve_order(
+                None, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
+            if _dedupe_order is not None and not self._fills_bridge_mark_seen(
+                    _dedupe_order, _deal_id, seqno,
+                    exchange_seq=payload.get("exchange_seq")):
+                return  # duplicate broker receipt — already applied (session or durable)
             order = self.order_mgr.apply_deal_fill(
                 None,
-                deal_id=_deal_id,
+                deal_id=payload.get("trade_id") or payload.get("deal_id"),
                 fill_price=fill_price,
                 fill_qty=fill_qty,
                 exchange_fill_id=payload.get("trade_id") or payload.get("deal_id"),
                 broker_trade_id=payload.get("trade_id"),
-                exchange_seq=_exchange_seq,
+                exchange_seq=payload.get("exchange_seq"),
                 raw_payload=payload,
                 broker_order_id=broker_order_id,
                 seqno=seqno,
                 ordno=ordno,
                 source="shioaji_callback",
                 reason=reason,
+                observation_type="FDEAL_CALLBACK",
             )
+            if order is not None:
+                self._leg_lock_apply_order_event(
+                    order, getattr(order, "status", None), fill_qty=fill_qty)
             if order is None:
                 logger.warning(
                     "[FUTURES_DEAL_UNMATCHED] id=%s seqno=%s ordno=%s",
@@ -6476,7 +7916,7 @@ class FuturesMonitor:
                 )
             return
 
-        self.order_mgr.apply_order_update(
+        _updated_order = self.order_mgr.apply_order_update(
             None,
             raw_status=payload.get("status") or state_value,
             reason=reason,
@@ -6485,7 +7925,54 @@ class FuturesMonitor:
             seqno=seqno,
             ordno=ordno,
             source="shioaji_callback",
+            observation_type="FORDER_CALLBACK",
         )
+        if _updated_order is not None:
+            self._leg_lock_apply_order_event(
+                _updated_order, getattr(_updated_order, "status", None))
+
+    def _fills_bridge_mark_seen(self, order, deal_id, seqno,
+                               exchange_seq=None) -> bool:
+        """Return True if this broker fill identity is NEW (not seen before).
+
+        Restart-safe: checks the order's durable fills first (order.fills
+        carries the broker identity via OrderFill and round-trips through the
+        orders JSON), so a restored order with an already-applied deal is never
+        re-applied after a restart.  Deal-id match covers deal_id-carrying
+        receipts; a seqno-only receipt (no deal id) dedupes against the durable
+        fill's exchange_seq on the same order.  Session dedupe: bounded map
+        keyed by (order id | deal id | seqno), entries older than 1h pruned at
+        5000.  Fail-open on internal error — an explicit loss-vs-duplicate
+        tradeoff: a dedupe fault may let one duplicate through (a visible
+        over-fill the remaining-guard still caps) rather than silently drop a
+        real fill (a lost fill would strand the position without a record).
+        """
+        try:
+            _oid = getattr(order, "order_id", None)
+            for _f in (getattr(order, "fills", None) or []):
+                _fid = (getattr(_f, "broker_trade_id", None)
+                        or getattr(_f, "exchange_fill_id", None)
+                        or getattr(_f, "deal_id", None))
+                if _fid and _fid == deal_id:
+                    return False  # durable — already applied (restored state)
+                _fseq = getattr(_f, "exchange_seq", None)
+                if _fseq and exchange_seq and _fseq == exchange_seq:
+                    return False  # seqno/exchange_seq-only receipt — already applied
+            _key = f"{_oid}|{deal_id}|{seqno}"
+            _seen = getattr(self, "_fills_bridge_seen", None)
+            if _seen is None:
+                _seen = self._fills_bridge_seen = {}
+            _now = time.monotonic()
+            if _key in _seen:
+                return False
+            if len(_seen) > 5000:
+                _old = _now - 3600.0
+                for _k in [k for k, v in _seen.items() if v < _old]:
+                    del _seen[_k]
+            _seen[_key] = _now
+            return True
+        except Exception:
+            return True
 
     def _wire_order_callbacks(self):
         """Wire OrderManager callbacks to PaperTrader and audit system."""
@@ -6499,7 +7986,31 @@ class FuturesMonitor:
                 action = "BUY" if event.side == OrderSide.BUY else "SELL"
                 # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent
                 console.print(f"[green]📦 Confirmed deal: {action} {event.fill_qty} @ {event.fill_price:.0f} deal={event.deal_id} → {msg}[/green]")
-            
+
+            # 2026-08-25 Item1 (Hermes): advance the durable exit intent on a
+            # confirmed paper fill.  Without this, the intent leg stays
+            # SUBMITTED forever, active intents accumulate to
+            # MAX_ACTIVE_INTENTS (20), and every later EXIT fails at intent
+            # creation with IntentCapacityError (ORDER_INTENT_CREATED emitted
+            # but ORDER_SUBMITTED never).  mark_paper_filled only advances a
+            # leg that is already SUBMITTED and never guesses UNKNOWN —
+            # unknown/attempted intents are left untouched for reconciliation.
+            _fill_iid = getattr(event, "intent_id", None)
+            if _fill_iid and not self.live_trading:
+                try:
+                    from core.exit_intent import IntentLog as _MTSIntentLog
+                    _ilog = _MTSIntentLog(_mts_intent_log_dir())
+                    _row = _ilog.get(_fill_iid)
+                    if _row is not None:
+                        for _leg, _leg_meta in (_row.get("legs") or {}).items():
+                            if str(_leg_meta.get("status", "")) == "SUBMITTED":
+                                _ilog.mark_paper_filled(_fill_iid, _leg)
+                except Exception as _fill_intent_exc:
+                    import logging as _logging
+                    _logging.getLogger().warning(
+                        "[PAPER_FILL_INTENT_MARK_FAILED] intent=%s err=%s",
+                        _fill_iid, _fill_intent_exc)
+
             # [GSD] Always update dashboard file to reflect latest OrderManager state (e.g. FILLED)
             self._save_orders_file_wrapper()
             self._maybe_finalize_exit_only_reconciliation()
@@ -6599,14 +8110,8 @@ class FuturesMonitor:
 
         if self.live_trading and not self.dry_run:
             try:
-                _premise = ({"kind": "NOT_HOLD"}
-                            if signal in ("BUY", "SELL") else
-                            {"kind": "HOLD_LEG", "leg": "target",
-                             "side": "LONG" if self.trader.position > 0 else "SHORT",
-                             "qty": lots})
-                trade = self.client.place_order(
-                    self.contract, action=action, quantity=lots,
-                    premise=_premise, intent_action=signal)
+                trade = self.client.place_order(self.contract, action=action,
+                                                quantity=lots)
             except AdapterOrderError as e:
                 # P0: structured durable failure — never swallowed
                 self._clear_pending_lifecycle_order(order.order_id)
@@ -6652,7 +8157,7 @@ class FuturesMonitor:
     def _reconcile_paper_oco_orders_from_state(self) -> None:
         """Re-register OCO orders from state file (no strategy dependency).
         
-        Reads /tmp/mts_position_state.json directly for lifecycle.release_group.
+        Reads the canonical runtime state directly for lifecycle.release_group.
         Used at startup before market open when strategy lifecycle isn't restored yet.
         """
         if not self.paper_fill_sim or not self.order_mgr:
@@ -6859,6 +8364,17 @@ class FuturesMonitor:
             self._make_synthetic_tick(near_price, ts, symbol=_near_symbol),
             self._make_synthetic_tick(far_price, ts, symbol=_far_symbol),
         ]
+
+        # Paper combo entries remain pending until both leg ticks are
+        # available.  Process that parent lifecycle first; the existing loop
+        # below continues to serve independent OCO/combined-exit orders.
+        if hasattr(self.paper_fill_sim, "process_combo_ticks"):
+            try:
+                self.paper_fill_sim.process_combo_ticks(ticks[0], ticks[1])
+            except Exception as exc:
+                import logging
+                logging.getLogger("FuturesMonitor").exception(
+                    "[MTS][PAPER_COMBO_FILL] process failed: %s", exc)
 
         for tick in ticks:
             # [ADR-010] Pre-tick guard: don't feed second tick if OCO already resolved
@@ -7289,8 +8805,15 @@ class FuturesMonitor:
         self.latest_router_decision = decision
         return decision, ctx, session_regime, bar_regime
 
-    def _append_mts_event(self, event_type: str, **kwargs):
-        """Append an MTS-specific event to the shared event ledger."""
+    def _append_mts_event_checked(self, event_type: str, **kwargs):
+        """Append an MTS event and report whether it was durably written.
+
+        Most historical telemetry is best-effort.  Entry decision evidence is
+        different: without a durable decision record we must not create broker
+        intents that cannot later be explained.  Keep this primitive small so
+        the normal writer remains backward-compatible while entry can enforce
+        the all-or-nothing contract.
+        """
         try:
             _dir = runtime_logs()
             if not os.path.exists(_dir):
@@ -7301,8 +8824,126 @@ class FuturesMonitor:
             event.update(kwargs)
             with open(path, "a") as f:
                 f.write(json.dumps(event, default=str) + "\n")
+            return True
+        except Exception:
+            return False
+
+    def _append_mts_event(self, event_type: str, **kwargs):
+        """Append an MTS-specific event to the shared event ledger.
+
+        Legacy telemetry remains best-effort; callers that require a durable
+        audit record use :meth:`_append_mts_event_checked` explicitly.
+        """
+        try:
+            _dir = runtime_logs()
+            if not os.path.exists(_dir):
+                os.makedirs(_dir, exist_ok=True)
+            path = os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl"))
+            event = {"event": event_type, "ts": datetime.now().isoformat()}
+            event.update(kwargs)
+            with open(path, "a") as f:
+                f.write(json.dumps(event, default=str) + "\n")
         except Exception:
             pass
+
+    def _check_entry_quote_freshness(
+            self, *, near_slot: dict, far_slot: dict,
+            near_trade_age_ms, far_trade_age_ms,
+            near_source: str, far_source: str,
+            threshold_ms: int = 12000) -> tuple[bool, dict]:
+        """BBO-based freshness hard gate for a NEW manual spread entry.
+
+        Both legs must carry a valid BBO update:
+          - bid and ask present, finite positive numeric, ask >= bid, and
+          - BBO update timestamp (bidask_at, seconds epoch) age <= threshold.
+        A missing/invalid/crossed/stale BBO on EITHER leg blocks the entry
+        (fail-closed), in paper and live mode alike.  Returns
+        (ok, detail) where detail carries per-leg evidence for the
+        ENTRY_BLOCKED_STALE_QUOTE audit event.  Last-trade age is included
+        in detail as telemetry only — it never gates.
+        """
+        import math as _math
+
+        def _bbo_evidence(slot: dict, leg: str) -> dict:
+            _bid = slot.get("bid")
+            _ask = slot.get("ask")
+            _bbo_at = slot.get("bidask_at")
+            _ev = {
+                f"{leg}_bid": _bid,
+                f"{leg}_ask": _ask,
+                f"{leg}_bbo_age_ms": None,
+                f"{leg}_bbo_reason": None,
+            }
+            if _bid is None or _ask is None:
+                _ev[f"{leg}_bbo_reason"] = "BBO_MISSING"
+                return _ev
+            try:
+                _b = float(_bid)
+                _a = float(_ask)
+            except (TypeError, ValueError):
+                _b = _a = None
+            if _b is None or _a is None or not (
+                    _math.isfinite(_b) and _math.isfinite(_a)):
+                _ev[f"{leg}_bbo_reason"] = "BBO_NONFINITE"
+                return _ev
+            if _b <= 0 or _a <= 0:
+                _ev[f"{leg}_bbo_reason"] = "BBO_NON_POSITIVE"
+                return _ev
+            if _a < _b:
+                _ev[f"{leg}_bbo_reason"] = "BBO_CROSSED"
+                return _ev
+            if _bbo_at is None:
+                _ev[f"{leg}_bbo_reason"] = "BBO_NO_TIMESTAMP"
+                return _ev
+            try:
+                _age_ms = (time.time() - float(_bbo_at)) * 1000.0
+            except (TypeError, ValueError):
+                _ev[f"{leg}_bbo_reason"] = "BBO_TS_INVALID"
+                return _ev
+            _ev[f"{leg}_bbo_age_ms"] = int(_age_ms)
+            if _age_ms > threshold_ms:
+                _ev[f"{leg}_bbo_reason"] = "BBO_STALE"
+            return _ev
+
+        _near = _bbo_evidence(near_slot or {}, "near")
+        _far = _bbo_evidence(far_slot or {}, "far")
+        _near_reason = _near["near_bbo_reason"]
+        _far_reason = _far["far_bbo_reason"]
+        _ok = _near_reason is None and _far_reason is None
+        _detail = {
+            **_near, **_far,
+            # last-trade age retained as TELEMETRY only (not the gate)
+            "near_age_ms": (int(near_trade_age_ms)
+                             if isinstance(near_trade_age_ms, (int, float))
+                             and near_trade_age_ms >= 0 else None),
+            "far_age_ms": (int(far_trade_age_ms)
+                            if isinstance(far_trade_age_ms, (int, float))
+                            and far_trade_age_ms >= 0 else None),
+            "near_source": near_source,
+            "far_source": far_source,
+            "reason": (_near_reason or _far_reason) if not _ok else None,
+        }
+        try:
+            from core.callback_trace_context import emit as _trace_emit
+            _trace_emit(
+                "STALE_GATE_READ",
+                gate_name="ENTRY_BBO_FRESHNESS",
+                gate_timestamp_field="bidask_at",
+                near_bbo_age_ms=_near.get("near_bbo_age_ms"),
+                far_bbo_age_ms=_far.get("far_bbo_age_ms"),
+                near_tick_age_ms=_detail.get("near_age_ms"),
+                far_tick_age_ms=_detail.get("far_age_ms"),
+                computed_age_ms=max(
+                    [x for x in (_near.get("near_bbo_age_ms"),
+                                 _far.get("far_bbo_age_ms"))
+                     if isinstance(x, (int, float))], default=None),
+                final_reason=_detail.get("reason"),
+                gate_pass=_ok,
+                read_monotonic_ns=time.monotonic_ns(),
+            )
+        except Exception:
+            pass
+        return _ok, _detail
 
     def _mts_ledger_reconstructed_open_qty(self, trade_id: str) -> dict[str, int] | None:
         """Rebuild per-leg open quantity from the append-only fills ledger.
@@ -7322,8 +8963,7 @@ class FuturesMonitor:
         if not trade_id:
             return None
         _fills_path = os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "logs", "mts_trade_fills.jsonl",
+            runtime_logs(), "mts_trade_fills.jsonl",
         )
         if not os.path.exists(_fills_path):
             return None
@@ -7364,108 +9004,202 @@ class FuturesMonitor:
             return None
         return _open_qty
 
-    def _release_startup_safety_gate(self, strategy, near_symbol, far_symbol):
-        """L4: reconcile release decision inputs from a fresh broker snapshot."""
-        if getattr(self, "_release_startup_checked", False):
-            return not getattr(self, "_release_safety_halted", False)
-        from core.futures_release_guard import sanitize_startup_state
-
+    def _reclaim_proven_paper_exit_intents(self, intent_log) -> int:
+        """Close only paper intents proven flat by the fills ledger."""
+        if self.live_trading:
+            return 0
+        reclaimed = 0
         try:
-            snapshot = self._capture_post_startup_snapshot()
-            state = {}
-            state_path = _mts_position_state_path()
-            if state_path.exists():
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-            decision = sanitize_startup_state(
-                state, snapshot, near_symbol=near_symbol, far_symbol=far_symbol)
-        except Exception as exc:
-            decision = None
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action="RELEASE",
-                reason="BROKER_QUERY_UNAVAILABLE",
-                error=f"{type(exc).__name__}: {exc}")
-        if decision is None or not decision.release_allowed:
-            self._release_safety_halted = True
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action="RELEASE",
-                reason=(decision.reason if decision is not None
-                        else "BROKER_QUERY_UNAVAILABLE"),
-                audit=(decision.audit if decision is not None else {}))
-            console.print(
-                "[bold red]⛔ [MTS_RELEASE_BLOCKED] startup broker premise "
-                "not confirmed; no-order mode[/bold red]")
-            return False
-
-        clean = decision.state
-        for attr, key in (("_near_side", "near_side"),
-                          ("_far_side", "far_side"),
-                          ("_released_leg", "released_leg"),
-                          ("_near_entry", "near_entry"),
-                          ("_far_entry", "far_entry")):
-            if key in clean:
-                setattr(strategy, attr, clean.get(key))
-        strategy._has_position = bool(clean.get("has_position"))
-        self._release_startup_checked = True
-        return True
-
-    def _release_pre_submit_guard(self, *, action, reason, strategy,
-                                  symbol, leg):
-        """L1/L2: require a fresh broker-held leg immediately before create_order."""
-        from core.futures_release_guard import (
-            ReleaseIntent, evaluate_release_precondition,
-        )
-        try:
-            snapshot = self._capture_post_startup_snapshot()
-            raw_side = getattr(strategy, f"_{leg}_side", None)
-            premise = {"kind": "HOLD_LEG", "leg": leg,
-                       "side": str(raw_side or "").upper(), "qty": 1}
-            intent = ReleaseIntent(
-                action=action, symbol=symbol,
-                side="BUY" if premise["side"] == "SHORT" else "SELL",
-                qty=1, premise=premise)
-            decision = evaluate_release_precondition(intent, snapshot)
+            for iid in list(intent_log.list_active()):
+                row = intent_log.get(iid)
+                legs = row.get("legs") or {}
+                if not legs or any(
+                        str(v.get("status", "")) != "SUBMITTED"
+                        for v in legs.values()):
+                    continue
+                qty = self._mts_ledger_reconstructed_open_qty(
+                    row.get("trade_id"))
+                if not isinstance(qty, dict) or any(
+                        qty.get(leg, 1) > 0 for leg in legs):
+                    continue
+                for leg in legs:
+                    intent_log.mark_paper_filled(iid, leg)
+                self._append_mts_event(
+                    "PAPER_EXIT_INTENT_RECLAIMED",
+                    intent_id=iid, trade_id=row.get("trade_id"),
+                    legs=list(legs), reason="FILLS_LEDGER_PROVES_FLAT")
+                reclaimed += 1
         except Exception as exc:
             self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action=action,
-                reason="BROKER_QUERY_UNAVAILABLE",
-                error=f"{type(exc).__name__}: {exc}")
+                "PAPER_EXIT_INTENT_RECONCILE_FAILED",
+                reason="DURABLE_RECONCILE_ERROR",
+                error_type=type(exc).__name__)
+        return reclaimed
+
+    def _reset_mts_dynamics_for_session(self, bar) -> None:
+        """Reset the dynamics calculator when the bar's session changes so
+        derivatives never span sessions (day -> night etc.)."""
+        _sess = bar.get("session_type")
+        if _sess is None or _sess == getattr(
+                self, "_spread_dynamics_session", None):
+            return
+        self._spread_dynamics_session = _sess
+        _sd = getattr(self, "_spread_dynamics", None)
+        if _sd is None:
+            return
+        from strategies.futures.mts.spread_dynamics import (
+            SpreadDynamicsCalculator)
+        self._spread_dynamics = SpreadDynamicsCalculator(
+            tau_sec=_sd.tau_sec, window_sec=_sd.window_sec,
+            min_dt_sec=_sd.min_dt_sec,
+            max_derivative_gap_sec=_sd.max_derivative_gap_sec,
+            min_abs_z_for_ratio=_sd.min_abs_z_for_ratio,
+            min_slope_samples=_sd.min_slope_samples,
+            min_slope_duration_sec=_sd.min_slope_duration_sec)
+
+    def _update_mts_spread_dynamics(self, bar: dict):
+        """Dynamics telemetry seam (bar-timestamp clock, session-aware).
+
+        Bar timestamps drive dt so behavior is deterministic and a
+        session_type change resets the calculator so derivatives never
+        span sessions.  The production tick pipeline uses
+        _apply_spread_dynamics (real arrival time — the 5-minute bar
+        cadence would otherwise trip max_derivative_gap_sec on every bar).
+        Returns the metrics; never raises.
+        """
+        _sd = getattr(self, "_spread_dynamics", None)
+        _z = bar.get("spread_z")
+        if _sd is None or _z is None:
             return None
-        if not decision.allowed:
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action=action,
-                reason=decision.reason, premise=intent.premise,
-                audit=decision.audit)
-            console.print(
-                f"[bold red]⛔ [MTS_RELEASE_BLOCKED] {decision.reason}: "
-                f"{symbol} {reason}[/bold red]")
-            return None
-        return snapshot
-
-    def _release_post_submit_guard(self, before_snapshot, symbol):
-        """L3: reject further sends if a release increases the target leg."""
-        from core.futures_release_guard import validate_release_effect
         try:
-            after_snapshot = self._capture_post_startup_snapshot()
-            decision = validate_release_effect(
-                before=before_snapshot, after=after_snapshot, symbol=symbol)
-        except Exception as exc:
-            decision = None
-            self._append_mts_event(
-                "POST_RELEASE_EFFECT_BLOCKED", symbol=symbol,
-                reason="POST_RELEASE_QUERY_UNAVAILABLE",
-                error=f"{type(exc).__name__}: {exc}")
-        if decision is None or not decision.allowed:
-            self._release_safety_halted = True
-            self._append_mts_event(
-                "POST_RELEASE_EFFECT_BLOCKED", symbol=symbol,
-                reason=(decision.reason if decision is not None
-                        else "POST_RELEASE_QUERY_UNAVAILABLE"),
-                audit=(decision.audit if decision is not None else {}))
-            console.print(
-                "[bold red]⛔ [MTS_RELEASE_HALTED] post-release broker "
-                "effect invalid; further orders halted[/bold red]")
-            return False
-        return True
+            self._reset_mts_dynamics_for_session(bar)
+            _sd = getattr(self, "_spread_dynamics", None)
+            _ts_raw = bar.get("ts") or bar.get("timestamp") or time.time()
+            if hasattr(_ts_raw, "timestamp"):
+                _ts_float = float(_ts_raw.timestamp())
+            elif hasattr(_ts_raw, "tz"):
+                _ts_float = float(pd.Timestamp(_ts_raw).timestamp())
+            else:
+                _ts_float = float(_ts_raw)
+            _m = _sd.update(_ts_float, float(_z))
+            _raw = (float(bar.get("near_close", 0.0) or 0.0)
+                    - float(bar.get("far_close", 0.0) or 0.0))
+            bar["raw_spread"] = _raw
+            bar["dz"] = _m.z_velocity
+            bar["spread_slope"] = _m.rolling_slope
+            bar["velocity_ema"] = _m.velocity_ema
+            bar["spread"] = _raw
+            return _m
+        except Exception:
+            return None
+
+    def _apply_spread_dynamics(self, bar: dict) -> None:
+        """Wire the SpreadDynamicsCalculator into the bar pipeline so the
+        entry_observation research records carry dz / spread_slope /
+        velocity_ema (research wiring gap — the calculator was never
+        called, leaving those columns NULL).  Also records the spread into
+        the candidate payload.  Never raises; the research features are
+        best-effort telemetry."""
+        _sd = getattr(self, "_spread_dynamics", None)
+        _z = bar.get("spread_z")
+        if _sd is None or _z is None:
+            return
+        try:
+            self._reset_mts_dynamics_for_session(bar)
+            # Real arrival time, not bar timestamps: bars carry a 5-minute
+            # cadence whose dt (300s) exceeds the calculator's
+            # max_derivative_gap_sec=15, resetting the sample counter every
+            # update so dz / spread_slope never form (the evaluation is
+            # stuck in CANDIDATE_AWAITING_EVALUATION forever).
+            _m = _sd.update(time.time(), float(_z))
+            bar["dz"] = _m.z_velocity
+            bar["spread_slope"] = _m.rolling_slope
+            bar["velocity_ema"] = _m.velocity_ema
+            bar.setdefault(
+                "spread",
+                float(bar.get("near_close", 0.0) or 0.0)
+                - float(bar.get("far_close", 0.0) or 0.0))
+        except Exception:
+            pass
+
+
+    def _record_mts_entry_research_candidate(self, strategy, bar_dict, ts):
+        """Best-effort z-score candidate telemetry; never affects orders."""
+        try:
+            _z = float(bar_dict.get("spread_z"))
+            _threshold = bar_dict.get("entry_z_threshold", bar_dict.get("entry_z"))
+            if _threshold is None:
+                _threshold = getattr(strategy, "_entry_z", None)
+            _threshold = float(_threshold)
+            if not (math.isfinite(_z) and math.isfinite(_threshold)
+                    and _threshold > 0 and abs(_z) >= _threshold):
+                return
+            # P1-C: stale / invalid quotes reject the candidate, but the
+            # rejection is RECORDED (decision=REJECT + standardized
+            # reason) so the research ledger explains every dropped
+            # candidate.  Absent BBO keys pass (legacy bars keep
+            # recording as CANDIDATE).
+            _reject_reason = None
+            _q_age = bar_dict.get("quote_age_ms")
+            if _q_age is not None:
+                try:
+                    _max_age = float(getattr(
+                        strategy, "_max_quote_age_ms", 30000) or 30000)
+                    if float(_q_age) > _max_age:
+                        _reject_reason = "STALE_QUOTE"
+                except (TypeError, ValueError):
+                    _reject_reason = "STALE_QUOTE"
+            if _reject_reason is None:
+                _bbo_present = [k for k in
+                                ("near_bid", "near_ask", "far_bid",
+                                 "far_ask") if k in bar_dict]
+                for _k in _bbo_present:
+                    _v = bar_dict.get(_k)
+                    if _v is None:
+                        _reject_reason = "BBO_MISSING"
+                        break
+                    if isinstance(_v, float) and (
+                            math.isnan(_v) or math.isinf(_v)):
+                        _reject_reason = "BBO_NONFINITE"
+                        break
+                    if _v == 0 or _v == "":
+                        _reject_reason = "BBO_INVALID"
+                        break
+                if _reject_reason is None and 0 < len(_bbo_present) < 4:
+                    _reject_reason = "BBO_MISSING"
+            _action = "SELL_NEAR_BUY_FAR" if _z > 0 else "BUY_NEAR_SELL_FAR"
+            _audit = {
+                "event_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "action": _action,
+                "decision": "REJECT" if _reject_reason else "CANDIDATE",
+                "rejection_reason": (_reject_reason if _reject_reason
+                                     else "CANDIDATE_AWAITING_EVALUATION"),
+                "trade_id": getattr(strategy, "_trade_id", None),
+                "near_contract": getattr(self, "near_code", None),
+                "far_contract": getattr(self, "far_code", None),
+                "spread": bar_dict.get("spread"), "spread_z": _z,
+                "entry_z": _threshold, "spread_ma": bar_dict.get("spread_ma"),
+                "spread_std": bar_dict.get("spread_std"), "dz": bar_dict.get("dz"),
+                "spread_slope": bar_dict.get("spread_slope"),
+                "velocity_ema": bar_dict.get("velocity_ema"),
+                "atr": bar_dict.get("atr"), "regime": bar_dict.get("regime"),
+                "near_bid": bar_dict.get("near_bid"), "near_ask": bar_dict.get("near_ask"),
+                "far_bid": bar_dict.get("far_bid"), "far_ask": bar_dict.get("far_ask"),
+                "quote_age_ms": bar_dict.get("quote_age_ms"),
+                "pair_skew_ms": bar_dict.get("pair_skew_ms"),
+            }
+            from core.entry_research_store import record_entry_observation
+            _ctx = getattr(self, "_execution_context", None)
+            record_entry_observation(
+                _audit, mode="live" if self.live_trading else "paper",
+                session_id=getattr(_ctx, "session_id", None),
+                config_hash=getattr(_ctx, "config_hash", None),
+                release_sha=os.environ.get("LRC_RELEASE_SHA"),
+                run_id=getattr(self, "run_id", None),
+                source=("live_strategy" if self.live_trading else "paper_strategy"),
+            )
+        except Exception:
+            pass
 
     def _submit_mts_order_signal(self, signal, strategy, bar_dict, ts):
         """Submit order via order_mgr for MTS signals (entry, release, exit).
@@ -7578,15 +9312,6 @@ class FuturesMonitor:
         from core.order_management.order import OrderType, OrderSide
         _action = signal.action
         _reason = signal.reason
-
-        # L0-L4 release safety is intentionally kept in this monitor
-        # chokepoint.  It does not modify OrderManager, watchdog, or Combo.
-        if (self.live_trading and getattr(self, "_release_safety_halted", False)):
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action=_action,
-                reason="RELEASE_SAFETY_HALTED",
-                trade_id=getattr(strategy, "_trade_id", ""))
-            return
         _near_close = float(bar_dict.get("near_close", 0))
         _far_close = float(bar_dict.get("far_close", 0))
         _ts = ts or datetime.now()
@@ -7639,25 +9364,6 @@ class FuturesMonitor:
         _near_code = self.contract.code
         _far_code = self.far_contract.code
 
-        _release_before_snapshot = None
-        _release_leg = None
-        if _action == "PARTIAL_EXIT":
-            if _reason and "RELEASE_NEAR" in str(_reason).upper():
-                _release_leg = "near"
-            elif _reason and "RELEASE_FAR" in str(_reason).upper():
-                _release_leg = "far"
-        if self.live_trading and _release_leg:
-            if not self._release_startup_safety_gate(strategy, _near_code, _far_code):
-                return
-            _release_before_snapshot = self._release_pre_submit_guard(
-                action=str(_action), reason=str(_reason or ""),
-                strategy=strategy,
-                symbol=_near_code if _release_leg == "near" else _far_code,
-                leg=_release_leg,
-            )
-            if _release_before_snapshot is None:
-                return
-
         # [Snapshot] Capture submission-time OHLC for slippage analysis
         _snap = {
             "near": {k: bar_dict.get(f"near_{k}") for k in ("open", "high", "low", "close")},
@@ -7674,8 +9380,22 @@ class FuturesMonitor:
                                              "SELL_NEAR_BUY_FAR")
                               else "MTS_EXIT" if _action == "EXIT"
                               else "MTS_RELEASE")
+        # [QUARANTINE_EXIT 2026-08-18] LIVE_QUARANTINED 窄化授權: 只有
+        # snapshot-bound remaining-leg MTS_RELEASE/MTS_EXIT 可送 —
+        # pre-submit fresh broker-truth recheck 生成 per-order proof;
+        # entry/manual/OCO 沒有 proof → 維持 blocked。
+        _q_proof = None
+        _is_combined = (_action == "EXIT"
+                        and "COMBINED_EXIT" in str(_reason).upper())
+        if (getattr(getattr(self, "_execution_context", None),
+                    "effective_mode", "") == "live_quarantined"
+                and _gw_intent_strategy in ("MTS_RELEASE", "MTS_EXIT")
+                and not _is_combined):
+            _q_proof = self._mts_quarantine_exit_proof(
+                strategy, _gw_intent_strategy, _action)
         _gw_ok, _gw_binding, _gw_reason = self._authorize_intent(
-            _action, _gw_intent_strategy, strategy)
+            _action, _gw_intent_strategy, strategy,
+            quarantine_exit_proof=_q_proof)
         self._exit_only_decision_binding = _gw_binding
         if not _gw_ok:
             # [S2 audit] persist the canonical failure-evidence payload
@@ -7700,9 +9420,22 @@ class FuturesMonitor:
             _is_release_far = _reason and "RELEASE_FAR" in str(_reason).upper()
             if _is_release_near:
                 _side = OrderSide.BUY if getattr(strategy, "_near_side") == "SHORT" else OrderSide.SELL
+                _leg_key = None
+                if self._leg_lock_enabled():
+                    _leg_key = self._mts_leg_lock_key(
+                        trade_id=_trade_id, contract=_near_code, side=_side, qty=1)
+                    if self._leg_lock_check(_leg_key):
+                        return
+                    if not self._leg_lock_acquire(_leg_key):
+                        self._append_mts_event(
+                            "ORDER_INTENT_BLOCKED", action=_action,
+                            reason="LEG_LOCK_ACQUIRE_FAILED",
+                            trade_id=_trade_id, contract=_near_code)
+                        return
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
                 self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
 
                 # [GSD] Track in lifecycle orders so fill is not ignored
@@ -7713,6 +9446,8 @@ class FuturesMonitor:
                 }
 
                 if not self._submit_via_gateway(_order):
+                    if _leg_key is not None:
+                        self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                     from core.exit_only_position import (
                         build_bbo_failure_evidence)
                     _cap = getattr(
@@ -7726,9 +9461,8 @@ class FuturesMonitor:
                             self._exit_only_bbo_slots(), _cap,
                             "SUBMIT_FAILED"))
                     return
-                if not self._release_post_submit_guard(
-                        _release_before_snapshot, _near_code):
-                    return
+                if _leg_key is not None:
+                    self._leg_lock_bind_order(_leg_key, _order)
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
                     "ref_ohlc": _snap["near"],
@@ -7747,9 +9481,22 @@ class FuturesMonitor:
                         console.print(f"[bold green]✅ [MTS_ORDER] RELEASE_NEAR FILLED: {_side} (MKP)[/bold green]")
             elif _is_release_far:
                 _side = OrderSide.BUY if getattr(strategy, "_far_side") == "SHORT" else OrderSide.SELL
+                _leg_key = None
+                if self._leg_lock_enabled():
+                    _leg_key = self._mts_leg_lock_key(
+                        trade_id=_trade_id, contract=_far_code, side=_side, qty=1)
+                    if self._leg_lock_check(_leg_key):
+                        return
+                    if not self._leg_lock_acquire(_leg_key):
+                        self._append_mts_event(
+                            "ORDER_INTENT_BLOCKED", action=_action,
+                            reason="LEG_LOCK_ACQUIRE_FAILED",
+                            trade_id=_trade_id, contract=_far_code)
+                        return
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
                 self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
 
                 # [GSD] Track in lifecycle orders so fill is not ignored
@@ -7760,6 +9507,8 @@ class FuturesMonitor:
                 }
 
                 if not self._submit_via_gateway(_order):
+                    if _leg_key is not None:
+                        self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                     from core.exit_only_position import (
                         build_bbo_failure_evidence)
                     _cap = getattr(
@@ -7773,9 +9522,8 @@ class FuturesMonitor:
                             self._exit_only_bbo_slots(), _cap,
                             "SUBMIT_FAILED"))
                     return
-                if not self._release_post_submit_guard(
-                        _release_before_snapshot, _far_code):
-                    return
+                if _leg_key is not None:
+                    self._leg_lock_bind_order(_leg_key, _order)
                 self._append_mts_event("ORDER_SUBMITTED", **{
                     **_ev_meta(_order),
                     "ref_ohlc": _snap["far"],
@@ -7848,7 +9596,25 @@ class FuturesMonitor:
                 )
                 return
 
-            # Claim idempotency key
+            # Acquire both leg locks before creating/submitting either order.
+            # A conflict on one leg blocks the whole pair; no partial local
+            # order objects or broker I/O may occur.
+            _near_lock_key = _far_lock_key = None
+            if self._leg_lock_enabled():
+                _near_lock_key = self._mts_leg_lock_key(
+                    trade_id=_trade_id, contract=_near_code,
+                    side=_near_order_side, qty=_near_qty)
+                _far_lock_key = self._mts_leg_lock_key(
+                    trade_id=_trade_id, contract=_far_code,
+                    side=_far_order_side, qty=_far_qty)
+                if (self._leg_lock_check(_near_lock_key)
+                        or self._leg_lock_check(_far_lock_key)):
+                    return
+                if not self._leg_lock_acquire_pair(_near_lock_key, _far_lock_key):
+                    return
+
+            # Claim idempotency only after the durable pair lock succeeds;
+            # a blocked attempt must be retryable after broker reconciliation.
             self._claimed_execution_keys.add(_claim_key)
 
             # Create combined_exit_group_id for correlation
@@ -7857,6 +9623,8 @@ class FuturesMonitor:
 
             _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
             _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
+            _near_order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
+            _far_order.quarantine_exit_proof = _q_proof
 
             # P1-B durable-exit-intent: ids persisted BEFORE any broker I/O;
             # each leg goes through the canonical submit_leg (durable
@@ -7866,8 +9634,19 @@ class FuturesMonitor:
             _ilog = _MTSIntentLog(_mts_intent_log_dir())
             _iid = None
             for _i in _ilog.list_active():
-                if _ilog.get(_i).get("trade_id") == _trade_id:
+                _existing_intent = _ilog.get(_i)
+                if _existing_intent.get("trade_id") == _trade_id:
                     _iid = _i
+                    # Paper retries must not inherit a malformed historical
+                    # intent containing only one leg.  No broker order exists
+                    # in paper mode; retire the incomplete local intent and
+                    # create a canonical two-leg intent.  Live mode remains
+                    # fail-closed and requires explicit reconciliation.
+                    if (not self.live_trading
+                            and set((_existing_intent.get("legs") or {}))
+                            != {"NEAR", "FAR"}):
+                        _ilog.mark_terminal(_i, "SUPERSEDED_PAPER_INCOMPLETE")
+                        _iid = None
                     break
             if _iid is None:
                 _iid = _ilog.create(_trade_id, "COMBINED_EXIT")
@@ -7885,24 +9664,36 @@ class FuturesMonitor:
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
+                return
             except _MTSGWFail as _gwe:
                 # [S0] failed near leg: force LIVE_QUARANTINED + persist
                 # (reconciliation-required); the FAR leg must never
                 # submit after a near failure.
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg="NEAR", reason=str(_gwe))
+                if _near_lock_key is not None:
+                    self._leg_lock_mark_terminal(_near_lock_key, "SUBMIT_FAILED")
+                if _far_lock_key is not None:
+                    self._leg_lock_mark_terminal(_far_lock_key, "SUBMIT_FAILED")
                 return
+            if _near_lock_key is not None:
+                self._leg_lock_bind_order(_near_lock_key, _near_order)
             try:
                 _ilog.submit_leg(_iid, "FAR", self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_far_order, raise_on_failure=True))
             except _MTSDupSubmit:
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
+                return
             except _MTSGWFail as _gwe:
                 # [S0] failed far leg: force LIVE_QUARANTINED + persist
                 # (reconciliation-required); no retry, no cancel.
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg="FAR", reason=str(_gwe))
+                if _far_lock_key is not None:
+                    self._leg_lock_mark_terminal(_far_lock_key, "SUBMIT_FAILED")
                 return
+            if _far_lock_key is not None:
+                self._leg_lock_bind_order(_far_lock_key, _far_order)
             # 2026-07-30: Write state to COMBINED_EXIT only AFTER successful submission
             try:
                 from strategies.plugins.futures.active.tmf_spread import _write_mts_state
@@ -7949,6 +9740,14 @@ class FuturesMonitor:
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_near_order)
                 self.paper_fill_sim.register(_far_order)
+                # Paper exits are local accounting events.  They must not be
+                # stranded by the market-hours gate used to protect live
+                # orders; consume both legs immediately using the latest
+                # validated synthetic prices and the normal fill callback.
+                self.paper_fill_sim.process_tick(
+                    self._make_synthetic_tick(_near_close, _ts, symbol=_near_order.symbol))
+                self.paper_fill_sim.process_tick(
+                    self._make_synthetic_tick(_far_close, _ts, symbol=_far_order.symbol))
 
             # Persist orders to Dashboard-readable file
             self._save_orders_file_wrapper()
@@ -8035,24 +9834,23 @@ class FuturesMonitor:
 
             _side = OrderSide.SELL if _remaining_side == "LONG" else OrderSide.BUY
 
-            # L2 also applies to the remaining-leg EXIT path.  The target leg
-            # is derived only from the confirmed single-leg lifecycle; broker
-            # truth is still the final premise immediately before submission.
-            _exit_before_snapshot = None
-            if self.live_trading and _released in ("near", "far"):
-                if not self._release_startup_safety_gate(strategy, _near_code, _far_code):
+            _leg_key = None
+            if self._leg_lock_enabled():
+                _leg_key = self._mts_leg_lock_key(
+                    trade_id=_trade_id, contract=_symbol, side=_side, qty=1)
+                if self._leg_lock_check(_leg_key):
                     return
-                _exit_before_snapshot = self._release_pre_submit_guard(
-                    action="EXIT", reason=str(_reason or "EXIT_REMAINING"),
-                    strategy=strategy, symbol=_symbol,
-                    leg="far" if _released == "near" else "near",
-                )
-                if _exit_before_snapshot is None:
+                if not self._leg_lock_acquire(_leg_key):
+                    self._append_mts_event(
+                        "ORDER_INTENT_BLOCKED", action=_action,
+                        reason="LEG_LOCK_ACQUIRE_FAILED",
+                        trade_id=_trade_id, contract=_symbol)
                     return
 
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
+            _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
             # B48 (codex C): correlate the decision event through the order
             _order.event_id = getattr(signal, "event_id", "")
             _order.winner = getattr(signal, "winner", "")
@@ -8078,7 +9876,19 @@ class FuturesMonitor:
                     _iid = _i
                     break
             if _iid is None:
-                _iid = _ilog.create(_trade_id, "COMBINED_EXIT", leg=_leg_label)
+                self._reclaim_proven_paper_exit_intents(_ilog)
+                try:
+                    _iid = _ilog.create(_trade_id, "COMBINED_EXIT", leg=_leg_label)
+                except Exception as _intent_exc:
+                    if _leg_key is not None:
+                        self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
+                    self._append_mts_event(
+                        "ORDER_SUBMIT_FAILED",
+                        action=_action, trade_id=_trade_id,
+                        contract=_symbol, strategy="MTS_EXIT",
+                        reason="EXIT_INTENT_CREATE_FAILED",
+                        error_type=type(_intent_exc).__name__)
+                    return
             _order.intent_id = _iid
             _order.client_order_id = _ilog.get(_iid)["legs"][_leg_label]["client_order_id"]
             from core.exit_intent import DuplicateSubmitError as _MTSDupSubmit
@@ -8091,13 +9901,29 @@ class FuturesMonitor:
             except _MTSDupSubmit:
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
+                return
             except _MTSGWFail as _gwe:
+                self._append_mts_event(
+                    "ORDER_SUBMIT_FAILED", action=_action,
+                    trade_id=_trade_id, contract=_symbol,
+                    strategy="MTS_EXIT", reason="GATEWAY_SUBMIT_FAILED",
+                    error_type=type(_gwe).__name__)
                 self._quarantine_mts_exit_leg_failure(
                     trade_id=_trade_id, leg=_leg_label, reason=str(_gwe))
+                if _leg_key is not None:
+                    self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                 return
-            if (_exit_before_snapshot is not None
-                    and not self._release_post_submit_guard(_exit_before_snapshot, _symbol)):
+            except Exception as _submit_exc:
+                if _leg_key is not None:
+                    self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
+                self._append_mts_event(
+                    "ORDER_SUBMIT_FAILED", action=_action,
+                    trade_id=_trade_id, contract=_symbol,
+                    strategy="MTS_EXIT", reason="EXIT_INTENT_SUBMIT_FAILED",
+                    error_type=type(_submit_exc).__name__)
                 return
+            if _leg_key is not None:
+                self._leg_lock_bind_order(_leg_key, _order)
             self._append_mts_event("ORDER_SUBMITTED", **{**_ev_meta(_order), "ref_ohlc": _ref_ohlc,
                                                           "event_id": _order.event_id,
                                                           "winner": _order.winner})
@@ -8128,6 +9954,17 @@ class FuturesMonitor:
                     self.paper_fill_sim.register(_order)
                     # [Fixed 2026-05-27] Force immediate fill in paper mode
                     self.paper_fill_sim.process_tick(self._make_synthetic_tick(_ref_price, _ts, symbol=_symbol))
+                    if str(getattr(getattr(_order, "status", None),
+                                   "value", getattr(_order, "status", ""))).upper() == "FILLED":
+                        try:
+                            _ilog.mark_paper_filled(_iid, _leg_label)
+                        except Exception as _fill_intent_exc:
+                            self._append_mts_event(
+                                "PAPER_EXIT_INTENT_RECONCILE_FAILED",
+                                intent_id=_iid, trade_id=_trade_id,
+                                leg=_leg_label,
+                                reason="FILL_CALLBACK_DURABLE_WRITE_FAILED",
+                                error_type=type(_fill_intent_exc).__name__)
 
                     # Force fill ONLY in paper mode
                     if self.dry_run or not self.live_trading:
@@ -8147,6 +9984,86 @@ class FuturesMonitor:
             # Entry: submit two legs
             _near_side = OrderSide.SELL if _action == "SELL_NEAR_BUY_FAR" else OrderSide.BUY
             _far_side = OrderSide.BUY if _action == "SELL_NEAR_BUY_FAR" else OrderSide.SELL
+
+            # Decision provenance is a hard precondition for a live entry.
+            # The order-intent rows alone preserve prices/sides but not the
+            # signal that selected them.  Persist the complete decision before
+            # constructing either leg; if the audit write fails, no order can
+            # be created or submitted without an explainable entry rationale.
+            _entry_audit = {
+                "event_time": _ts.isoformat() if hasattr(_ts, "isoformat") else str(_ts),
+                "action": _action,
+                "decision": "ENTER",
+                "reason": _reason,
+                "trade_id": _trade_id,
+                "near_contract": _near_code,
+                "far_contract": _far_code,
+                "near_side": "SHORT" if _action == "SELL_NEAR_BUY_FAR" else "LONG",
+                "far_side": "LONG" if _action == "SELL_NEAR_BUY_FAR" else "SHORT",
+                "near_price": _near_close,
+                "far_price": _far_close,
+                "spread_now": bar_dict.get("spread"),
+                "spread_z": bar_dict.get("spread_z"),
+                "entry_z": getattr(strategy, "_entry_z", None),
+                "spread_ma": bar_dict.get("spread_ma"),
+                "spread_std": bar_dict.get("spread_std"),
+                "atr": bar_dict.get("atr"),
+                "expected_reversion": (
+                    "SPREAD_TO_NARROW" if _action == "SELL_NEAR_BUY_FAR"
+                    else "SPREAD_TO_WIDEN"
+                ),
+                "near_price_source": "LIVE_TICK" if "near_close_rt" in bar_dict else "BAR_CLOSE",
+                "far_price_source": "LIVE_TICK" if "far_close_rt" in bar_dict else "BAR_CLOSE",
+                "near_tick_age_ms": bar_dict.get("near_tick_age_ms"),
+                "far_tick_age_ms": bar_dict.get("far_tick_age_ms"),
+                "signal_event_id": getattr(signal, "event_id", ""),
+            }
+            if self.live_trading:
+                _audit_ok = self._append_mts_event_checked(
+                    "ENTRY_AUDIT", **_entry_audit)
+            else:
+                # Preserve paper-mode behavior: telemetry remains best-effort
+                # and never changes the paper execution contract.
+                self._append_mts_event("ENTRY_AUDIT", **_entry_audit)
+                _audit_ok = True
+            if not _audit_ok:
+                console.print(
+                    "[bold red]⛔ [MTS_ENTRY_BLOCKED] "
+                    "ENTRY_AUDIT_PERSIST_FAILED — no legs created or submitted"
+                    "[/bold red]"
+                )
+                return
+
+            # Research-only shadow write.  It is intentionally after the
+            # durable audit and has no authority over the order path: a
+            # missing/locked database must never reject or delay an entry.
+            try:
+                from core.entry_research_store import record_entry_observation
+                _ctx_for_research = getattr(self, "_execution_context", None)
+                record_entry_observation(
+                    _entry_audit,
+                    mode="live" if self.live_trading else "paper",
+                    session_id=getattr(_ctx_for_research, "session_id", None),
+                    config_hash=getattr(_ctx_for_research, "config_hash", None),
+                    release_sha=os.environ.get("LRC_RELEASE_SHA"),
+                    run_id=getattr(self, "run_id", None),
+                    source=("live_strategy" if self.live_trading
+                            else "paper_strategy"),
+                )
+            except Exception:
+                pass
+
+            # Both live and paper MTS entries use one calendar-spread combo
+            # lifecycle.  The paper branch uses the local two-leg fill model
+            # below; it never calls the broker adapter.
+            if ((self.live_trading and not self.dry_run)
+                    or (not self.live_trading and self.paper_fill_sim)):
+                return self._submit_mts_combo_entry(
+                    trade_id=_trade_id, action=_action, reason=_reason,
+                    near_code=_near_code, far_code=_far_code,
+                    near_side=_near_side, far_side=_far_side,
+                    near_price=_near_close, far_price=_far_close,
+                    bar_dict=bar_dict, ts=_ts, snapshot=_snap)
 
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders (MKP Range Market): NEAR={_near_side}, FAR={_far_side}[/yellow]")
             
@@ -8249,6 +10166,610 @@ class FuturesMonitor:
             console.print(f"[red]⚠️ [MTS_ORDER] Unknown signal action: {_action}[/red]")
             return
 
+
+
+    def _submit_mts_combo_entry(
+        self, *, trade_id, action, reason, near_code, far_code,
+        near_side, far_side, near_price, far_price, bar_dict, ts, snapshot,
+    ):
+        """Submit one MTS combo lifecycle.
+
+        Live mode sends one broker calendar-spread order.  Paper mode sends
+        the same lifecycle through OrderManager's paper submit path and then
+        requires both synthetic leg ticks before emitting one parent fill.
+        """
+        from core.order_management.order import OrderSide, OrderType
+
+        _near_value = getattr(near_side, "value", near_side)
+        _far_value = getattr(far_side, "value", far_side)
+        _spread = bar_dict.get("spread")
+        try:
+            _spread = float(_spread)
+        except (TypeError, ValueError):
+            _spread = float(near_price) - float(far_price)
+        if not math.isfinite(_spread):
+            self._append_mts_event(
+                "ORDER_REJECTED_LOCAL", trade_id=trade_id,
+                strategy="MTS_ENTRY", reason="COMBO_PRICE_NONFINITE")
+            return
+        # Combo net price follows the leg order: near - far for Buy-near,
+        # far - near for Sell-near.  The broker receives per-leg actions.
+        _combo_price = _spread if action == "BUY_NEAR_SELL_FAR" else -_spread
+        _combo_legs = [
+            {"symbol": near_code, "side": str(_near_value).lower(),
+             "quantity": 1},
+            {"symbol": far_code, "side": str(_far_value).lower(),
+             "quantity": 1},
+        ]
+        try:
+            _order = self.order_mgr.create_order(
+                symbol=f"{near_code}-{far_code}", side=near_side,
+                order_type=OrderType.MKP, quantity=1, price=_combo_price,
+                strategy="MTS_ENTRY", truth_source="broker_combo",
+                combo_legs=_combo_legs, combo_strategy="TIME_SPREAD")
+        except Exception as exc:
+            self._append_mts_event(
+                "ORDER_REJECTED_LOCAL", trade_id=trade_id,
+                strategy="MTS_ENTRY", reason="COMBO_LIFECYCLE_CREATE_FAILED")
+            return
+
+        self._pending_lifecycle_orders[_order.order_id] = {
+            "intent_id": _order.intent_id, "signal": action, "reason": reason,
+            "ts": ts, "lots": 1, "price": _combo_price,
+            "ref_ohlc": snapshot, "strategy": "MTS_ENTRY",
+            "combo_legs": _combo_legs, "combo_order": True,
+        }
+        self._mts_pending_fills[trade_id] = {
+            "combo_order_id": _order.order_id,
+            "near_order_id": None, "far_order_id": None,
+            "near_filled": False, "far_filled": False,
+            "side": "SHORT" if action == "SELL_NEAR_BUY_FAR" else "LONG",
+            "spread_side": action, "near_label": "NEAR", "far_label": "FAR",
+            "near_ref": near_price, "far_ref": far_price, "ts": ts,
+            "combo": True,
+            "combo_legs": _combo_legs,
+        }
+        self._append_mts_event(
+            "COMBO_ORDER_INTENT_CREATED", order_id=_order.order_id,
+            intent_id=_order.intent_id, symbol=_order.symbol,
+            side=_near_value, type="time_spread", price=_combo_price,
+            qty=1, strategy="MTS_ENTRY", trade_id=trade_id,
+            combo_legs=_combo_legs, ref_ohlc=snapshot)
+        if not self._submit_via_gateway(_order):
+            self._pending_lifecycle_orders.pop(_order.order_id, None)
+            self._mts_pending_fills.pop(trade_id, None)
+            self._append_mts_event(
+                "COMBO_ORDER_REJECTED", order_id=_order.order_id,
+                trade_id=trade_id, reason=getattr(
+                    _order, "reject_reason", "COMBO_SUBMIT_FAILED"))
+            return
+        self._append_mts_event(
+            "COMBO_ORDER_SUBMITTED", order_id=_order.order_id,
+            trade_id=trade_id, strategy="MTS_ENTRY", combo_legs=_combo_legs,
+            price=_combo_price)
+        if not self.live_trading or self.dry_run:
+            if self.paper_fill_sim:
+                self.paper_fill_sim.register_combo(
+                    _order, near_symbol=near_code, far_symbol=far_code,
+                    metadata=self._mts_pending_fills[trade_id])
+                self.paper_fill_sim.process_combo_ticks(
+                    self._make_synthetic_tick(near_price, ts, symbol=near_code),
+                    self._make_synthetic_tick(far_price, ts, symbol=far_code))
+            console.print(
+                f"[green]✅ [MTS_ORDER] PAPER COMBO ENTRY: "
+                f"{near_code}/{far_code} {action} price={_combo_price}[/green]")
+            return
+        console.print(
+            f"[green]✅ [MTS_ORDER] COMBO ENTRY SUBMITTED: "
+            f"{near_code}/{far_code} {action} price={_combo_price}[/green]")
+
+    def _leg_lock_path(self) -> str:
+        _p = getattr(self, "_leg_lock_store", "")
+        if _p:
+            return _p
+        try:
+            from core.runtime_paths import runtime_path
+            return runtime_path("exports", "trades", "live", "diagnostics",
+                                "mts_leg_locks.json")
+        except Exception:
+            return "/tmp/mts_leg_locks.json"
+
+    def _leg_lock_id(self, key: dict) -> str:
+        return "|".join(str(key.get(k)) for k in (
+            "trade_id", "session_generation", "contract",
+            "closing_side", "qty"))
+
+    def _mts_leg_lock_key(self, *, trade_id, contract, side, qty) -> dict:
+        """Build the canonical lock key for a broker-facing MTS leg."""
+        _ctx = getattr(self, "_execution_context", None)
+        _side = getattr(side, "value", side)
+        return {
+            "trade_id": trade_id,
+            "session_generation": getattr(_ctx, "session_id", "") or "",
+            "contract": contract,
+            "closing_side": str(_side or "").upper(),
+            "qty": qty,
+        }
+
+    def _leg_lock_enabled(self) -> bool:
+        """Enable broker leg locks only for the live order path.
+
+        Paper mode has synchronous local fills and must retain its existing
+        compatibility semantics; the durable broker lock is a live-side
+        duplicate-submission barrier.
+        """
+        return bool(getattr(self, "live_trading", False)
+                    and not getattr(self, "dry_run", False))
+
+    def _leg_lock_bind_order(self, key: dict, order) -> None:
+        """Attach broker identity to an already-acquired leg lock."""
+        try:
+            _broker_id = (getattr(order, "broker_order_id", None)
+                          or getattr(order, "exchange_order_id", None)
+                          or "")
+            _seqno = getattr(order, "seqno", None) or ""
+            if not (_broker_id or _seqno):
+                return
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _lock = _locks.get(self._leg_lock_id(key))
+                if _lock is None:
+                    return
+                _lock["local_order_id"] = getattr(order, "order_id", "") or ""
+                _lock["broker_order_id"] = str(_broker_id)
+                _lock["seqno"] = str(_seqno)
+                self._leg_lock_write(_locks)
+        except Exception:
+            # Identity enrichment must never turn a confirmed receipt into a
+            # false success; the lock remains held under its canonical key.
+            return
+
+    def _leg_lock_apply_order_event(self, order, status, fill_qty=None) -> None:
+        """Release/retain the lock from an authoritative order event."""
+        if not self._leg_lock_enabled():
+            return
+        try:
+            _status = str(getattr(status, "value", status) or "").upper()
+            _broker_id = str(
+                getattr(order, "broker_order_id", None)
+                or getattr(order, "exchange_order_id", None) or "")
+            _seqno = str(getattr(order, "seqno", None) or "")
+            _local_id = str(getattr(order, "order_id", None) or "")
+            _locks = self._leg_lock_load()
+            for _record in list(_locks.values()):
+                if not (
+                    (_broker_id and str(_record.get("broker_order_id") or "") == _broker_id)
+                    or (_seqno and str(_record.get("seqno") or "") == _seqno)
+                    or (_local_id and str(_record.get("local_order_id") or "") == _local_id)
+                ):
+                    continue
+                _key = {
+                    "trade_id": _record.get("trade_id"),
+                    "session_generation": _record.get("session_generation"),
+                    "contract": _record.get("contract"),
+                    "closing_side": _record.get("closing_side"),
+                    "qty": _record.get("qty"),
+                    "broker_order_id": _record.get("broker_order_id"),
+                    "seqno": _record.get("seqno"),
+                }
+                if _status in {"FILLED", "PARTIAL_FILLED"}:
+                    _filled = fill_qty
+                    if _filled is None:
+                        _filled = getattr(order, "filled_quantity", 0)
+                    self._leg_lock_apply_broker_deal(_key, _filled)
+                elif _status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+                    self._leg_lock_mark_terminal(_key, _status)
+        except Exception:
+            # A callback parsing failure must never release a pending lock.
+            return
+
+    def _leg_lock_save(self, locks: dict) -> None:
+        """Atomic replace under the stable .lock flock (single-writer)."""
+        try:
+            with self._leg_lock_flock(exclusive=True):
+                self._leg_lock_write(locks)
+        except Exception:
+            pass
+
+    def _leg_lock_load(self) -> dict:
+        try:
+            with self._leg_lock_flock(exclusive=False):
+                return self._leg_lock_read()
+        except Exception:
+            return {}  # corrupted file -> fail-safe: no locks assumed
+
+    def _leg_lock_flock_path(self) -> str:
+        """Stable flock target — NEVER replaced, so the lock survives the
+        JSON's atomic os.replace (inode race fix)."""
+        return self._leg_lock_path() + ".lock"
+
+    @contextlib.contextmanager
+    def _leg_lock_flock(self, exclusive: bool = True):
+        import fcntl
+        _p = self._leg_lock_flock_path()
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+        _f = open(_p, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(_f, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield _f
+        finally:
+            try:
+                fcntl.flock(_f, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            _f.close()
+
+    def _leg_lock_read(self) -> dict:
+        """Direct JSON read — callers hold the .lock flock."""
+        try:
+            import json as _json
+            _p = self._leg_lock_path()
+            if not os.path.exists(_p):
+                return {}
+            with open(_p, encoding="utf-8") as _f:
+                return _json.load(_f) or {}
+        except Exception:
+            return {}
+
+    def _leg_lock_write(self, locks: dict) -> None:
+        """Atomic replace — callers hold the .lock flock."""
+        _p = self._leg_lock_path()
+        _d = os.path.dirname(_p)
+        if _d:
+            os.makedirs(_d, exist_ok=True)
+        import json as _json
+        _tmp = _p + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _json.dump(locks, _f, default=str)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(_tmp, _p)
+
+    def _leg_lock_rebind(self, locks: dict, key: dict) -> dict | None:
+        """Rebind a lock to the new session after a restart.
+
+        Broker identity (broker_order_id + seqno) is authoritative and
+        unique.  The generic 4-field match (trade_id + contract +
+        closing_side + qty) is allowed ONLY when it resolves to exactly one
+        candidate; multiple candidates -> fail-closed QUARANTINE
+        (LEG_LOCK_REBIND_AMBIGUOUS) — never a silent pass/resend."""
+        _bid = str(key.get("broker_order_id") or "")
+        if _bid:
+            _seq = str(key.get("seqno") or "")
+            for _lock in locks.values():
+                if (str(_lock.get("broker_order_id") or "") == _bid
+                        and (not _seq or str(_lock.get("seqno") or "") == _seq)):
+                    _lock["session_generation"] = key.get("session_generation")
+                    self._leg_lock_save(locks)
+                    return _lock
+            return None
+        _cands = [v for v in locks.values()
+                  if (str(v.get("trade_id") or "") == str(key.get("trade_id") or "")
+                      and str(v.get("contract") or "") == str(key.get("contract") or "")
+                      and str(v.get("closing_side") or "") == str(key.get("closing_side") or "")
+                      and int(v.get("qty") or 0) == int(key.get("qty") or 0))]
+        if len(_cands) == 1:
+            _cands[0]["session_generation"] = key.get("session_generation")
+            self._leg_lock_save(locks)
+            return _cands[0]
+        if len(_cands) > 1:
+            self._append_mts_event(
+                "LEG_LOCK_REBIND_AMBIGUOUS",
+                reason="LEG_LOCK_REBIND_AMBIGUOUS",
+                trade_id=key.get("trade_id"),
+                contract=key.get("contract"))
+            return _cands[0]  # fail-closed: still block submissions
+        return None
+
+    def _leg_lock_acquire(self, key: dict,
+                          status: str = "PENDING_UNCONFIRMED") -> bool:
+        """Persist a leg lock BEFORE submission.  Key:
+        trade_id + session_generation + contract + closing_side + qty.
+        status: PENDING_UNCONFIRMED (receipt, never released early) or
+        SUBMIT_FAILED (released after failure handling).
+
+        The whole read-modify-write runs under ONE exclusive flock on the
+        lock file so concurrent processes/threads cannot lose a lock."""
+        try:
+            import json as _json
+            import fcntl
+            _p = self._leg_lock_path()
+            _d = os.path.dirname(_p)
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _locks[self._leg_lock_id(key)] = {
+                    "trade_id": key.get("trade_id"),
+                    "session_generation": key.get("session_generation"),
+                    "contract": key.get("contract"),
+                    "closing_side": key.get("closing_side"),
+                    "qty": key.get("qty"),
+                    "local_order_id": key.get("local_order_id") or "",
+                    "broker_order_id": key.get("broker_order_id") or "",
+                    "seqno": key.get("seqno") or "",
+                    "status": status,
+                    "terminal": "",
+                    "locked_at": datetime.now().isoformat(),
+                }
+                self._leg_lock_write(_locks)
+            return True
+        except Exception:
+            return False
+
+    def _leg_lock_acquire_pair(self, near_key: dict, far_key: dict) -> bool:
+        """③ combined all-or-none: acquire BOTH leg locks atomically.
+
+        - Both legs free -> lock both, return True.
+        - Either leg already holds a non-terminal lock -> acquire nothing
+          (no partial pair), record LEG_LOCK_PAIR_PARTIAL quarantine /
+          reconcile intent, return False.  The other leg is never left
+          locked, and neither leg is ever submitted."""
+        try:
+            _near_id = self._leg_lock_id(near_key)
+            _far_id = self._leg_lock_id(far_key)
+            _terminal = ("FILLED", "CANCELLED", "REJECTED", "CANCELED",
+                         "EXPIRED", "RETIRED_UNRESOLVED")
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _conflicts = []
+                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
+                    _existing = _locks.get(_kid)
+                    if (_existing and str(_existing.get("status", "")).upper()
+                            not in _terminal):
+                        _conflicts.append(_k.get("contract"))
+                if _conflicts:
+                    self._append_mts_event(
+                        "LEG_LOCK_PAIR_PARTIAL",
+                        reason="LEG_LOCK_PAIR_PARTIAL",
+                        trade_id=near_key.get("trade_id"),
+                        contract=",".join(_conflicts))
+                    return False
+                _now = datetime.now().isoformat()
+                for _kid, _k in ((_near_id, near_key), (_far_id, far_key)):
+                    _locks[_kid] = {
+                        "trade_id": _k.get("trade_id"),
+                        "session_generation": _k.get("session_generation"),
+                        "contract": _k.get("contract"),
+                        "closing_side": _k.get("closing_side"),
+                        "qty": _k.get("qty"),
+                        "local_order_id": _k.get("local_order_id") or "",
+                        "broker_order_id": _k.get("broker_order_id") or "",
+                        "seqno": _k.get("seqno") or "",
+                        "status": "PENDING_UNCONFIRMED",
+                        "terminal": "",
+                        "locked_at": _now,
+                    }
+                self._leg_lock_write(_locks)
+                return True
+        except Exception:
+            try:
+                self._append_mts_event(
+                    "LEG_LOCK_PAIR_PARTIAL",
+                    reason="LEG_LOCK_PAIR_PARTIAL",
+                    trade_id=near_key.get("trade_id"))
+            except Exception:
+                pass
+            return False
+
+    def _leg_lock_mark_terminal(self, key: dict, status: str) -> None:
+        """Mark a lock terminal (FILLED/CANCELLED/REJECTED) then release —
+        only explicit broker terminal evidence may do this."""
+        try:
+            with self._leg_lock_flock(exclusive=True):
+                _locks = self._leg_lock_read()
+                _lid = self._leg_lock_id(key)
+                if _lid in _locks:
+                    _locks[_lid]["status"] = status
+                    _locks[_lid]["terminal"] = status
+                    self._leg_lock_write(_locks)
+        except Exception:
+            pass
+        self._leg_lock_release(key)
+
+    def _leg_lock_apply_broker_deal(self, key: dict, filled_qty) -> bool:
+        """④ broker deal evidence: ONLY a full fill (filled_qty >= qty) is
+        terminal.  A partial fill retains the lock and records the
+        reconcile intent — release/resend stay forbidden."""
+        try:
+            _qty = int(key.get("qty") or 0)
+            try:
+                _filled = float(filled_qty)
+            except (TypeError, ValueError):
+                _filled = 0.0
+            if _qty > 0 and _filled >= _qty:
+                self._leg_lock_mark_terminal(key, "FILLED")
+                return True
+            self._append_mts_event(
+                "LEG_LOCK_PARTIAL_FILL",
+                reason="LEG_LOCK_PARTIAL_FILL",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"),
+                filled_qty=_filled, qty=_qty)
+            return False
+        except Exception:
+            return False
+
+    def _leg_lock_apply_broker_query(self, key: dict, trades) -> bool:
+        """④ reconciliation query evidence: an empty result or a query
+        exception must NOT release the lock (no terminal proof) — only an
+        explicit full-fill deal in the queried trades releases."""
+        try:
+            if trades is None:
+                self._append_mts_event(
+                    "LEG_LOCK_QUERY_FAILED",
+                    reason="LEG_LOCK_QUERY_FAILED",
+                    contract=key.get("contract"),
+                    trade_id=key.get("trade_id"))
+                return False
+            _qty = int(key.get("qty") or 0)
+            _bid = str(key.get("broker_order_id") or "")
+            for _t in trades:
+                _order = getattr(_t, "order", None)
+                _id = str(
+                    getattr(_t, "order_id", None)
+                    or getattr(_t, "id", None)
+                    or getattr(_order, "id", None) or "")
+                _st = getattr(_t, "status", None)
+                _nested_st = getattr(_st, "status", None)
+                _raw_st = _nested_st if _nested_st is not None else _st
+                _status = str(
+                    getattr(_raw_st, "name", None)
+                    or getattr(_raw_st, "value", None)
+                    or _raw_st or "").split(".")[-1].upper()
+                _filled = float(
+                    getattr(_t, "fill_qty", None)
+                    or getattr(_t, "filled_quantity", None)
+                    or getattr(_t, "quantity", 0) or 0)
+                if ((not _bid or _id == _bid)
+                        and _status.upper() == "FILLED"
+                        and _qty > 0 and _filled >= _qty):
+                    self._leg_lock_mark_terminal(key, "FILLED")
+                    return True
+            self._append_mts_event(
+                "LEG_LOCK_QUERY_NO_TERMINAL",
+                reason="LEG_LOCK_QUERY_NO_TERMINAL",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"))
+            return False
+        except Exception:
+            return False
+
+    def _reconcile_intent_path(self) -> str:
+        _p = getattr(self, "_reconcile_intent_store", "")
+        if _p:
+            return _p
+        try:
+            from core.runtime_paths import runtime_path
+            return runtime_path("exports", "trades", "live", "diagnostics",
+                                "mts_reconcile_intents.json")
+        except Exception:
+            return "/tmp/mts_reconcile_intents.json"
+
+    def _mts_partial_submission_quarantine(self, near_key: dict,
+                                           far_key: dict) -> None:
+        """Partial-submission quarantine: the first leg's receipt landed
+        but the second leg's submit FAILED.  Record a DURABLE reconcile
+        intent (restored after restart).  No retry, no cancel, no
+        compensating order — the pair is not complete."""
+        try:
+            import json as _json
+            _p = self._reconcile_intent_path()
+            _intents = {}
+            if os.path.exists(_p):
+                with open(_p, encoding="utf-8") as _f:
+                    _intents = _json.load(_f) or {}
+            _intents[self._leg_lock_id(near_key)] = {
+                "reason": "PARTIAL_SUBMISSION_QUARANTINE",
+                "near": near_key, "far": far_key,
+                "ts": datetime.now().isoformat(),
+            }
+            _d = os.path.dirname(_p)
+            if _d:
+                os.makedirs(_d, exist_ok=True)
+            with open(_p, "w", encoding="utf-8") as _f:
+                _json.dump(_intents, _f, default=str)
+            self._append_mts_event(
+                "PARTIAL_SUBMISSION_QUARANTINE",
+                reason="PARTIAL_SUBMISSION_QUARANTINE",
+                contract=near_key.get("contract"),
+                trade_id=near_key.get("trade_id"))
+        except Exception:
+            pass
+
+    def _reconcile_intent_exists(self, key: dict) -> bool:
+        try:
+            import json as _json
+            _p = self._reconcile_intent_path()
+            if not os.path.exists(_p):
+                return False
+            with open(_p, encoding="utf-8") as _f:
+                _intents = _json.load(_f) or {}
+            return self._leg_lock_id(key) in _intents
+        except Exception:
+            return False
+
+    def _submit_release_pair(self, near_key: dict, far_key: dict,
+                             near_submit_ok: bool = True,
+                             far_submit_ok: bool = True) -> str:
+        """Release pair submission with partial-submission protection.
+
+        Acquires both leg locks (all-or-none), submits the near leg, then
+        the far leg.  If the FAR submit fails after the NEAR receipt, the
+        pair enters MTS_ENTRY_RECONCILE / partial-submission quarantine:
+        the near lock is retained, no retry/cancel/compensating order, and
+        a durable reconcile intent is recorded."""
+        try:
+            if not self._leg_lock_acquire_pair(near_key, far_key):
+                return "PAIR_LOCK_BLOCKED"
+            if near_submit_ok:
+                self._append_mts_event(
+                    "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
+                    contract=near_key.get("contract"),
+                    trade_id=near_key.get("trade_id"),
+                    leg_role="RELEASED", exit_stage="FIRST_LEG_RELEASE")
+            else:
+                self._leg_lock_release(near_key)
+                return "NEAR_SUBMIT_FAILED"
+            if not far_submit_ok:
+                self._mts_partial_submission_quarantine(near_key, far_key)
+                return "MTS_ENTRY_RECONCILE"
+            self._append_mts_event(
+                "ORDER_SUBMITTED", event="ORDER_SUBMITTED",
+                contract=far_key.get("contract"),
+                trade_id=far_key.get("trade_id"),
+                leg_role="RELEASED", exit_stage="SECOND_LEG_RELEASE")
+            return "OK"
+        except Exception:
+            return "SUBMIT_ERROR"
+
+    def _leg_lock_release(self, key: dict,
+                          only_statuses=("FILLED", "CANCELLED", "REJECTED",
+                                         "CANCELED", "EXPIRED", "RETIRED_UNRESOLVED",
+                                         "SUBMIT_FAILED")) -> None:
+        """Release a leg lock ONLY on terminal states or SUBMIT_FAILED.
+        PENDING_UNCONFIRMED is never released early (no resend)."""
+        try:
+            _locks = self._leg_lock_load()
+            _lid = self._leg_lock_id(key)
+            _lock = _locks.get(_lid)
+            if _lock is None:
+                return
+            _st = str(_lock.get("status", "")).upper()
+            if _st in tuple(s.upper() for s in only_statuses):
+                _locks.pop(_lid, None)
+                self._leg_lock_save(_locks)
+        except Exception:
+            pass
+
+    def _leg_lock_check(self, key: dict) -> bool:
+        """True when a non-terminal lock exists for this leg — a second
+        signal must NOT resubmit (zero submissions)."""
+        try:
+            _locks = self._leg_lock_load()
+            _lock = _locks.get(self._leg_lock_id(key))
+            if _lock is None:
+                # restart rebinding: session_generation changed after a
+                # restart — match by broker identity components
+                # (trade_id + contract + closing_side + qty) and rebind.
+                _lock = self._leg_lock_rebind(_locks, key)
+            if _lock is None:
+                return False
+            if str(_lock.get("status", "")).upper() in (
+                    "FILLED", "CANCELLED", "REJECTED", "CANCELED", "EXPIRED",
+                    "RETIRED_UNRESOLVED"):
+                return False
+            self._append_mts_event(
+                "ORDER_BLOCKED_PENDING_EXISTS",
+                reason="ORDER_BLOCKED_PENDING_EXISTS",
+                contract=key.get("contract"),
+                trade_id=key.get("trade_id"))
+            return True
+        except Exception:
+            return False
+
     def _execute_trade(self, signal, price, ts, lots, *, stop_loss=None, break_even_trigger=None, trail_points=None, reason=None):
         action = None
         exit_order_side = None
@@ -8315,12 +10836,8 @@ class FuturesMonitor:
                                 getattr(self._execution_context,
                                         "audit_reasons", ()) or ())}
             try:
-                _premise = ({"kind": "NOT_HOLD"}
-                            if signal in ("BUY", "SELL") else
-                            {"kind": "HOLD_ANY"})
-                trade = self.client.place_order(
-                    self.contract, action=action, quantity=lots,
-                    premise=_premise, intent_action=signal)
+                trade = self.client.place_order(self.contract, action=action,
+                                                quantity=lots)
             except AdapterOrderError as e:
                 # P0: structured durable failure — never swallowed
                 console.print(
@@ -8742,6 +11259,65 @@ class FuturesMonitor:
                 "volume", "volume_spike", "vwap",
             ]
             
+            # 2026-08-26 (feature precision cleanup, rev2): normalize float
+            # columns to meaningful precision BEFORE writing.  Raw pandas
+            # float64 (e.g. VWAP=44998.806593605535) bloats the CSV and
+            # implies fake 1e-14 precision.  Classification:
+            #   ROUND0  exchange-native whole prices / observed extremes:
+            #           OHLC, actual traded prices, recent high/low, day
+            #           high/low (rounding these to the tick is lossless).
+            #   ROUND2  computed price levels where decimals are meaningful:
+            #           ATR (mean of integer TRs, e.g. 67.93), VWAP, EMA,
+            #           Bollinger bands, MACD (price-difference), and the
+            #           percent columns consumed by dashboards/research.
+            #   ROUND4  ratios / normalized / oscillator values: volume_spike,
+            #           breakout_strength*, mom_velo, score, RSI, RSV, K, D,
+            #           trend_strength_raw.
+            #   ROUND6  price_vs_vwap keeps its RATIO semantics (monitor
+            #           threshold trend_hold_min_price_vs_vwap=0.0003
+            #           depends on it).
+            # Booleans, strings and NaN are preserved verbatim; non-finite
+            # (+/-Inf) are never rounded (round() would raise) and pass
+            # through unchanged.  Unclassified numeric columns are left
+            # untouched (never silently rounded).
+            _ROUND0 = {
+                "Close", "High", "Low", "Open", "close", "high", "low", "open",
+                "recent_high", "recent_low", "day_max", "day_min", "day_open",
+                "high_20_prev", "low_20_prev",
+            }
+            _ROUND2 = {
+                "atr", "atr_raw", "atr_floor", "atr_used",
+                "vwap",
+                "bb_low", "bb_lower", "bb_mid", "bb_up", "bb_upper",
+                "ema_fast", "ema_slow", "ema_filter", "ema_macro", "ema_200_up",
+                "macd_hist", "macd_line", "macd_signal",
+                "price_vs_vwap_pct", "intraday_strength_pct",
+            }
+            _ROUND4 = {
+                "breakout_strength", "breakout_strength_atr",
+                "bear_breakout_strength", "bear_breakout_strength_atr",
+                "volume_spike", "trend_strength_raw", "mom_velo", "score",
+                "rsi", "rsv", "k_val", "d_val", "momentum",
+            }
+            import math as _precision_math
+            for _k, _v in list(data.items()):
+                if isinstance(_v, bool):
+                    continue  # bool is an int subclass — never round to 0/1
+                if not isinstance(_v, (int, float)):
+                    continue
+                _f = float(_v)
+                if not _precision_math.isfinite(_f):
+                    continue  # keep NaN / +/-Inf as-is
+                if _k in _ROUND0:
+                    data[_k] = round(_f)
+                elif _k in _ROUND2:
+                    data[_k] = round(_f, 2)
+                elif _k in _ROUND4:
+                    data[_k] = round(_f, 4)
+                elif _k == "price_vs_vwap":
+                    data[_k] = round(_f, 6)
+                # else: unclassified numeric column passes through unchanged
+
             if not path.exists():
                 # First time: Write header with canonical column order
                 cols = [c for c in CANONICAL_INDICATOR_COLS if c in data]
@@ -9586,6 +12162,121 @@ class FuturesMonitor:
         # Signal caller to skip this tick (probe takes priority)
         return True
 
+    def _mts_tag_bar_session(self, bar: dict) -> dict:
+        """[MTS_SESSION_TAG 2026-08-18] RESTART_BASELINE gate input: the
+        production MTS bar never carried a session_type tag, so the gate
+        failed closed on every bar (TRAIL_REANCHOR_SESSION_UNKNOWN) and the
+        remaining-leg anchor could never be established.  Inject the
+        monitor's trading session at bar construction.  An explicit value
+        on the bar is preserved; when the session is itself unknown the
+        key is left absent so the gate stays fail-closed."""
+        if "session_type" not in bar:
+            _sess = (getattr(self, "session_type", None)
+                     or get_taifex_futures_session_type())
+            if _sess:
+                bar["session_type"] = _sess
+        return bar
+
+    def _reconcile_pending_mts_combos(self) -> None:
+        """Reconcile broker combo deals before promoting MTS entry state."""
+        if not self.live_trading or self.dry_run:
+            return
+        _manager = getattr(self, "order_mgr", None)
+        _adapter = getattr(_manager, "broker_adapter", None)
+        _list = getattr(_adapter, "list_combo_trades", None)
+        if _manager is None or not callable(_list):
+            return
+        _pending = getattr(self, "_mts_pending_fills", {}) or {}
+        if not any(isinstance(v, dict) and v.get("combo")
+                   for v in _pending.values()):
+            return
+        try:
+            _trades = _list()
+        except Exception:
+            return
+
+        def _value(obj, *keys):
+            for key in keys:
+                value = getattr(obj, key, None)
+                if value is None and isinstance(obj, dict):
+                    value = obj.get(key)
+                if value is not None:
+                    return value
+            return None
+
+        def _deal_summary(rows):
+            total = 0
+            notional = 0.0
+            for row in rows or []:
+                qty = _value(row, "quantity", "qty")
+                price = _value(row, "price", "fill_price")
+                try:
+                    qty = int(qty or 0)
+                    price = float(price)
+                except (TypeError, ValueError):
+                    continue
+                if qty > 0 and math.isfinite(price) and price > 0:
+                    total += qty
+                    notional += qty * price
+            return total, (notional / total if total else None)
+
+        for _trade_id, _pending in list(_pending.items()):
+            if not isinstance(_pending, dict) or not _pending.get("combo"):
+                continue
+            _order = self._get_lifecycle_order(
+                _pending.get("combo_order_id"))
+            if _order is None:
+                continue
+            _target_ids = {
+                str(x) for x in (
+                    getattr(_order, "broker_order_id", None),
+                    getattr(_order, "ordno", None),
+                    getattr(_order, "seqno", None),
+                ) if x
+            }
+            for _combo in _trades or []:
+                _combo_order = _value(_combo, "order")
+                _status = _value(_combo, "status")
+                _combo_ids = {
+                    str(x) for x in (
+                        _value(_combo_order, "id", "broker_order_id"),
+                        _value(_combo_order, "ordno"),
+                        _value(_combo_order, "seqno"),
+                        _value(_status, "id"),
+                    ) if x
+                }
+                if not _target_ids.intersection(_combo_ids):
+                    continue
+                _deals = _value(_status, "deals") or {}
+                _legs = _pending.get("combo_legs") or []
+                _prices = []
+                _complete = True
+                for _leg in _legs:
+                    _code = str(_leg.get("symbol"))
+                    _rows = (_deals.get(_code, []) if isinstance(_deals, dict)
+                             else [])
+                    _qty, _price = _deal_summary(_rows)
+                    if _qty < int(_leg.get("quantity") or 0) or _price is None:
+                        _complete = False
+                    _prices.append(_price)
+                _status_name = str(_value(_status, "status") or "")
+                _signature = repr((_status_name, _deals, _prices))
+                if _pending.get("combo_last_signature") == _signature:
+                    continue
+                _pending["combo_last_signature"] = _signature
+                if _complete and len(_prices) == 2:
+                    _pending["near_filled"] = True
+                    _pending["far_filled"] = True
+                    _pending["near_fill_price"] = _prices[0]
+                    _pending["far_fill_price"] = _prices[1]
+                try:
+                    _manager.reconcile_combo_trade_snapshot(
+                        combo_trade=_combo, source="mts_combo_refresh",
+                        reason="broker_combo_status")
+                except Exception:
+                    logger.exception("[MTS_COMBO_RECONCILE_FAILED]")
+                break
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
@@ -9604,6 +12295,7 @@ class FuturesMonitor:
         """MTS minimal execution path. Uses enriched bar from pipeline when available,
         falls back to building bar from tick deque if none provided."""
         print("MTS_ALIVE", flush=True)
+        self._reconcile_pending_mts_combos()
 
         # [P1] observation-only: refresh persistent EXIT_ONLY_BBO_OBSERVED
         # evidence when the current capability has fresh valid dual BBO
@@ -9680,27 +12372,18 @@ class FuturesMonitor:
                         "exit_only_capability", None), dict)
         )
 
-        _requested_mode = str(getattr(getattr(self, "_execution_context", None),
-                                     "requested_mode", "")).lower()
-        _effective_mode = str(getattr(getattr(self, "_execution_context", None),
-                                      "effective_mode", "")).lower()
-        if (_fills_open and not _state_has_pos
-                and (bool(getattr(self, "live_trading", False))
-                     or "live" in _requested_mode
-                     or "live" in _effective_mode)):
-            console.print(
-                "[yellow]⚠️ [MTS_RECOVERY_BLOCKED_LIVE] broker truth "
-                "must establish live position; historical fills are "
-                "evidence only[/yellow]"
-            )
-            if hasattr(self, "_append_mts_event"):
-                self._append_mts_event(
-                    "MTS_RECOVERY_BLOCKED_LIVE",
-                    reason="BROKER_TRUTH_REQUIRED",
-                )
-            _fills_open = False
-
-        if _fills_open and not _state_has_pos:
+        # LIVE broker truth is authoritative.  Never resurrect a local
+        # position from historical fills in live mode — the recovery path is
+        # PAPER-only.  Gate on the execution context's requested_mode (the
+        # live INTENT, set at ctx creation): the config's live_trading key is
+        # absent in futures_live.yaml (monitor defaults to False), and
+        # effective_mode is not yet "live_ready" at startup (the certificate
+        # transition happens later) — either signal alone let the fills-led
+        # recovery resurrect a ghost (reason=fills_recovery observed).
+        _live_authority_runtime = bool(
+            getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") == "live")
+        if _fills_open and not _state_has_pos and not _live_authority_runtime:
             # Split-brain: fills says open, state says closed.
             # Try fills-led recovery via strategy's _restore_from_fills_log
             console.print(
@@ -9756,6 +12439,24 @@ class FuturesMonitor:
             _bar_dict["ts"] = last_5m.name if hasattr(last_5m, "name") else None
 
         if not _bar_dict: return
+        # HVWAP requires a real bucket timestamp.  DataFrame rows normally
+        # carry a Timestamp index, but enriched/runtime bars may originate
+        # from a serialized numeric index.  Normalize seconds-only epoch
+        # values here and fail closed for RangeIndex-like values instead of
+        # allowing 99 to become 1970-01-01 in the strategy.
+        _raw_bar_ts = _bar_dict.get("ts") or _bar_dict.get("timestamp")
+        if isinstance(_raw_bar_ts, (int, float)) and not isinstance(_raw_bar_ts, bool):
+            if float(_raw_bar_ts) >= 1_000_000_000:
+                _bar_dict["ts"] = pd.Timestamp(float(_raw_bar_ts), unit="s")
+            else:
+                _bar_dict["ts"] = None
+        elif _raw_bar_ts is not None:
+            try:
+                _bar_dict["ts"] = pd.Timestamp(_raw_bar_ts)
+            except Exception:
+                _bar_dict["ts"] = None
+        if _bar_dict.get("ts") is not None and _bar_dict.get("timestamp") is None:
+            _bar_dict["timestamp"] = _bar_dict["ts"]
         if hasattr(self, '_spread_loader') and self._spread_loaded:
             try: self._spread_loader.enrich_bar(_bar_dict)
             except: pass
@@ -9779,6 +12480,10 @@ class FuturesMonitor:
             if _spread_std > 0:
                 _rt_spread = _bar_dict["near_close"] - _bar_dict["far_close"]
                 _bar_dict["spread_z"] = (_rt_spread - _spread_ma) / _spread_std
+
+        # Research wiring: dz / spread_slope / velocity_ema into the bar
+        # (entry_observation payload reads these; previously always NULL).
+        self._apply_spread_dynamics(_bar_dict)
 
         # 2026-07-08 Hermes Agent: Pass sqz_on to bar dict for BB filter gate.
         # Read from squeeze indicator pipeline (_last_processed_data["5m"]).
@@ -9812,6 +12517,14 @@ class FuturesMonitor:
             pass
         _bar_dict["near_vwap"] = _near_vwap
         _bar_dict["far_vwap"] = _far_vwap
+        # 2026-08-23 Hermes Agent: expose the FAR leg's OWN tick volume for the
+        # telemetry-only Hierarchical VWAP candidate arm. Per-leg session VWAP
+        # requires each leg's own volume; `far_vwap` above is a deque-wide
+        # aggregate (spans the 15:00 reset boundary) and must NEVER be used as
+        # a substitute for far volume. 0/missing -> candidate fails closed.
+        _bar_dict["far_volume"] = float(self._far_current_bar.get("volume", 0) or 0)
+        _bar_dict["regime_prewarm_bars"] = self._get_hvwap_regime_prewarm_bars(
+            _bar_dict.get("ts"))
 
         # 2026-07-08 Hermes Agent: Compute BB bands for near/far release filter.
         # Only computed when BB filter is enabled AND sqz_on is active.
@@ -9950,6 +12663,7 @@ class FuturesMonitor:
                         near_last=_n_last, far_last=_f_last,
                         near_upl=_n_upl, far_upl=_f_upl, total_upl=_n_upl + _f_upl,
                         quote_age_ms=_bar_dict.get("quote_age_ms", 0),
+                        spread_z=_bar_dict.get("spread_z", 0),
                     )
                 except Exception:
                     pass
@@ -9964,6 +12678,7 @@ class FuturesMonitor:
                         near_last=_n_last, far_last=_f_last,
                         near_upl=_n_upl, far_upl=_f_upl, total_upl=_n_upl + _f_upl,
                         quote_age_ms=_bar_dict.get("quote_age_ms", 0),
+                        spread_z=_bar_dict.get("spread_z", 0),
                     )
                 except Exception:
                     pass
@@ -9975,6 +12690,7 @@ class FuturesMonitor:
                         near_last=_n_last, far_last=_f_last,
                         near_upl=_n_upl, far_upl=_f_upl, total_upl=_n_upl + _f_upl,
                         quote_age_ms=_bar_dict.get("quote_age_ms", 0),
+                        spread_z=_bar_dict.get("spread_z", 0),
                     )
                 except Exception:
                     pass
@@ -10031,30 +12747,13 @@ class FuturesMonitor:
             # sent wrong-direction orders. Near derives from the broker
             # position; far accepts only valid LONG/SHORT (else None, and
             # close_all fails closed instead of sending a wrong order).
-            # L0: never use a state-file side or a hard-coded direction as a
-            # release premise.  Recover the near side only from the fresh
-            # broker position row for the actual near contract; absence or an
-            # unreadable query remains unknown and is fail-closed later.
-            _near_side = None
-            _far_side = None
-            try:
-                _fresh = self._capture_post_startup_snapshot()
-                _rows = (_fresh.get("positions") or []) if isinstance(_fresh, dict) else []
-                for _row in _rows:
-                    if _row.get("account") != "futures":
-                        continue
-                    _code = str(_row.get("code"))
-                    if _code not in {str(self.contract.code), str(self.far_contract.code)}:
-                        continue
-                    _direction = str(_row.get("direction") or _row.get("side") or "").lower()
-                    _side = ("LONG" if "buy" in _direction or "long" in _direction
-                             else "SHORT" if "sell" in _direction or "short" in _direction
-                             else None)
-                    if _code == str(self.contract.code):
-                        _near_side = _side
-                    elif _code == str(self.far_contract.code):
-                        _far_side = _side
-            except Exception:
+            _near_side = _disk.get("near_side") or getattr(strategy, "_near_side", None)
+            _far_side = _disk.get("far_side") or getattr(strategy, "_far_side", None)
+            if _broker_pos > 0:
+                _near_side = "LONG"
+            elif _broker_pos < 0:
+                _near_side = "SHORT"
+            else:
                 _near_side = None
             if _far_side not in ("LONG", "SHORT"):
                 console.print(
@@ -10177,11 +12876,33 @@ class FuturesMonitor:
         _auth = self._ledger_projection.snapshot()
         # LIVE broker truth supersedes a silent/missing callback ledger.  The
         # helper is read-only and leaves PAPER and legacy EXIT_ONLY untouched.
+        from strategies.futures.mts_ledger_authority import MtsAuthority
         _broker_auth = self._refresh_live_broker_authority(strategy)
         if _broker_auth is not None:
             _auth = _broker_auth
-            _authority_has_pos = True
-            _state_has_pos = True
+            _authority_has_pos = (_broker_auth.status in (
+                MtsAuthority.OPEN, MtsAuthority.SINGLE_LEG))
+            _state_has_pos = _authority_has_pos
+            # The strategy's own restore hook runs inside on_bar, before the
+            # next monitor gate.  Carry the current broker-flat proof into
+            # that hook so historical fills cannot resurrect a ghost.
+            strategy._broker_truth_flat = not _authority_has_pos
+        # An audited abandon is terminal authority, even when the append-only
+        # ledger still contains historical ENTRY rows.  Read the audit set
+        # once for this cycle so every authority consumer sees the same view.
+        from strategies.plugins.futures.active.tmf_spread import (
+            _abandoned_trade_ids,
+        )
+        _abandoned_ids = _abandoned_trade_ids()
+        _auth = self._apply_abandon_authority_filter(_auth, _abandoned_ids)
+        # 2026-08-23 Hermes Agent: inject the execution-mode gate for the
+        # telemetry-only HVWAP paper-release wiring (the strategy has no
+        # other access to the execution context). Fail-closed default: when
+        # the context is absent the strategy's paper gate returns MODE_UNKNOWN.
+        _hvwap_ctx = getattr(self, "_execution_context", None)
+        strategy._hvwap_execution_mode = getattr(_hvwap_ctx, "effective_mode", None)
+        strategy._hvwap_live_order_allowed = getattr(
+            _hvwap_ctx, "live_order_allowed", False)
         # [S1 repair] ONE shared EXIT_ONLY capability validation at tick
         # start — before ANY risk gate / strategy evaluation.  The
         # previous tick's authority override is cleared here; when valid,
@@ -10197,6 +12918,14 @@ class FuturesMonitor:
         _gate_auth = _exit_override if _exit_override is not None else _auth
         _gate_state_has_pos = (_authority_has_pos
                                if _exit_override is None else True)
+        # Read-only authority handoff for telemetry consumers.  During PAPER
+        # recovery the strategy's private _has_position can remain UNKNOWN
+        # until its next hydration, while the ledger already proves the
+        # spread is open.  Do not mutate strategy state; expose the authority
+        # on this bar so HVWAP can observe the position without weakening any
+        # order/risk gate.
+        _bar_dict["_mts_authority_has_position"] = bool(_gate_state_has_pos)
+        _bar_dict["_mts_authority_status"] = str(getattr(_gate_auth, "status", "UNKNOWN"))
         _pre_action = gate_decision_pre_signal(
             _gate_auth, _gate_state_has_pos, _strat_has_pos, _strat_tid,
         )
@@ -10212,6 +12941,9 @@ class FuturesMonitor:
         # 2026-08-06 codex audit: evaluator-lag SLO — runs every tick so a
         # stalled evaluator is caught even when the gates skip on_bar.
         self._mts_check_evaluator_lag(strategy, _strat_has_pos)
+
+        if _exit_ok:
+            self._record_mts_entry_research_candidate(strategy, _bar_dict, datetime.now())
 
         signal = None
         if _pre_action != MtsGateAction.RESET_STRATEGY and _exit_ok:
@@ -10282,6 +13014,7 @@ class FuturesMonitor:
             )
 
         if signal:
+            self._emit_release_telemetry(signal, strategy, _bar_dict)
             self._submit_mts_order_signal(signal, strategy, _bar_dict, datetime.now())
             # 💡 [Fixed 2026-05-27] Removed premature strategy._reset(). 
             # Reset now happens in _apply_confirmed_futures_deal upon fill to prevent runaway re-entry loops.
@@ -10386,6 +13119,21 @@ class FuturesMonitor:
     # 2026-07-08 Hermes Agent: P0 — Multi-source open position detection
     # ═══════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _apply_abandon_authority_filter(auth, abandoned_trade_ids):
+        """Downgrade an abandoned ledger authority to terminal FLAT."""
+        if getattr(auth, "trade_id", None) not in abandoned_trade_ids:
+            return auth
+        logger.warning(
+            "[MTS_ABANDON_SKIP] authority trade_id=%s", auth.trade_id,
+        )
+        return MtsAuthorityState(
+            MtsAuthority.FLAT,
+            trade_id=auth.trade_id,
+            current_trade_id=getattr(auth, "current_trade_id", None),
+            anomalies=getattr(auth, "anomalies", ()),
+        )
+
     def _mts_has_open_position_from_fills(self) -> bool:
         """Three-state ledger authority (incremental projection, 2026-08-06 P1).
 
@@ -10394,7 +13142,21 @@ class FuturesMonitor:
         (tail-read of new bytes only); this is now a thin snapshot read.
         """
         self._ledger_projection.sync_from_ledger()
-        return self._ledger_projection.snapshot().status == MtsAuthority.OPEN
+        _authority = self._ledger_projection.snapshot()
+        if _authority.status == MtsAuthority.OPEN:
+            # An audited abandon is terminal even when the append-only fills
+            # ledger still contains historical ENTRY rows. Keep this check at
+            # the authority consumer so the generic projection remains pure.
+            from strategies.plugins.futures.active.tmf_spread import (
+                _abandoned_trade_ids,
+            )
+            if _authority.trade_id in _abandoned_trade_ids():
+                import logging
+                logging.getLogger("FuturesMonitor").warning(
+                    "[MTS_ABANDON_SKIP] trade_id=%s", _authority.trade_id
+                )
+                return False
+        return _authority.status == MtsAuthority.OPEN
 
     def _reconstruct_position_from_ledger(self, strategy, auth):
         """Rebuild the strategy position state from the ledger authority and
@@ -10405,13 +13167,20 @@ class FuturesMonitor:
         correct side / qty / lifecycle — then persisted. This is not a
         skipped reset; it is an authoritative rebuild.
         """
+        from strategies.futures.mts_ledger_authority import MtsAuthority
         strategy._has_position = True
         strategy._trade_id = auth.trade_id
         strategy._near_side = auth.near_side
         strategy._far_side = auth.far_side
+        strategy._near_qty = abs(auth.near_qty)
+        strategy._far_qty = abs(auth.far_qty)
         strategy._near_entry = auth.near_entry
         strategy._far_entry = auth.far_entry
-        strategy._released_leg = None
+        _single_leg = getattr(auth, "status", None) is MtsAuthority.SINGLE_LEG
+        strategy._released_leg = (
+            "near" if _single_leg and auth.far_qty else
+            "far" if _single_leg and auth.near_qty else None
+        )
         console.print(
             f"[bold yellow]♻️ [POSITION_AUTHORITY] Ledger reconstruct: "
             f"trade={auth.trade_id} near={auth.near_side}x{abs(auth.near_qty)} "
@@ -10423,9 +13192,15 @@ class FuturesMonitor:
                 infer_lifecycle_from_legacy_state,
             )
             strategy._lifecycle_oca = infer_lifecycle_from_legacy_state(
-                {"has_position": True, "released_leg": None, "release_state": "BOTH_HELD"}
+                {"has_position": True,
+                 "released_leg": strategy._released_leg,
+                 "release_state": (
+                     "NEAR_RELEASED" if strategy._released_leg == "near"
+                     else "FAR_RELEASED" if strategy._released_leg == "far"
+                     else "BOTH_HELD")}
             )
-            strategy._lifecycle = "RECOVERED_LEDGER"
+            strategy._lifecycle = (
+                "SINGLE_LEG" if _single_leg else "RECOVERED_LEDGER")
             _write_mts_state(
                 has_position=True, action="LEDGER_RECONSTRUCTED",
                 reason="authority_rebuild",
@@ -10433,10 +13208,11 @@ class FuturesMonitor:
                 far_entry=auth.far_entry,
                 near_side=auth.near_side,
                 far_side=auth.far_side,
+                released_leg=strategy._released_leg,
                 trade_id=auth.trade_id,
                 ticker=self.ticker,
                 atr=0.0,
-                lifecycle={"phase": "SPREAD",
+                lifecycle={"phase": "SINGLE_LEG" if _single_leg else "SPREAD",
                            "release_group": {"status": "INACTIVE"},
                            "trail_group": {"status": "INACTIVE"}},
             )
@@ -10486,10 +13262,32 @@ class FuturesMonitor:
             if isinstance(_active, dict):
                 _active = list(_active.values())
             _mts_strategies = {"MTS_ENTRY", "MTS_MANUAL", "MTS_RELEASE", "MTS_EXIT"}
+            _terminal = {
+                "FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED",
+                "BROKER_NOT_FOUND", "BROKER_RECONCILED",
+            }
+            # Paper truth is the local simulator queue, not broker-style
+            # lifecycle history.  A stale active OrderManager row must not
+            # suppress the evaluator when paper_fill_sim has no corresponding
+            # pending order.  Live mode deliberately keeps the stricter
+            # OrderManager-based gate and is unchanged.
+            _paper_pending_ids = None
+            if not self.live_trading and self.paper_fill_sim is not None:
+                _paper_pending_ids = set(
+                    getattr(self.paper_fill_sim, "_pending_orders", {}) or {}
+                )
+                _paper_pending_ids.update(
+                    getattr(self.paper_fill_sim, "_pending_combos", {}) or {}
+                )
             _ages = []
             _now_dt = datetime.now()
             for _o in _active:
                 if str(getattr(_o, "strategy", "") or "") not in _mts_strategies:
+                    continue
+                _status = str(getattr(getattr(_o, "status", None), "value", getattr(_o, "status", "")) or "").upper()
+                if _status in _terminal:
+                    continue
+                if _paper_pending_ids is not None and getattr(_o, "order_id", None) not in _paper_pending_ids:
                     continue
                 _ts = getattr(_o, "created_at", None)
                 if _ts is None:
@@ -10618,6 +13416,38 @@ class FuturesMonitor:
         except Exception:
             return False
 
+    def _canonical_confirms_flat(self) -> bool:
+        """Fresh broker snapshot is direct flat evidence for the entry guard.
+
+        The in-memory _live_broker_flat_proven flag can be stale during
+        degraded windows; the canonical snapshot (fresh + OK capture + no
+        futures position + no open orders) is authoritative.  Guards the
+        fills-ledger orphan case: a broker-side close the system never saw
+        (phone flatten) leaves an orphan ENTRY in the fills ledger that must
+        not block a fresh entry when the broker truth confirms flat.
+        """
+        try:
+            from core.runtime_paths import runtime_path
+            _p = Path(runtime_path("exports", "trades", "live",
+                                   "diagnostics",
+                                   "broker_snapshot_canonical.json"))
+            if not _p.exists():
+                return False
+            _d = json.loads(_p.read_text())
+            _age = time.time() - (int(_d.get("captured_at") or 0) / 1000.0)
+            if _age > 60:
+                return False
+            if ((_d.get("fetch_status") or {}).get("capture") != "OK"):
+                return False
+            if _d.get("open_orders"):
+                return False
+            _fut = [p for p in (_d.get("positions") or [])
+                    if p.get("account") == "futures"
+                    and int(p.get("quantity", 0) or 0) > 0]
+            return not _fut
+        except Exception:
+            return False
+
     def _mts_block_entry_if_open_position(
         self, strategy, signal_action: str
     ) -> bool:
@@ -10654,18 +13484,29 @@ class FuturesMonitor:
         _blocked = False
         _reasons = []
 
-        if _state_has_pos:
+        _live_flat_proven = (
+            getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") == "live"
+            and (bool(getattr(self, "_live_broker_flat_proven", False))
+                 or self._canonical_confirms_flat())
+            and not bool(getattr(self, "_broker_authority_degraded", False))
+        )
+        if bool(getattr(self, "_broker_authority_degraded", False)):
             _blocked = True
-            _reasons.append("state.has_position=True")
-        if bool(getattr(strategy, "_has_position", False)):
-            _blocked = True
-            _reasons.append("strategy.has_position=True")
-        if _lifecycle_phase and _lifecycle_phase != "FLAT":
-            _blocked = True
-            _reasons.append(f"lifecycle.phase={_lifecycle_phase}")
-        if _fills_has_open:
-            _blocked = True
-            _reasons.append("fills_ledger_has_open_entry")
+            _reasons.append("broker_authority_degraded")
+        elif not _live_flat_proven:
+            if _state_has_pos:
+                _blocked = True
+                _reasons.append("state.has_position=True")
+            if bool(getattr(strategy, "_has_position", False)):
+                _blocked = True
+                _reasons.append("strategy.has_position=True")
+            if _lifecycle_phase and _lifecycle_phase != "FLAT":
+                _blocked = True
+                _reasons.append(f"lifecycle.phase={_lifecycle_phase}")
+            if _fills_has_open:
+                _blocked = True
+                _reasons.append("fills_ledger_has_open_entry")
         if _has_pending:
             _blocked = True
             _reasons.append("pending_mts_orders")
@@ -10688,6 +13529,98 @@ class FuturesMonitor:
         return False
 
 
+    def _resolve_close_all_position(self):
+        """Resolve the position to close.  The BROKER canonical (actual
+        positions) is the authority — local state is used only when the
+        broker capture is unavailable.  Duplicate contracts or unknown
+        directions fail closed (no close info).  Returns
+        (has_pos, near_side, far_side, released_leg, trade_id, disk)."""
+        _has_pos = False
+        _near_side = None
+        _far_side = None
+        _released_leg = None
+        _trade_id = "mts-emergency"
+        _disk = None
+        _canon_ok = False
+
+        def _side(row):
+            if row is None:
+                return None
+            text = str(row.get("direction") or "").lower()
+            if "sell" in text or "short" in text:
+                return "SHORT"
+            if "buy" in text or "long" in text:
+                return "LONG"
+            return None
+
+        # 1. broker canonical first (broker facts are the authority).
+        #    capture == OK is authoritative IMMEDIATELY — even an empty
+        #    positions list proves flat and must never fall back to a
+        #    possibly-stale local state (ghost resurrection).
+        try:
+            _snap = self._capture_post_startup_snapshot()
+            if (_snap and (_snap.get("fetch_status") or {})
+                    .get("capture") == "OK"):
+                _canon_ok = True
+                _codes = {str(getattr(self.contract, "code", "")),
+                          str(getattr(self.far_contract, "code", ""))}
+                _rows = [p for p in (_snap.get("positions") or [])
+                         if p.get("account") == "futures"
+                         and str(p.get("code") or "") in _codes
+                         and int(p.get("quantity") or 0) > 0]
+                if not _rows:
+                    # broker flat, or no target MTS contracts -> flat,
+                    # zero close info, zero orders
+                    return (False, None, None, None,
+                            "mts-emergency", None)
+                if _rows:
+                    if len(_rows) != len({str(p.get("code")) for p in _rows}):
+                        # duplicate contract: fail closed
+                        return (False, None, None, None,
+                                "mts-emergency", None)
+                    _by_code = {str(p.get("code")): p for p in _rows}
+                    _near = _by_code.get(
+                        str(getattr(self.contract, "code", "")))
+                    _far = _by_code.get(
+                        str(getattr(self.far_contract, "code", "")))
+                    _near_side = _side(_near)
+                    _far_side = _side(_far)
+                    if _near_side is None and _far_side is None:
+                        # unknown directions: fail closed
+                        return (False, None, None, None,
+                                "mts-emergency", None)
+                    if len(_rows) == 1 and _near_side is not None:
+                        _released_leg = "far"
+                    elif len(_rows) == 1 and _far_side is not None:
+                        _released_leg = "near"
+                    _has_pos = True
+                    _trade_id = "mts-emergency-broker"
+                    _canon_ok = True
+                    console.print(
+                        "[yellow]📝 [MANUAL_TRADE] close_all: "
+                        "sides from broker canonical[/yellow]")
+        except Exception as _bc_e:
+            console.print(
+                f"[red]⚠️ [MANUAL_TRADE] close_all: broker canonical "
+                f"fallback failed: {_bc_e}[/red]")
+        # 2. local state fallback ONLY when the canonical is unavailable
+        if not _canon_ok:
+            try:
+                _state_path = _mts_position_state_path()
+                if _state_path.exists():
+                    _disk = json.loads(_state_path.read_text())
+                if _disk and _disk.get("has_position") is True:
+                    _has_pos = True
+                    _near_side = _disk.get("near_side")
+                    _far_side = _disk.get("far_side")
+                    _released_leg = _disk.get("released_leg")
+                    _trade_id = _disk.get("trade_id", "mts-emergency")
+            except Exception as _sf_e:
+                console.print(
+                    f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
+        return (_has_pos, _near_side, _far_side, _released_leg,
+                _trade_id, _disk)
+
     def _write_manual_command_status(self, command_id, status, message, **extra) -> None:
         """2026-07-31: Write manual-command audit status for the dashboard.
 
@@ -10696,7 +13629,7 @@ class FuturesMonitor:
         timestamp; COMPLETED carries position_before/position_after/order_ids.
         """
         try:
-            _path = runtime_path("data", "state", "futures_manual_trade_status.json")
+            _path = "/tmp/futures_manual_trade_status.json"
             _data = {
                 "command_id": command_id,
                 "status": status,
@@ -10869,57 +13802,6 @@ class FuturesMonitor:
         # Tier 5: All tiers exhausted
         return (None, "NO_PRICE_SOURCE")
 
-    def _check_entry_quote_freshness(
-        self, *, near_slot: dict, far_slot: dict,
-        near_trade_age_ms: float, far_trade_age_ms: float,
-        near_source: str, far_source: str,
-        threshold_ms: int = 12000,
-    ) -> tuple[bool, dict]:
-        """Fail closed unless both entry legs have a fresh, valid BBO."""
-        import math
-
-        now = time.time()
-        detail = {
-            "threshold": threshold_ms,
-            "near_trade_age_ms": near_trade_age_ms,
-            "far_trade_age_ms": far_trade_age_ms,
-            "near_source": near_source,
-            "far_source": far_source,
-        }
-
-        def _validate(prefix: str, slot: dict) -> bool:
-            bid = slot.get("bid")
-            ask = slot.get("ask")
-            observed_at = slot.get("bidask_at")
-            detail[f"{prefix}_bid"] = bid
-            detail[f"{prefix}_ask"] = ask
-            if observed_at is None:
-                detail[f"{prefix}_bbo_age_ms"] = None
-                detail[f"{prefix}_bbo_reason"] = "BBO_NO_TIMESTAMP"
-                return False
-            try:
-                bid_f = float(bid)
-                ask_f = float(ask)
-                age_ms = max(0.0, (now - float(observed_at)) * 1000.0)
-            except (TypeError, ValueError, OverflowError):
-                detail[f"{prefix}_bbo_age_ms"] = None
-                detail[f"{prefix}_bbo_reason"] = "BBO_INVALID"
-                return False
-            detail[f"{prefix}_bbo_age_ms"] = age_ms
-            if (not math.isfinite(bid_f) or not math.isfinite(ask_f)
-                    or bid_f <= 0 or ask_f <= 0 or ask_f < bid_f):
-                detail[f"{prefix}_bbo_reason"] = "BBO_INVALID"
-                return False
-            if age_ms > threshold_ms:
-                detail[f"{prefix}_bbo_reason"] = "BBO_STALE"
-                return False
-            detail[f"{prefix}_bbo_reason"] = "BBO_VALID"
-            return True
-
-        near_ok = _validate("near", near_slot or {})
-        far_ok = _validate("far", far_slot or {})
-        return near_ok and far_ok, detail
-
     def _process_manual_trade_flag(self) -> bool:
         """Consume /tmp/futures_manual_trade.flag if present.
         
@@ -11082,27 +13964,12 @@ class FuturesMonitor:
                 _strat_name = _mts_cfg.get("strategy", "tmf_spread")
                 _strategy_obj = self._registry.get(_strat_name)
 
-                # Read state file for position recovery (strategy may not have _has_position)
-                _has_pos = False
-                _near_side = None
-                _far_side = None
-                _released_leg = None
-                _trade_id = "mts-emergency"
-                try:
-                    # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
-                    _state_path = _mts_position_state_path()
-                    _disk = None
-                    if _state_path.exists():
-                        _disk = json.loads(_state_path.read_text())
-                    if _disk and _disk.get("has_position") is True:
-                        _has_pos = True
-                        _near_side = _disk.get("near_side")
-                        _far_side = _disk.get("far_side")
-                        _released_leg = _disk.get("released_leg")
-                        _trade_id = _disk.get("trade_id", "mts-emergency")
-                        console.print("[yellow]📝 [MANUAL_TRADE] close_all: recovered from disk state[/yellow]")
-                except Exception as _sf_e:
-                    console.print(f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
+                # Read state file for position recovery (strategy may not
+                # have _has_position); fall back to the BROKER canonical
+                # (actual positions) when local state is empty — broker
+                # facts are the authority for the emergency close.
+                (_has_pos, _near_side, _far_side, _released_leg,
+                 _trade_id, _disk) = self._resolve_close_all_position()
 
                 self._write_manual_command_status(
                     _command_id, "PROCESSING", "正在送出平倉單",
@@ -11457,10 +14324,13 @@ class FuturesMonitor:
 
                 _spread_side = _flag.get("side", "SELL_NEAR_BUY_FAR")
                 
-                # 2026-05-27 Gemini CLI: P0: Strict Price Integrity Contract
-                # Manual entry ONLY accepted from fresh LIVE_TICK.
-                # Use local_arrival_at to avoid clock drift issues. Increased limit to 5s.
-                _MAX_ENTRY_AGE_MS = 5000
+                # 2026-08-25 Item1 (Hermes): entry freshness is decided by
+                # the BBO-based hard gate (_check_entry_quote_freshness),
+                # not by last-trade age.  Last-trade age is telemetry only.
+                # 2026-08-25 Item1 (Hermes): dual-leg entry freshness hard gate
+                # threshold (config-overridable, default 12000ms).
+                _MAX_QUOTE_AGE_GATE_MS = int(self.cfg.get(
+                    "mts", {}).get("manual_entry_max_quote_age_ms", 12000))
                 _price = None
                 # 2026-06-23 Gemini CLI: Initialize with valid UNSET to satisfy price provenance test
                 _price_source = "UNSET"
@@ -11499,24 +14369,13 @@ class FuturesMonitor:
                     
                     if _price_raw and _price_raw > 0 and _arrival_at:
                         _tick_age_ms = (time.time() - _arrival_at) * 1000
-                        if _tick_age_ms <= _MAX_ENTRY_AGE_MS:
-                            _price = float(_price_raw)
-                            _price_source = "LIVE_TICK"
-                        else:
-                            self._manual_trade_status = f"REJECTED: STALE_TICK ({int(_tick_age_ms)}ms)"
-                            console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: Latest tick is stale ({int(_tick_age_ms)}ms > {_MAX_ENTRY_AGE_MS}ms)[/red]")
-                            
-                            # 2026-05-27 Gemini CLI: P3: Detailed rejection logging for observability
-                            self._append_mts_event("REJECTED_ENTRY", 
-                                                  reason="STALE_TICK",
-                                                  near_age_ms=int(_tick_age_ms),
-                                                  far_age_ms=-1, # Unknown
-                                                  max_allowed_age_ms=_MAX_ENTRY_AGE_MS,
-                                                  ticker=self.ticker)
-                            # 2026-06-05 JVS Claw: retryable — keep .processing for next tick
-                            self._flag_retry_count += 1
-                            console.print(f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (STALE_TICK)[/dim]")
-                            return True
+                        # 2026-08-25 Item1 (Hermes): last-trade age is NO
+                        # LONGER the entry freshness gate (revised BBO spec).
+                        # The price is still usable; entry freshness is decided
+                        # solely by _check_entry_quote_freshness (BBO update
+                        # age).  Last-trade age remains as audit telemetry.
+                        _price = float(_price_raw)
+                        _price_source = "LIVE_TICK"
 
                     # 2026-06-05 JVS Claw: retryable — first tick hasn't arrived yet,
                     # next tick populates market_data → succeeds
@@ -11525,6 +14384,16 @@ class FuturesMonitor:
                     if _src != "LIVE_TICK":
                         self._manual_trade_status = "REJECTED: NO_LIVE_TICK"
                         console.print(f"[red]⛔ [MANUAL_TRADE] Rejected: No fresh LIVE_TICK available (Source={_price_source})[/red]")
+                        # 2026-08-25 Item1 (Hermes): missing/unknown near quote
+                        # also records the unified stale-quote audit event.
+                        self._append_mts_event("ENTRY_BLOCKED_STALE_QUOTE",
+                                              reason="NO_LIVE_TICK",
+                                              action="MANUAL_TRADE",
+                                              near_age_ms=None,
+                                              far_age_ms=None,
+                                              near_source=_price_source,
+                                              far_source="UNRESOLVED_YET",
+                                              threshold=_MAX_QUOTE_AGE_GATE_MS)
                         self._flag_retry_count += 1
                         console.print(f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (NO_LIVE_TICK)[/dim]")
                         return True
@@ -11556,24 +14425,41 @@ class FuturesMonitor:
                     # Guard for test check: self.dry_run or not self.live_trading or paper
                     _far_price_source = "FLAG_FALLBACK"
 
-                _near_slot = self.market_data.get(self.ticker, {})
-                if not _near_slot.get("close") and self.contract is not None:
-                    _near_slot = self.market_data.get(self.contract.code, {})
-                _far_slot = self.market_data.get(f"{self.ticker}_FAR", {})
-                if not _far_slot.get("close") and self.far_contract is not None:
-                    _far_slot = self.market_data.get(self.far_contract.code, {})
-                _quotes_ok, _quote_detail = self._check_entry_quote_freshness(
-                    near_slot=_near_slot, far_slot=_far_slot,
+                # ── 2026-08-25 Item1 (Hermes): MTS manual ENTRY freshness
+                # hard gate — BBO-based (revised spec) ──
+                # Reject a NEW spread entry unless BOTH legs carry a valid,
+                # fresh BBO update: bid & ask present, finite positive
+                # numeric, ask >= bid (never crossed), and BBO update
+                # timestamp age <= 12000ms.  Last-trade age is kept ONLY as
+                # telemetry (audit fields) and never gates the entry.
+                # Fail-closed in paper AND live mode alike.  This gate runs
+                # only on the ENTRY path (spread action); it never touches
+                # existing-position release / stop-loss / emergency exit,
+                # which live in the strategy and close_all paths.
+                _gate_ok, _gate_detail = self._check_entry_quote_freshness(
+                    near_slot=self.market_data.get(self.ticker, {}),
+                    far_slot=self.market_data.get(f"{self.ticker}_FAR", {})
+                    or self.market_data.get(
+                        getattr(self.far_contract, "code", ""), {}),
                     near_trade_age_ms=_tick_age_ms,
                     far_trade_age_ms=_far_tick_age_ms,
                     near_source=_price_source,
                     far_source=_far_price_source,
                 )
-                if not _quotes_ok:
+                if not _gate_ok:
                     self._manual_trade_status = "REJECTED: STALE_QUOTE"
+                    console.print(
+                        "[red]⛔ [MANUAL_TRADE] Rejected: stale/invalid BBO "
+                        f"({_gate_detail.get('reason')})[/red]")
                     self._append_mts_event(
-                        "ENTRY_BLOCKED_STALE_QUOTE", **_quote_detail)
+                        "ENTRY_BLOCKED_STALE_QUOTE",
+                        action="MANUAL_TRADE",
+                        threshold=_MAX_QUOTE_AGE_GATE_MS,
+                        **_gate_detail)
+                    # retryable — keep .processing for the next tick
                     self._flag_retry_count += 1
+                    console.print(
+                        f"[dim]🔄 [MANUAL_TRADE] Retry {self._flag_retry_count}/10 (STALE_QUOTE)[/dim]")
                     return True
 
                 _ts = datetime.now()
@@ -11790,6 +14676,15 @@ class FuturesMonitor:
 
         found_tid = None
         for tid, data in self._mts_pending_fills.items():
+            if data.get("combo_order_id") == order_id and data.get("combo"):
+                # Combo reconciliation supplies the two per-leg prices from
+                # ComboStatus.deals before this helper is called.  Never
+                # synthesize leg prices from the net combo price.
+                if data.get("near_fill_price") is not None and data.get("far_fill_price") is not None:
+                    data["near_filled"] = True
+                    data["far_filled"] = True
+                    found_tid = tid
+                break
             if data.get("near_order_id") == order_id:
                 data["near_filled"] = True
                 data["near_fill_price"] = fill_price
@@ -12032,9 +14927,19 @@ class FuturesMonitor:
                     _set[f"{_lk}_closed_qty"] = _q
                     _set[f"{_lk}_realized_pnl_gross"] = round(_g, 1)
                 _combined_gross = round(_set["near_realized_pnl_gross"] + _set["far_realized_pnl_gross"], 1)
+                _effective_mode = getattr(
+                    getattr(self, "_execution_context", None),
+                    "effective_mode", "")
+                _live_settlement = {
+                    "settlement_origin": "LIVE",
+                } if _effective_mode in {
+                    "live", "live_preflight", "live_reconciling",
+                    "live_quarantined", "live_ready",
+                    "reconciled_exit_only",
+                } else {}
                 _append_fill(
                     ticker=getattr(self, "ticker", "TMF"),
-                    contract="", leg="", side="", qty=0, price=0.0,
+                    contract="", leg="SETTLED", side="", qty=0, price=0.0,
                     fill_type="COMBINED_EXIT_SETTLED",
                     trade_id=trade_id,
                     event_type="COMBINED_EXIT_SETTLED",
@@ -12046,9 +14951,9 @@ class FuturesMonitor:
                     pnl_status="GROSS_ONLY",
                     fees=None,
                     tax=None,
-                    settlement_origin="LIVE",
                     price_confidence="EXACT",
                     settled_at=datetime.now().isoformat(),
+                    **_live_settlement,
                     **_set,
                 )
                 console.print(f"[green]📗 [COMBINED_EXIT_SETTLED] trade_id={trade_id} gross={_combined_gross:+.0f}[/green]")
@@ -12080,7 +14985,14 @@ class FuturesMonitor:
                 _exit_side = "SELL" if str(_side_before).upper() == "LONG" else "BUY"
                 _entry = float(tracker.get(f"{_leg_key}_entry") or 0.0)
                 _exit_px = tracker.get(f"{_leg_key}_price")
-                _px_source = "BROKER_FILL" if _exit_px is not None else "STATE_SNAPSHOT"
+                # 2026-08-27 (codex spec §3): paper fills must NEVER be
+                # marked BROKER_FILL — that is broker-truth provenance for
+                # live fills only.  Paper mode uses PAPER_FILL so the
+                # performance reconstruction can classify provenance.
+                _px_source = (
+                    "BROKER_FILL" if (self.live_trading and _exit_px is not None)
+                    else "PAPER_FILL" if _exit_px is not None
+                    else "STATE_SNAPSHOT")
                 if _exit_px is None:
                     _exit_px = float(price or 0.0)
                 _qty = int(tracker.get(f"{_leg_key}_filled_qty") or 0)
@@ -12622,7 +15534,6 @@ class FuturesMonitor:
         # the legacy manual-entry flag and may be reviewed before any strategy
         # decision runs.
         self._process_live_upl_refresh_command()
-        self._process_reconciled_exit_attestation_command()
         self._hydrate_exit_only_position()
 
         # 2026-05-27 Gemini CLI: MTS Safety Watchdog (P4)
@@ -13103,6 +16014,7 @@ class FuturesMonitor:
                 _mts_bar["far_close_rt"] = self._far_current_bar["close"]
                 _mts_bar["far_high_rt"] = self._far_current_bar.get("high", _mts_bar["far_close_rt"])
                 _mts_bar["far_low_rt"] = self._far_current_bar.get("low", _mts_bar["far_close_rt"])
+            self._mts_tag_bar_session(_mts_bar)
             self._mts_tick(enriched_bar=_mts_bar)
             return
 
