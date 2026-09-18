@@ -65,16 +65,18 @@ def test_position_query_error_writes_unavailable_not_flat(monkeypatch, tmp_path)
 
 def test_empty_positions_after_prior_holding_is_unavailable(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
+    api = _Api(positions=[], margin=SimpleNamespace(available_margin=300000))
     prior = {
         "source": "live_broker", "mode": "live",
         "positions": [{"code": "TMFJ6", "qty": 1, "direction": "buy", "avg_cost": 46451}],
         "open_orders": [], "available_margin": 300000,
-        "account_identity_hash": "a" * 64, "captured_at": 1,
+        "account_identity_hash": preflight._account_hash(api.futopt_account),
+        "scope": "futopt", "captured_at": 1,
         "canonical_input_hash": "b" * 64, "session_id": "old",
     }
     (tmp_path / "broker_snapshot_canonical.json").write_text(json.dumps(prior))
     response = preflight.run_once(
-        lambda: _Api(positions=[], margin=SimpleNamespace(available_margin=300000)),
+        lambda: api,
         request_id="empty-after-position",
     )
     artifact = json.loads((tmp_path / "broker_snapshot_canonical.json").read_text())
@@ -82,6 +84,29 @@ def test_empty_positions_after_prior_holding_is_unavailable(monkeypatch, tmp_pat
     assert artifact["source"] == "unavailable"
     assert artifact["capture_error"] is True
     assert "POSITIONS_EMPTY_AFTER_PRIOR_HOLDING" in artifact["error"]
+
+
+def test_empty_positions_different_account_scope_does_not_reuse_prior_holding(
+        monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    prior = {
+        "source": "live_broker", "mode": "live", "scope": "futopt",
+        "positions": [{"code": "TMFJ6", "qty": 1, "direction": "buy"}],
+        "open_orders": [], "available_margin": 300000,
+        "account_identity_hash": "different-account", "captured_at": 1,
+        "canonical_input_hash": "b" * 64, "session_id": "old",
+    }
+    (tmp_path / "broker_snapshot_canonical.json").write_text(json.dumps(prior))
+
+    response = preflight.run_once(
+        lambda: _Api(positions=[], margin=SimpleNamespace(available_margin=300000)),
+        request_id="empty-different-account",
+    )
+    artifact = json.loads((tmp_path / "broker_snapshot_canonical.json").read_text())
+
+    assert response["preflight"]["passed"] is True
+    assert artifact["source"] == "live_broker"
+    assert artifact["positions"] == []
 
 
 def test_margin_unavailable_cannot_create_flat_artifact(monkeypatch, tmp_path):
