@@ -115,7 +115,7 @@ class ShioajiClient:
                 "fetch_status": {"capture": "OK"}}
 
     def _authorize_broker_premise(self, contract, action, quantity,
-                                  premise, intent_action=None):
+                                  premise, intent_action=None, snapshot=None):
         """Lowest live send boundary: broker truth must satisfy the premise."""
         if not isinstance(premise, dict):
             raise AdapterOrderError(
@@ -126,13 +126,14 @@ class ShioajiClient:
         intent = ReleaseIntent(
             action=str(intent_action or "ORDER"), symbol=str(symbol),
             side=str(action), qty=int(quantity), premise=premise)
-        try:
-            snapshot = self._broker_truth_snapshot()
-        except Exception as exc:
-            raise AdapterOrderError(
-                code="BROKER_QUERY_UNAVAILABLE",
-                context={"method": "place_order", "symbol": symbol,
-                         "error": f"{type(exc).__name__}: {exc}"}) from exc
+        if snapshot is None:
+            try:
+                snapshot = self._broker_truth_snapshot()
+            except Exception as exc:
+                raise AdapterOrderError(
+                    code="BROKER_QUERY_UNAVAILABLE",
+                    context={"method": "place_order", "symbol": symbol,
+                             "error": f"{type(exc).__name__}: {exc}"}) from exc
         decision = evaluate_release_precondition(intent, snapshot)
         if not decision.allowed:
             logger.warning("[ORDER_INTENT_BLOCKED] reason=%s audit=%s",
@@ -447,6 +448,7 @@ class ShioajiClient:
                 context={"method": "place_combo_order_object"})
 
         combo_bases = []
+        contracts = []
         for leg in legs:
             if not isinstance(leg, dict):
                 raise AdapterOrderError(
@@ -466,6 +468,7 @@ class ShioajiClient:
                 raise AdapterOrderError(
                     code="ADAPTER_COMBO_CONTRACT_UNRESOLVED",
                     context={"method": "place_combo_order_object"})
+            contracts.append((contract, side, quantity))
             action = sj.Action.Buy if side == "buy" else sj.Action.Sell
             combo_base_cls = getattr(getattr(sj, "contracts", sj), "ComboBase")
             try:
@@ -481,6 +484,24 @@ class ShioajiClient:
                     action=action,
                 )
             combo_bases.append(combo_base)
+
+        strategy = str(getattr(order, "strategy", "") or "").upper()
+        premise = getattr(order, "premise", None)
+        if premise is None and strategy == "MTS_ENTRY":
+            premise = {"kind": "NOT_HOLD"}
+        try:
+            snapshot = self._broker_truth_snapshot()
+        except Exception as exc:
+            raise AdapterOrderError(
+                code="BROKER_QUERY_UNAVAILABLE",
+                context={"method": "place_combo_order_object",
+                         "error": f"{type(exc).__name__}: {exc}"}) from exc
+        # One broker snapshot authorizes every leg.  For an entry premise,
+        # either held leg blocks the atomic combo before SDK construction.
+        for contract, side, quantity in contracts:
+            self._authorize_broker_premise(
+                contract, side, quantity, premise,
+                intent_action=strategy or "COMBO_ORDER", snapshot=snapshot)
 
         combo_contract_cls = getattr(getattr(sj, "contracts", sj), "ComboContract")
         combo_contract = combo_contract_cls(legs=combo_bases)

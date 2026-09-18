@@ -27,6 +27,9 @@ _SAFE_ADAPTER_SUBMISSION_REASONS = frozenset({
     "ADAPTER_ORDER_NO_TRADE",
     "ADAPTER_ORDER_REJECTED",
     "ADAPTER_ORDER_PLACE_FAILED",
+    "ORDER_PREMISE_MISSING",
+    "BROKER_QUERY_UNAVAILABLE",
+    "BROKER_PREMISE_MISMATCH",
 })
 
 
@@ -703,7 +706,8 @@ class OrderManager:
         except Exception as exc:
             _code = getattr(exc, "code", None)
             _reason = (_code if isinstance(_code, str)
-                       and _code.startswith("ADAPTER_COMBO_")
+                       and (_code.startswith("ADAPTER_COMBO_")
+                            or _code in _SAFE_ADAPTER_SUBMISSION_REASONS)
                        else "ADAPTER_COMBO_ORDER_FAILED")
             self.reject(order.order_id, reason=_reason,
                         source="broker_combo_submit")
