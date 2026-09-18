@@ -5231,7 +5231,30 @@ class FuturesMonitor:
                                     snapshot_generation=_generation,
                                     observed_at=_observed_at))
                         else:
-                            errors["refresh:futures"] = _refresh.get("state")
+                            # Older Shioaji-compatible adapters expose the
+                            # read-only list_trades surface but no
+                            # update_status transaction.  Preserve that
+                            # valid schema path; real adapters with the
+                            # refresh primitive remain fail-closed above.
+                            if not hasattr(_api, "update_status"):
+                                try:
+                                    try:
+                                        _rows = _api.list_trades()
+                                    except TypeError:
+                                        _rows = _api.list_trades(_acct)
+                                    _rows = _rows or []
+                                    open_orders.extend(
+                                        self._normalize_snapshot_orders(_rows))
+                                    broker_trades.extend(
+                                        self._normalize_snapshot_trades(
+                                            _rows,
+                                            observation_type="REFRESHED_TRADE"))
+                                except Exception as _fallback_exc:
+                                    errors["refresh:futures"] = (
+                                        f"{type(_fallback_exc).__name__}: "
+                                        f"{_fallback_exc}")
+                            else:
+                                errors["refresh:futures"] = _refresh.get("state")
                         continue
                     try:
                         try:
