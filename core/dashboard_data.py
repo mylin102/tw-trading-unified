@@ -211,6 +211,7 @@ def build_stock_orders_from_trades(
             {
                 "order_id": f"{mode}-{action}-{ticker}-{order_suffix}-{index}",
                 "ticker": ticker,
+                "name": _stable_string_identifier(trade.get("name", "")),
                 "side": action,
                 "order_type": "LMT",
                 "qty": qty,

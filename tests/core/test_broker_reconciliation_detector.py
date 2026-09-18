@@ -1,3 +1,5 @@
+import json
+
 from core.broker_reconciliation_detector import detect_broker_reconciliation
 
 
@@ -98,3 +100,72 @@ def test_terminal_trade_without_deal_identity_is_evidence_unavailable():
     assert report.hold is True
     assert report.entry_blocked is True
     assert [e.code for e in report.events] == ["BROKER_EVIDENCE_UNAVAILABLE"]
+
+
+def test_l3_va0pg_freezes_captures_and_attributes_release_premise(tmp_path):
+    report = detect_broker_reconciliation(
+        broker_trades=[], ledger_rows=[], broker_legs=[],
+        canonical_legs=[{"code": "va0pG", "side": "LONG", "qty": 1, "avg_cost": 10}],
+        event_window=[{"event": "ORDER_INTENT", "action": "RELEASE", "code": "va0pG"}],
+        diagnostic_report_dir=tmp_path,
+    )
+
+    assert report.hold is True
+    assert report.send_orders_frozen is True
+    assert report.manual_release_required is True
+    assert report.order_submission_allowed is False
+    assert report.attribution["code"] == "PREMISE_VIOLATION_RELEASE"
+    assert report.events[0].diagnostic_report_path == report.diagnostic_report_path
+    assert report.events[0].evidence_hash == report.evidence["evidence_hash"]
+    saved = json.loads(open(report.diagnostic_report_path, encoding="utf-8").read())
+    assert saved["disposition"] == "FROZEN_PENDING_HUMAN_CONFIRMATION"
+    assert saved["facts"][0].startswith("[observed]")
+    assert saved["attribution"]["conclusion"].startswith("[inferred]")
+
+
+def test_l3_unknown_is_unclassified_with_full_evidence(tmp_path):
+    report = detect_broker_reconciliation(
+        broker_trades=[], ledger_rows=[{"tail": 1}],
+        broker_legs=[{"code": "A", "side": "LONG", "qty": 1, "avg_cost": 1}],
+        canonical_legs=[{"code": "B", "side": "LONG", "qty": 1, "avg_cost": 1}],
+        internal_flags={"flag": "x"}, event_window=[{"event": "ODD_UNKNOWN"}],
+        diagnostic_report_dir=tmp_path,
+    )
+
+    assert report.attribution["code"] == "UNCLASSIFIED"
+    assert report.evidence["sections"]["ledger_tail"] == [{"tail": 1}]
+    assert report.evidence["section_hashes"]["broker_legs"]
+    assert report.evidence["evidence_hash"]
+
+
+def test_l3_duplicate_divergence_does_not_write_duplicate_report(tmp_path):
+    kwargs = dict(
+        broker_trades=[], ledger_rows=[], broker_legs=[],
+        canonical_legs=[{"code": "va0pG", "side": "LONG", "qty": 1, "avg_cost": 10}],
+        event_window=[{"event": "ORDER_INTENT", "action": "RELEASE", "code": "va0pG"}],
+        diagnostic_report_dir=tmp_path,
+    )
+    first = detect_broker_reconciliation(**kwargs)
+    second = detect_broker_reconciliation(**kwargs)
+    assert first.diagnostic_deduplicated is False
+    assert second.diagnostic_deduplicated is True
+    assert len(list(tmp_path.glob("divergence-*.json"))) == 1
+
+
+def test_l3_mutation_guard_attribution_is_evidence_dependent(tmp_path):
+    premise = detect_broker_reconciliation(
+        broker_trades=[], ledger_rows=[], broker_legs=[],
+        canonical_legs=[{"code": "va0pG", "side": "LONG", "qty": 1, "avg_cost": 10}],
+        event_window=[{"event": "ORDER_INTENT", "action": "RELEASE", "code": "va0pG"}],
+        diagnostic_report_dir=tmp_path / "premise",
+    )
+    unknown = detect_broker_reconciliation(
+        broker_trades=[], ledger_rows=[],
+        broker_legs=[{"code": "A", "side": "LONG", "qty": 1, "avg_cost": 1}],
+        canonical_legs=[{"code": "B", "side": "LONG", "qty": 1, "avg_cost": 1}],
+        event_window=[{"event": "ODD_UNKNOWN"}],
+        diagnostic_report_dir=tmp_path / "unknown",
+    )
+    assert premise.attribution["code"] != unknown.attribution["code"]
+    assert premise.attribution["code"] == "PREMISE_VIOLATION_RELEASE"
+    assert unknown.attribution["code"] == "UNCLASSIFIED"

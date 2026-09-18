@@ -17,6 +17,7 @@ from core.runtime_paths import enforce_runtime_identity
 enforce_runtime_identity(__file__)
 
 import streamlit as st
+import plotly.graph_objects as go
 import shioaji as sj  # GSD: Display version in sidebar
 from core.broker.shioaji_compat import is_rust_version
 import pandas as pd
@@ -3004,10 +3005,14 @@ def format_stock_trades(ledger_df):
         if "OVERNIGHT_RECOVERY" in reason:
             continue
         if action == "BUY":
+            ledger_name = row.get("name", "")
+            if pd.isna(ledger_name):
+                ledger_name = ""
+            ledger_name = str(ledger_name).strip()
             pending_entries[ticker] = {
                 "entry_time": str(row.get("timestamp", "")),
                 "ticker": ticker,
-                "name": ticker_names.get(ticker, ""),
+                "name": ledger_name or ticker_names.get(ticker, ""),
                 "entry_price": float(row.get("entry_price", row.get("price", 0)) or 0),
                 "qty": int(row.get("qty", row.get("Quantity", 0)) or 0),
                 "reason": str(row.get("reason", "")),
@@ -4000,7 +4005,35 @@ def load_stock_trades(mode="PAPER"):
     )
     if f and f.exists():
         try:
-            return pd.read_csv(f)
+            trades = pd.read_csv(f)
+            if "name" not in trades.columns:
+                trades.insert(
+                    trades.columns.get_loc("ticker") + 1
+                    if "ticker" in trades.columns else len(trades.columns),
+                    "name",
+                    "",
+                )
+
+            # Legacy rows may have a name column but no value. Resolve from
+            # the indicator snapshots so SELL-only rows also display names.
+            indicator_names = dict(_STOCK_NAMES)
+            for indicator in FUTURES_MKT.glob("STOCK_*_indicators.csv"):
+                try:
+                    frame = pd.read_csv(indicator, nrows=1)
+                    if frame.empty or "name" not in frame.columns:
+                        continue
+                    ticker = indicator.stem.split("_")[1]
+                    value = frame.iloc[0].get("name", "")
+                    if pd.notna(value) and str(value).strip():
+                        indicator_names[ticker] = str(value).strip()
+                except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError):
+                    continue
+            if "ticker" in trades.columns:
+                blank = trades["name"].isna() | trades["name"].astype(str).str.strip().eq("")
+                trades.loc[blank, "name"] = trades.loc[blank, "ticker"].map(
+                    lambda ticker: indicator_names.get(str(ticker), "")
+                )
+            return trades
         except Exception:
             pass
     return None
@@ -7525,8 +7558,9 @@ elif page == "台股 Stocks":
                 return [''] * len(row)
             st.dataframe(round_trips.style.apply(style_stock_trades, axis=1), width='stretch', hide_index=True)
         else:
-            display_cols = [c for c in ["timestamp", "ticker", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
+            display_cols = [c for c in ["timestamp", "ticker", "name", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
             col_rename = {"timestamp": "時間", "ticker": "代號", "action": "動作", "entry_price": "進場價",
+                          "name": "名稱",
                           "price": "出場價", "qty": "股數", "reason": "原因", "strategy": "策略",
                           "pnl_gross": "毛利", "fees": "手續費+稅", "pnl_cash": "淨損益"}
             display = sl[display_cols].sort_values("timestamp", ascending=False).head(30)

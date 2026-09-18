@@ -1155,10 +1155,69 @@ class StockMonitor:
             self._log_trade(ticker, "SELL", price, qty, reason, pnl, pos["entry_price"], fees, net_pnl)
             self._save_position_state_to_disk()
 
+    def _stock_name(self, ticker):
+        """Return the broker contract name for ledger/dashboard consumers."""
+        try:
+            contract = self.api.Contracts.Stocks[str(ticker)]
+            for attr in ("name", "local_name"):
+                value = getattr(contract, attr, "")
+                if value and str(value).strip():
+                    return str(value).strip()
+        except Exception:
+            pass
+        # Historical ledgers may be migrated after the broker session is gone.
+        # Use the latest indicator snapshot as a read-only name source rather
+        # than leaving the newly-added column blank.
+        try:
+            pattern = f"STOCK_{str(ticker)}_*_indicators.csv"
+            candidates = list(MKT_LOGS.glob(pattern))
+            for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+                frame = pd.read_csv(path, nrows=1)
+                if "name" not in frame.columns or frame.empty:
+                    continue
+                value = frame.iloc[0].get("name", "")
+                if pd.notna(value) and str(value).strip():
+                    return str(value).strip()
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError):
+            pass
+        return ""
+
+    def _ensure_trade_ledger_schema(self):
+        """Add columns required by new rows before appending to legacy ledgers."""
+        if not self.ledger_path.exists():
+            return
+        try:
+            legacy = pd.read_csv(self.ledger_path)
+            columns = legacy.columns.tolist()
+            changed = False
+            if "name" not in columns:
+                insert_at = columns.index("ticker") + 1 if "ticker" in columns else len(columns)
+                legacy.insert(insert_at, "name", "")
+                changed = True
+
+            # Backfill blank names as well as adding the column. This repairs
+            # old rows without overwriting a broker-provided name.
+            if "ticker" in legacy.columns:
+                for idx, ticker in legacy.loc[
+                    legacy["name"].isna() | legacy["name"].astype(str).str.strip().eq(""),
+                    "ticker",
+                ].items():
+                    name = self._stock_name(ticker)
+                    if name:
+                        legacy.at[idx, "name"] = name
+                        changed = True
+            if changed:
+                legacy.to_csv(self.ledger_path, index=False)
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError):
+            # A malformed/empty legacy file must not prevent the next trade from
+            # being recorded; the append below will preserve the normal path.
+            return
+
     def _log_trade(self, ticker, action, price, qty, reason, pnl, entry_price=0.0, fees=0.0, net_pnl=0.0):
         row = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "ticker": ticker,
+            "name": self._stock_name(ticker),
             "strategy": self.strat_name,
             "mode": self.mode_tag,
             "action": action,
@@ -1170,6 +1229,7 @@ class StockMonitor:
             "fees": round(fees, 0),
             "pnl_cash": round(net_pnl if action == "SELL" else 0, 0),
         }
+        self._ensure_trade_ledger_schema()
         trade_df = pd.DataFrame([row])
         trade_df.to_csv(self.ledger_path, mode='a', header=not self.ledger_path.exists(), index=False)
         

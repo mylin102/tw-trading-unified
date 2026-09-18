@@ -9,6 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from core.reconciliation.divergence_diagnostics import (
+    attribute_divergence,
+    capture_evidence,
+    write_report,
+)
+
 
 @dataclass(frozen=True)
 class ReconciliationEvent:
@@ -16,6 +22,9 @@ class ReconciliationEvent:
     detail: str
     trade_id: str = ""
     order_id: str = ""
+    diagnostic_report_path: str = ""
+    attribution: str = ""
+    evidence_hash: str = ""
 
 
 @dataclass
@@ -24,6 +33,16 @@ class ReconciliationReport:
     repaired_fill_count: int = 0
     hold: bool = False
     entry_blocked: bool = False
+    send_orders_frozen: bool = False
+    manual_release_required: bool = False
+    attribution: dict = field(default_factory=dict)
+    evidence: dict = field(default_factory=dict)
+    diagnostic_report_path: str = ""
+    diagnostic_deduplicated: bool = False
+
+    @property
+    def order_submission_allowed(self) -> bool:
+        return not self.send_orders_frozen and not self.hold
 
 
 def _value(row, *keys):
@@ -66,7 +85,12 @@ def detect_broker_reconciliation(*, broker_trades, ledger_rows, broker_legs,
                                  canonical_legs, tick_size: float = 1.0,
                                  trade_id: str = "",
                                  repair_fill: Callable[[dict], None] | None = None,
-                                 emit: Callable[[ReconciliationEvent], None] | None = None) -> ReconciliationReport:
+                                 emit: Callable[[ReconciliationEvent], None] | None = None,
+                                 diagnostic_report_dir=None,
+                                 event_window=None,
+                                 internal_flags=None,
+                                 canonical_state=None,
+                                 ledger_tail=None) -> ReconciliationReport:
     """Compare both directions and repair only broker-proven missing fills."""
     report = ReconciliationReport()
     if broker_trades is None:
@@ -158,8 +182,52 @@ def detect_broker_reconciliation(*, broker_trades, ledger_rows, broker_legs,
     if mismatch:
         event = ReconciliationEvent("RECONCILIATION_HOLD",
             "broker positions disagree with canonical holding")
-        report.events.append(event)
         report.hold = True
+        if emit:
+            # Emit after diagnostics are attached so external alert sinks can
+            # link directly to the immutable evidence report.
+            pass
+        report.send_orders_frozen = True
+        report.manual_release_required = True
+        report.evidence = capture_evidence(
+            broker_legs=broker_legs,
+            local_legs=canonical_legs,
+            canonical_state=canonical_state or {"legs": list(canonical_legs or ())},
+            internal_flags=internal_flags,
+            ledger_tail=ledger_tail if ledger_tail is not None else ledger_rows,
+            event_window=event_window,
+            broker_trades=broker_trades,
+        )
+        report.attribution = attribute_divergence(report.evidence)
+        if diagnostic_report_dir is None:
+            # Production wiring supplies TRADING_RUNTIME_DIR.  Tests and local
+            # probes stay side-effect free unless an explicit directory is
+            # requested.
+            import os
+            import sys
+            if (os.environ.get("NODE_ENV") == "production"
+                    or os.environ.get("TRADING_RUNTIME_DIR")) and "pytest" not in sys.modules:
+                try:
+                    from core.runtime_paths import runtime_path
+                    diagnostic_report_dir = runtime_path(
+                        "exports", "trades", "live", "diagnostics")
+                except (ImportError, RuntimeError):
+                    diagnostic_report_dir = None
+        (report.diagnostic_report_path,
+         report.diagnostic_deduplicated) = write_report(
+            diagnostic_report_dir,
+            evidence=report.evidence,
+            attribution=report.attribution,
+            reason="RECONCILIATION_HOLD",
+            frozen=True,
+        )
+        event = ReconciliationEvent(
+            event.code, event.detail, event.trade_id, event.order_id,
+            diagnostic_report_path=report.diagnostic_report_path,
+            attribution=report.attribution.get("code", ""),
+            evidence_hash=report.evidence.get("evidence_hash", ""),
+        )
+        report.events.append(event)
         if emit:
             emit(event)
     if not broker_map and canonical_map and trade_id:
