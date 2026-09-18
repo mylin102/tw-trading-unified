@@ -181,6 +181,20 @@ class TestSampleOnce:
 
 
 class TestLifecycle:
+    def test_sampler_thread_does_not_block_process_shutdown(self) -> None:
+        sampler = HealthEvidenceSampler(
+            health_fn=lambda: _FakeHealth(),
+            output_dir=tempfile.mkdtemp(),
+            interval_sec=3600,
+        )
+
+        sampler.start()
+        try:
+            assert sampler._thread is not None
+            assert sampler._thread.daemon is True
+        finally:
+            sampler.stop()
+
     def test_start_and_stop(self) -> None:
         tmpdir = tempfile.mkdtemp()
         clock = _ManualClock()

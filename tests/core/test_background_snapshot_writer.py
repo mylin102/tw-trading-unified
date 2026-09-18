@@ -234,6 +234,20 @@ class TestFlushOnce:
 # ── Start / Stop lifecycle ──
 
 class TestLifecycle:
+    def test_writer_thread_does_not_block_process_shutdown(self) -> None:
+        w = BackgroundSnapshotWriter(
+            providers=[_FakeProvider()],
+            persisters=[_SpyPersister()],
+            interval_sec=3600,
+        )
+
+        w.start()
+        try:
+            assert w._thread is not None
+            assert w._thread.daemon is True
+        finally:
+            w.stop()
+
     def test_start_starts_thread(self) -> None:
         w = BackgroundSnapshotWriter(
             providers=[_FakeProvider()],
