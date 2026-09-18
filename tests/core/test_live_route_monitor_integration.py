@@ -725,7 +725,7 @@ def test_capture_normalize_with_account_tag(tmp_path):
                         order=SimpleNamespace(id="o1"))
     orders = FuturesMonitor._normalize_snapshot_orders([t])
     assert orders == [{"order_id": "o1", "code": "TMFH6",
-                       "status": "Pending"}]
+                       "status": "Pending", "broker_order_id": "o1"}]
 
 
 def test_run_gate_passes_release_dir_manifests(tmp_path, monkeypatch):
