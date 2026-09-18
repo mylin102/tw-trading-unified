@@ -336,7 +336,14 @@ class TestBuiltinPersisters:
         p.persist(_FakeSnapshot(ticker="MTX"))
         assert True
 
-    def test_json_persister_not_implemented(self) -> None:
-        p = JsonStatePersister()
-        with pytest.raises(NotImplementedError):
-            p.persist(_FakeSnapshot(ticker="MTX"))
+    def test_json_persister_writes_atomic_state(self, tmp_path) -> None:
+        p = JsonStatePersister(output_dir=str(tmp_path))
+        p.persist(_FakeSnapshot(ticker="MTX", generation=7))
+
+        output = tmp_path / "mts_position_state_mtx.json"
+        assert output.exists()
+        assert not (tmp_path / "mts_position_state_mtx.json.tmp").exists()
+        import json
+        state = json.loads(output.read_text())
+        assert state["ticker"] == "MTX"
+        assert state["generation"] == 7
