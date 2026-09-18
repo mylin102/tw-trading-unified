@@ -80,3 +80,50 @@ def test_combo_submission_requires_broker_presence_before_state_promotion():
     names = [n.func.attr for n in ast.walk(fn)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
     assert "_reconcile_pending_mts_combos" in names
+
+
+def test_broker_submitted_keeps_pending_without_promoting_legs(tmp_path,
+                                                               monkeypatch):
+    from strategies.futures import monitor as monitor_module
+
+    monitor, state = _monitor(tmp_path)
+    monkeypatch.setattr(monitor_module, "_mts_position_state_path",
+                        lambda: state)
+    monitor._capture_post_startup_snapshot = lambda: {
+        "fetch_status": {"capture": "OK"},
+        "positions": [],
+        "open_orders": [{"broker_order_id": "1818c426",
+                         "status": "Submitted"}],
+        "broker_trades": [],
+    }
+    monitor._append_mts_event = lambda *args, **kwargs: None
+
+    result = monitor._reconcile_pending_mts_combos()
+
+    assert result["status"] == "BROKER_CONFIRMED"
+    assert "LOCAL-47" in monitor.order_mgr.active_orders
+    assert "T-1818" in monitor._mts_pending_fills
+    assert json.loads(state.read_text())["has_position"] is True
+
+
+def test_broker_rejected_combo_clears_pending_and_legs(tmp_path, monkeypatch):
+    from strategies.futures import monitor as monitor_module
+
+    monitor, state = _monitor(tmp_path)
+    monkeypatch.setattr(monitor_module, "_mts_position_state_path",
+                        lambda: state)
+    monitor._capture_post_startup_snapshot = lambda: {
+        "fetch_status": {"capture": "OK"},
+        "positions": [], "open_orders": [],
+        "broker_trades": [{"broker_order_id": "1818c426",
+                            "status": "Failed"}],
+    }
+    monitor._append_mts_event = lambda *args, **kwargs: None
+
+    result = monitor._reconcile_pending_mts_combos()
+
+    assert result["status"] == "REJECTED"
+    assert monitor.order_mgr.active_orders == {}
+    assert monitor.order_mgr.completed[0].status.value == "rejected"
+    assert monitor._mts_pending_fills == {}
+    assert json.loads(state.read_text())["has_position"] is False

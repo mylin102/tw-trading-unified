@@ -1784,6 +1784,40 @@ class OrderManager:
         }
 
 
+    def mark_broker_not_found(
+        self, order_id: str, *, source: str = "broker_reconcile",
+        reason: str = "BROKER_ORDER_NOT_FOUND",
+    ) -> Optional[Order]:
+        """Terminalize a locally submitted order absent from broker truth.
+
+        A successful broker read showing neither the order nor a covered
+        position is explicit phantom evidence.  Keep the order in completed
+        for audit, never resubmit it, and emit the same status-change event as
+        other terminal transitions.
+        """
+        order = self.active_orders.get(order_id)
+        if order is None:
+            return None
+        previous = order.status
+        order.status = OrderStatus.BROKER_NOT_FOUND
+        order.updated_at = datetime.now()
+        self._record_audit(
+            order, "order_terminal", source=source, reason=reason,
+            from_status=previous, to_status=order.status,
+            raw_status="BROKER_NOT_FOUND",
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno, ordno=order.ordno)
+        del self.active_orders[order_id]
+        self.completed.append(order)
+        self._emit("on_status_change", OrderEvent(
+            order_id=order.order_id, status=order.status,
+            symbol=order.symbol, side=order.side,
+            intent_id=order.intent_id,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno, ordno=order.ordno, reason=reason,
+            raw_status="BROKER_NOT_FOUND"))
+        return order
+
     def reconcile_pending_terminal(
         self, snapshot: dict, *, source: str = "", reason: str = ""
     ) -> List[Dict[str, Any]]:

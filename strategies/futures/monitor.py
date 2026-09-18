@@ -10299,6 +10299,13 @@ class FuturesMonitor:
                 trade_id=trade_id, reason=getattr(
                     _order, "reject_reason", "COMBO_SUBMIT_FAILED"))
             return
+        # A gateway receipt is not broker truth.  Confirm the exact broker
+        # identity before publishing COMBO_ORDER_SUBMITTED/ENTRY_SUBMITTED;
+        # absent/terminal broker evidence converges the local order and clears
+        # the pending leg state instead of creating a phantom position.
+        _broker_result = self._reconcile_pending_mts_combos(trade_id=trade_id)
+        if _broker_result.get("status") != "BROKER_CONFIRMED":
+            return
         self._append_mts_event(
             "COMBO_ORDER_SUBMITTED", order_id=_order.order_id,
             trade_id=trade_id, strategy="MTS_ENTRY", combo_legs=_combo_legs,
@@ -12246,23 +12253,151 @@ class FuturesMonitor:
                 bar["session_type"] = _sess
         return bar
 
-    def _reconcile_pending_mts_combos(self) -> None:
-        """Reconcile broker combo deals before promoting MTS entry state."""
+    def _clear_unconfirmed_combo_state(self, trade_id: str, reason: str) -> None:
+        """Remove leg-bearing state when broker did not confirm the combo."""
+        try:
+            _path = _mts_position_state_path()
+            _state = json.loads(_path.read_text()) if _path.exists() else {}
+            if not isinstance(_state, dict):
+                _state = {}
+            _state.update({
+                "has_position": False,
+                "state": "FLAT",
+                "reason": reason,
+                "trade_id": trade_id,
+                "_updated": datetime.now().isoformat(),
+            })
+            for _key in ("near_side", "far_side", "near_entry", "far_entry",
+                         "near_last", "far_last", "released_leg",
+                         "remaining_side"):
+                _state.pop(_key, None)
+            _path.parent.mkdir(parents=True, exist_ok=True)
+            _path.write_text(json.dumps(_state, default=str))
+        except Exception as _exc:
+            self._append_mts_event(
+                "COMBO_STATE_CLEAR_FAILED", trade_id=trade_id,
+                reason=reason, error_type=type(_exc).__name__)
+
+    def _reconcile_pending_mts_combos(self, trade_id: str | None = None) -> dict:
+        """Reconcile broker combo deals before promoting MTS entry state.
+
+        The gateway receipt is only a local submission receipt.  A live combo
+        is promotable only when the authenticated broker snapshot contains the
+        exact broker identity (open or terminal).  A successful snapshot that
+        contains neither is explicit ``BROKER_NOT_FOUND`` evidence: finalize
+        the local order as unknown and clear every leg-bearing state field.
+        """
         if not self.live_trading or self.dry_run:
-            return
+            return {"status": "SKIPPED"}
         _manager = getattr(self, "order_mgr", None)
+        if _manager is None:
+            return {"status": "BROKER_QUERY_UNAVAILABLE"}
+        _pending = getattr(self, "_mts_pending_fills", {}) or {}
+        _selected = [
+            (_tid, _meta) for _tid, _meta in list(_pending.items())
+            if isinstance(_meta, dict) and _meta.get("combo")
+            and (trade_id is None or _tid == trade_id)
+        ]
+        if not _selected:
+            return {"status": "NO_PENDING_COMBO"}
+
+        _snapshot = self._capture_post_startup_snapshot()
+        if ((_snapshot.get("fetch_status") or {}).get("capture") != "OK"):
+            for _tid, _meta in _selected:
+                self._append_mts_event(
+                    "COMBO_ORDER_BROKER_QUERY_UNAVAILABLE",
+                    trade_id=_tid, order_id=_meta.get("combo_order_id"),
+                    reason="BROKER_QUERY_UNAVAILABLE")
+            return {"status": "BROKER_QUERY_UNAVAILABLE"}
+
+        def _row_value(row, *keys):
+            if not isinstance(row, dict):
+                return None
+            for _key in keys:
+                if row.get(_key) not in (None, ""):
+                    return row.get(_key)
+            return None
+
+        _rows = list(_snapshot.get("open_orders") or [])
+        _rows.extend(_snapshot.get("broker_trades") or [])
+        _result = {"status": "BROKER_NOT_FOUND"}
+        for _tid, _meta in _selected:
+            _order = self._get_lifecycle_order(_meta.get("combo_order_id"))
+            if _order is None:
+                continue
+            _target_ids = {str(_value) for _value in (
+                getattr(_order, "broker_order_id", None),
+                getattr(_order, "exchange_order_id", None),
+                getattr(_order, "ordno", None), getattr(_order, "seqno", None),
+            ) if _value not in (None, "")}
+            _match = None
+            for _row in _rows:
+                _ids = {str(_row_value(_row, _key)) for _key in (
+                    "order_id", "broker_order_id", "exchange_order_id",
+                    "ordno", "seqno", "id") if _row_value(_row, _key)}
+                if _target_ids.intersection(_ids):
+                    _match = _row
+                    break
+            if _match is None:
+                _mark = getattr(_manager, "mark_broker_not_found", None)
+                if callable(_mark):
+                    _mark(_order.order_id,
+                          source="mts_combo_broker_reconcile",
+                          reason="BROKER_ORDER_NOT_FOUND")
+                else:
+                    from core.order_management.order import OrderStatus
+                    _order.status = OrderStatus.BROKER_NOT_FOUND
+                    _manager.active_orders.pop(_order.order_id, None)
+                    _manager.completed.append(_order)
+                self._pending_lifecycle_orders.pop(_order.order_id, None)
+                self._mts_pending_fills.pop(_tid, None)
+                self._clear_unconfirmed_combo_state(
+                    _tid, "BROKER_ORDER_NOT_FOUND")
+                self._append_mts_event(
+                    "COMBO_ORDER_RECONCILED", trade_id=_tid,
+                    order_id=_order.order_id,
+                    broker_order_id=getattr(_order, "broker_order_id", None),
+                    status="BROKER_NOT_FOUND",
+                    reason="BROKER_ORDER_NOT_FOUND")
+                continue
+            _status = str(_row_value(_match, "status", "source_status") or "").upper()
+            if _status in {"FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"}:
+                _reject = getattr(_manager, "reject", None)
+                if callable(_reject) and _order.order_id in getattr(_manager, "active_orders", {}):
+                    _reject(_order.order_id, reason=f"BROKER_{_status}",
+                            source="mts_combo_broker_reconcile")
+                else:
+                    from core.order_management.order import OrderStatus
+                    _order.status = OrderStatus.REJECTED
+                    _manager.active_orders.pop(_order.order_id, None)
+                    _manager.completed.append(_order)
+                self._pending_lifecycle_orders.pop(_order.order_id, None)
+                self._mts_pending_fills.pop(_tid, None)
+                self._clear_unconfirmed_combo_state(_tid, f"BROKER_{_status}")
+                self._append_mts_event(
+                    "COMBO_ORDER_RECONCILED", trade_id=_tid,
+                    order_id=_order.order_id, status="REJECTED",
+                    reason=f"BROKER_{_status}")
+                _result = {"status": "REJECTED"}
+                continue
+            self._append_mts_event(
+                "COMBO_ORDER_BROKER_CONFIRMED", trade_id=_tid,
+                order_id=_order.order_id,
+                broker_order_id=getattr(_order, "broker_order_id", None),
+                status=_status or "SUBMITTED")
+            _result = {"status": "BROKER_CONFIRMED"}
+
         _adapter = getattr(_manager, "broker_adapter", None)
         _list = getattr(_adapter, "list_combo_trades", None)
-        if _manager is None or not callable(_list):
-            return
-        _pending = getattr(self, "_mts_pending_fills", {}) or {}
+        if not callable(_list):
+            return _result
         if not any(isinstance(v, dict) and v.get("combo")
                    for v in _pending.values()):
-            return
+            return _result
         try:
             _trades = _list()
         except Exception:
-            return
+            return _result
 
         def _value(obj, *keys):
             for key in keys:
@@ -12345,6 +12480,7 @@ class FuturesMonitor:
                 except Exception:
                     logger.exception("[MTS_COMBO_RECONCILE_FAILED]")
                 break
+        return _result
 
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
