@@ -531,13 +531,20 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
                 if (not failed_checks and snapshot.get("positions") == []
                         and _prior_path.exists()):
                     _prior = json.loads(_prior_path.read_text(encoding="utf-8"))
+                    _same_scope = (
+                        _prior.get("scope") == "futopt"
+                        and bool(_prior.get("account_identity_hash"))
+                        and _prior.get("account_identity_hash")
+                        == snapshot.get("account_id_hash")
+                    )
                     _prior_positions = _prior.get("positions") or []
                     _prior_holding = any(
                         isinstance(row, dict)
                         and int(row.get("qty", row.get("quantity", 0)) or 0) > 0
                         for row in _prior_positions
                     )
-                    if _prior.get("source") == "live_broker" and _prior_holding:
+                    if (_same_scope and _prior.get("source") == "live_broker"
+                            and _prior_holding):
                         failed_checks.append("POSITIONS_EMPTY_AFTER_PRIOR_HOLDING")
             except (OSError, ValueError, TypeError):
                 pass
