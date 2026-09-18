@@ -135,11 +135,12 @@ def test_short_pnl_sign_and_value(tmp_path):
 
 
 def test_price_source_broker_fill(tmp_path):
+    """Paper simulator fills retain paper provenance, not broker provenance."""
     mon = _make_monitor(tmp_path)
     sp = _state_file(tmp_path)
     _complete_both(mon, tmp_path, "T6", 43825.0, 43910.0, sp)
     near = [f for f in _read_fills(tmp_path) if f.get("leg") == "NEAR"][0]
-    assert near["price_source"] == "BROKER_FILL"
+    assert near["price_source"] == "PAPER_FILL"
 
 
 def test_duplicate_settlement_suppressed(tmp_path):

@@ -200,43 +200,25 @@ def _mts_position_state_path() -> Path:
     # 2026-07-21 Gemini CLI: Support thread-local path override for multi-instance concurrent processes
     if getattr(_thread_local, "state_path", None) is not None:
         return Path(_thread_local.state_path)
-    # 2026-07-08 Gemini CLI: test injection is isolated; production always
-    # resolves through core.runtime_paths.
-    import sys
-    import os
-    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
-        _env = os.getenv("MTS_STATE_PATH")
-        if _env:
-            return Path(_env)
-        # If the constant was monkeypatched in the test, honor the patch!
-        if MTS_POSITION_STATE_PATH != Path(mts_position_state_path()):
-            return MTS_POSITION_STATE_PATH
-        # Allow contract test to verify default constant fallback
-        if "uses_constant" in os.getenv("PYTEST_CURRENT_TEST", ""):
-            return MTS_POSITION_STATE_PATH
-        import tempfile
-        return Path(tempfile.gettempdir()) / "test_mts_position_state.json"
+    # Test isolation is explicit dependency injection (MTS_STATE_PATH or a
+    # monkeypatched module seam); production never inspects pytest/runtime
+    # test names to choose a state path.
+    _env = os.getenv("MTS_STATE_PATH")
+    if _env:
+        return Path(_env)
+    if MTS_POSITION_STATE_PATH != Path(mts_position_state_path()):
+        return MTS_POSITION_STATE_PATH
     return Path(mts_position_state_path())
 
 
 def _mts_intent_log_dir() -> str:
     """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
 
-    Same isolation convention as _mts_position_state_path: under pytest
-    without TRADING_RUNTIME_DIR, use a PER-TEST temp dir (never the repo)."""
-    import sys as _sys
-    if "pytest" in _sys.modules:
-        _rt = os.environ.get("TRADING_RUNTIME_DIR")
-        if _rt:
-            return os.path.join(_rt, "logs")
-        import tempfile as _tf
-        import hashlib as _hl
-        _pt = os.environ.get("PYTEST_CURRENT_TEST", "") or ""
-        _pt_id = _hl.md5(_pt.encode()).hexdigest()[:10] if _pt else "default"
-        # per-test AND per-run (pid): a previous run's SUBMITTED intent must
-        # never bleed into this run's assertions
-        return os.path.join(_tf.gettempdir(),
-                            f"test_mts_exit_intent_{_pt_id}_{os.getpid()}")
+    Test isolation is explicit dependency injection through
+    TRADING_RUNTIME_DIR; production never inspects pytest state."""
+    _rt = os.environ.get("TRADING_RUNTIME_DIR")
+    if _rt:
+        return os.path.join(_rt, "logs")
     from core.runtime_paths import runtime_root
     return os.path.join(runtime_root(), "logs")
 
@@ -3378,12 +3360,12 @@ class FuturesMonitor:
             return {"source": "unavailable", "capture_error": True}
         try:
             try:
-                _pos_rows = _api.list_positions(account=_acct)
+                _pos_rows = _api.list_positions(_acct)
             except TypeError:
                 # same SDK signature quirk the preflight guards against
                 _pos_rows = _api.list_positions()
             try:
-                _trades_rows = _api.list_trades(account=_acct)
+                _trades_rows = _api.list_trades(_acct)
             except TypeError:
                 _trades_rows = _api.list_trades()
             for _p in (_pos_rows or []):
@@ -6670,24 +6652,27 @@ class FuturesMonitor:
             safety_pts = stop_loss_pts * 2 if stop_loss_pts > 0 else 200
             if direction == "LONG":
                 safety_price = entry_price - safety_pts
-                action = sj.constant.Action.Sell
+                action = "SELL"
+                held_side = "LONG"
             else:
                 safety_price = entry_price + safety_pts
-                action = sj.constant.Action.Buy
+                action = "BUY"
+                held_side = "SHORT"
 
-            order = self.api.Order(
+            # P0-2: safety-stop orders use the same client chokepoint as every
+            # other live order.  The premise is broker-verified immediately
+            # before send; bypassing the client chokepoint is forbidden.
+            trade = self.client.place_order(
+                self.contract, action=action, quantity=lots,
                 price=safety_price,
-                quantity=lots,
-                action=action,
-                price_type=sj.constant.FuturesPriceType.LMT,
-                order_type=sj.constant.OrderType.ROD,
+                premise={"kind": "HOLD_LEG", "leg": "near",
+                         "side": held_side, "qty": lots},
+                intent_action="SAFETY_STOP",
                 octype=sj.constant.FuturesOCType.Cover,
-                account=self.api.futopt_account,
             )
-            trade = self.api.place_order(self.contract, order)
-            if trade and trade.status.status != sj.constant.Status.Failed:
+            if trade is not None:
                 self._safety_stop_trade = trade
-                console.print(f"[bold yellow]🛡️ Safety stop placed: {action.value} @ {safety_price:.0f} ({safety_pts:.0f}pts from entry)[/bold yellow]")
+                console.print(f"[bold yellow]🛡️ Safety stop placed: {action} @ {safety_price:.0f} ({safety_pts:.0f}pts from entry)[/bold yellow]")
             else:
                 console.print("[red]Safety stop failed to place[/red]")
         except Exception as e:
@@ -7122,13 +7107,9 @@ class FuturesMonitor:
                     f"{_sf_exc}[/dim yellow]"
                 )
 
-            # 2026-07-08 Gemini CLI: Use session-date-aware orders_file path with test isolation to prevent test leakage
-            import sys
+            # Use the shared runtime export root; tests inject it through
+            # TRADING_RUNTIME_DIR / runtime_paths.
             orders_dir = runtime_path("exports", "trades")
-            if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
-                current_cwd = Path.cwd().resolve()
-                if (current_cwd / "RULES.md").exists() and (current_cwd / "exports").exists():
-                    orders_dir = "tests/temp_exports_trades"
             orders_file = Path(orders_dir) / f"{self.ticker}_{_date}_orders.json"
             orders_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -13731,7 +13712,8 @@ class FuturesMonitor:
         timestamp; COMPLETED carries position_before/position_after/order_ids.
         """
         try:
-            _path = "/tmp/futures_manual_trade_status.json"
+            _path = runtime_path("data", "state", "futures_manual_trade_status.json")
+            Path(_path).parent.mkdir(parents=True, exist_ok=True)
             _data = {
                 "command_id": command_id,
                 "status": status,

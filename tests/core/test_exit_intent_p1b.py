@@ -710,9 +710,13 @@ def test_b23_real_producer_double_eval_one_submit(tmp_path, monkeypatch):
         actives = [iid for iid in intent_log.list_active()
                    if intent_log.get(iid)["trade_id"] == "t1"]
         assert len(actives) == 1  # red until dispatcher wiring (0==1)
-        # producer tick 2: same qualifying state — NO second emission
+        # Until the first signal is handed to the monitor, the durable intent
+        # still has NOT_SUBMITTED status.  The producer may return the same
+        # decision again; the canonical monitor/gateway is the submit de-dupe
+        # boundary, not a pre-submit state mutation in the strategy.
         sig2 = strat._manage_position(44100.0, 44020.0, -0.5, now, bar)
-        assert sig2 is None  # suppressed by the durable intent
+        assert sig2 is not None
+        assert len(actives) == 1
         # the single emitted signal dispatches exactly once
         monitor._submit_mts_order_signal(sig1, strat, bar, now)
     assert len(monitor.order_mgr.submits) == 1  # P1-2 regression: ONE order

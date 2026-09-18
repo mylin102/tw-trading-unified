@@ -22,6 +22,20 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_route_process_state():
+    """Prevent session/certificate globals from leaking across this module.
+
+    The tests pass in isolation but the full suite reuses the process-level
+    session registry.  Each case owns a fresh fake broker session; stale
+    generations from an earlier case are not valid evidence for the next one.
+    """
+    import core.live_route_certificate as lrc
+    lrc.session_registry.invalidate_all()
+    yield
+    lrc.session_registry.invalidate_all()
+
+
 def _monitor_path():
     return Path(__file__).resolve().parents[2] / "strategies" / "futures" / "monitor.py"
 
