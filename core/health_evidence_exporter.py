@@ -136,7 +136,10 @@ class HealthEvidenceSampler:
         self._thread = threading.Thread(
             target=_loop,
             name=f"health-sampler-{self._product}",
-            daemon=False,
+            # Explicit stop() remains the orderly shutdown path.  Daemon mode
+            # prevents a failed test or abrupt interpreter shutdown from being
+            # held open indefinitely by this best-effort evidence worker.
+            daemon=True,
         )
         self._thread.start()
 
