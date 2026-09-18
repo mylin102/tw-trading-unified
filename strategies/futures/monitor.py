@@ -141,6 +141,22 @@ def _extract_bbo(quote_obj):
     return (None, None, "DATA_QUALITY_BLOCKED")
 
 
+def _bbo_tick_fields(tick, observed_at: float) -> dict:
+    """Return tick-carried BBO telemetry without granting BidAsk freshness."""
+    bid = getattr(tick, "buy_price", None)
+    ask = getattr(tick, "sell_price", None)
+    if bid is None or ask is None:
+        return {}
+    try:
+        bid_f = float(bid)
+        ask_f = float(ask)
+    except (TypeError, ValueError):
+        return {}
+    if bid_f <= 0 or ask_f <= 0 or ask_f < bid_f:
+        return {}
+    return {"bid": bid_f, "ask": ask_f, "tick_bbo_at": observed_at}
+
+
 def _repo_root() -> str:
     """Repo root from __file__ (strategies/futures/monitor.py -> parents[2]).
     Never cwd-dependent."""
@@ -2461,9 +2477,8 @@ class FuturesMonitor:
                 "close": _p,
                 "datetime": getattr(tick, 'datetime', None),
                 "local_arrival_at": self.last_tick_at,
-                "bid": float(getattr(tick, 'buy_price', _p) or _p),
-                "ask": float(getattr(tick, 'sell_price', _p) or _p),
             }
+            _tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
             if _t_code:
                 self.market_data[_t_code] = _tick_info
             
@@ -2594,38 +2609,31 @@ class FuturesMonitor:
         # 2026-07-31 Antigravity P0 Guard Phase 2: Gate NEAR slot updates strictly on is_primary tick.
         # Prevent far-month/secondary ticks from contaminating NEAR bid/ask/close cache at Line 1693.
         if is_primary:
-            self.market_data[self.ticker] = {
+            _near_tick_info = {
                 "close": price, 
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                # 2026-06-26 Gemini CLI: cache bid/ask prices
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
             }
-            self.market_data[f"{self.ticker}_NEAR"] = {
-                "close": price,
-                "datetime": tick.datetime,
-                "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
-            }
+            _near_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+            self.market_data[self.ticker] = _near_tick_info
+            self.market_data[f"{self.ticker}_NEAR"] = _near_tick_info
         elif is_far_tick:
-            self.market_data[f"{self.ticker}_FAR"] = {
+            _far_tick_info = {
                 "close": float(getattr(tick, 'close', price) or price),
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
             }
+            _far_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+            self.market_data[f"{self.ticker}_FAR"] = _far_tick_info
 
         if getattr(tick, 'code', None):
-            self.market_data[tick.code] = {
+            _code_tick_info = {
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
             }
+            _code_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+            self.market_data[tick.code] = _code_tick_info
 
         # Only count volume for primary ticker to keep indicators accurate
         vol = int(getattr(tick, "volume", 0)) if is_primary else 0        
@@ -2765,22 +2773,15 @@ class FuturesMonitor:
         ts_int = int(tick_ts.timestamp() / 300) * 300
 
         # 2026-06-24 Gemini CLI: Maintain far/code-specific market data caches for spread execution price integrity.
-        self.market_data[f"{self.ticker}_FAR"] = {
+        _far_tick_info = {
             "close": price,
             "datetime": tick.datetime,
             "local_arrival_at": time.time(),
-            # 2026-06-26 Gemini CLI: cache bid/ask prices
-            "bid": float(getattr(tick, 'buy_price', price) or price),
-            "ask": float(getattr(tick, 'sell_price', price) or price)
         }
+        _far_tick_info.update(_bbo_tick_fields(tick, self.last_tick_at))
+        self.market_data[f"{self.ticker}_FAR"] = _far_tick_info
         if getattr(tick, 'code', None):
-            self.market_data[tick.code] = {
-                "close": price,
-                "datetime": tick.datetime,
-                "local_arrival_at": time.time(),
-                "bid": float(getattr(tick, 'buy_price', price) or price),
-                "ask": float(getattr(tick, 'sell_price', price) or price)
-            }
+            self.market_data[tick.code] = _far_tick_info
 
         # [Debug] Periodic far tick log (every 30s)
         now_s = time.time()
@@ -10841,6 +10842,57 @@ class FuturesMonitor:
         # Tier 5: All tiers exhausted
         return (None, "NO_PRICE_SOURCE")
 
+    def _check_entry_quote_freshness(
+        self, *, near_slot: dict, far_slot: dict,
+        near_trade_age_ms: float, far_trade_age_ms: float,
+        near_source: str, far_source: str,
+        threshold_ms: int = 12000,
+    ) -> tuple[bool, dict]:
+        """Fail closed unless both entry legs have a fresh, valid BBO."""
+        import math
+
+        now = time.time()
+        detail = {
+            "threshold": threshold_ms,
+            "near_trade_age_ms": near_trade_age_ms,
+            "far_trade_age_ms": far_trade_age_ms,
+            "near_source": near_source,
+            "far_source": far_source,
+        }
+
+        def _validate(prefix: str, slot: dict) -> bool:
+            bid = slot.get("bid")
+            ask = slot.get("ask")
+            observed_at = slot.get("bidask_at")
+            detail[f"{prefix}_bid"] = bid
+            detail[f"{prefix}_ask"] = ask
+            if observed_at is None:
+                detail[f"{prefix}_bbo_age_ms"] = None
+                detail[f"{prefix}_bbo_reason"] = "BBO_NO_TIMESTAMP"
+                return False
+            try:
+                bid_f = float(bid)
+                ask_f = float(ask)
+                age_ms = max(0.0, (now - float(observed_at)) * 1000.0)
+            except (TypeError, ValueError, OverflowError):
+                detail[f"{prefix}_bbo_age_ms"] = None
+                detail[f"{prefix}_bbo_reason"] = "BBO_INVALID"
+                return False
+            detail[f"{prefix}_bbo_age_ms"] = age_ms
+            if (not math.isfinite(bid_f) or not math.isfinite(ask_f)
+                    or bid_f <= 0 or ask_f <= 0 or ask_f < bid_f):
+                detail[f"{prefix}_bbo_reason"] = "BBO_INVALID"
+                return False
+            if age_ms > threshold_ms:
+                detail[f"{prefix}_bbo_reason"] = "BBO_STALE"
+                return False
+            detail[f"{prefix}_bbo_reason"] = "BBO_VALID"
+            return True
+
+        near_ok = _validate("near", near_slot or {})
+        far_ok = _validate("far", far_slot or {})
+        return near_ok and far_ok, detail
+
     def _process_manual_trade_flag(self) -> bool:
         """Consume /tmp/futures_manual_trade.flag if present.
         
@@ -11476,6 +11528,26 @@ class FuturesMonitor:
                 else:
                     # Guard for test check: self.dry_run or not self.live_trading or paper
                     _far_price_source = "FLAG_FALLBACK"
+
+                _near_slot = self.market_data.get(self.ticker, {})
+                if not _near_slot.get("close") and self.contract is not None:
+                    _near_slot = self.market_data.get(self.contract.code, {})
+                _far_slot = self.market_data.get(f"{self.ticker}_FAR", {})
+                if not _far_slot.get("close") and self.far_contract is not None:
+                    _far_slot = self.market_data.get(self.far_contract.code, {})
+                _quotes_ok, _quote_detail = self._check_entry_quote_freshness(
+                    near_slot=_near_slot, far_slot=_far_slot,
+                    near_trade_age_ms=_tick_age_ms,
+                    far_trade_age_ms=_far_tick_age_ms,
+                    near_source=_price_source,
+                    far_source=_far_price_source,
+                )
+                if not _quotes_ok:
+                    self._manual_trade_status = "REJECTED: STALE_QUOTE"
+                    self._append_mts_event(
+                        "ENTRY_BLOCKED_STALE_QUOTE", **_quote_detail)
+                    self._flag_retry_count += 1
+                    return True
 
                 _ts = datetime.now()
                 _trade_id = f"mts-{_ts.strftime('%Y%m%d-%H%M%S')}"
