@@ -17,8 +17,8 @@ def _position():
 
 
 def _coordinator(**kwargs):
-    from core.exit_only_position import ExitAuthorizationCoordinator
-    return ExitAuthorizationCoordinator(**kwargs)
+    from core.exit_only_position import ReconciledPositionHydration
+    return ReconciledPositionHydration(**kwargs)
 
 
 def test_m1_evaluate_before_hydrate_has_no_intent_or_submit_and_reverse_can_send():
@@ -33,7 +33,7 @@ def test_m1_evaluate_before_hydrate_has_no_intent_or_submit_and_reverse_can_send
     c.reconcile(_position())
     allowed = c.evaluate_exit("i-1", "key-1")
     assert allowed.status == "AUTHORIZED"
-    assert c.submit("i-1", "key-1", lambda: calls.append(1)) is True
+    assert c.submit("i-1", "key-1", lambda: (calls.append(1) or True)) is True
     assert calls == [1]
 
 
@@ -43,7 +43,7 @@ def test_m2_ordering_rejection_retries_once_same_identity_then_terminal():
     c.reconcile(_position())
     assert c.evaluate_exit("i-2", "key-2").status == "AUTHORIZED"
     c.record_rejection("i-2", reason="HYDRATION_AUTHORIZATION_ORDERING", receipt=None)
-    assert c.retry_once("i-2", "key-2", lambda: calls.append(1),
+    assert c.retry_once("i-2", "key-2", lambda: (calls.append(1) or True),
                         active_orders=[], position=_position()) is True
     assert calls == [1]
     c.record_rejection("i-2", reason="HYDRATION_AUTHORIZATION_ORDERING", receipt=None)
@@ -77,8 +77,8 @@ def test_m5_duplicate_idempotency_is_local_reject():
     c = _coordinator()
     c.reconcile(_position())
     c.evaluate_exit("i-5", "same-key")
-    assert c.submit("i-5", "same-key", lambda: calls.append(1)) is True
-    assert c.submit("i-5b", "same-key", lambda: calls.append(1)) is False
+    assert c.submit("i-5", "same-key", lambda: (calls.append(1) or True)) is True
+    assert c.submit("i-5b", "same-key", lambda: (calls.append(1) or True)) is False
     assert calls == [1]
 
 

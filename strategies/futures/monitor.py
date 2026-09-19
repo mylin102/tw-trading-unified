@@ -3507,6 +3507,7 @@ class FuturesMonitor:
         """[S0] canonical gateway policy authority bundle."""
         _ctx = getattr(self, "_execution_context", None)
         _gw_mode = getattr(_ctx, "effective_mode", "")
+        _reconciled = getattr(self, "_exit_only_reconciled_authorization", None)
         return {
             "live": bool(
                 (getattr(self, "live_trading", False)
@@ -3514,6 +3515,13 @@ class FuturesMonitor:
                 or _gw_mode == "reconciled_exit_only"),
             "mode": _gw_mode,
             "live_order_allowed": getattr(_ctx, "live_order_allowed", False),
+            "reconciled_position_hydrated": bool(
+                isinstance(_reconciled, dict)
+                and _reconciled.get("position") is not None),
+            "exit_authorized": bool(
+                isinstance(_reconciled, dict)
+                and _reconciled.get("live_order_allowed") is True
+                and _reconciled.get("authority") is not None),
             "capability": getattr(_ctx, "exit_only_capability", None),
             "hydrated_position": getattr(self, "_exit_only_position", None),
             "strategy_reconciliation_id": getattr(
@@ -4226,15 +4234,13 @@ class FuturesMonitor:
             return False, None, "EXIT_ONLY_LEG_MISMATCH"
         return True, _position, None
 
-    def _exit_only_pre_evaluation_hydration(self, strategy) -> bool:
-        """[S1] EXIT_ONLY: build the strategy position from the validated
-        capability/attested broker snapshot BEFORE every strategy
-        evaluation (never inside submit).  Consumes the shared
-        _validate_exit_only_position result (no duplicate rules); returns
-        False (evaluator skipped) with one typed blocked event on any
-        failure — zero strategy order submission.  Idempotent per snapshot
-        hash; refreshes when the hash changes.  Normal LIVE/PAPER flow
-        returns True untouched (never overwrites strategy state)."""
+    def _reconcile_exit_only_authorization(self, strategy=None) -> bool:
+        """Collapse 2 chokepoint: hydrate and authorize in one transition.
+
+        The position and its exit authority are published together.  Callers
+        must use this method before evaluating an exit; submit code may only
+        consume the already-published authority and may not hydrate lazily.
+        """
         _ctx = getattr(self, "_execution_context", None)
         if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
             return True
@@ -4250,8 +4256,41 @@ class FuturesMonitor:
                 return False
             self._exit_only_strategy_hydrated_hash = \
                 _position["snapshot_hash"]
-        self._exit_only_auth_override = \
-            self._build_exit_only_authority(_position)
+        # Publish the reconciled position and live-order decision together;
+        # no evaluator can observe a hydrated position with stale authority.
+        _authority = self._build_exit_only_authority(_position)
+        self._exit_only_reconciled_authorization = {
+            "position": _position,
+            "mode": getattr(_ctx, "effective_mode", None),
+            "live_order_allowed": _authority is not None,
+            "authority": _authority,
+        }
+        self._exit_only_auth_override = _authority
+        return True
+
+    def _exit_only_pre_evaluation_hydration(self, strategy) -> bool:
+        """[S1/C2] Hydrate and authorize strictly before exit evaluation."""
+        return self._reconcile_exit_only_authorization(strategy)
+
+    def _exit_only_authorization_ready(self, strategy=None) -> bool:
+        """Consume-only check for guards after evaluation.
+
+        This deliberately never calls hydration or attestation code.  The
+        pre-evaluation chokepoint must already have published the atomic
+        reconciled authorization transition.
+        """
+        _ctx = getattr(self, "_execution_context", None)
+        if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
+            return True
+        _state = getattr(self, "_exit_only_reconciled_authorization", None)
+        _authority = (_state or {}).get("authority") if isinstance(_state, dict) else None
+        if _authority is None:
+            return False
+        if strategy is not None:
+            _pos = (_state or {}).get("position", {})
+            if getattr(strategy, "_snapshot_hash", None) not in (None, _pos.get("snapshot_hash")):
+                return False
+        self._exit_only_auth_override = _authority
         return True
 
 
@@ -4265,9 +4304,8 @@ class FuturesMonitor:
         self._exit_only_decision_binding = None
         if getattr(_ctx, "effective_mode", None) != "reconciled_exit_only":
             return True, None, None
-        self._hydrate_exit_only_position()
-        if strategy is not None:
-            self._hydrate_strategy_position(strategy)
+        if not self._exit_only_authorization_ready(strategy):
+            return False, None, "EXIT_ONLY_HYDRATION_BLOCKED"
         _intent_strategy = ("MTS_ENTRY"
                            if action in ("BUY_NEAR_SELL_FAR",
                                           "SELL_NEAR_BUY_FAR")
@@ -9408,7 +9446,13 @@ class FuturesMonitor:
         # [S0 gateway] single MTS order-intent authorization boundary:
         # merged P0 live / entry / EXIT_ONLY / FLAT policy.
         _gw = self._gateway()
-        self._hydrate_exit_only_position()
+        # Collapse 2: submission consumes the pre-evaluation transition;
+        # hydration is never performed lazily here.
+        if not self._exit_only_authorization_ready(strategy):
+            self._append_mts_event(
+                "EXIT_ONLY_HYDRATION_BLOCKED",
+                reason="EXIT_ONLY_PRE_EVALUATION_REQUIRED")
+            return
         _gw_intent_strategy = ("MTS_ENTRY"
                               if _action in ("BUY_NEAR_SELL_FAR",
                                              "SELL_NEAR_BUY_FAR")
@@ -13187,11 +13231,9 @@ class FuturesMonitor:
         # the capability position IS the authority for the pre/post
         # signal gates.  Invalid/stale/missing => risk gates, evaluator
         # and submit all blocked (zero), with one typed blocked event.
-        _exit_ok, _exit_position, _exit_reason = \
-            self._validate_exit_only_position()
-        if _exit_ok and _exit_position is not None:
-            self._exit_only_auth_override = \
-                self._build_exit_only_authority(_exit_position)
+        _exit_ok = self._reconcile_exit_only_authorization(strategy)
+        _exit_position = getattr(self, "_exit_only_position", None)
+        _exit_reason = None if _exit_ok else "EXIT_ONLY_HYDRATION_BLOCKED"
         _exit_override = getattr(self, "_exit_only_auth_override", None)
         _gate_auth = _exit_override if _exit_override is not None else _auth
         _gate_state_has_pos = (_authority_has_pos
@@ -15814,7 +15856,7 @@ class FuturesMonitor:
         # the legacy manual-entry flag and may be reviewed before any strategy
         # decision runs.
         self._process_live_upl_refresh_command()
-        self._hydrate_exit_only_position()
+        self._reconcile_exit_only_authorization()
 
         # 2026-05-27 Gemini CLI: MTS Safety Watchdog (P4)
         # Replaces and expands _check_stale_mts_orders

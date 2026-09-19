@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from core.reconciled_exit import AttestationError
@@ -29,6 +30,149 @@ BBO_SKEW_MS: int = 1_000  # [S2] named conservative cross-leg skew bound
 
 ENTRY_ACTIONS: frozenset = frozenset(
     {"BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"})
+
+
+@dataclass(frozen=True)
+class ExitEvaluation:
+    """Result of the single Collapse-2 exit evaluation chokepoint."""
+
+    status: str
+    intent: dict | None = None
+    reason: str | None = None
+
+
+class ReconciledPositionHydration:
+    """Atomic reconciliation/authorization boundary for controlled exits.
+
+    ``reconcile`` publishes the broker-attested position, mode, and order
+    authorization as one immutable state transition.  Evaluation cannot
+    create an intent until that transition exists.  The deliberately narrow
+    retry path is only for an ordering rejection with no broker receipt; all
+    timeout, unknown, receipt, active-order, and position-mismatch cases stay
+    pending and fail closed.
+
+    This is a pure coordination seam: the caller supplies broker queries and
+    the submit callback, so construction and tests never contact a broker.
+    ``durable_intents`` is the restart payload; restored pending intents are
+    never submitted until the caller performs a fresh reconciliation.
+    """
+
+    _PENDING = {"PENDING_RECONCILE", "PENDING_UNCONFIRMED"}
+
+    def __init__(self, *, durable_intents: Optional[dict] = None):
+        self._reconciled: dict | None = None
+        self._intents: dict[str, dict] = {
+            str(iid): dict(rec) for iid, rec in (durable_intents or {}).items()
+        }
+        self._used_keys = {
+            rec.get("idempotency_key") for rec in self._intents.values()
+            if rec.get("idempotency_key")
+        }
+
+    def guard_names(self) -> tuple[str, ...]:
+        return ("hydration_required", "retry_once", "active_order_recheck",
+                "position_recheck")
+
+    def reconcile(self, position: dict) -> dict:
+        """Atomically publish hydrated position and exit authorization."""
+        if not isinstance(position, dict):
+            raise ValueError("reconciliation position must be an object")
+        mode = position.get("mode")
+        allowed = position.get("live_order_allowed")
+        if not isinstance(mode, str) or not isinstance(allowed, bool):
+            raise ValueError("mode and live_order_allowed are required")
+        legs = position.get("legs")
+        if not isinstance(legs, list) or not legs:
+            raise ValueError("reconciled position legs are required")
+        # One assignment is intentional: no observer can see hydrated legs
+        # with a stale authorization flag (or vice versa).
+        self._reconciled = {
+            "mode": mode, "live_order_allowed": allowed,
+            "legs": [dict(leg) for leg in legs],
+        }
+        return {**self._reconciled, "legs": [dict(leg) for leg in legs]}
+
+    def evaluate_exit(self, intent_id: str, idempotency_key: str) -> ExitEvaluation:
+        if not self._reconciled:
+            return ExitEvaluation("HYDRATION_REQUIRED", reason="HYDRATION_REQUIRED")
+        if not self._reconciled["live_order_allowed"]:
+            return ExitEvaluation("AUTHORIZATION_REQUIRED",
+                                  reason="LIVE_ORDER_AUTHORIZATION_FAILED")
+        if idempotency_key in self._used_keys:
+            return ExitEvaluation("REJECTED", reason="DUPLICATE_IDEMPOTENCY_KEY")
+        rec = self._intents.setdefault(str(intent_id), {
+            "intent_id": str(intent_id),
+            "idempotency_key": idempotency_key,
+            "state": "AUTHORIZED", "retry_count": 0,
+            "broker_receipt": None,
+        })
+        return ExitEvaluation("AUTHORIZED", intent=dict(rec))
+
+    def submit(self, intent_id: str, idempotency_key: str,
+               submit_callable) -> bool:
+        rec = self._intents.get(str(intent_id))
+        if (rec is None or rec.get("idempotency_key") != idempotency_key
+                or rec.get("state") != "AUTHORIZED"
+                or idempotency_key in self._used_keys):
+            return False
+        self._used_keys.add(idempotency_key)
+        try:
+            ok = bool(submit_callable())
+        except Exception:
+            ok = False
+        rec["state"] = "SUBMITTED" if ok else "PENDING_RECONCILE"
+        return ok
+
+    def record_rejection(self, intent_id: str, *, reason: str,
+                         receipt: Any = None) -> None:
+        rec = self._intents.setdefault(str(intent_id), {
+            "intent_id": str(intent_id), "retry_count": 0,
+        })
+        rec["last_reason"] = reason
+        rec["broker_receipt"] = receipt
+        if receipt is not None:
+            rec["state"] = "PENDING_RECONCILE"
+        elif reason == "HYDRATION_AUTHORIZATION_ORDERING":
+            rec["state"] = "RETRYABLE_ORDERING"
+        else:
+            rec["state"] = "PENDING_RECONCILE"
+
+    @staticmethod
+    def _same_position(expected: dict, actual: dict) -> bool:
+        return (isinstance(actual, dict)
+                and expected.get("legs") == actual.get("legs"))
+
+    def retry_once(self, intent_id: str, idempotency_key: str,
+                   submit_callable, *, active_orders: list,
+                   position: dict) -> bool:
+        rec = self._intents.get(str(intent_id))
+        if (rec is None or rec.get("state") != "RETRYABLE_ORDERING"
+                or rec.get("idempotency_key") != idempotency_key
+                or rec.get("retry_count", 0) >= 1
+                or rec.get("broker_receipt") is not None
+                or active_orders
+                or not self._reconciled
+                or not self._same_position(self._reconciled, position)):
+            return False
+        rec["retry_count"] = 1
+        self._used_keys.add(idempotency_key)
+        try:
+            ok = bool(submit_callable())
+        except Exception:
+            ok = False
+        rec["state"] = "SUBMITTED" if ok else "PENDING_RECONCILE"
+        return ok
+
+    def partial_fill_recovery(self, legs: list[dict]) -> list[dict]:
+        return [dict(leg) for leg in legs
+                if isinstance(leg, dict) and (leg.get("quantity") or 0) > 0]
+
+    def intent_state(self, intent_id: str) -> Optional[str]:
+        rec = self._intents.get(str(intent_id))
+        return rec.get("state") if rec else None
+
+    def durable_view(self) -> dict:
+        return {iid: dict(rec) for iid, rec in self._intents.items()}
 
 
 def _positive_float(value: Any) -> float | None:

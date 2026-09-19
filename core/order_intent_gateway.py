@@ -201,6 +201,22 @@ class OrderIntentGateway:
         if sname == "MTS_RELEASE_OCO":
             return False, None, "GATEWAY_OCO_DISABLED"
         mode = authority.get("mode")
+        # Collapse 2: a broker-reconciled position has a scoped exit
+        # authorization published by the pre-evaluation hydration
+        # transition.  It must not be upgraded to NORMAL_LIVE and the
+        # gateway must not hydrate capability/attestation a second time.
+        if mode == "reconciled_exit_only":
+            if action in ENTRY_ACTIONS:
+                return False, None, "EXIT_ONLY_ENTRY_BLOCKED"
+            if action not in EXIT_STRATEGIES and action not in ("EXIT", "PARTIAL_EXIT"):
+                return False, None, "EXIT_ONLY_STRATEGY_BLOCKED"
+            if not authority.get("reconciled_position_hydrated"):
+                return False, None, "EXIT_ONLY_HYDRATION_REQUIRED"
+            if not authority.get("exit_authorized"):
+                return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
+            if not authority.get("position_has_position"):
+                return False, None, "EXIT_FLAT_BLOCKED"
+            return True, None, None
         if mode != "live_ready" or not authority.get("live_order_allowed"):
             return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
         for field, reason in (("identity_ok", "GATEWAY_IDENTITY_FAILED"),
