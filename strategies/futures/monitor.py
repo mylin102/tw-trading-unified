@@ -9467,9 +9467,15 @@ class FuturesMonitor:
         # Collapse 2: submission consumes the pre-evaluation transition;
         # hydration is never performed lazily here.
         if not self._exit_only_authorization_ready(strategy):
+            _reason = ("LIVE_ORDER_AUTHORIZATION_FAILED"
+                       if getattr(self, "_exit_only_position", None) is not None
+                       else "EXIT_ONLY_HYDRATION_REQUIRED")
+            self._append_mts_event(
+                "ORDER_INTENT_BLOCKED", action=_action,
+                reason=_reason, trade_id=getattr(strategy, "_trade_id", ""))
             self._append_mts_event(
                 "EXIT_ONLY_HYDRATION_BLOCKED",
-                reason="EXIT_ONLY_PRE_EVALUATION_REQUIRED")
+                reason=_reason)
             return
         _gw_intent_strategy = ("MTS_ENTRY"
                               if _action in ("BUY_NEAR_SELL_FAR",
