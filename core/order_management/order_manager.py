@@ -2015,6 +2015,7 @@ class OrderManager:
             filled = self.apply_deal_fill(
                 order.order_id, fill_price=price, fill_qty=qty,
                 fill_time=fill_time, broker_order_id=order.broker_order_id,
+                deal_id=f"broker-position:{order.order_id}:{code}:{qty}:{price}",
                 seqno=order.seqno, ordno=order.ordno,
                 source=source, reason=reason,
                 raw_payload={"position": row, "authority": "broker_position"},
