@@ -2317,6 +2317,28 @@ def test_collapse2_monitor_ordering_retry_is_bounded_and_rechecks_broker(monkeyp
                         active_orders=[], position={"legs": []}) is False
 
 
+@pytest.mark.parametrize("case", ("active_order", "position_mismatch"))
+def test_collapse2_monitor_recheck_blocks_retry(case, monkeypatch):
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, _events = _monitor(_fresh_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    monitor.api.list_orders = lambda account=None: (
+        [{"ordno": "ACTIVE"}] if case == "active_order" else [])
+    if case == "position_mismatch":
+        monitor.api._positions[0] = SimpleNamespace(
+            code="TMFH6", direction=SimpleNamespace(name="Buy"), quantity=1)
+    monitor.order_mgr.submit = lambda order: pytest.fail("retry must be blocked")
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open", lambda: True)
+    monitor._pre_submit_exit_only_proof = lambda: (True, None)
+    monitor._submit_mts_order_signal(
+        SimpleNamespace(action="PARTIAL_EXIT", reason="RELEASE_NEAR"),
+        _bound_strategy(), {}, __import__("datetime").datetime.now())
+    record = next(iter(monitor._reconciled_position_hydration.durable_view().values()))
+    assert record["retry_count"] == 0
+
+
 def test_e2e_persist_failure_zero_adapter_calls(monkeypatch):
     """[audit round2 #1 E2E] persistence failure -> typed
     GATEWAY_INTENT_PERSIST_FAILED -> zero adapter calls (the durable
