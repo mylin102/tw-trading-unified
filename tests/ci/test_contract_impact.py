@@ -142,8 +142,9 @@ def test_plan_line_lists_the_test_command():
 
 
 def test_git_mode_reports_unknown_base_as_error():
-    rc, out = _run(["--base", "0000000000000000000000000000000000000000", "--paths", ""])
-    assert rc == 2
+    """No --paths => git mode; an unresolvable base must be a hard error (2)."""
+    rc, out = _run(["--base", "0000000000000000000000000000000000000000"])
+    assert rc == 2, out
 
 
 def test_git_mode_empty_range_requires_full():
