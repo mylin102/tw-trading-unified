@@ -181,17 +181,24 @@ def classify(paths, deleted, repo):
             continue
         verdicts.append("FULL")
         reasons.append(("UNCLASSIFIED", p, "not in any allowlist -> fail-closed FULL"))
-    if not [p for p in paths if p not in deleted] and not deleted:
-        decisions = "FULL"
+    no_evidence = not paths and not deleted
+    if no_evidence:
         reasons.append(("NO_EVIDENCE", "", "empty diff -> fail-closed FULL"))
     for p in deleted:
         reasons.append(("DELETED", p, "path removed -> FULL"))
         verdicts.append("FULL")
-    decisions = "FULL" if any(v == "FULL" for v in verdicts) else "FAST"
-    return decisions, reasons
+    decision = "FULL" if (no_evidence or any(v == "FULL" for v in verdicts)) else "FAST"
+    return decision, reasons
 
 
 def git_changed_paths(repo, base, head):
+    verify = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--verify", f"{base}^{{commit}}"],
+        capture_output=True, text=True,
+    )
+    sha = (verify.stdout or "").strip()
+    if verify.returncode != 0 or not sha or set(sha) == {"0"}:
+        return None, f"unknown base revision: {base}"
     proc = subprocess.run(
         ["git", "-C", repo, "diff", "--name-status", "--find-renames", f"{base}..{head}"],
         capture_output=True, text=True,
