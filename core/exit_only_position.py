@@ -73,6 +73,13 @@ class ReconciledPositionHydration:
         return ("hydration_required", "retry_once", "active_order_recheck",
                 "position_recheck")
 
+    def authorization_ready(self, position: Optional[dict] = None) -> bool:
+        if not isinstance(self._reconciled, dict):
+            return False
+        if position is None:
+            return True
+        return self._same_position(self._reconciled, position)
+
     def reconcile(self, position: dict) -> dict:
         """Atomically publish hydrated position and exit authorization."""
         if not isinstance(position, dict):

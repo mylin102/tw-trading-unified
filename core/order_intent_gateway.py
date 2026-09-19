@@ -201,6 +201,13 @@ class OrderIntentGateway:
         if sname == "MTS_RELEASE_OCO":
             return False, None, "GATEWAY_OCO_DISABLED"
         mode = authority.get("mode")
+        # Identity, route, and authenticated session are universal gates;
+        # scoped reconciled exits must not bypass them.
+        for field, reason in (("identity_ok", "GATEWAY_IDENTITY_FAILED"),
+                              ("route_ok", "GATEWAY_ROUTE_FAILED"),
+                              ("session_ok", "GATEWAY_SESSION_FAILED")):
+            if field in authority and authority[field] is not True:
+                return False, None, reason
         # Collapse 2: a broker-reconciled position has a scoped exit
         # authorization published by the pre-evaluation hydration
         # transition.  It must not be upgraded to NORMAL_LIVE and the
@@ -211,7 +218,14 @@ class OrderIntentGateway:
             if action not in EXIT_STRATEGIES and action not in ("EXIT", "PARTIAL_EXIT"):
                 return False, None, "EXIT_ONLY_STRATEGY_BLOCKED"
             if not authority.get("reconciled_position_hydrated"):
-                return False, None, "EXIT_ONLY_HYDRATION_REQUIRED"
+                # A position may already be hydrated while the atomic
+                # authorization publication is absent/stale.  Preserve the
+                # established authorization/reconciliation reason there;
+                # use HYDRATION_REQUIRED only when no position was hydrated.
+                return False, None, (
+                    "EXIT_ONLY_HYDRATION_REQUIRED"
+                    if authority.get("hydrated_position") is None
+                    else "LIVE_ORDER_AUTHORIZATION_FAILED")
             if not authority.get("exit_authorized"):
                 return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
             if not authority.get("position_has_position"):
@@ -219,11 +233,6 @@ class OrderIntentGateway:
             return True, None, None
         if mode != "live_ready" or not authority.get("live_order_allowed"):
             return False, None, "LIVE_ORDER_AUTHORIZATION_FAILED"
-        for field, reason in (("identity_ok", "GATEWAY_IDENTITY_FAILED"),
-                              ("route_ok", "GATEWAY_ROUTE_FAILED"),
-                              ("session_ok", "GATEWAY_SESSION_FAILED")):
-            if field in authority and authority[field] is not True:
-                return False, None, reason
         if action in ENTRY_ACTIONS:
             if authority.get("startup_not_ready"):
                 return False, None, "STARTUP_NOT_READY"

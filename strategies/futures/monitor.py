@@ -4259,6 +4259,22 @@ class FuturesMonitor:
         # Publish the reconciled position and live-order decision together;
         # no evaluator can observe a hydrated position with stale authority.
         _authority = self._build_exit_only_authority(_position)
+        from core.exit_only_position import ReconciledPositionHydration
+        _hydrator = getattr(self, "_reconciled_position_hydration", None)
+        if _hydrator is None:
+            _hydrator = self._reconciled_position_hydration = \
+                ReconciledPositionHydration()
+        try:
+            _hydrator.reconcile({
+                "mode": getattr(_ctx, "effective_mode", None),
+                "live_order_allowed": _authority is not None,
+                "legs": _position["legs"],
+            })
+        except Exception:
+            self._append_mts_event(
+                "EXIT_ONLY_HYDRATION_BLOCKED",
+                reason="EXIT_ONLY_RECONCILIATION_STATE_INVALID")
+            return False
         self._exit_only_reconciled_authorization = {
             "position": _position,
             "mode": getattr(_ctx, "effective_mode", None),
@@ -4284,7 +4300,9 @@ class FuturesMonitor:
             return True
         _state = getattr(self, "_exit_only_reconciled_authorization", None)
         _authority = (_state or {}).get("authority") if isinstance(_state, dict) else None
-        if _authority is None:
+        _hydrator = getattr(self, "_reconciled_position_hydration", None)
+        if _authority is None or _hydrator is None \
+                or not _hydrator.authorization_ready((_state or {}).get("position")):
             return False
         if strategy is not None:
             _pos = (_state or {}).get("position", {})
