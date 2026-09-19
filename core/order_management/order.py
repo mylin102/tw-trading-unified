@@ -22,9 +22,13 @@ class OrderStatus(Enum):
     CANCELLED = "cancelled"              # 已取消（終端狀態）
     REJECTED = "rejected"                # 退單/失敗（終端狀態）
     EXPIRED = "expired"                  # 過期未成交（終端狀態）
-    BROKER_NOT_FOUND = "BROKER_NOT_FOUND"  # 券商查無訂單與持倉
-        # （phantom pending 終端狀態 — broker 證據證明訂單與持倉皆
-        # 不存在；永不重送、永不視為成交，紀錄保留供稽核）
+    RECEIVED_NOT_FILLED = "received_not_filled"
+    NOT_SENT = "not_sent"
+    UNKNOWN = "unknown"
+    PENDING_UNCONFIRMED = "pending_unconfirmed"
+    # Deprecated compatibility value.  It is deliberately not completed and
+    # must never appear in a terminal-safe set.
+    BROKER_NOT_FOUND = "BROKER_NOT_FOUND"
 
 
 class OrderType(Enum):
@@ -130,6 +134,11 @@ class Order:
         # available.  Persist this explicit accounting state across restart;
         # it must never be inferred as a zero-price fill.
         self.fill_accounting_status: Optional[str] = None
+        # Durable FIX3 evidence survives restart through the order JSON.
+        self.position_baseline: list[dict[str, Any]] = []
+        self.idempotency_key: Optional[str] = None
+        self.retry_of_order_id: Optional[str] = None
+        self.reconciliation_evidence: Dict[str, Any] = {}
         
         # 執行品質指標
         self.slippage = 0.0
@@ -272,6 +281,8 @@ class Order:
             OrderStatus.PRE_SUBMITTED,
             OrderStatus.SUBMITTED,
             OrderStatus.PARTIAL_FILLED,
+            OrderStatus.PENDING_UNCONFIRMED,
+            OrderStatus.UNKNOWN,
         )
 
     def is_completed(self) -> bool:
@@ -281,7 +292,8 @@ class Order:
             OrderStatus.CANCELLED,
             OrderStatus.REJECTED,
             OrderStatus.EXPIRED,
-            OrderStatus.BROKER_NOT_FOUND,
+            OrderStatus.RECEIVED_NOT_FILLED,
+            OrderStatus.NOT_SENT,
         )
         
     def get_remaining_quantity(self) -> int:
@@ -324,6 +336,10 @@ class Order:
             "fills": [fill.to_dict() for fill in self.fills],
             "raw_events": self.raw_events,
             "fill_accounting_status": self.fill_accounting_status,
+            "position_baseline": self.position_baseline,
+            "idempotency_key": self.idempotency_key,
+            "retry_of_order_id": self.retry_of_order_id,
+            "reconciliation_evidence": self.reconciliation_evidence,
             "created_at": self.created_at.isoformat()
             if isinstance(self.created_at, datetime) else None,
             "submitted_at": self.submitted_at.isoformat()
@@ -382,6 +398,10 @@ class Order:
         order.fills = [OrderFill.from_dict(item) for item in data.get("fills", [])]
         order.raw_events = data.get("raw_events", [])
         order.fill_accounting_status = data.get("fill_accounting_status")
+        order.position_baseline = list(data.get("position_baseline", []))
+        order.idempotency_key = data.get("idempotency_key")
+        order.retry_of_order_id = data.get("retry_of_order_id")
+        order.reconciliation_evidence = dict(data.get("reconciliation_evidence", {}))
         
         # 恢復時間戳記
         def parse_datetime(dt_str):

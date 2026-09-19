@@ -533,8 +533,18 @@ class ShioajiClient:
                 context={"method": "place_combo_order_object"})
         return trade
 
-    def list_combo_trades(self):
-        """Read broker combo status for restart-safe MTS reconciliation."""
+    def update_combostatus(self, account=None):
+        """Refresh broker combo status using the explicit account keyword."""
+        if self.api is None or not hasattr(self.api, "update_combostatus"):
+            return None
+        if account is None:
+            account = getattr(self.api, "futopt_account", None)
+        if account is None:
+            return None
+        return self.api.update_combostatus(account=account)
+
+    def list_combotrades(self):
+        """Read the SDK combo trades projection after an explicit refresh."""
         if self.api is None or not self.is_logged_in:
             return []
         try:
@@ -542,6 +552,12 @@ class ShioajiClient:
         except Exception:
             logger.warning("[shioaji_client] combo status refresh failed")
             return []
+
+    def list_combo_status_trades(self, account=None, refresh=True):
+        """Refresh then read combo trades for futures MTS reconciliation."""
+        if refresh:
+            self.update_combostatus(account=account)
+        return self.list_combotrades()
 
     def get_contract(self, symbol: str):
         """Resolve one exact futures code without guessing a near/far alias.

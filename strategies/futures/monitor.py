@@ -5482,8 +5482,7 @@ class FuturesMonitor:
                         continue  # no broker identity -> never guess (rule 3)
                     _st = str(_lock.get("status") or "").upper()
                     if _st in ("FILLED", "CANCELLED", "REJECTED", "CANCELED",
-                               "EXPIRED", "RETIRED_UNRESOLVED",
-                               "BROKER_NOT_FOUND", "BROKER_RECONCILED"):
+                               "EXPIRED", "RETIRED_UNRESOLVED", "BROKER_RECONCILED"):
                         continue  # already terminal
                     if _bid in _open_ids:
                         continue  # broker still has the open order -> keep lock
@@ -10223,6 +10222,37 @@ class FuturesMonitor:
             return
 
 
+    def _capture_mts_position_baseline(self) -> list[dict]:
+        """Capture the pre-submit broker position baseline by leg.
+
+        A missing baseline is evidence-incomplete; callers must not infer
+        zero positions from a failed query.  The broker account is always
+        passed by keyword to avoid accidentally iterating an account handle.
+        """
+        if not getattr(self, "live_trading", False) or getattr(self, "dry_run", False):
+            return []
+        api = getattr(self, "api", None)
+        account = getattr(api, "futopt_account", None) if api else None
+        if api is None or account is None:
+            return []
+        try:
+            rows = api.list_positions(account=account)
+        except Exception:
+            return []
+        baseline = []
+        for row in rows or []:
+            code = getattr(getattr(row, "contract", None), "code", None)
+            code = code or getattr(row, "code", None)
+            quantity = getattr(row, "quantity", None)
+            direction = getattr(getattr(row, "direction", None), "name", None)
+            direction = direction or getattr(row, "direction", None)
+            if code is not None:
+                baseline.append({
+                    "code": str(code),
+                    "direction": str(direction or ""),
+                    "quantity": int(quantity or 0),
+                })
+        return sorted(baseline, key=lambda item: item["code"])
 
     def _submit_mts_combo_entry(
         self, *, trade_id, action, reason, near_code, far_code,
@@ -10263,6 +10293,10 @@ class FuturesMonitor:
                 order_type=OrderType.MKP, quantity=1, price=_combo_price,
                 strategy="MTS_ENTRY", truth_source="broker_combo",
                 combo_legs=_combo_legs, combo_strategy="TIME_SPREAD")
+            _order.position_baseline = self._capture_mts_position_baseline()
+            _order.idempotency_key = (
+                f"mts-entry:{trade_id}:{near_code}:{far_code}:{action}"
+            )
         except Exception as exc:
             self._append_mts_event(
                 "ORDER_REJECTED_LOCAL", trade_id=trade_id,
@@ -10274,6 +10308,8 @@ class FuturesMonitor:
             "ts": ts, "lots": 1, "price": _combo_price,
             "ref_ohlc": snapshot, "strategy": "MTS_ENTRY",
             "combo_legs": _combo_legs, "combo_order": True,
+            "idempotency_key": getattr(_order, "idempotency_key", None),
+            "position_baseline": getattr(_order, "position_baseline", []),
         }
         self._mts_pending_fills[trade_id] = {
             "combo_order_id": _order.order_id,
@@ -12284,8 +12320,9 @@ class FuturesMonitor:
         The gateway receipt is only a local submission receipt.  A live combo
         is promotable only when the authenticated broker snapshot contains the
         exact broker identity (open or terminal).  A successful snapshot that
-        contains neither is explicit ``BROKER_NOT_FOUND`` evidence: finalize
-        the local order as unknown and clear every leg-bearing state field.
+        contains neither is not terminal evidence.  Keep the lifecycle order
+        and leg locks pending until the reconciliation window has complete
+        order/deal/position evidence.
         """
         if not self.live_trading or self.dry_run:
             return {"status": "SKIPPED"}
@@ -12320,7 +12357,7 @@ class FuturesMonitor:
 
         _rows = list(_snapshot.get("open_orders") or [])
         _rows.extend(_snapshot.get("broker_trades") or [])
-        _result = {"status": "BROKER_NOT_FOUND"}
+        _result = {"status": "PENDING_UNCONFIRMED"}
         for _tid, _meta in _selected:
             _order = self._get_lifecycle_order(_meta.get("combo_order_id"))
             if _order is None:
@@ -12339,46 +12376,68 @@ class FuturesMonitor:
                     _match = _row
                     break
             if _match is None:
-                _mark = getattr(_manager, "mark_broker_not_found", None)
-                if callable(_mark):
-                    _mark(_order.order_id,
-                          source="mts_combo_broker_reconcile",
-                          reason="BROKER_ORDER_NOT_FOUND")
-                else:
-                    from core.order_management.order import OrderStatus
-                    _order.status = OrderStatus.BROKER_NOT_FOUND
-                    _manager.active_orders.pop(_order.order_id, None)
-                    _manager.completed.append(_order)
-                self._pending_lifecycle_orders.pop(_order.order_id, None)
-                self._mts_pending_fills.pop(_tid, None)
-                self._clear_unconfirmed_combo_state(
-                    _tid, "BROKER_ORDER_NOT_FOUND")
+                from core.order_lifecycle_reconciler import reconcile_order
+                _local = _order.to_dict() if hasattr(_order, "to_dict") else {}
+                _local["receipt"] = True
+                _local["position_baseline"] = (
+                    getattr(_order, "position_baseline", None)
+                    or _meta.get("position_baseline") or [])
+                _decision = reconcile_order(
+                    _local,
+                    {
+                        "source": "live_broker",
+                        "positions": _snapshot.get("positions") or [],
+                        "open_orders": [],
+                        "trades": [],
+                        "query_evidence": {
+                            "query_available": True,
+                            "window_complete": False,
+                            "order_query_result": False,
+                            "callbacks": [],
+                        },
+                    },
+                )
                 self._append_mts_event(
-                    "COMBO_ORDER_RECONCILED", trade_id=_tid,
+                    "COMBO_ORDER_RECONCILIATION_PENDING", trade_id=_tid,
                     order_id=_order.order_id,
                     broker_order_id=getattr(_order, "broker_order_id", None),
-                    status="BROKER_NOT_FOUND",
-                    reason="BROKER_ORDER_NOT_FOUND")
+                    status=_decision.state,
+                    reason=_decision.reason)
                 continue
             _status = str(_row_value(_match, "status", "source_status") or "").upper()
-            if _status in {"FAILED", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"}:
-                _reject = getattr(_manager, "reject", None)
-                if callable(_reject) and _order.order_id in getattr(_manager, "active_orders", {}):
-                    _reject(_order.order_id, reason=f"BROKER_{_status}",
-                            source="mts_combo_broker_reconcile")
-                else:
-                    from core.order_management.order import OrderStatus
-                    _order.status = OrderStatus.REJECTED
-                    _manager.active_orders.pop(_order.order_id, None)
-                    _manager.completed.append(_order)
-                self._pending_lifecycle_orders.pop(_order.order_id, None)
-                self._mts_pending_fills.pop(_tid, None)
-                self._clear_unconfirmed_combo_state(_tid, f"BROKER_{_status}")
+            if _status in {"FAILED", "INACTIVE", "CANCELLED", "CANCELED", "EXPIRED"}:
+                # A broker terminal label alone is insufficient.  Zero-fill
+                # convergence is owned by the canonical lifecycle reconciler
+                # and requires receipt, deal, and unchanged baseline evidence.
+                from core.order_lifecycle_reconciler import reconcile_order
+                _local = _order.to_dict() if hasattr(_order, "to_dict") else {}
+                _local["receipt"] = True
+                _local["position_baseline"] = (
+                    getattr(_order, "position_baseline", None)
+                    or _meta.get("position_baseline") or [])
+                _decision = reconcile_order(
+                    _local,
+                    {
+                        "source": "live_broker",
+                        "positions": _snapshot.get("positions") or [],
+                        "open_orders": [], "trades": [],
+                        "query_evidence": {
+                            "query_available": True,
+                            "window_complete": False,
+                            "order_status": _status,
+                            "deal_quantity": _row_value(_match, "deal_quantity", "filled_quantity") or 0,
+                            "deals": _row_value(_match, "deals") or {},
+                            "receipt": True,
+                            "callbacks": [],
+                        },
+                    },
+                )
                 self._append_mts_event(
-                    "COMBO_ORDER_RECONCILED", trade_id=_tid,
-                    order_id=_order.order_id, status="REJECTED",
-                    reason=f"BROKER_{_status}")
-                _result = {"status": "REJECTED"}
+                    "COMBO_ORDER_RECONCILIATION_PENDING", trade_id=_tid,
+                    order_id=_order.order_id,
+                    broker_order_id=getattr(_order, "broker_order_id", None),
+                    status=_decision.state,
+                    reason=_decision.reason)
                 continue
             self._append_mts_event(
                 "COMBO_ORDER_BROKER_CONFIRMED", trade_id=_tid,
@@ -12388,14 +12447,15 @@ class FuturesMonitor:
             _result = {"status": "BROKER_CONFIRMED"}
 
         _adapter = getattr(_manager, "broker_adapter", None)
-        _list = getattr(_adapter, "list_combo_trades", None)
-        if not callable(_list):
+        _account = getattr(getattr(self, "api", None), "futopt_account", None)
+        _refresh = getattr(_adapter, "list_combo_status_trades", None)
+        if not callable(_refresh):
             return _result
         if not any(isinstance(v, dict) and v.get("combo")
                    for v in _pending.values()):
             return _result
         try:
-            _trades = _list()
+            _trades = _refresh(account=_account, refresh=True)
         except Exception:
             return _result
 
@@ -13482,7 +13542,7 @@ class FuturesMonitor:
             _mts_strategies = {"MTS_ENTRY", "MTS_MANUAL", "MTS_RELEASE", "MTS_EXIT"}
             _terminal = {
                 "FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED",
-                "BROKER_NOT_FOUND", "BROKER_RECONCILED",
+                "RECEIVED_NOT_FILLED", "BROKER_RECONCILED",
             }
             # Paper truth is the local simulator queue, not broker-style
             # lifecycle history.  A stale active OrderManager row must not

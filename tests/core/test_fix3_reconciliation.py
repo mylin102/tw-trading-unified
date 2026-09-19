@@ -23,7 +23,7 @@ def local(**overrides):
 
 def evidence(*, status=None, deal_quantity=0, deals=None, positions=None,
              window_complete=True, callback=True, query=True,
-             mismatch=False):
+             mismatch=False, broker_order_id="B-IOC-1"):
     return {
         "source": "live_broker",
         "query_evidence": {
@@ -34,7 +34,7 @@ def evidence(*, status=None, deal_quantity=0, deals=None, positions=None,
             "callbacks": ["ORDER_SUBMITTED"] if callback else [],
             "window_complete": window_complete,
             "receipt": True,
-            "broker_order_id": "B-IOC-1",
+            "broker_order_id": broker_order_id,
             "order_status": status,
             "deal_quantity": deal_quantity,
             "deals": deals if deals is not None else {},
@@ -110,9 +110,10 @@ def test_broker_not_found_is_not_a_terminal_safe_state():
 
 
 def test_not_sent_requires_all_five_absence_conditions():
-    no_receipt = local(receipt=False, broker_order_id=None)
+    no_receipt = local(receipt=False, broker_order_id=None,
+                       local_submit_exception=True)
     snap = evidence(status=None, callback=False, query=False,
-                    window_complete=True)
+                    window_complete=True, broker_order_id=None)
     decision = reconcile_order(no_receipt, snap)
     assert decision.state == "NOT_SENT"
     assert decision.action == "RETAIN_AUDIT"
@@ -132,3 +133,13 @@ def test_pending_state_baseline_and_idempotency_survive_restart_roundtrip():
     assert restored.idempotency_key == "mts-entry:key-1"
     assert restored.retry_of_order_id is None
 
+
+def test_futures_mts_wires_combo_refresh_and_callback_to_canonical_paths():
+    client = Path("strategies/futures/squeeze_futures/data/shioaji_client.py").read_text()
+    monitor = Path("strategies/futures/monitor.py").read_text()
+    assert "def update_combostatus(self, account=None)" in client
+    assert "update_combostatus(account=account)" in client
+    assert "def list_combo_status_trades(self, account=None, refresh=True)" in client
+    assert "_refresh(account=_account, refresh=True)" in monitor
+    assert "from core.order_lifecycle_reconciler import reconcile_order" in monitor
+    assert "self.order_mgr.apply_order_update(" in monitor

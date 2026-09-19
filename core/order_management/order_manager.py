@@ -392,7 +392,7 @@ class OrderManager:
         if isinstance(value, OrderStatus):
             return value
 
-        normalized = str(value).strip().lower()
+        normalized = str(value).strip().split(".")[-1].lower()
         mapping = {
             "pendingsubmit": OrderStatus.PENDING_SUBMIT,
             "pending_submit": OrderStatus.PENDING_SUBMIT,
@@ -406,7 +406,11 @@ class OrderManager:
             "filled": OrderStatus.FILLED,
             "cancelled": OrderStatus.CANCELLED,
             "canceled": OrderStatus.CANCELLED,
-            "failed": OrderStatus.REJECTED,
+            # Failed/Inactive are broker evidence labels, not proof that a
+            # local order was rejected.  The canonical reconciler promotes
+            # them only after zero-deal + unchanged-baseline evidence.
+            "failed": OrderStatus.UNKNOWN,
+            "inactive": OrderStatus.UNKNOWN,
             "rejected": OrderStatus.REJECTED,
             "expired": OrderStatus.EXPIRED,
         }
@@ -579,6 +583,21 @@ class OrderManager:
                 reason=reason,
                 raw_status=str(getattr(raw_status, "value", raw_status)),
             ))
+            return order
+
+        if normalized == OrderStatus.UNKNOWN:
+            # Failed/Inactive callback labels are retained as ambiguous until
+            # the canonical reconciler has zero-deal and baseline evidence.
+            order.status = OrderStatus.UNKNOWN
+            order.updated_at = datetime.now()
+            self._record_audit(
+                order, "order_pending", source=source or "order_update",
+                reason=reason or "BROKER_TERMINAL_EVIDENCE_INCOMPLETE",
+                from_status=previous_status, to_status=order.status,
+                raw_status=raw_status, payload=raw_payload,
+                broker_order_id=order.broker_order_id,
+                seqno=order.seqno, ordno=order.ordno,
+            )
             return order
 
         if normalized == OrderStatus.CANCELLED:
