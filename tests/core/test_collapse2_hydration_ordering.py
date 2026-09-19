@@ -112,9 +112,35 @@ def test_m8_timeout_or_unknown_stays_pending_and_never_retries():
         assert c.intent_state("i-8") == "PENDING_RECONCILE"
 
 
-def test_m9_guards_are_explicitly_observable():
+def test_m9_guards_have_behavioral_effects():
     c = _coordinator()
-    assert "hydration_required" in c.guard_names()
-    assert "retry_once" in c.guard_names()
-    assert "active_order_recheck" in c.guard_names()
-    assert "position_recheck" in c.guard_names()
+    assert c.evaluate_exit("i-9", "key-9").status == "HYDRATION_REQUIRED"
+    c.reconcile(_position())
+    c.evaluate_exit("i-9", "key-9")
+    c.record_rejection("i-9", reason="HYDRATION_AUTHORIZATION_ORDERING")
+    assert c.retry_once("i-9", "key-9", lambda: True,
+                        active_orders=[{"id": "active"}],
+                        position=_position()) is False
+    assert c.authorization_ready(_position()) is True
+    assert c.authorization_ready({**_position(), "legs": []}) is False
+
+
+def test_gateway_scoped_exit_keeps_identity_route_session_gates():
+    from core.order_intent_gateway import OrderIntentGateway
+
+    gw = OrderIntentGateway()
+    base = {
+        "live": True, "mode": "reconciled_exit_only",
+        "reconciled_position_hydrated": True, "exit_authorized": True,
+        "position_has_position": True,
+    }
+    for field, reason in (("identity_ok", "GATEWAY_IDENTITY_FAILED"),
+                          ("route_ok", "GATEWAY_ROUTE_FAILED"),
+                          ("session_ok", "GATEWAY_SESSION_FAILED")):
+        denied = dict(base, **{field: False})
+        assert gw.authorize_intent(action="EXIT", strategy="MTS_EXIT",
+                                   authority=denied)[2] == reason
+    assert gw.authorize_intent(
+        action="EXIT", strategy="MTS_EXIT",
+        authority=dict(base, identity_ok=True, route_ok=True,
+                       session_ok=True))[0] is True
