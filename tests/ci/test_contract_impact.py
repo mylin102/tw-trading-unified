@@ -144,3 +144,10 @@ def test_plan_line_lists_the_test_command():
 def test_git_mode_reports_unknown_base_as_error():
     rc, out = _run(["--base", "0000000000000000000000000000000000000000", "--paths", ""])
     assert rc == 2
+
+
+def test_git_mode_empty_range_requires_full():
+    """A valid git range with no changes must still be fail-closed FULL."""
+    rc, out = _run(["--base", "HEAD", "--head", "HEAD"])
+    assert rc == 0, out
+    assert _decision(out) == "FULL", out
