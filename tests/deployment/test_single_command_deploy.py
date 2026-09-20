@@ -34,7 +34,8 @@ def _write(path: Path, text: str, exec_bit: bool = False) -> None:
         path.chmod(0o755)
 
 
-def _stub_bin(tmp: Path, git_rc: int = 0, pm2_start_status: str = "online") -> tuple[Path, Path]:
+def _stub_bin(tmp: Path, git_rc: int = 0, pm2_start_status: str = "online",
+              running_sha: str = "2222222222222222222222222222222222222222") -> tuple[Path, Path]:
     """Return (bin_dir, pm2_log)."""
     bin_dir = tmp / "stubbin"
     pm2_log = tmp / "pm2_calls.log"
@@ -52,7 +53,7 @@ printf 'pm2 %s\\n' "$*" >> {pm2_log}
 case "$1" in
   jlist)
     if grep -q "pm2 start" {pm2_log} 2>/dev/null; then st={pm2_start_status}; else st=stopped; fi
-    printf '[{{"name":"trading-system","pm2_env":{{"status":"%s","LRC_RELEASE_SHA":"1111111111111111111111111111111111111111"}}}}]' "$st"
+    printf '[{{"name":"trading-system","pm2_env":{{"status":"%s","LRC_RELEASE_SHA":"{running_sha}"}}}}]' "$st"
     ;;
   stop) exit 0 ;;
   start) exit 0 ;;
@@ -63,7 +64,9 @@ exit 0
 
 
 def _layout(tmp: Path, gate_pre_rc: int = 0, gate_post_rc: int = 0,
-            reconcile_rc: int = 0, verify_rc: int = 0, disk_ok: bool = True) -> Path:
+            reconcile_rc: int = 0, verify_rc: int = 0, disk_ok: bool = True,
+            impact_rc: int = 0, env_ok: bool = True,
+            scope_record: bool = False) -> Path:
     repo = tmp / "repo"
     (repo / "scripts" / "deployment").mkdir(parents=True)
     shutil.copy2(DEPLOY_SRC, repo / "scripts" / "deployment" / "deploy_release.sh")
@@ -89,12 +92,21 @@ if "--check-disk" in sys.argv:
 sys.exit({verify_rc})
 """)
     _write(repo / "scripts" / "reconcile_pending_orders.py", stub % reconcile_rc)
+    # contract-impact stub: rc 0 = FAST, 1 = FULL, 2 = error
+    _write(repo / "scripts" / "ci" / "contract_impact.py",
+           f"""import sys
+sys.exit({impact_rc})
+""")
     (tmp / "runtime" / "logs").mkdir(parents=True, exist_ok=True)
     (tmp / "runtime" / "execution_context.json").write_text(
         json.dumps({"requested_mode": "live", "effective_mode": "live_ready",
                     "live_order_allowed": True, "audit_reasons": [],
                     "session_id": "sess-1"}))
-    (tmp / ".env").write_text("EXPORTED=1\n")
+    (tmp / ".env").write_text("EXPORTED=1\n" if env_ok else "false\n")
+    if scope_record:
+        (tmp / "runtime" / "logs" / "verify_scope.json").write_text(
+            json.dumps({"sha": "1111111111111111111111111111111111111111",
+                        "decision": "FULL"}))
     return repo
 
 
@@ -205,3 +217,73 @@ def test_disk_floor_aborts_at_preflight(tmp_path):
     assert r.returncode != 0
     assert "stage=PREFLIGHT" in r.stderr
     assert not pm2_log.exists() or "pm2 stop" not in pm2_log.read_text()
+
+
+def test_env_load_failure_aborts_at_start(tmp_path):
+    """Audit C3 round 3: a failing credentials file must abort, never start the app."""
+    bin_dir, pm2_log = _stub_bin(tmp_path)
+    repo = _layout(tmp_path, env_ok=False)   # .env content is `false`
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=START" in r.stderr, r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 start" not in log
+
+
+def test_dry_run_never_sources_the_env_file(tmp_path):
+    """Audit M5 round 3: dry-run must not execute the credentials file."""
+    bin_dir, pm2_log = _stub_bin(tmp_path)
+    repo = _layout(tmp_path)
+    marker = tmp_path / "env_was_sourced"
+    (tmp_path / ".env").write_text(f"touch {marker}\n")
+    r = _run(tmp_path, repo, bin_dir, args=["--dry-run"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists(), "dry-run sourced the credentials file"
+    assert not pm2_log.exists()
+
+
+def test_impact_full_requires_recorded_verification(tmp_path):
+    """Audit C7b: a FULL classification must be backed by a recorded verification."""
+    bin_dir, pm2_log = _stub_bin(tmp_path)
+    repo = _layout(tmp_path, impact_rc=1)     # FULL
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=IMPACT" in r.stderr, r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 stop" not in log
+
+
+def test_impact_full_with_recorded_verification_proceeds(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path)
+    repo = _layout(tmp_path, impact_rc=1, scope_record=True)
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[DEPLOY OK]" in r.stdout
+
+
+def test_impact_unknown_running_sha_forces_full(tmp_path):
+    """Fail-closed: an unknown running sha cannot be classified as FAST."""
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha="")
+    repo = _layout(tmp_path, impact_rc=0)     # stub would say FAST, must not be consulted
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=IMPACT" in r.stderr, r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 stop" not in log
+
+
+def test_impact_fast_proceeds_without_a_record(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path)
+    repo = _layout(tmp_path, impact_rc=0)
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_verifier_requires_expected_sha(tmp_path):
+    """Audit M4 round 3: the standalone verifier must fail closed without a sha."""
+    import subprocess
+    vlc = REPO_SRC / "scripts" / "deployment" / "verify_live_context.py"
+    r = subprocess.run([sys.executable, "-B", str(vlc), "--runtime-dir",
+                        str(tmp_path / "runtime")], capture_output=True, text=True)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "--expected-sha is required" in r.stdout
