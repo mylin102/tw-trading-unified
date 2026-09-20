@@ -120,6 +120,12 @@ log "preflight OK (free ${FREE_GB}GB)"
 if [ "$DRY_RUN" = 0 ]; then
   # input-only preconditions are validated BEFORE anything is stopped: a config
   # or credential problem discovered after STOP would be downtime.
+  set -a
+  if ! . "$ENV_FILE"; then
+    set +a
+    fail 2 "credentials env load failed: $ENV_FILE — refusing to continue (no downtime)"
+  fi
+  set +a
   [ -f ecosystem.config.js ] || fail 2 "ecosystem.config.js missing — cannot start $APP"
   command -v node >/dev/null 2>&1 || fail 2 "node not found on PATH — cannot validate ecosystem.config.js"
   if ! NODE_ENV=production TRADING_PYTHON_BIN="$PYTHON_BIN" TRADING_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -128,12 +134,6 @@ if [ "$DRY_RUN" = 0 ]; then
       > "$ARTIFACT_DIR/deploy_ecosystem_check.out" 2>&1; then
     fail 2 "ecosystem.config.js rejects this release dir/env — refusing to continue (no downtime): see $ARTIFACT_DIR/deploy_ecosystem_check.out"
   fi
-  set -a
-  if ! . "$ENV_FILE"; then
-    set +a
-    fail 2 "credentials env load failed: $ENV_FILE — refusing to continue (no downtime)"
-  fi
-  set +a
   log "pre-stop checks OK (ecosystem config validated, credentials loaded)"
 fi
 
