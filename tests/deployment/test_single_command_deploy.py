@@ -59,6 +59,7 @@ exit 0
 def _layout(tmp: Path, *, gate_pre_rc: int = 0, gate_post_rc: int = 0,
             reconcile_rc: int = 0, verify_rc: int = 0, disk_ok: bool = True,
             env_ok: bool = True, scope_record: bool = False,
+            evidence_fail: bool = False,
             deployed_change: str = "tests") -> Path:
     """Build a real git repo: base commit (running) + deployed commit (HEAD)."""
     repo = tmp / "repo"
@@ -72,9 +73,26 @@ def _layout(tmp: Path, *, gate_pre_rc: int = 0, gate_post_rc: int = 0,
     _write(repo / "scripts" / "deployment" / "re_freeze.py", "import sys; sys.exit(0)\n")
     _write(repo / "scripts" / "deployment" / "check_deployment.py",
            f"""import sys
+open({str(tmp / "gate_calls.log")!r}, "a").write(" ".join(sys.argv) + "\\n")
 if "--phase" in sys.argv and sys.argv[sys.argv.index("--phase") + 1] == "pre_deploy":
     sys.exit({gate_pre_rc})
 sys.exit({gate_post_rc})
+""")
+    _write(repo / "scripts" / "deployment" / "capture_flat_evidence.py",
+           f"""import json, os, sys
+from pathlib import Path
+rt = Path(os.environ["TRADING_RUNTIME_DIR"])
+art = rt / "exports" / "trades" / "live" / "diagnostics" / "broker_snapshot_canonical.json"
+marker = rt / "evidence_capture_ran"
+marker.write_text("ran")
+if {int(evidence_fail)}:
+    print(json.dumps({{"preflight_passed": False, "artifact": None,
+                       "failed_checks": ["BROKER_CAPTURE_UNAVAILABLE"]}}))
+    sys.exit(5)
+art.parent.mkdir(parents=True, exist_ok=True)
+art.write_text(json.dumps({{"source": "live_broker", "positions": [], "open_orders": [],
+                            "session_scope": "read_only_capture"}}))
+print(json.dumps({{"preflight_passed": True, "artifact": str(art), "failed_checks": []}}))
 """)
     _write(repo / "scripts" / "deployment" / "verify_live_context.py",
            f"""import sys
@@ -157,8 +175,8 @@ def test_dry_run_prints_plan_only_and_touches_nothing(tmp_path):
     logs_before = set(os.listdir(tmp_path / "runtime" / "logs"))
     r = _run(tmp_path, repo, bin_dir, args=["--dry-run"])
     assert r.returncode == 0, r.stdout + r.stderr
-    for st in ("PREFLIGHT", "FREEZE", "IMPACT", "GATE_PRE", "STOP", "RECONCILE",
-               "START", "GATE_POST", "VERIFY"):
+    for st in ("PREFLIGHT", "FREEZE", "IMPACT", "EVIDENCE", "GATE_PRE", "STOP",
+               "RECONCILE", "START", "GATE_POST", "VERIFY"):
         assert st in r.stdout, st
     assert "NOTHING was verified" in r.stdout, r.stdout
     assert not pm2_log.exists()
@@ -173,6 +191,8 @@ def test_dry_run_never_sources_the_env_file(tmp_path):
     r = _run(tmp_path, repo, bin_dir, args=["--dry-run"])
     assert r.returncode == 0, r.stdout + r.stderr
     assert not marker.exists(), "dry-run sourced the credentials file"
+    assert not (tmp_path / "runtime" / "evidence_capture_ran").exists(), \
+        "dry-run performed the broker evidence capture"
     assert not pm2_log.exists()
 
 
@@ -321,3 +341,31 @@ def test_verifier_requires_expected_sha(tmp_path):
                  str(tmp_path / "runtime")], capture_output=True, text=True)
     assert r.returncode == 2, r.stdout + r.stderr
     assert "--expected-sha is required" in r.stdout
+
+
+def test_pre_gate_receives_its_prerequisites(tmp_path):
+    """The gate must get the sealed profile, its hash and the fresh flat evidence."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests")
+    bin_dir, _ = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = (tmp_path / "gate_calls.log").read_text().strip().splitlines()
+    pre = next(c for c in calls if "pre_deploy" in c)
+    assert "--config-profile config/futures_live.yaml" in pre, pre
+    assert "--config-hash " in pre and len(pre.split("--config-hash ")[1].split()[0]) == 64, pre
+    art = str(tmp_path / "runtime" / "exports" / "trades" / "live" / "diagnostics"
+              / "broker_snapshot_canonical.json")
+    assert f"--position-state {art}" in pre, pre
+    assert f"--margin-evidence {art}" in pre, pre
+    assert (tmp_path / "runtime" / "evidence_capture_ran").exists(), "evidence capture did not run"
+
+
+def test_evidence_capture_failure_aborts_before_stop(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests", evidence_fail=True)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=EVIDENCE" in r.stderr, r.stderr
+    assert "pm2 stop" not in (pm2_log.read_text() if pm2_log.exists() else "")
