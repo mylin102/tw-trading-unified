@@ -11,22 +11,27 @@
 # Stages
 #   1 PREFLIGHT   repo/python/runtime/.env present, tracked tree clean, disk floor, app known
 #   2 FREEZE      re_freeze --verify, else re-freeze + commit manifest; pin LRC_RELEASE_SHA=HEAD
-#   3 GATE_PRE    check_deployment.py --phase pre_deploy   (CLI only, gate never bypassed)
-#   4 STOP        pm2 stop <app> and confirm stopped
-#   5 RECONCILE   scripts/reconcile_pending_orders.py (fail-closed)
-#   6 START       pm2 start <app> with the pinned env (never --update-env)
-#   7 GATE_POST   check_deployment.py --phase post_startup
-#   8 VERIFY      verify_live_context.py: live_ready + live_order_allowed + pinned sha
+#   3 IMPACT      contract_impact.py on (running sha -> HEAD); a FULL verdict needs a
+#                 recorded verification of that sha (audit C7b call site)
+#   4 GATE_PRE    check_deployment.py --phase pre_deploy   (CLI only, gate never bypassed)
+#   5 STOP        pm2 stop <app> and confirm stopped
+#   6 RECONCILE   scripts/reconcile_pending_orders.py (fail-closed)
+#   7 START       pm2 start <app> with the pinned env (never --update-env)
+#   8 GATE_POST   check_deployment.py --phase post_startup
+#   9 VERIFY      verify_live_context.py: live_ready + live_order_allowed + pinned sha
 #
 # Safety properties (audited 2026-09-20):
 #   * tools are NOT overridable — `git` and `pm2` resolve from PATH and every
 #     safety threshold is a literal in this file; only the runtime's own env
 #     (TRADING_RUNTIME_DIR / TRADING_ENV_FILE / TRADING_PYTHON_BIN) is read.
-#   * `--dry-run` performs NO external action and writes NO file: it prints the
-#     plan only, so its rc=0 means "the plan printed", never "the gates passed".
+#   * `--dry-run` performs NO external action, writes NO file and never sources
+#     the credentials file: it prints the plan only, so its rc=0 means "the plan
+#     printed", never "the gates passed".
+#   * every command whose result matters (gate, reconcile, env load, verify) is
+#     checked; a failing `.env` or an unrecorded FULL verification aborts.
 set -u -o pipefail
 
-TOTAL_STAGES=8
+TOTAL_STAGES=9
 CURRENT_STAGE="init"
 STAGE_NO=0
 DRY_RUN=0
@@ -123,7 +128,49 @@ export LRC_RELEASE_SHA="$EXPECTED_SHA"
 export TRADING_RUNTIME_DIR="$RUNTIME_DIR"
 log "expected_sha=$LRC_RELEASE_SHA"
 
-# ── 3 GATE_PRE ───────────────────────────────────────────────────────────────
+# ── 3 IMPACT ─────────────────────────────────────────────────────────────────
+stage IMPACT
+if [ "$DRY_RUN" = 1 ]; then
+  log "DRY-RUN would run: contract_impact.py --base <running ${APP} sha> --head ${EXPECTED_SHA:-HEAD} --exit-code"
+  log "DRY-RUN: the impact gate and the FULL-verification record are NOT checked in dry-run"
+else
+  if [ ! -f scripts/ci/contract_impact.py ]; then
+    fail 4 "scripts/ci/contract_impact.py missing — cannot classify the deployed diff"
+  fi
+  RUNNING_SHA="$("$PM2_BIN" jlist > "$ARTIFACT_DIR/deploy_pm2_pre.json" 2>/dev/null; "$PYTHON_BIN" -B -c "import json,sys; items=json.load(open(sys.argv[1])); print(next((x['pm2_env'].get('LRC_RELEASE_SHA','') for x in items if x['name']==sys.argv[2]), ''))" "$ARTIFACT_DIR/deploy_pm2_pre.json" "$APP" 2>/dev/null)"
+  IMPACT_BASE="${RUNNING_SHA:-}"
+  if [ -z "$IMPACT_BASE" ]; then
+    log "running sha unknown -> forcing FULL classification"
+    IMPACT_BASE=""
+  fi
+  IMPACT_RC=0
+  if [ -n "$IMPACT_BASE" ] && [ "$IMPACT_BASE" != "$EXPECTED_SHA" ]; then
+    "$PYTHON_BIN" -B scripts/ci/contract_impact.py --repo "$REPO_DIR" --base "$IMPACT_BASE" \
+        --head "$EXPECTED_SHA" --json --exit-code > "$ARTIFACT_DIR/deploy_impact.json" 2>"$ARTIFACT_DIR/deploy_impact.err"
+    IMPACT_RC=$?
+    log "impact decision rc=$IMPACT_RC (0=FAST 1=FULL 2=error)"
+  else
+    if [ -z "$IMPACT_BASE" ]; then
+      printf '{"decision": "FULL", "reason": "running sha unknown"}\n' > "$ARTIFACT_DIR/deploy_impact.json"
+      IMPACT_RC=1
+    else
+      printf '{"decision": "NO_CHANGE", "reason": "running sha == expected sha"}\n' > "$ARTIFACT_DIR/deploy_impact.json"
+      IMPACT_RC=0
+    fi
+  fi
+  [ "$IMPACT_RC" -ne 2 ] || fail 4 "contract-impact classification failed — see $ARTIFACT_DIR/deploy_impact.err"
+  if [ "$IMPACT_RC" -eq 1 ]; then
+    SCOPE_FILE="$ARTIFACT_DIR/verify_scope.json"
+    [ -f "$SCOPE_FILE" ] || fail 4 "FULL verification required for this diff but $SCOPE_FILE is missing"
+    "$PYTHON_BIN" -B -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get('sha')==sys.argv[2] and d.get('decision')=='FULL' else 4)" \
+      "$SCOPE_FILE" "$EXPECTED_SHA" || fail 4 "verify_scope.json does not record a FULL verification of $EXPECTED_SHA"
+    log "FULL verification recorded for $EXPECTED_SHA"
+  else
+    log "impact decision FAST/NO_CHANGE — no FULL record required"
+  fi
+fi
+
+# ── 4 GATE_PRE ───────────────────────────────────────────────────────────────
 stage GATE_PRE
 GATE_ARGS=(--release-dir "$REPO_DIR" --runtime-dir "$RUNTIME_DIR" --pid-file "$PID_FILE"
            --position-state "$POSITION_STATE" --monitor strategies/futures/monitor.py
@@ -160,7 +207,16 @@ fi
 
 # ── 6 START ──────────────────────────────────────────────────────────────────
 stage START
-set -a; . "$ENV_FILE"; set +a
+if [ "$DRY_RUN" = 1 ]; then
+  log "DRY-RUN would load credentials from $ENV_FILE (not sourced in dry-run)"
+else
+  set -a
+  if ! . "$ENV_FILE"; then
+    set +a
+    fail 8 "credentials env load failed: $ENV_FILE"
+  fi
+  set +a
+fi
 export LRC_RELEASE_SHA="$EXPECTED_SHA"
 export TRADING_RUNTIME_DIR="$RUNTIME_DIR"
 run "$PM2_BIN" start "$APP" || fail 8 "pm2 start failed"

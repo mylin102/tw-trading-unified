@@ -44,6 +44,11 @@ def main() -> int:
     ap.add_argument("--min-free-gb", type=int, default=3)
     args = ap.parse_args()
 
+    if not args.check_disk and not args.expected_sha:
+        print("[VERIFY] FAIL --expected-sha is required: the running pm2 identity "
+              "check is the point of this verifier")
+        return 2
+
     if args.check_disk:
         try:
             free = disk_free_gb(args.runtime_dir)
