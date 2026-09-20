@@ -44,7 +44,9 @@ def _stub_bin(tmp: Path, running_sha: str = "BASE",
     pm2_log = tmp / "pm2_calls.log"
     _write(bin_dir / "pm2", f"""#!/usr/bin/env bash
 printf 'pm2 %s\\n' "$*" >> {pm2_log}
+printf 'ENV LRC=%s NODE=%s PY=%s\\n' "$LRC_RELEASE_SHA" "$NODE_ENV" "$TRADING_PYTHON_BIN" >> {pm2_log}
 case "$1" in
+  delete|save) exit 0 ;;
   jlist)
     if grep -q "pm2 start" {pm2_log} 2>/dev/null; then st={pm2_start_status}; else st=stopped; fi
     printf '[{{"name":"trading-system","pm2_env":{{"status":"%s","LRC_RELEASE_SHA":"{running_sha}"}}}}]' "$st"
@@ -216,7 +218,8 @@ def test_test_only_diff_is_fast_and_proceeds(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "[DEPLOY OK]" in r.stdout
     log = pm2_log.read_text()
-    assert "pm2 stop trading-system" in log and "pm2 start trading-system" in log
+    assert "pm2 stop trading-system" in log
+    assert "pm2 start ecosystem.config.js --only trading-system" in log
 
 
 def test_contract_diff_requires_recorded_verification(tmp_path):
@@ -392,3 +395,23 @@ def test_deploy_helpers_get_the_repo_on_pythonpath(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     seen = (tmp_path / "reconcile_env.log").read_text()
     assert str(repo) in seen, f"PYTHONPATH did not carry the repo: {seen!r}"
+
+
+def test_start_re_registers_with_the_new_identity_pin(tmp_path):
+    """The app must be started from the ecosystem file with THIS sha pinned."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests")
+    head = (tmp_path / "head_sha").read_text().strip()
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 0, r.stdout + r.stderr
+    log = pm2_log.read_text()
+    assert "pm2 delete trading-system" in log
+    assert "pm2 start ecosystem.config.js --only trading-system" in log
+    assert "pm2 save" in log
+    assert "restart" not in log, "pm2 restart is a forbidden deploy action"
+    assert "--update-env" not in log, "--update-env is forbidden"
+    env_lines = [l for l in log.splitlines() if l.startswith("ENV ")]
+    assert env_lines, log
+    assert f"LRC={head}" in env_lines[-1], env_lines[-1]
+    assert "NODE=production" in env_lines[-1], env_lines[-1]
