@@ -86,13 +86,20 @@ art = rt / "exports" / "trades" / "live" / "diagnostics" / "broker_snapshot_cano
 marker = rt / "evidence_capture_ran"
 marker.write_text("ran")
 if {int(evidence_fail)}:
-    print(json.dumps({{"preflight_passed": False, "artifact": None,
-                       "failed_checks": ["BROKER_CAPTURE_UNAVAILABLE"]}}))
+    _out = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else None
+    if _out:
+        Path(_out).write_text(json.dumps({{"preflight_passed": False, "artifact": None,
+                                           "failed_checks": ["BROKER_CAPTURE_UNAVAILABLE"]}}))
     sys.exit(5)
 art.parent.mkdir(parents=True, exist_ok=True)
 art.write_text(json.dumps({{"source": "live_broker", "positions": [], "open_orders": [],
                             "session_scope": "read_only_capture"}}))
-print(json.dumps({{"preflight_passed": True, "artifact": str(art), "failed_checks": []}}))
+out = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else None
+payload = json.dumps({{"preflight_passed": True, "artifact": str(art), "failed_checks": []}})
+if out:
+    Path(out).write_text(payload)
+print("broker banner noise on stdout")
+print(payload)
 """)
     _write(repo / "scripts" / "deployment" / "verify_live_context.py",
            f"""import sys
