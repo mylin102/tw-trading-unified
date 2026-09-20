@@ -165,7 +165,7 @@ else
       "$SCOPE_FILE" "$EXPECTED_SHA" || fail 4 "verify_scope.json does not record a FULL verification of $EXPECTED_SHA"
     log "FULL verification recorded for $EXPECTED_SHA"
   else
-    log "impact decision FAST/NO_CHANGE — no FULL record required"
+    log "impact decision FAST — no FULL record required"
   fi
 fi
 
