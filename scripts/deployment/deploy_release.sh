@@ -3,6 +3,11 @@
 #
 #   bash scripts/deployment/deploy_release.sh [--dry-run] [--app NAME]
 #
+# Failure codes: 2 preflight/helper-missing, 3 pm2 app not registered, 4 IMPACT
+# classification, 5 = the EVIDENCE capture helper's rc (propagated), 6 GATE_PRE,
+# 7 STOP, 8 RECONCILE, 9 START (incl. the no-downtime ecosystem validation),
+# 10 GATE_POST, 11 VERIFY — the [FAIL] line always names the stage.
+#
 # One command, one approval: every stage below runs in order and the script
 # aborts on the FIRST non-zero result.  There is no retry, no bypass flag and
 # no "--force" — a failed gate means the deploy stops and the operator gets a
@@ -185,8 +190,13 @@ else
   [ -f "$CONFIG_PROFILE" ] || fail 4 "config profile missing: $CONFIG_PROFILE"
   LIVE_PREFLIGHT_NO_ORDERS=1 "$PYTHON_BIN" -B scripts/deployment/capture_flat_evidence.py \
     --env-file "$ENV_FILE" --out "$ARTIFACT_DIR/deploy_flat_evidence.json" \
-    > "$ARTIFACT_DIR/deploy_flat_evidence.stdout" 2>"$ARTIFACT_DIR/deploy_flat_evidence.err" \
-    || fail 4 "read-only flat evidence capture failed — see $ARTIFACT_DIR/deploy_flat_evidence.err"
+    > "$ARTIFACT_DIR/deploy_flat_evidence.stdout" 2>"$ARTIFACT_DIR/deploy_flat_evidence.err"
+  CAPTURE_RC=$?
+  # contract: the EVIDENCE stage propagates the capture helper's own rc
+  # (5 = capture failed / not READY, 2 = usage) so the caller can tell a broker
+  # evidence failure from a gate/classification failure.
+  [ "$CAPTURE_RC" -eq 0 ] \
+    || fail "$CAPTURE_RC" "read-only flat evidence capture failed (helper rc=$CAPTURE_RC) — see $ARTIFACT_DIR/deploy_flat_evidence.err"
   FLAT_SNAPSHOT="$("$PYTHON_BIN" -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("artifact") or "")' "$ARTIFACT_DIR/deploy_flat_evidence.json")"
   [ -n "$FLAT_SNAPSHOT" ] || fail 4 "capture did not report an artifact — see $ARTIFACT_DIR/deploy_flat_evidence.json"
   [ -f "$FLAT_SNAPSHOT" ] || fail 4 "capture reported an artifact that does not exist: $FLAT_SNAPSHOT"
@@ -225,7 +235,30 @@ fi
 # ── 5 RECONCILE ──────────────────────────────────────────────────────────────
 stage RECONCILE
 if [ -f scripts/reconcile_pending_orders.py ]; then
-  run "$PYTHON_BIN" -B scripts/reconcile_pending_orders.py || fail 7 "reconcile_pending_orders failed (fail-closed)"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "DRY-RUN would load credentials from $ENV_FILE (not sourced in dry-run)"
+    log "DRY-RUN: $PYTHON_BIN -B scripts/reconcile_pending_orders.py"
+  else
+    # the helper needs broker credentials: they are loaded HERE (before START)
+    # so the probe is real — a probe-less "reconcile" would be a no-op
+    set -a
+    if ! . "$ENV_FILE"; then
+      set +a
+      fail 7 "credentials env load failed before reconciliation: $ENV_FILE"
+    fi
+    set +a
+    "$PYTHON_BIN" -B scripts/reconcile_pending_orders.py \
+      > "$ARTIFACT_DIR/deploy_reconcile.out" 2>&1
+    RECONCILE_RC=$?
+    [ "$RECONCILE_RC" -eq 0 ] \
+      || fail 7 "reconcile_pending_orders failed (rc=$RECONCILE_RC, fail-closed) — see $ARTIFACT_DIR/deploy_reconcile.out"
+    # "nothing changed because the broker probe was unavailable" is NOT a
+    # completed reconciliation: refuse to start on unverified pending orders
+    if grep -q "BROKER_PROBE_UNAVAILABLE" "$ARTIFACT_DIR/deploy_reconcile.out"; then
+      fail 7 "reconcile_pending_orders could not obtain broker evidence (BROKER_PROBE_UNAVAILABLE) — see $ARTIFACT_DIR/deploy_reconcile.out"
+    fi
+    log "reconcile OK (broker evidence available)"
+  fi
 else
   fail 2 "scripts/reconcile_pending_orders.py missing — refusing to start with unreconciled orders"
 fi
@@ -253,6 +286,15 @@ export NODE_ENV=production
 export TRADING_PYTHON_BIN="$PYTHON_BIN"
 export TRADING_RUNTIME_DIR="$RUNTIME_DIR"
 [ -f ecosystem.config.js ] || fail 8 "ecosystem.config.js missing — cannot start $APP"
+  command -v node >/dev/null 2>&1 || fail 8 "node not found on PATH — cannot validate ecosystem.config.js"
+  # a delete that cannot be followed by a start IS downtime: the PM2 config is
+  # validated (production mode requires the canonical release root) BEFORE the
+  # app is removed from the process list.
+  if ! NODE_ENV=production TRADING_PYTHON_BIN="$PYTHON_BIN" TRADING_RUNTIME_DIR="$RUNTIME_DIR" \
+      LRC_RELEASE_SHA="$EXPECTED_SHA" node -e 'require("./ecosystem.config.js")' \
+      > "$ARTIFACT_DIR/deploy_ecosystem_check.out" 2>&1; then
+    fail 8 "ecosystem.config.js rejects this release dir/env — refusing to stop the app (no downtime): see $ARTIFACT_DIR/deploy_ecosystem_check.out"
+  fi
 run "$PM2_BIN" delete "$APP" || log "pm2 delete: $APP was not registered (continuing)"
 run "$PM2_BIN" start ecosystem.config.js --only "$APP" || fail 8 "pm2 start failed"
 if [ "$DRY_RUN" = 0 ]; then
