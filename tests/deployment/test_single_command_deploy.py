@@ -288,13 +288,19 @@ def test_same_sha_redeploy_follows_the_gate_empty_diff_is_full(tmp_path):
     assert "pm2 stop" not in log
 
 
-def test_env_load_failure_aborts_at_start(tmp_path):
+def test_env_load_failure_aborts_before_start(tmp_path):
+    """A failing credentials file must abort before the app is ever started.
+
+    Credentials are loaded before RECONCILE (the reconciliation probe needs
+    them), so a broken .env now aborts there — still strictly before START.
+    """
     bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
     repo = _layout(tmp_path, env_ok=False)
     bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
     r = _run(tmp_path, repo, bin_dir)
     assert r.returncode != 0, r.stdout + r.stderr
-    assert "stage=START" in r.stderr, r.stderr
+    assert "stage=RECONCILE" in r.stderr, r.stderr
+    assert "credentials env load failed" in r.stderr, r.stderr
     log = pm2_log.read_text() if pm2_log.exists() else ""
     assert "pm2 start" not in log
 
