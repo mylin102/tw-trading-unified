@@ -106,6 +106,8 @@ sys.exit({verify_rc})
 """)
     _write(repo / "scripts" / "reconcile_pending_orders.py", stub % reconcile_rc)
     _write(repo / "core" / "order_intent_gateway.py", "GATEWAY = 1\n")
+    _write(repo / "config" / "futures_live.yaml",
+           "live_trading: true\nconfig_profile: futures_live\n")
     _write(repo / "tests" / "core" / "test_x.py", "def test_x():\n    assert True\n")
     _write(repo / "tests" / "core" / "test_order_intent_gateway.py", "def test_g():\n    assert True\n")
     (tmp / "runtime" / "logs").mkdir(parents=True, exist_ok=True)
