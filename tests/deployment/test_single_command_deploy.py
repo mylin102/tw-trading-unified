@@ -38,10 +38,14 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _stub_bin(tmp: Path, running_sha: str = "BASE",
-              pm2_start_status: str = "online") -> tuple[Path, Path]:
+              pm2_start_status: str = "online", node_ok: bool = True) -> tuple[Path, Path]:
     """Return (bin_dir, pm2_log).  `running_sha` is resolved at layout time."""
     bin_dir = tmp / "stubbin"
     pm2_log = tmp / "pm2_calls.log"
+    _write(bin_dir / "node", f"""#!/usr/bin/env bash
+printf 'node %s\\n' "$*" >> {tmp / 'node_calls.log'}
+exit {0 if node_ok else 1}
+""", exec_bit=True)
     _write(bin_dir / "pm2", f"""#!/usr/bin/env bash
 printf 'pm2 %s\\n' "$*" >> {pm2_log}
 printf 'ENV LRC=%s NODE=%s PY=%s\\n' "$LRC_RELEASE_SHA" "$NODE_ENV" "$TRADING_PYTHON_BIN" >> {pm2_log}
@@ -60,6 +64,7 @@ exit 0
 
 def _layout(tmp: Path, *, gate_pre_rc: int = 0, gate_post_rc: int = 0,
             reconcile_rc: int = 0, verify_rc: int = 0, disk_ok: bool = True,
+            reconcile_unavailable: bool = False,
             env_ok: bool = True, scope_record: bool = False,
             evidence_fail: bool = False,
             deployed_change: str = "tests") -> Path:
@@ -120,6 +125,7 @@ sys.exit({verify_rc})
     _write(repo / "scripts" / "reconcile_pending_orders.py",
            "import os, sys\n"
            f"open({str(tmp / 'reconcile_env.log')!r}, 'w').write(os.environ.get('PYTHONPATH', ''))\n"
+           f"print('reconcile_pending_orders: ' + ('BROKER_PROBE_UNAVAILABLE' if {int(reconcile_unavailable)} else 'broker evidence OK; 0 changes'))\n"
            f"sys.exit({reconcile_rc})\n")
     _write(repo / "core" / "order_intent_gateway.py", "GATEWAY = 1\n")
     _write(repo / "config" / "futures_live.yaml",
@@ -419,3 +425,41 @@ def test_start_re_registers_with_the_new_identity_pin(tmp_path):
     assert env_lines, log
     assert f"LRC={head}" in env_lines[-1], env_lines[-1]
     assert "NODE=production" in env_lines[-1], env_lines[-1]
+
+
+def test_start_validates_the_ecosystem_config_before_delete(tmp_path):
+    """A delete that cannot be followed by a start is downtime: validate first."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests")
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip(),
+                                 node_ok=False)
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=START" in r.stderr, r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 delete" not in log, "the app was deleted before the PM2 config was validated"
+    assert "pm2 start" not in log
+    assert (tmp_path / "node_calls.log").exists(), "the ecosystem config was never validated"
+
+
+def test_reconcile_refuses_unverified_pending_orders(tmp_path):
+    """A probe-less reconcile is a no-op; the deploy must not start on it."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests", reconcile_unavailable=True)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=RECONCILE" in r.stderr, r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 start" not in log
+
+
+def test_evidence_stage_propagates_the_capture_rc(tmp_path):
+    """The EVIDENCE stage must surface the capture helper's own rc (5)."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests", evidence_fail=True)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 5, f"expected the helper rc 5, got {r.returncode}: {r.stdout}{r.stderr}"
+    assert "stage=EVIDENCE rc=5" in r.stderr, r.stderr
+    assert "pm2 stop" not in (pm2_log.read_text() if pm2_log.exists() else "")
