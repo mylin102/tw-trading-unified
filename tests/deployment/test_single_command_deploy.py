@@ -71,6 +71,10 @@ def _layout(tmp: Path, *, gate_pre_rc: int = 0, gate_post_rc: int = 0,
     (repo / "scripts" / "ci").mkdir(parents=True, exist_ok=True)
     shutil.copy2(IMPACT_SRC, repo / "scripts" / "ci" / "contract_impact.py")
     (repo / "PHASE1_FINAL_FREEZE.md").write_text("manifest\n")
+    _write(repo / "ecosystem.config.js",
+           "module.exports = { apps: [{ name: 'trading-system', script: 'taskpolicy',"
+           " args: '-c background main.py --config futures_live', interpreter: 'none',"
+           " cwd: __dirname, autorestart: true, stop_exit_codes: [0] }] };\n")
     stub = "import sys; sys.exit(%d)\n"
     _write(repo / "scripts" / "deployment" / "re_freeze.py", "import sys; sys.exit(0)\n")
     _write(repo / "scripts" / "deployment" / "check_deployment.py",
