@@ -181,7 +181,8 @@ else
     || fail 4 "scripts/deployment/capture_flat_evidence.py missing — cannot produce gate evidence"
   [ -f "$CONFIG_PROFILE" ] || fail 4 "config profile missing: $CONFIG_PROFILE"
   LIVE_PREFLIGHT_NO_ORDERS=1 "$PYTHON_BIN" -B scripts/deployment/capture_flat_evidence.py \
-    --env-file "$ENV_FILE" > "$ARTIFACT_DIR/deploy_flat_evidence.json" 2>"$ARTIFACT_DIR/deploy_flat_evidence.err" \
+    --env-file "$ENV_FILE" --out "$ARTIFACT_DIR/deploy_flat_evidence.json" \
+    > "$ARTIFACT_DIR/deploy_flat_evidence.stdout" 2>"$ARTIFACT_DIR/deploy_flat_evidence.err" \
     || fail 4 "read-only flat evidence capture failed — see $ARTIFACT_DIR/deploy_flat_evidence.err"
   FLAT_SNAPSHOT="$("$PYTHON_BIN" -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("artifact") or "")' "$ARTIFACT_DIR/deploy_flat_evidence.json")"
   [ -n "$FLAT_SNAPSHOT" ] || fail 4 "capture did not report an artifact — see $ARTIFACT_DIR/deploy_flat_evidence.json"

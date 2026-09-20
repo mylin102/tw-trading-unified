@@ -19,11 +19,26 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
+def _emit(payload: dict, out_path: str) -> int:
+    """Write the payload atomically; stdout keeps whatever the broker printed."""
+    import os as _os
+    tmp = f"{out_path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+        fh.flush()
+        _os.fsync(fh.fileno())
+    _os.replace(tmp, out_path)
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--env-file", required=True, help="credentials env file (broker keys)")
     ap.add_argument("--product", default="TMF")
     ap.add_argument("--request-id", default=None)
+    ap.add_argument("--out", required=True,
+                    help="file to write the JSON payload to (stdout carries broker banner noise)")
     args = ap.parse_args()
 
     # the read-only preflight refuses to run without this guard (by design)
@@ -45,9 +60,8 @@ def main() -> int:
     try:
         response = run_once(api_factory, request_id=args.request_id, product=args.product)
     except Exception as exc:  # fail-closed: no artifact => the deploy stops
-        print(json.dumps({"preflight_passed": False, "artifact": None,
-                          "failed_checks": [f"{type(exc).__name__}: {exc}"]},
-                         ensure_ascii=False))
+        _emit({"preflight_passed": False, "artifact": None,
+               "failed_checks": [f"{type(exc).__name__}: {exc}"]}, args.out)
         return 5
 
     artifact = diagnostics_dir() / "broker_snapshot_canonical.json"
@@ -78,7 +92,7 @@ def main() -> int:
             "stock_rows": sum(1 for p in positions if isinstance(p, dict)
                               and str(p.get("account", "") or "") == "stock"),
         })
-    print(json.dumps(out, ensure_ascii=False))
+    _emit(out, args.out)
     return 0 if out["preflight_passed"] and out["artifact"] else 5
 
 
