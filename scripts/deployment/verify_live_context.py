@@ -11,7 +11,11 @@ with a typed reason.  Checks
     (a restart that silently kept an old env is caught here)
 
 Exit codes: 0 ok / 2 missing evidence / 3 context not live_ready / 4 identity
-mismatch / 5 pm2 query failed.
+mismatch / 5 disk floor not met / 6 pm2 query failed.
+
+--check-disk exposes the disk floor as a pure, unit-tested function instead of a
+tunable threshold inside the deploy script (audit 2026-09-20: safety thresholds
+must not be overridable).
 """
 from __future__ import annotations
 
@@ -22,13 +26,35 @@ import subprocess
 import sys
 
 
+def disk_free_gb(path: str, _statvfs=None) -> float:
+    """Free gigabytes on the filesystem holding ``path`` (pure, injectable)."""
+    statvfs = _statvfs or os.statvfs
+    st = statvfs(path)
+    return st.f_bavail * st.f_frsize / float(1024 ** 3)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runtime-dir", required=True)
     ap.add_argument("--expected-sha", default=None)
     ap.add_argument("--app", default="trading-system")
     ap.add_argument("--pm2-bin", default="pm2")
+    ap.add_argument("--check-disk", action="store_true",
+                    help="only check the disk floor and print free GB")
+    ap.add_argument("--min-free-gb", type=int, default=3)
     args = ap.parse_args()
+
+    if args.check_disk:
+        try:
+            free = disk_free_gb(args.runtime_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[VERIFY] FAIL cannot stat {args.runtime_dir}: {exc}")
+            return 2
+        if free < args.min_free_gb:
+            print(f"[VERIFY] FAIL disk free {free:.1f}GB < required {args.min_free_gb}GB")
+            return 5
+        print(f"{free:.0f}")
+        return 0
 
     ctx_path = os.path.join(args.runtime_dir, "execution_context.json")
     if not os.path.exists(ctx_path):
