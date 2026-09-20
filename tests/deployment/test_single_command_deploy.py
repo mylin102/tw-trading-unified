@@ -111,7 +111,10 @@ if "--check-disk" in sys.argv:
     sys.exit(5)
 sys.exit({verify_rc})
 """)
-    _write(repo / "scripts" / "reconcile_pending_orders.py", stub % reconcile_rc)
+    _write(repo / "scripts" / "reconcile_pending_orders.py",
+           "import os, sys\n"
+           f"open({str(tmp / 'reconcile_env.log')!r}, 'w').write(os.environ.get('PYTHONPATH', ''))\n"
+           f"sys.exit({reconcile_rc})\n")
     _write(repo / "core" / "order_intent_gateway.py", "GATEWAY = 1\n")
     _write(repo / "config" / "futures_live.yaml",
            "live_trading: true\nconfig_profile: futures_live\n")
@@ -378,3 +381,14 @@ def test_evidence_capture_failure_aborts_before_stop(tmp_path):
     assert r.returncode != 0, r.stdout + r.stderr
     assert "stage=EVIDENCE" in r.stderr, r.stderr
     assert "pm2 stop" not in (pm2_log.read_text() if pm2_log.exists() else "")
+
+
+def test_deploy_helpers_get_the_repo_on_pythonpath(tmp_path):
+    """Real-machine finding: reconcile_pending_orders.py needs PYTHONPATH=repo."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests")
+    bin_dir, _ = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 0, r.stdout + r.stderr
+    seen = (tmp_path / "reconcile_env.log").read_text()
+    assert str(repo) in seen, f"PYTHONPATH did not carry the repo: {seen!r}"
