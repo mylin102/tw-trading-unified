@@ -26,6 +26,13 @@ Usage
 
 Exit codes
   0 = classification ok (default); with --exit-code: 0 = FAST, 1 = FULL, 2 = error
+
+Enforcement point (audit 2026-09-20): this repository has no CI runner (no
+.github/workflows, and the suite needs broker/SDK deps), so the gate is NOT
+enforced by CI.  It is enforced by the verification protocol: whoever verifies
+a change runs this gate first and then runs the scope it names (FULL = the
+whole suite plus every gate).  An operator who skips the gate is not blocked
+by tooling — that is a known, deliberate limitation, not an oversight.
 """
 import argparse
 import ast
@@ -54,6 +61,7 @@ CONTRACT_GLOBS = (
     "ecosystem.config.js",
     "scripts/deployment/**",
     "scripts/restart_live.sh",
+    ".github/workflows/**",   # CI that can deploy/restart is contract surface
 )
 
 TEST_ONLY_GLOBS = (
