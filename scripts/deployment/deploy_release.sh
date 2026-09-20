@@ -13,12 +13,12 @@
 #   2 FREEZE      re_freeze --verify, else re-freeze + commit manifest; pin LRC_RELEASE_SHA=HEAD
 #   3 IMPACT      contract_impact.py on (running sha -> HEAD); a FULL verdict needs a
 #                 recorded verification of that sha (audit C7b call site)
-#   4 GATE_PRE    check_deployment.py --phase pre_deploy   (CLI only, gate never bypassed)
-#   5 STOP        pm2 stop <app> and confirm stopped
-#   6 RECONCILE   scripts/reconcile_pending_orders.py (fail-closed)
-#   7 START       pm2 start <app> with the pinned env (never --update-env)
-#   8 GATE_POST   check_deployment.py --phase post_startup
-#   9 VERIFY      verify_live_context.py: live_ready + live_order_allowed + pinned sha
+#   5 GATE_PRE    check_deployment.py --phase pre_deploy   (CLI only, gate never bypassed)
+#   6 STOP        pm2 stop <app> and confirm stopped
+#   7 RECONCILE   scripts/reconcile_pending_orders.py (fail-closed)
+#   8 START       pm2 start <app> with the pinned env (never --update-env)
+#   9 GATE_POST   check_deployment.py --phase post_startup
+#  10 VERIFY      verify_live_context.py: live_ready + live_order_allowed + pinned sha
 #
 # Safety properties (audited 2026-09-20):
 #   * tools are NOT overridable — `git` and `pm2` resolve from PATH and every
@@ -31,7 +31,7 @@
 #     checked; a failing `.env` or an unrecorded FULL verification aborts.
 set -u -o pipefail
 
-TOTAL_STAGES=9
+TOTAL_STAGES=10
 CURRENT_STAGE="init"
 STAGE_NO=0
 DRY_RUN=0
@@ -44,8 +44,8 @@ ENV_FILE="${TRADING_ENV_FILE:-/Users/myllin_mini/Documents/mylin102/tw-trading-u
 GIT_BIN="git"
 PM2_BIN="pm2"
 MANIFEST="PHASE1_FINAL_FREEZE.md"
-POSITION_STATE="$RUNTIME_DIR/logs/position_state.json"
 PID_FILE="$RUNTIME_DIR/logs/pm2-trading-trading-20.pid"
+CONFIG_PROFILE="config/futures_live.yaml"
 MIN_FREE_GB=3
 STOP_WAIT_S=2
 START_WAIT_S=25
@@ -170,9 +170,31 @@ else
 fi
 
 # ── 4 GATE_PRE ───────────────────────────────────────────────────────────────
+stage EVIDENCE
+
+FLAT_SNAPSHOT=""
+CONFIG_HASH=""
+if [ "$DRY_RUN" = 1 ]; then
+  log "DRY-RUN would capture fresh read-only flat evidence (broker login) — NOT captured in dry-run"
+else
+  [ -f scripts/deployment/capture_flat_evidence.py ] \
+    || fail 4 "scripts/deployment/capture_flat_evidence.py missing — cannot produce gate evidence"
+  [ -f "$CONFIG_PROFILE" ] || fail 4 "config profile missing: $CONFIG_PROFILE"
+  LIVE_PREFLIGHT_NO_ORDERS=1 "$PYTHON_BIN" -B scripts/deployment/capture_flat_evidence.py \
+    --env-file "$ENV_FILE" > "$ARTIFACT_DIR/deploy_flat_evidence.json" 2>"$ARTIFACT_DIR/deploy_flat_evidence.err" \
+    || fail 4 "read-only flat evidence capture failed — see $ARTIFACT_DIR/deploy_flat_evidence.err"
+  FLAT_SNAPSHOT="$("$PYTHON_BIN" -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("artifact") or "")' "$ARTIFACT_DIR/deploy_flat_evidence.json")"
+  [ -n "$FLAT_SNAPSHOT" ] || fail 4 "capture did not report an artifact — see $ARTIFACT_DIR/deploy_flat_evidence.json"
+  [ -f "$FLAT_SNAPSHOT" ] || fail 4 "capture reported an artifact that does not exist: $FLAT_SNAPSHOT"
+  CONFIG_HASH="$("$PYTHON_BIN" -B -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$CONFIG_PROFILE")"
+  log "flat evidence=$FLAT_SNAPSHOT config_profile=$CONFIG_PROFILE hash=${CONFIG_HASH:0:12}"
+fi
+
 stage GATE_PRE
 GATE_ARGS=(--release-dir "$REPO_DIR" --runtime-dir "$RUNTIME_DIR" --pid-file "$PID_FILE"
-           --position-state "$POSITION_STATE" --monitor strategies/futures/monitor.py
+           --position-state "$FLAT_SNAPSHOT" --margin-evidence "$FLAT_SNAPSHOT" \
+           --config-profile "$CONFIG_PROFILE" --config-hash "$CONFIG_HASH" \
+           --monitor strategies/futures/monitor.py
            --expected-sha "$LRC_RELEASE_SHA" --manifest "$MANIFEST")
 if [ "$DRY_RUN" = 1 ]; then
   log "DRY-RUN would run: $PYTHON_BIN -B scripts/deployment/check_deployment.py --phase pre_deploy ${GATE_ARGS[*]} --json"
@@ -239,7 +261,8 @@ if [ "$DRY_RUN" = 1 ]; then
   log "DRY-RUN would run: check_deployment.py --phase post_startup ${GATE_ARGS[*]} --session-generation $SESSION_GEN --json"
 else
   "$PYTHON_BIN" -B scripts/deployment/check_deployment.py --phase post_startup "${GATE_ARGS[@]}" \
-      --session-generation "$SESSION_GEN" --json > "$ARTIFACT_DIR/deploy_gate_post.json" 2>"$ARTIFACT_DIR/deploy_gate_post.err"
+      --session-generation "$SESSION_GEN" --allow-existing-mts-position \
+      --json > "$ARTIFACT_DIR/deploy_gate_post.json" 2>"$ARTIFACT_DIR/deploy_gate_post.err"
   GATE_RC=$?
   [ $GATE_RC -eq 0 ] || fail 9 "gate post_startup NOT_READY (rc=$GATE_RC) — see $ARTIFACT_DIR/deploy_gate_post.err"
   log "gate post_startup READY"
