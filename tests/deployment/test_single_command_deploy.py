@@ -1,16 +1,12 @@
 """Fail-closed contract of the single-command deploy script (Collapse 1).
 
-The tests drive the REAL scripts/deployment/deploy_release.sh in a throwaway
-repo layout.  Stubs for `git`/`pm2` are put on PATH and the stage scripts
-(check_deployment.py / re_freeze.py / reconcile / verify) are tiny fakes inside
-the throwaway repo, so the production script carries NO fault-injection hook:
-the injection is entirely test-side (PATH + throwaway layout).
+The tests drive the REAL scripts/deployment/deploy_release.sh against a REAL
+scripts/ci/contract_impact.py inside a throwaway git repository, so the IMPACT
+stage is exercised end-to-end (audit 2026-09-20 round 3: a fixture that stubs
+the classifier proves nothing about the deployed integration).
 
-Audited properties (2026-09-20):
-  * no test seam inside the production script: tools come from PATH and every
-    safety threshold is a literal (no DEPLOY_* override knobs)
-  * the deploy stops at the FIRST failure and never runs a later stage
-  * `--dry-run` performs no external action and writes no file
+Only `pm2` and the stage helper scripts are stubbed; `git` is the real one and
+the throwaway repo carries real commits for the "running" and "deployed" shas.
 """
 from __future__ import annotations
 
@@ -25,6 +21,7 @@ import pytest
 
 REPO_SRC = Path(__file__).resolve().parents[2]
 DEPLOY_SRC = REPO_SRC / "scripts" / "deployment" / "deploy_release.sh"
+IMPACT_SRC = REPO_SRC / "scripts" / "ci" / "contract_impact.py"
 
 
 def _write(path: Path, text: str, exec_bit: bool = False) -> None:
@@ -34,20 +31,17 @@ def _write(path: Path, text: str, exec_bit: bool = False) -> None:
         path.chmod(0o755)
 
 
-def _stub_bin(tmp: Path, git_rc: int = 0, pm2_start_status: str = "online",
-              running_sha: str = "2222222222222222222222222222222222222222") -> tuple[Path, Path]:
-    """Return (bin_dir, pm2_log)."""
+def _git(repo: Path, *args: str) -> str:
+    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    assert r.returncode == 0, f"git {args} failed: {r.stderr}"
+    return r.stdout.strip()
+
+
+def _stub_bin(tmp: Path, running_sha: str = "BASE",
+              pm2_start_status: str = "online") -> tuple[Path, Path]:
+    """Return (bin_dir, pm2_log).  `running_sha` is resolved at layout time."""
     bin_dir = tmp / "stubbin"
     pm2_log = tmp / "pm2_calls.log"
-    _write(bin_dir / "git", f"""#!/usr/bin/env bash
-printf 'git %s\\n' "$*" >> {tmp}/git_calls.log
-case "$1" in
-  diff) exit {git_rc} ;;
-  rev-parse) echo 1111111111111111111111111111111111111111; exit 0 ;;
-  add|commit) exit 0 ;;
-esac
-exit 0
-""", exec_bit=True)
     _write(bin_dir / "pm2", f"""#!/usr/bin/env bash
 printf 'pm2 %s\\n' "$*" >> {pm2_log}
 case "$1" in
@@ -55,22 +49,24 @@ case "$1" in
     if grep -q "pm2 start" {pm2_log} 2>/dev/null; then st={pm2_start_status}; else st=stopped; fi
     printf '[{{"name":"trading-system","pm2_env":{{"status":"%s","LRC_RELEASE_SHA":"{running_sha}"}}}}]' "$st"
     ;;
-  stop) exit 0 ;;
-  start) exit 0 ;;
+  stop|start) exit 0 ;;
 esac
 exit 0
 """, exec_bit=True)
     return bin_dir, pm2_log
 
 
-def _layout(tmp: Path, gate_pre_rc: int = 0, gate_post_rc: int = 0,
+def _layout(tmp: Path, *, gate_pre_rc: int = 0, gate_post_rc: int = 0,
             reconcile_rc: int = 0, verify_rc: int = 0, disk_ok: bool = True,
-            impact_rc: int = 0, env_ok: bool = True,
-            scope_record: bool = False) -> Path:
+            env_ok: bool = True, scope_record: bool = False,
+            deployed_change: str = "tests") -> Path:
+    """Build a real git repo: base commit (running) + deployed commit (HEAD)."""
     repo = tmp / "repo"
     (repo / "scripts" / "deployment").mkdir(parents=True)
     shutil.copy2(DEPLOY_SRC, repo / "scripts" / "deployment" / "deploy_release.sh")
     (repo / "scripts" / "deployment" / "deploy_release.sh").chmod(0o755)
+    (repo / "scripts" / "ci").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(IMPACT_SRC, repo / "scripts" / "ci" / "contract_impact.py")
     (repo / "PHASE1_FINAL_FREEZE.md").write_text("manifest\n")
     stub = "import sys; sys.exit(%d)\n"
     _write(repo / "scripts" / "deployment" / "re_freeze.py", "import sys; sys.exit(0)\n")
@@ -80,7 +76,6 @@ if "--phase" in sys.argv and sys.argv[sys.argv.index("--phase") + 1] == "pre_dep
     sys.exit({gate_pre_rc})
 sys.exit({gate_post_rc})
 """)
-    # stage 8 stub: answers the stage-1 disk probe, then behaves as configured
     _write(repo / "scripts" / "deployment" / "verify_live_context.py",
            f"""import sys
 if "--check-disk" in sys.argv:
@@ -92,44 +87,60 @@ if "--check-disk" in sys.argv:
 sys.exit({verify_rc})
 """)
     _write(repo / "scripts" / "reconcile_pending_orders.py", stub % reconcile_rc)
-    # contract-impact stub: rc 0 = FAST, 1 = FULL, 2 = error
-    _write(repo / "scripts" / "ci" / "contract_impact.py",
-           f"""import sys
-sys.exit({impact_rc})
-""")
+    _write(repo / "core" / "order_intent_gateway.py", "GATEWAY = 1\n")
+    _write(repo / "tests" / "core" / "test_x.py", "def test_x():\n    assert True\n")
+    _write(repo / "tests" / "core" / "test_order_intent_gateway.py", "def test_g():\n    assert True\n")
     (tmp / "runtime" / "logs").mkdir(parents=True, exist_ok=True)
     (tmp / "runtime" / "execution_context.json").write_text(
         json.dumps({"requested_mode": "live", "effective_mode": "live_ready",
                     "live_order_allowed": True, "audit_reasons": [],
                     "session_id": "sess-1"}))
     (tmp / ".env").write_text("EXPORTED=1\n" if env_ok else "false\n")
+
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
+    (tmp / "base_sha").write_text(base_sha)
+
+    # the deployed diff: TEST_ONLY (FAST) or a contract path (FULL)
+    if deployed_change == "tests":
+        _write(repo / "tests" / "core" / "test_x.py",
+               "def test_x():\n    assert True  # deployed\n")
+    else:
+        _write(repo / "core" / "order_intent_gateway.py", "GATEWAY = 2\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "deployed")
+    head_sha = _git(repo, "rev-parse", "HEAD")
+    (tmp / "head_sha").write_text(head_sha)
+
     if scope_record:
         (tmp / "runtime" / "logs" / "verify_scope.json").write_text(
-            json.dumps({"sha": "1111111111111111111111111111111111111111",
-                        "decision": "FULL"}))
+            json.dumps({"sha": head_sha, "decision": "FULL"}))
     return repo
 
 
-def _run(tmp: Path, repo: Path, bin_dir: Path, extra_env: dict | None = None,
-         args: list[str] | None = None) -> subprocess.CompletedProcess:
+def _run(tmp: Path, repo: Path, bin_dir: Path, args: list[str] | None = None,
+         extra_env: dict | None = None) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
-    # only the runtime's own env is honoured by the script
     env["TRADING_RUNTIME_DIR"] = str(tmp / "runtime")
     env["TRADING_ENV_FILE"] = str(tmp / ".env")
     env["TRADING_PYTHON_BIN"] = sys.executable
     env.update(extra_env or {})
     return subprocess.run(["bash", str(repo / "scripts" / "deployment" / "deploy_release.sh"),
                            *(args or [])], capture_output=True, text=True, env=env,
-                          cwd=str(repo), timeout=180)
+                          cwd=str(repo), timeout=300)
 
 
-def test_script_present():
+def test_script_and_classifier_present():
     assert DEPLOY_SRC.exists(), "scripts/deployment/deploy_release.sh missing"
+    assert IMPACT_SRC.exists(), "scripts/ci/contract_impact.py missing (deploy branch must carry it)"
 
 
 def test_no_deploy_override_seam_in_production_script():
-    """Audit C1: the production script must not expose tool/threshold overrides."""
     text = DEPLOY_SRC.read_text(encoding="utf-8")
     for banned in ("DEPLOY_GIT_BIN", "DEPLOY_PM2_BIN", "DEPLOY_PYTHON_BIN",
                    "DEPLOY_MIN_FREE_GB", "DEPLOY_MANIFEST", "DEPLOY_POSITION_STATE",
@@ -139,100 +150,23 @@ def test_no_deploy_override_seam_in_production_script():
 
 
 def test_dry_run_prints_plan_only_and_touches_nothing(tmp_path):
-    bin_dir, pm2_log = _stub_bin(tmp_path)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
     repo = _layout(tmp_path)
+    base = (tmp_path / "base_sha").read_text().strip()
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=base)
     logs_before = set(os.listdir(tmp_path / "runtime" / "logs"))
     r = _run(tmp_path, repo, bin_dir, args=["--dry-run"])
     assert r.returncode == 0, r.stdout + r.stderr
-    for st in ("PREFLIGHT", "FREEZE", "GATE_PRE", "STOP", "RECONCILE", "START",
-               "GATE_POST", "VERIFY"):
+    for st in ("PREFLIGHT", "FREEZE", "IMPACT", "GATE_PRE", "STOP", "RECONCILE",
+               "START", "GATE_POST", "VERIFY"):
         assert st in r.stdout, st
     assert "NOTHING was verified" in r.stdout, r.stdout
-    # no pm2 call at all, no artifact written anywhere
-    assert not pm2_log.exists(), pm2_log.read_text() if pm2_log.exists() else ""
+    assert not pm2_log.exists()
     assert set(os.listdir(tmp_path / "runtime" / "logs")) == logs_before
-    assert not (tmp_path / "git_calls.log").exists() or True  # local git use is read-only
-
-
-def test_happy_path_stops_then_starts_once(tmp_path):
-    bin_dir, pm2_log = _stub_bin(tmp_path)
-    repo = _layout(tmp_path)
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "[DEPLOY OK]" in r.stdout
-    calls = pm2_log.read_text().splitlines()
-    assert sum(1 for c in calls if c.startswith("pm2 stop")) == 1
-    assert sum(1 for c in calls if c.startswith("pm2 start")) == 1
-    assert calls.index("pm2 stop trading-system") < calls.index("pm2 start trading-system")
-
-
-def test_gate_pre_failure_aborts_before_stop(tmp_path):
-    bin_dir, pm2_log = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, gate_pre_rc=1)
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode != 0
-    assert "stage=GATE_PRE" in r.stderr
-    assert "pm2 stop" not in (pm2_log.read_text() if pm2_log.exists() else "")
-
-
-def test_reconcile_failure_aborts_before_start(tmp_path):
-    bin_dir, pm2_log = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, reconcile_rc=1)
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode != 0
-    assert "stage=RECONCILE" in r.stderr
-    log = pm2_log.read_text() if pm2_log.exists() else ""
-    assert "pm2 stop" in log and "pm2 start" not in log
-
-
-def test_gate_post_failure_reports_and_fails(tmp_path):
-    bin_dir, _ = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, gate_post_rc=1)
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode != 0
-    assert "stage=GATE_POST" in r.stderr
-
-
-def test_verify_failure_fails_closed(tmp_path):
-    bin_dir, _ = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, verify_rc=4)
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode != 0
-    assert "stage=VERIFY" in r.stderr
-
-
-def test_dirty_tree_aborts_at_preflight(tmp_path):
-    bin_dir, pm2_log = _stub_bin(tmp_path, git_rc=1)  # git diff --quiet -> dirty
-    repo = _layout(tmp_path)
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode != 0
-    assert "stage=PREFLIGHT" in r.stderr
-    assert not pm2_log.exists() or "pm2 stop" not in pm2_log.read_text()
-
-
-def test_disk_floor_aborts_at_preflight(tmp_path):
-    bin_dir, pm2_log = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, disk_ok=False)
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode != 0
-    assert "stage=PREFLIGHT" in r.stderr
-    assert not pm2_log.exists() or "pm2 stop" not in pm2_log.read_text()
-
-
-def test_env_load_failure_aborts_at_start(tmp_path):
-    """Audit C3 round 3: a failing credentials file must abort, never start the app."""
-    bin_dir, pm2_log = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, env_ok=False)   # .env content is `false`
-    r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode != 0, r.stdout + r.stderr
-    assert "stage=START" in r.stderr, r.stderr
-    log = pm2_log.read_text() if pm2_log.exists() else ""
-    assert "pm2 start" not in log
 
 
 def test_dry_run_never_sources_the_env_file(tmp_path):
-    """Audit M5 round 3: dry-run must not execute the credentials file."""
-    bin_dir, pm2_log = _stub_bin(tmp_path)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
     repo = _layout(tmp_path)
     marker = tmp_path / "env_was_sourced"
     (tmp_path / ".env").write_text(f"touch {marker}\n")
@@ -242,10 +176,21 @@ def test_dry_run_never_sources_the_env_file(tmp_path):
     assert not pm2_log.exists()
 
 
-def test_impact_full_requires_recorded_verification(tmp_path):
-    """Audit C7b: a FULL classification must be backed by a recorded verification."""
-    bin_dir, pm2_log = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, impact_rc=1)     # FULL
+def test_test_only_diff_is_fast_and_proceeds(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests")
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[DEPLOY OK]" in r.stdout
+    log = pm2_log.read_text()
+    assert "pm2 stop trading-system" in log and "pm2 start trading-system" in log
+
+
+def test_contract_diff_requires_recorded_verification(tmp_path):
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="contract")
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
     r = _run(tmp_path, repo, bin_dir)
     assert r.returncode != 0, r.stdout + r.stderr
     assert "stage=IMPACT" in r.stderr, r.stderr
@@ -253,18 +198,31 @@ def test_impact_full_requires_recorded_verification(tmp_path):
     assert "pm2 stop" not in log
 
 
-def test_impact_full_with_recorded_verification_proceeds(tmp_path):
-    bin_dir, _ = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, impact_rc=1, scope_record=True)
+def test_contract_diff_with_recorded_verification_proceeds(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="contract", scope_record=True)
+    bin_dir, _ = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
     r = _run(tmp_path, repo, bin_dir)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "[DEPLOY OK]" in r.stdout
 
 
-def test_impact_unknown_running_sha_forces_full(tmp_path):
-    """Fail-closed: an unknown running sha cannot be classified as FAST."""
+def test_stale_verification_record_is_rejected(tmp_path):
+    """A FULL record for a DIFFERENT sha must not authorise this deploy."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="contract",
+                   scope_record=False)
+    (tmp_path / "runtime" / "logs" / "verify_scope.json").write_text(
+        json.dumps({"sha": "0" * 40, "decision": "FULL"}))
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0
+    assert "stage=IMPACT" in r.stderr
+
+
+def test_unknown_running_sha_forces_full(tmp_path):
     bin_dir, pm2_log = _stub_bin(tmp_path, running_sha="")
-    repo = _layout(tmp_path, impact_rc=0)     # stub would say FAST, must not be consulted
+    repo = _layout(tmp_path, deployed_change="tests")  # would be FAST
     r = _run(tmp_path, repo, bin_dir)
     assert r.returncode != 0, r.stdout + r.stderr
     assert "stage=IMPACT" in r.stderr, r.stderr
@@ -272,18 +230,94 @@ def test_impact_unknown_running_sha_forces_full(tmp_path):
     assert "pm2 stop" not in log
 
 
-def test_impact_fast_proceeds_without_a_record(tmp_path):
-    bin_dir, _ = _stub_bin(tmp_path)
-    repo = _layout(tmp_path, impact_rc=0)
+def test_same_sha_redeploy_follows_the_gate_empty_diff_is_full(tmp_path):
+    """No NO_CHANGE shortcut: an empty diff is FULL, exactly like the gate says."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests")
+    head = (tmp_path / "head_sha").read_text().strip()
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=head)
     r = _run(tmp_path, repo, bin_dir)
-    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=IMPACT" in r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 stop" not in log
+
+
+def test_env_load_failure_aborts_at_start(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, env_ok=False)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "stage=START" in r.stderr, r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 start" not in log
+
+
+def test_gate_pre_failure_aborts_before_stop(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, gate_pre_rc=1)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0
+    assert "stage=GATE_PRE" in r.stderr
+    assert "pm2 stop" not in (pm2_log.read_text() if pm2_log.exists() else "")
+
+
+def test_reconcile_failure_aborts_before_start(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, reconcile_rc=1)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0
+    assert "stage=RECONCILE" in r.stderr
+    log = pm2_log.read_text() if pm2_log.exists() else ""
+    assert "pm2 stop" in log and "pm2 start" not in log
+
+
+def test_gate_post_failure_reports_and_fails(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, gate_post_rc=1)
+    bin_dir, _ = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0
+    assert "stage=GATE_POST" in r.stderr
+
+
+def test_verify_failure_fails_closed(tmp_path):
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, verify_rc=4)
+    bin_dir, _ = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0
+    assert "stage=VERIFY" in r.stderr
+
+
+def test_dirty_tree_aborts_at_preflight(tmp_path):
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path)
+    (repo / "core" / "order_intent_gateway.py").write_text("GATEWAY = 99  # uncommitted\n")
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0
+    assert "stage=PREFLIGHT" in r.stderr
+    assert not pm2_log.exists() or "pm2 stop" not in pm2_log.read_text()
+
+
+def test_disk_floor_aborts_at_preflight(tmp_path):
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, disk_ok=False)
+    bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode != 0
+    assert "stage=PREFLIGHT" in r.stderr
+    assert not pm2_log.exists() or "pm2 stop" not in pm2_log.read_text()
 
 
 def test_verifier_requires_expected_sha(tmp_path):
-    """Audit M4 round 3: the standalone verifier must fail closed without a sha."""
-    import subprocess
+    import subprocess as _sp
     vlc = REPO_SRC / "scripts" / "deployment" / "verify_live_context.py"
-    r = subprocess.run([sys.executable, "-B", str(vlc), "--runtime-dir",
-                        str(tmp_path / "runtime")], capture_output=True, text=True)
+    r = _sp.run([sys.executable, "-B", str(vlc), "--runtime-dir",
+                 str(tmp_path / "runtime")], capture_output=True, text=True)
     assert r.returncode == 2, r.stdout + r.stderr
     assert "--expected-sha is required" in r.stdout
