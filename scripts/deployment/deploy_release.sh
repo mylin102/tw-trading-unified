@@ -143,22 +143,21 @@ else
     log "running sha unknown -> forcing FULL classification"
     IMPACT_BASE=""
   fi
-  IMPACT_RC=0
-  if [ -n "$IMPACT_BASE" ] && [ "$IMPACT_BASE" != "$EXPECTED_SHA" ]; then
+  if [ -n "$IMPACT_BASE" ]; then
+    # always classify — including running == HEAD: the gate itself calls an
+    # empty diff FULL (NO_EVIDENCE), so a redeploy needs a recorded verification
     "$PYTHON_BIN" -B scripts/ci/contract_impact.py --repo "$REPO_DIR" --base "$IMPACT_BASE" \
         --head "$EXPECTED_SHA" --json --exit-code > "$ARTIFACT_DIR/deploy_impact.json" 2>"$ARTIFACT_DIR/deploy_impact.err"
     IMPACT_RC=$?
-    log "impact decision rc=$IMPACT_RC (0=FAST 1=FULL 2=error)"
   else
-    if [ -z "$IMPACT_BASE" ]; then
-      printf '{"decision": "FULL", "reason": "running sha unknown"}\n' > "$ARTIFACT_DIR/deploy_impact.json"
-      IMPACT_RC=1
-    else
-      printf '{"decision": "NO_CHANGE", "reason": "running sha == expected sha"}\n' > "$ARTIFACT_DIR/deploy_impact.json"
-      IMPACT_RC=0
-    fi
+    printf '{"decision": "FULL", "reason": "running sha unknown -> no evidence -> FULL"}\n' > "$ARTIFACT_DIR/deploy_impact.json"
+    IMPACT_RC=1
   fi
-  [ "$IMPACT_RC" -ne 2 ] || fail 4 "contract-impact classification failed — see $ARTIFACT_DIR/deploy_impact.err"
+  case "$IMPACT_RC" in
+    0) log "impact decision FAST (running=$IMPACT_BASE head=$EXPECTED_SHA)" ;;
+    1) log "impact decision FULL (running=$IMPACT_BASE head=$EXPECTED_SHA)" ;;
+    *) fail 4 "contract-impact classification returned rc=$IMPACT_RC (only 0=FAST / 1=FULL may continue) — see $ARTIFACT_DIR/deploy_impact.err" ;;
+  esac
   if [ "$IMPACT_RC" -eq 1 ]; then
     SCOPE_FILE="$ARTIFACT_DIR/verify_scope.json"
     [ -f "$SCOPE_FILE" ] || fail 4 "FULL verification required for this diff but $SCOPE_FILE is missing"
