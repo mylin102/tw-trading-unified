@@ -92,6 +92,9 @@ command -v "$PM2_BIN" >/dev/null 2>&1 || fail 2 "pm2 not found on PATH"
 [ -d "$RUNTIME_DIR" ] || fail 2 "runtime dir missing: $RUNTIME_DIR"
 [ -f "$ENV_FILE" ] || fail 2 "credentials env file missing: $ENV_FILE"
 cd "$REPO_DIR" || fail 2 "cannot cd $REPO_DIR"
+# the deploy helpers (reconcile_pending_orders.py et al) import the repo's own
+# `core` package and are launched from the repo root — they need it on sys.path
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 if ! "$GIT_BIN" diff --quiet || ! "$GIT_BIN" diff --cached --quiet; then
   fail 2 "tracked changes must be committed before deploy"
 fi
