@@ -152,3 +152,39 @@ def test_git_mode_empty_range_requires_full():
     rc, out = _run(["--base", "HEAD", "--head", "HEAD"])
     assert rc == 0, out
     assert _decision(out) == "FULL", out
+
+
+def test_ci_deploy_workflow_is_contract_not_test_only():
+    """Audit C7(a): a workflow that can deploy/restart is contract surface, never FAST."""
+    rc, out = _run(["--paths", ".github/workflows/live-deploy.yml"])
+    assert _decision(out) == "FULL", out
+    assert "CONTRACT" in out
+
+
+def test_github_non_workflow_paths_stay_test_only():
+    rc, out = _run(["--paths", ".github/ISSUE_TEMPLATE/bug.md"])
+    assert _decision(out) == "FAST", out
+
+
+def test_rename_of_a_contract_path_requires_full(tmp_path):
+    """Audit C5 gap: an explicit rename (R*) must be fail-closed FULL."""
+    import os as _os
+    import subprocess as _sp
+
+    repo = tmp_path / "renrepo"
+    (repo / "core").mkdir(parents=True)
+    g = ["git", "-C", str(repo)]
+    _sp.run(g + ["init", "-q"], check=True)
+    _sp.run(g + ["config", "user.email", "t@t"], check=True)
+    _sp.run(g + ["config", "user.name", "t"], check=True)
+    (repo / "core" / "order_intent_gateway.py").write_text("X = 1\n")
+    _sp.run(g + ["add", "-A"], check=True)
+    _sp.run(g + ["commit", "-qm", "a"], check=True)
+    base = _sp.run(g + ["rev-parse", "HEAD"], capture_output=True,
+                   text=True).stdout.strip()
+    _os.rename(repo / "core" / "order_intent_gateway.py",
+               repo / "core" / "order_intent_gateway_renamed.py")
+    _sp.run(g + ["add", "-A"], check=True)
+    _sp.run(g + ["commit", "-qm", "r"], check=True)
+    rc, out = _run(["--repo", str(repo), "--base", base, "--head", "HEAD"])
+    assert _decision(out) == "FULL", out
