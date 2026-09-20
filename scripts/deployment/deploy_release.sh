@@ -234,6 +234,7 @@ fi
 stage START
 if [ "$DRY_RUN" = 1 ]; then
   log "DRY-RUN would load credentials from $ENV_FILE (not sourced in dry-run)"
+  log "DRY-RUN: $PM2_BIN delete $APP; $PM2_BIN start ecosystem.config.js --only $APP; $PM2_BIN save"
 else
   set -a
   if ! . "$ENV_FILE"; then
@@ -242,14 +243,24 @@ else
   fi
   set +a
 fi
+# identity pin: `pm2 start <name>` reuses the registration's STORED env, which
+# keeps the previous LRC_RELEASE_SHA and makes main.py refuse to boot
+# (RUNTIME_IDENTITY_REJECTED).  Re-register from THIS shell env instead:
+# delete + single start from the canonical ecosystem file + save the dump.
+# `pm2 restart` and `--update-env` are forbidden deploy actions.
 export LRC_RELEASE_SHA="$EXPECTED_SHA"
+export NODE_ENV=production
+export TRADING_PYTHON_BIN="$PYTHON_BIN"
 export TRADING_RUNTIME_DIR="$RUNTIME_DIR"
-run "$PM2_BIN" start "$APP" || fail 8 "pm2 start failed"
+[ -f ecosystem.config.js ] || fail 8 "ecosystem.config.js missing — cannot start $APP"
+run "$PM2_BIN" delete "$APP" || log "pm2 delete: $APP was not registered (continuing)"
+run "$PM2_BIN" start ecosystem.config.js --only "$APP" || fail 8 "pm2 start failed"
 if [ "$DRY_RUN" = 0 ]; then
   sleep "$START_WAIT_S"
   "$PM2_BIN" jlist > "$ARTIFACT_DIR/deploy_pm2_after_start.json" 2>/dev/null
   STATUS="$("$PYTHON_BIN" -B -c "import json,sys; items=json.load(open(sys.argv[1])); print(next((x['pm2_env']['status'] for x in items if x['name']==sys.argv[2]), 'missing'))" "$ARTIFACT_DIR/deploy_pm2_after_start.json" "$APP")"
   [ "$STATUS" = "online" ] || fail 8 "app not online (status=$STATUS)"
+  run "$PM2_BIN" save || log "pm2 save failed (registration pin not persisted)"
   log "app online"
 fi
 
