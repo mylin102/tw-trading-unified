@@ -286,15 +286,17 @@ export NODE_ENV=production
 export TRADING_PYTHON_BIN="$PYTHON_BIN"
 export TRADING_RUNTIME_DIR="$RUNTIME_DIR"
 [ -f ecosystem.config.js ] || fail 8 "ecosystem.config.js missing — cannot start $APP"
+if [ "$DRY_RUN" = 0 ]; then
   command -v node >/dev/null 2>&1 || fail 8 "node not found on PATH — cannot validate ecosystem.config.js"
   # a delete that cannot be followed by a start IS downtime: the PM2 config is
   # validated (production mode requires the canonical release root) BEFORE the
-  # app is removed from the process list.
+  # app is removed from the process list.  Never runs in dry-run (no side effects).
   if ! NODE_ENV=production TRADING_PYTHON_BIN="$PYTHON_BIN" TRADING_RUNTIME_DIR="$RUNTIME_DIR" \
       LRC_RELEASE_SHA="$EXPECTED_SHA" node -e 'require("./ecosystem.config.js")' \
       > "$ARTIFACT_DIR/deploy_ecosystem_check.out" 2>&1; then
     fail 8 "ecosystem.config.js rejects this release dir/env — refusing to stop the app (no downtime): see $ARTIFACT_DIR/deploy_ecosystem_check.out"
   fi
+fi
 run "$PM2_BIN" delete "$APP" || log "pm2 delete: $APP was not registered (continuing)"
 run "$PM2_BIN" start ecosystem.config.js --only "$APP" || fail 8 "pm2 start failed"
 if [ "$DRY_RUN" = 0 ]; then
