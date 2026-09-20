@@ -299,10 +299,11 @@ def test_env_load_failure_aborts_before_start(tmp_path):
     bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
     r = _run(tmp_path, repo, bin_dir)
     assert r.returncode != 0, r.stdout + r.stderr
-    assert "stage=RECONCILE" in r.stderr, r.stderr
+    assert "stage=PREFLIGHT" in r.stderr, r.stderr
     assert "credentials env load failed" in r.stderr, r.stderr
     log = pm2_log.read_text() if pm2_log.exists() else ""
     assert "pm2 start" not in log
+    assert "pm2 stop" not in log, "a credentials failure must not stop a running app"
 
 
 def test_gate_pre_failure_aborts_before_stop(tmp_path):
@@ -433,17 +434,19 @@ def test_start_re_registers_with_the_new_identity_pin(tmp_path):
     assert "NODE=production" in env_lines[-1], env_lines[-1]
 
 
-def test_start_validates_the_ecosystem_config_before_delete(tmp_path):
-    """A delete that cannot be followed by a start is downtime: validate first."""
+def test_bad_ecosystem_config_aborts_before_anything_is_stopped(tmp_path):
+    """A PM2 config that rejects this release dir must abort BEFORE the stop."""
     bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
     repo = _layout(tmp_path, deployed_change="tests")
     bin_dir, pm2_log = _stub_bin(tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip(),
                                  node_ok=False)
     r = _run(tmp_path, repo, bin_dir)
     assert r.returncode != 0, r.stdout + r.stderr
-    assert "stage=START" in r.stderr, r.stderr
+    assert "stage=PREFLIGHT" in r.stderr, r.stderr
+    assert "ecosystem.config.js rejects this release dir/env" in r.stderr, r.stderr
     log = pm2_log.read_text() if pm2_log.exists() else ""
-    assert "pm2 delete" not in log, "the app was deleted before the PM2 config was validated"
+    assert "pm2 stop" not in log, "the app was stopped before the PM2 config was validated"
+    assert "pm2 delete" not in log
     assert "pm2 start" not in log
     assert (tmp_path / "node_calls.log").exists(), "the ecosystem config was never validated"
 
