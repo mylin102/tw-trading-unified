@@ -2284,6 +2284,61 @@ def test_e2e_release_failure_no_false_submitted(monkeypatch):
     assert monitor.api.calls == []
 
 
+def test_collapse2_monitor_ordering_retry_is_bounded_and_rechecks_broker(monkeypatch):
+    """The real monitor submit ingress retries ordering rejection once only."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_fresh_exit_only_ctx())
+    monitor._hydrate_exit_only_position()  # position exists, auth publication does not
+    monitor.api.list_orders = lambda account=None: []
+    monitor.order_mgr.submit = lambda order: False
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open", lambda: True)
+    monitor._pre_submit_exit_only_proof = lambda: (True, None)
+    strategy = _bound_strategy()
+    signal = SimpleNamespace(action="PARTIAL_EXIT", reason="RELEASE_NEAR")
+
+    monitor._submit_mts_order_signal(signal, strategy, {}, __import__("datetime").datetime.now())
+    h = monitor._reconciled_position_hydration
+    records = h.durable_view()
+    assert len(records) == 1
+    record = next(iter(records.values()))
+    assert record["retry_count"] == 1
+    assert record["intent_id"].startswith("mts-collapse2-exit:")
+    assert record["idempotency_key"]
+    assert monitor.api.calls == []
+    assert any(event[0] == "ORDER_INTENT_BLOCKED" for event in events)
+
+    # A second ordering rejection is terminal and cannot call submit again.
+    h.record_rejection(record["intent_id"],
+                       reason="HYDRATION_AUTHORIZATION_ORDERING")
+    assert h.retry_once(record["intent_id"], record["idempotency_key"],
+                        lambda: pytest.fail("third attempt"),
+                        active_orders=[], position={"legs": []}) is False
+
+
+@pytest.mark.parametrize("case", ("active_order", "position_mismatch"))
+def test_collapse2_monitor_recheck_blocks_retry(case, monkeypatch):
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, _events = _monitor(_fresh_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    monitor.api.list_orders = lambda account=None: (
+        [{"ordno": "ACTIVE"}] if case == "active_order" else [])
+    if case == "position_mismatch":
+        monitor.api._positions[0] = SimpleNamespace(
+            code="TMFH6", direction=SimpleNamespace(name="Buy"), quantity=1)
+    monitor.order_mgr.submit = lambda order: pytest.fail("retry must be blocked")
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open", lambda: True)
+    monitor._pre_submit_exit_only_proof = lambda: (True, None)
+    monitor._submit_mts_order_signal(
+        SimpleNamespace(action="PARTIAL_EXIT", reason="RELEASE_NEAR"),
+        _bound_strategy(), {}, __import__("datetime").datetime.now())
+    record = next(iter(monitor._reconciled_position_hydration.durable_view().values()))
+    assert record["retry_count"] == 0
+
+
 def test_e2e_persist_failure_zero_adapter_calls(monkeypatch):
     """[audit round2 #1 E2E] persistence failure -> typed
     GATEWAY_INTENT_PERSIST_FAILED -> zero adapter calls (the durable

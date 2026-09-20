@@ -131,10 +131,13 @@ class ReconciledPositionHydration:
         return ok
 
     def record_rejection(self, intent_id: str, *, reason: str,
-                         receipt: Any = None) -> None:
+                         receipt: Any = None,
+                         idempotency_key: Optional[str] = None) -> None:
         rec = self._intents.setdefault(str(intent_id), {
             "intent_id": str(intent_id), "retry_count": 0,
         })
+        if idempotency_key is not None:
+            rec["idempotency_key"] = idempotency_key
         rec["last_reason"] = reason
         rec["broker_receipt"] = receipt
         if receipt is not None:

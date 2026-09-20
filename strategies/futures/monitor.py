@@ -4311,6 +4311,96 @@ class FuturesMonitor:
         self._exit_only_auth_override = _authority
         return True
 
+    def _collapse2_exit_identity(self, action, strategy):
+        trade_id = getattr(strategy, "_trade_id", None) or "unknown"
+        intent_id = f"mts-collapse2-exit:{trade_id}:{action}"
+        return intent_id, f"mts-collapse2:{intent_id}"
+
+    def _collapse2_retry_broker_evidence(self):
+        """Read active orders and positions before the sole ordering retry."""
+        api = getattr(self, "api", None)
+        account = getattr(api, "futopt_account", None) if api else None
+        if api is None or account is None or not hasattr(api, "list_orders"):
+            return None, None
+        try:
+            active = api.list_orders(account=account)
+            rows = api.list_positions(account=account)
+        except Exception:
+            return None, None
+        expected = getattr(self, "_exit_only_position", None) or {}
+        expected_legs = expected.get("legs") or []
+        actual_legs = []
+        for leg in expected_legs:
+            code = leg.get("code")
+            match = None
+            for row in rows or []:
+                row_code = getattr(row, "code", None) or getattr(
+                    getattr(row, "contract", None), "code", None)
+                direction = getattr(getattr(row, "direction", None), "name", None)
+                direction = direction or getattr(row, "direction", None)
+                if str(row_code) == str(code) and str(direction).lower() == str(
+                        leg.get("side", "")).lower():
+                    match = row
+                    break
+            if match is None:
+                return active, None
+            actual_legs.append({
+                "code": str(code), "side": str(leg.get("side")),
+                "quantity": int(getattr(match, "quantity", 0) or 0),
+                "avg_cost": leg.get("avg_cost"),
+            })
+        return active or [], {
+            "mode": "reconciled_exit_only", "live_order_allowed": True,
+            "legs": actual_legs,
+        }
+
+    def _collapse2_retry_ordering_rejection(self, action, strategy, reason):
+        """Real submit-ingress retry: one pre-broker ordering retry only."""
+        if reason not in ("EXIT_ONLY_HYDRATION_REQUIRED",
+                          "LIVE_ORDER_AUTHORIZATION_FAILED"):
+            return False
+        if getattr(self, "_exit_only_position", None) is None:
+            return False
+        from core.exit_only_position import ReconciledPositionHydration
+        hydrator = getattr(self, "_reconciled_position_hydration", None)
+        if hydrator is None:
+            hydrator = self._reconciled_position_hydration = \
+                ReconciledPositionHydration()
+        position = self._exit_only_position
+        try:
+            hydrator.reconcile({
+                "mode": "reconciled_exit_only", "live_order_allowed": True,
+                "legs": position.get("legs") or [],
+            })
+        except Exception:
+            return False
+        intent_id, idem = self._collapse2_exit_identity(action, strategy)
+        if hydrator.intent_state(intent_id) not in (None, "RETRYABLE_ORDERING"):
+            return False
+        if hydrator.intent_state(intent_id) is None:
+            decision = hydrator.evaluate_exit(intent_id, idem)
+            if decision.status != "AUTHORIZED":
+                return False
+        hydrator.record_rejection(
+            intent_id, reason="HYDRATION_AUTHORIZATION_ORDERING",
+            receipt=None, idempotency_key=idem)
+        active, actual = self._collapse2_retry_broker_evidence()
+        if active is None or actual is None:
+            return False
+        return hydrator.retry_once(
+            intent_id, idem,
+            lambda: self._reconcile_exit_only_authorization(strategy),
+            active_orders=active, position=actual)
+
+    def _collapse2_bind_exit_order(self, order):
+        identity = getattr(self, "_collapse2_active_exit_identity", None)
+        if not identity:
+            return order
+        order.intent_id = identity["intent_id"]
+        order.idempotency_key = identity["idempotency_key"]
+        order.reconciliation_evidence["collapse2_retry"] = True
+        return order
+
 
     def _exit_only_decision_guard(self, action, strategy=None):
         """Thin delegate to the S0 OrderIntentGateway policy."""
@@ -9470,13 +9560,20 @@ class FuturesMonitor:
             _reason = ("LIVE_ORDER_AUTHORIZATION_FAILED"
                        if getattr(self, "_exit_only_position", None) is not None
                        else "EXIT_ONLY_HYDRATION_REQUIRED")
-            self._append_mts_event(
-                "ORDER_INTENT_BLOCKED", action=_action,
-                reason=_reason, trade_id=getattr(strategy, "_trade_id", ""))
-            self._append_mts_event(
-                "EXIT_ONLY_HYDRATION_BLOCKED",
-                reason=_reason)
-            return
+            if self._collapse2_retry_ordering_rejection(
+                    _action, strategy, _reason):
+                _intent_id, _idem = self._collapse2_exit_identity(
+                    _action, strategy)
+                self._collapse2_active_exit_identity = {
+                    "intent_id": _intent_id, "idempotency_key": _idem}
+            else:
+                self._append_mts_event(
+                    "ORDER_INTENT_BLOCKED", action=_action,
+                    reason=_reason, trade_id=getattr(strategy, "_trade_id", ""))
+                self._append_mts_event(
+                    "EXIT_ONLY_HYDRATION_BLOCKED",
+                    reason=_reason)
+                return
         _gw_intent_strategy = ("MTS_ENTRY"
                               if _action in ("BUY_NEAR_SELL_FAR",
                                              "SELL_NEAR_BUY_FAR")
@@ -9548,6 +9645,7 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_NEAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) instead of MARKET — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_near_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                self._collapse2_bind_exit_order(_order)
                 _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
                 self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
 
@@ -9614,6 +9712,7 @@ class FuturesMonitor:
                 console.print(f"[yellow]📝 [MTS_ORDER] Submitting RELEASE_FAR: {_side} (MKP Range Market)[/yellow]")
                 # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
                 _order = self.order_mgr.create_order(symbol=_far_code, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_RELEASE")
+                self._collapse2_bind_exit_order(_order)
                 _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
                 self._append_mts_event("ORDER_INTENT_CREATED", **_ev_meta(_order))
 
@@ -9746,6 +9845,8 @@ class FuturesMonitor:
 
             _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
             _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
+            self._collapse2_bind_exit_order(_near_order)
+            self._collapse2_bind_exit_order(_far_order)
             _near_order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
             _far_order.quarantine_exit_proof = _q_proof
 
@@ -9973,6 +10074,7 @@ class FuturesMonitor:
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting EXIT for {_leg_label}: {_side} (MKP Range Market)[/yellow]")
             # 2026-06-08 JVS Claw: Use MKP (範圍市價) — 避免滑價
             _order = self.order_mgr.create_order(symbol=_symbol, side=_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EXIT")
+            self._collapse2_bind_exit_order(_order)
             _order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
             # B48 (codex C): correlate the decision event through the order
             _order.event_id = getattr(signal, "event_id", "")
@@ -15044,6 +15146,19 @@ class FuturesMonitor:
         
         if found_tid:
             data = self._mts_pending_fills[found_tid]
+            if data.get("combo") and (data.get("near_filled") != data.get("far_filled")):
+                _hydrator = getattr(self, "_reconciled_position_hydration", None)
+                if _hydrator is not None:
+                    _hydrator.partial_fill_recovery([
+                        {"code": data.get("near_code", "NEAR"),
+                         "quantity": 1 if data.get("near_filled") else 0},
+                        {"code": data.get("far_code", "FAR"),
+                         "quantity": 1 if data.get("far_filled") else 0},
+                    ])
+                self._append_mts_event(
+                    "COMBO_PARTIAL_FILL_RECOVERY",
+                    trade_id=found_tid,
+                    recovery_scope="FILLED_LEGS_ONLY")
             if data.get("near_filled") and data.get("far_filled"):
                 console.print(f"[bold green]✅ [MTS_SYNC] Multi-leg fill COMPLETE: {found_tid}[/bold green]")
                 self._sync_mts_strategy_after_fill(found_tid)
