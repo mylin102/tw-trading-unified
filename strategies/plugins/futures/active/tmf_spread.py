@@ -1735,6 +1735,7 @@ def _write_mts_telemetry(
         for _key in ["state", "reason", "has_position", "near_entry", "far_entry",
                       "near_side", "far_side", "near_status", "far_status",
                       "released_leg", "remaining_leg", "remaining_side",
+                      "last_known_legs",
                       "near_realized_pnl", "far_realized_pnl", "total_realized_pnl",
                       "cumulative_realized_pnl", "initial_balance", "trade_id", "entry_ts",
                       "trail_side", "trail_mode", "trail_peak", "trail_nadir",
