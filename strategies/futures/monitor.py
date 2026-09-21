@@ -11950,6 +11950,41 @@ class FuturesMonitor:
     # ── [V-Model] MTS Mode: Minimal Tradable System ──
     # Bypass regime/router/policy/gates entirely. Direct path:
     #   Market → ORB Signal → Risk Check → Execution
+    def _restore_mts_recovery_legs_from_last_known(self, strategy,
+                                                   *, broker_position) -> dict:
+        """Restore broker-positive/local-flat legs without reading flat fields."""
+        _disk = {}
+        _state_path = _mts_position_state_path()
+        if _state_path.exists():
+            try:
+                _disk = json.loads(_state_path.read_text())
+            except Exception:
+                pass
+        _legs = _disk.get("last_known_legs")
+        if not isinstance(_legs, dict):
+            _legs = {}
+
+        strategy._near_entry = float(_legs.get("near_entry") or 0.0)
+        strategy._far_entry = float(_legs.get("far_entry") or 0.0)
+        strategy._near_side = (
+            "LONG" if broker_position > 0
+            else "SHORT" if broker_position < 0
+            else None
+        )
+        _far_side = _legs.get("far_side")
+        if _far_side not in ("LONG", "SHORT"):
+            console.print(
+                f"[red]⚠️ [BROKER_RECONCILED] invalid far_side={_far_side!r} → None; "
+                f"close_all will fail-closed[/red]"
+            )
+            _far_side = None
+        strategy._far_side = _far_side
+        _released_leg = _legs.get("released_leg")
+        strategy._released_leg = (
+            _released_leg if _released_leg in ("near", "far") else None
+        )
+        return _disk
+
     def _sync_mts_status(self):
         """[GSD] Synchronize MTS position and manual order state to disk for dashboard."""
         # 2026-05-27 Gemini CLI: Use isolated path if environment variable is set
@@ -11987,6 +12022,16 @@ class FuturesMonitor:
             # strategy memory. A rejected/unconfirmed order may leave stale legs
             # in memory even when _has_position is False.
             if not _has_pos_in_mem:
+                _last_known_legs = {
+                    "near_side": getattr(strategy, "_near_side", None) if strategy else None,
+                    "far_side": getattr(strategy, "_far_side", None) if strategy else None,
+                    "near_entry": getattr(strategy, "_near_entry", None) if strategy else None,
+                    "far_entry": getattr(strategy, "_far_entry", None) if strategy else None,
+                    "released_leg": getattr(strategy, "_released_leg", None) if strategy else None,
+                    "remaining_leg": getattr(strategy, "_remaining_leg", None) if strategy else None,
+                    "updated_at": datetime.now().isoformat(),
+                    "source": "strategy_memory",
+                }
                 existing.pop("near_entry", None)
                 existing.pop("far_entry", None)
                 existing.pop("near_side", None)
@@ -12047,6 +12092,7 @@ class FuturesMonitor:
                 "state": "HEARTBEAT",
                 "reason": "mts_sync_status",
                 "manual_trade_status": self._manual_trade_status,
+                "last_known_legs": _last_known_legs,
                 "near_side": _n_side, "far_side": _f_side,
                 "near_entry": round(_n_entry, 1), "far_entry": round(_f_entry, 1),
                 "near_last": round(_n_last, 1), "far_last": round(_f_last, 1),
@@ -13182,38 +13228,14 @@ class FuturesMonitor:
             )
             # 2026-07-21 Gemini CLI: Load entry prices, sides, trade_id from the state file on disk
             # to prevent entry prices from remaining 0.0 in memory after recovery.
-            _disk = {}
-            _state_path = _mts_position_state_path()
-            if _state_path.exists():
-                try:
-                    _disk = json.loads(_state_path.read_text())
-                except Exception:
-                    pass
-
-            strategy._near_entry = float(_disk.get("near_entry") or getattr(strategy, "_near_entry", 0) or 0.0)
-            strategy._far_entry = float(_disk.get("far_entry") or getattr(strategy, "_far_entry", 0) or 0.0)
+            _disk = self._restore_mts_recovery_legs_from_last_known(
+                strategy, broker_position=_broker_pos)
             # 2026-08-06 Hermes Agent P1: sides must be authoritative — the
             # reconcile previously copied whatever the state file held (once
             # leg labels "NEAR"/"FAR"), and close_all's `else BUY` mapping then
             # sent wrong-direction orders. Near derives from the broker
             # position; far accepts only valid LONG/SHORT (else None, and
             # close_all fails closed instead of sending a wrong order).
-            _near_side = _disk.get("near_side") or getattr(strategy, "_near_side", None)
-            _far_side = _disk.get("far_side") or getattr(strategy, "_far_side", None)
-            # Quantity sign is not an entry-side premise.  Never synthesize
-            # direction from the current net position; only canonical state
-            # may provide LONG/SHORT, otherwise downstream exits fail closed.
-            if _near_side not in ("LONG", "SHORT"):
-                _near_side = None
-            if _far_side not in ("LONG", "SHORT"):
-                console.print(
-                    f"[red]⚠️ [BROKER_RECONCILED] invalid far_side={_far_side!r} → None; "
-                    f"close_all will fail-closed[/red]"
-                )
-                _far_side = None
-            strategy._near_side = _near_side
-            strategy._far_side = _far_side
-            strategy._released_leg = _disk.get("released_leg") or getattr(strategy, "_released_leg", None)
             strategy._trade_id = _disk.get("trade_id") or getattr(strategy, "_trade_id", None)
 
             strategy._has_position = True
