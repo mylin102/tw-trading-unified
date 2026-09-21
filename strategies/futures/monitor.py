@@ -2663,15 +2663,21 @@ class FuturesMonitor:
                 **_bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag()),
             }
             if _t_code:
-                self.market_data[_t_code] = _tick_info
+                self.market_data[_t_code] = {
+                    **self.market_data.get(_t_code, {}), **_tick_info}
             
             _is_near_tick = (self.contract and _t_code == self.contract.code) or (not self.contract and _t_code and not _t_code.endswith("I6") and not _t_code.endswith("J6"))
             if _is_near_tick:
                 self._last_tmf_price = _p
-                self.market_data[self.ticker] = _tick_info
-                self.market_data[f"{self.ticker}_NEAR"] = _tick_info
+                self.market_data[self.ticker] = {
+                    **self.market_data.get(self.ticker, {}), **_tick_info}
+                _near_key = f"{self.ticker}_NEAR"
+                self.market_data[_near_key] = {
+                    **self.market_data.get(_near_key, {}), **_tick_info}
             elif self.far_contract and _t_code == self.far_contract.code:
-                self.market_data[f"{self.ticker}_FAR"] = _tick_info
+                _far_key = f"{self.ticker}_FAR"
+                self.market_data[_far_key] = {
+                    **self.market_data.get(_far_key, {}), **_tick_info}
 
         # ── [Manual Trade Flag] Check on every tick ──
         # 2026-06-05 JVS Claw: Step 4 — gate flag check with is_primary (C4).
@@ -2745,10 +2751,10 @@ class FuturesMonitor:
                 _rt_bar["confirm_ticks"] = self.cfg.get("mts", {}).get("params", {}).get("confirm_ticks", 2)
                 
                 # Cache and propagate bid/ask prices for spread width checks
-                _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid", _rt_bar.get("near_close", 0.0))
-                _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask", _rt_bar.get("near_close", 0.0))
-                _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
-                _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
+                _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid")
+                _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask")
+                _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid")
+                _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask")
                 
                 self._mts_tag_bar_session(_rt_bar)
                 self._mts_tick(enriched_bar=_rt_bar)
@@ -2796,20 +2802,25 @@ class FuturesMonitor:
         _bbo_fields = _bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag())
         if is_primary:
             self.market_data[self.ticker] = {
+                **self.market_data.get(self.ticker, {}),
                 "close": price, 
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
                 # 2026-06-26 Gemini CLI: cache bid/ask prices (real BBO only)
                 **_bbo_fields,
             }
-            self.market_data[f"{self.ticker}_NEAR"] = {
+            _near_key = f"{self.ticker}_NEAR"
+            self.market_data[_near_key] = {
+                **self.market_data.get(_near_key, {}),
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
                 **_bbo_fields,
             }
         elif is_far_tick:
-            self.market_data[f"{self.ticker}_FAR"] = {
+            _far_key = f"{self.ticker}_FAR"
+            self.market_data[_far_key] = {
+                **self.market_data.get(_far_key, {}),
                 "close": float(getattr(tick, 'close', price) or price),
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
@@ -2818,6 +2829,7 @@ class FuturesMonitor:
 
         if getattr(tick, 'code', None):
             self.market_data[tick.code] = {
+                **self.market_data.get(tick.code, {}),
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
@@ -2932,10 +2944,10 @@ class FuturesMonitor:
             _rt_bar["confirm_ticks"] = self.cfg.get("mts", {}).get("params", {}).get("confirm_ticks", 2)
 
             # Cache and propagate bid/ask prices for spread width checks
-            _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid", _rt_bar.get("near_close", 0.0))
-            _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask", _rt_bar.get("near_close", 0.0))
-            _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
-            _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
+            _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid")
+            _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask")
+            _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid")
+            _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask")
 
             self._mts_tag_bar_session(_rt_bar)
             self._mts_tick(enriched_bar=_rt_bar)
@@ -2965,7 +2977,9 @@ class FuturesMonitor:
         # 2026-06-24 Gemini CLI: Maintain far/code-specific market data caches for spread execution price integrity.
         _bbo_now = time.time()
         _bbo_fields = _bbo_tick_fields(tick, bbo_now=_bbo_now, generation_id=self._bbo_generation_tag())
-        self.market_data[f"{self.ticker}_FAR"] = {
+        _far_key = f"{self.ticker}_FAR"
+        self.market_data[_far_key] = {
+            **self.market_data.get(_far_key, {}),
             "close": price,
             "datetime": tick.datetime,
             "local_arrival_at": time.time(),
@@ -2974,6 +2988,7 @@ class FuturesMonitor:
         }
         if getattr(tick, 'code', None):
             self.market_data[tick.code] = {
+                **self.market_data.get(tick.code, {}),
                 "close": price,
                 "datetime": tick.datetime,
                 "local_arrival_at": time.time(),
