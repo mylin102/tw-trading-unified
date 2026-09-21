@@ -11983,16 +11983,16 @@ class FuturesMonitor:
             if not _has_pos_in_mem and existing.get("has_position") is True:
                 return
 
-            # ADR-009 Task 10: FLAT must not inherit position fields from existing.
-            # When local has_position=False, clear near_entry/far_entry/side to prevent
-            # stale entry prices from self-perpetuating via the fallback chain:
-            #   strategy._near_entry=0 → existing.get("near_entry")=47369 → re-write → loop
+            # ADR-009 Task 10: FLAT must not inherit position fields from disk or
+            # strategy memory. A rejected/unconfirmed order may leave stale legs
+            # in memory even when _has_position is False.
             if not _has_pos_in_mem:
                 existing.pop("near_entry", None)
                 existing.pop("far_entry", None)
                 existing.pop("near_side", None)
                 existing.pop("far_side", None)
                 existing.pop("released_leg", None)
+                existing.pop("remaining_leg", None)
                 existing.pop("remaining_side", None)
 
             # 2. Position Details
@@ -12001,6 +12001,12 @@ class FuturesMonitor:
             _f_entry = getattr(strategy, "_far_entry", 0.0) or float(existing.get("far_entry") or 0.0)
             _n_side = getattr(strategy, "_near_side", None) or existing.get("near_side")
             _f_side = getattr(strategy, "_far_side", None) or existing.get("far_side")
+            if not _has_pos_in_mem:
+                # Flat heartbeat uses the existing numeric-zero schema for entry
+                # prices; position direction is absent. Do not mutate strategy
+                # memory, which is reconciled by its own lifecycle authority.
+                _n_entry = _f_entry = 0.0
+                _n_side = _f_side = None
             
             # 2026-06-09 JVS Claw: Read latest prices from market_data, fallback to existing
             # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
