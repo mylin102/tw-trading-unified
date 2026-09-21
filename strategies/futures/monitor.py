@@ -12853,6 +12853,9 @@ class FuturesMonitor:
         # 2026-07-15 Gemini CLI: Ensure strategy is initialized before recovery or OCO checks
         # to prevent AttributeError on uninitialized fields like _release_price during state writes.
         strategy = self._registry.get(_strat_name)
+        _live_authority_runtime = bool(
+            getattr(getattr(self, "_execution_context", None),
+                    "requested_mode", "") == "live")
         if strategy is not None and not hasattr(strategy, "_has_position"):
             ctx = StrategyContext(
                 market=MarketData(
@@ -12867,9 +12870,6 @@ class FuturesMonitor:
             # current-session broker snapshot.  TMFSpread preserves this
             # marker through init and refuses fills-led OPEN recovery while
             # broker truth is pending or unavailable.
-            _live_authority_runtime = bool(
-                getattr(getattr(self, "_execution_context", None),
-                        "requested_mode", "") == "live")
             if _live_authority_runtime:
                 strategy._fills_recovery_broker_truth = "PENDING"
             strategy.init(ctx)
