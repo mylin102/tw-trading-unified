@@ -12863,19 +12863,34 @@ class FuturesMonitor:
                 position=PositionView(size=self.trader.position), 
                 config=_mts
             )
+            # LIVE startup must not let local fills run before the first
+            # current-session broker snapshot.  TMFSpread preserves this
+            # marker through init and refuses fills-led OPEN recovery while
+            # broker truth is pending or unavailable.
+            _live_authority_runtime = bool(
+                getattr(getattr(self, "_execution_context", None),
+                        "requested_mode", "") == "live")
+            if _live_authority_runtime:
+                strategy._fills_recovery_broker_truth = "PENDING"
             strategy.init(ctx)
 
         # LIVE startup authority must be latched before any local recovery.
         # A fills-ledger restore below is allowed only after the broker truth
         # query has had first refusal; otherwise a stale local fills record can
         # recreate the ghost release state before the broker gate runs.
-        _live_authority_runtime = bool(
-            getattr(getattr(self, "_execution_context", None),
-                    "requested_mode", "") == "live")
         _early_broker_auth = (
             self._refresh_live_broker_authority(strategy)
             if _live_authority_runtime else None
         )
+        if _live_authority_runtime:
+            _broker_status = getattr(
+                getattr(_early_broker_auth, "status", None), "value", None)
+            if _broker_status == "FLAT":
+                strategy._fills_recovery_broker_truth = "FLAT"
+            elif _broker_status in ("OPEN", "SINGLE_LEG"):
+                strategy._fills_recovery_broker_truth = "MATCHED_OPEN"
+            else:
+                strategy._fills_recovery_broker_truth = "UNKNOWN"
 
         # ── [ADR-010] OCO reconciliation: runs even when market closed ──
         # Must reconcile paper_fill_sim after restart before first market tick,

@@ -3538,6 +3538,26 @@ class TMFSpread(StrategyBase):
 
     def _restore_from_fills_log(self) -> bool:
         """Rebuild position state from fills log. Returns True on success."""
+        # LIVE fills are historical evidence, never current position truth.
+        # The monitor sets this tri-state marker from a current-session broker
+        # snapshot before allowing fills-led reconstruction.  PENDING and
+        # UNKNOWN are deliberately fail-closed; only a broker-confirmed
+        # matching position may revive an OPEN lifecycle.
+        _broker_truth = getattr(
+            self, "_fills_recovery_broker_truth", None)
+        if _broker_truth in ("FLAT", "PENDING", "UNKNOWN"):
+            _reason = ("BROKER_FLAT" if _broker_truth == "FLAT"
+                       else "BROKER_UNAVAILABLE")
+            logger.warning(
+                "[MTS_FILLS_RECOVERY_REFUSED] reason=%s broker_truth=%s",
+                _reason, _broker_truth,
+            )
+            _append_event(
+                "MTS_FILLS_RECOVERY_REFUSED",
+                reason=_reason,
+                broker_truth=_broker_truth,
+            )
+            return False
         # The monitor sets this marker after a successful current-session
         # broker snapshot.  In LIVE mode historical fills are evidence only;
         # they must not recreate a position the broker has proved flat.
