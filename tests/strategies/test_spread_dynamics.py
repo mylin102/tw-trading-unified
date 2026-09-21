@@ -293,7 +293,9 @@ def test_research_rejects_are_recorded_with_standardized_reasons(monkeypatch):
 
     stale = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
              "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
-             "quote_age_ms": 5000}
+             "bbo_near_bid": 100.5, "bbo_near_ask": 101.5,
+             "bbo_far_bid": 97.5, "bbo_far_ask": 98.5,
+             "bbo_near_age_ms": 5000, "bbo_far_age_ms": 5000}
     monitor._record_mts_entry_research_candidate(strat, stale, now)
     assert captured[-1]["decision"] == "REJECT"
     assert captured[-1]["rejection_reason"] == "STALE_QUOTE"
@@ -303,15 +305,18 @@ def test_research_rejects_are_recorded_with_standardized_reasons(monkeypatch):
 
     invalid_bbo = {"ts": 101.0, "session_type": "day", "near_close": 101.0,
                    "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
-                   "near_bid": 0, "near_ask": None}
+                   "bbo_near_bid": 0, "bbo_near_ask": 101.5,
+                   "bbo_far_bid": 97.5, "bbo_far_ask": 98.5,
+                   "bbo_near_age_ms": 100, "bbo_far_age_ms": 100}
     monitor._record_mts_entry_research_candidate(strat, invalid_bbo, now)
     assert captured[-1]["decision"] == "REJECT"
     assert captured[-1]["rejection_reason"] == "BBO_INVALID"
 
     ok_bar = {"ts": 102.0, "session_type": "day", "near_close": 101.0,
               "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
-              "quote_age_ms": 100, "near_bid": 100.5, "near_ask": 101.5,
-              "far_bid": 97.5, "far_ask": 98.5}
+              "bbo_near_age_ms": 100, "bbo_far_age_ms": 100,
+              "bbo_near_bid": 100.5, "bbo_near_ask": 101.5,
+              "bbo_far_bid": 97.5, "bbo_far_ask": 98.5}
     monitor._record_mts_entry_research_candidate(strat, ok_bar, now)
     assert captured[-1]["decision"] == "CANDIDATE"
 
@@ -333,22 +338,22 @@ def test_research_bbomissing_and_bbo_nonfinite_reasons(monkeypatch):
 
     none_bbo = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
                 "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
-                "near_bid": None}
+                "bbo_near_bid": None}
     monitor._record_mts_entry_research_candidate(strat, none_bbo, now)
     assert captured[-1]["decision"] == "REJECT"
     assert captured[-1]["rejection_reason"] == "BBO_MISSING"
 
     partial_bbo = {"ts": 101.0, "session_type": "day", "near_close": 101.0,
                    "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
-                   "near_bid": 100.5, "near_ask": 101.5}
+                   "bbo_near_bid": 100.5, "bbo_near_ask": 101.5}
     monitor._record_mts_entry_research_candidate(strat, partial_bbo, now)
     assert captured[-1]["decision"] == "REJECT"
     assert captured[-1]["rejection_reason"] == "BBO_MISSING"
 
     nan_bbo = {"ts": 102.0, "session_type": "day", "near_close": 101.0,
                "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
-               "near_bid": float("nan"), "near_ask": 101.5,
-               "far_bid": 97.5, "far_ask": 98.5}
+               "bbo_near_bid": float("nan"), "bbo_near_ask": 101.5,
+               "bbo_far_bid": 97.5, "bbo_far_ask": 98.5}
     monitor._record_mts_entry_research_candidate(strat, nan_bbo, now)
     assert captured[-1]["decision"] == "REJECT"
     assert captured[-1]["rejection_reason"] == "BBO_NONFINITE"
