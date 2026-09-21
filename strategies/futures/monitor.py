@@ -2751,10 +2751,20 @@ class FuturesMonitor:
                 _rt_bar["confirm_ticks"] = self.cfg.get("mts", {}).get("params", {}).get("confirm_ticks", 2)
                 
                 # Cache and propagate bid/ask prices for spread width checks
-                _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid")
-                _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask")
-                _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid")
-                _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask")
+                _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid", _rt_bar.get("near_close", 0.0))
+                _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask", _rt_bar.get("near_close", 0.0))
+                _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
+                _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
+                _near_bbo = self.market_data.get(self.ticker, {})
+                _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
+                for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
+                    _at = _slot.get("bidask_at")
+                    _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _at is not None else None
+                    _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _at is not None else None
+                    try:
+                        _rt_bar[f"bbo_{_leg}_age_ms"] = max(0.0, (_now_t - float(_at)) * 1000.0)
+                    except (TypeError, ValueError):
+                        _rt_bar[f"bbo_{_leg}_age_ms"] = None
                 
                 self._mts_tag_bar_session(_rt_bar)
                 self._mts_tick(enriched_bar=_rt_bar)
@@ -2944,10 +2954,20 @@ class FuturesMonitor:
             _rt_bar["confirm_ticks"] = self.cfg.get("mts", {}).get("params", {}).get("confirm_ticks", 2)
 
             # Cache and propagate bid/ask prices for spread width checks
-            _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid")
-            _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask")
-            _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid")
-            _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask")
+            _rt_bar["near_bid"] = self.market_data.get(self.ticker, {}).get("bid", _rt_bar.get("near_close", 0.0))
+            _rt_bar["near_ask"] = self.market_data.get(self.ticker, {}).get("ask", _rt_bar.get("near_close", 0.0))
+            _rt_bar["far_bid"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("bid", _rt_bar.get("far_close", 0.0))
+            _rt_bar["far_ask"] = self.market_data.get(f"{self.ticker}_FAR", {}).get("ask", _rt_bar.get("far_close", 0.0))
+            _near_bbo = self.market_data.get(self.ticker, {})
+            _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
+            for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
+                _at = _slot.get("bidask_at")
+                _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _at is not None else None
+                _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _at is not None else None
+                try:
+                    _rt_bar[f"bbo_{_leg}_age_ms"] = max(0.0, (_now_t - float(_at)) * 1000.0)
+                except (TypeError, ValueError):
+                    _rt_bar[f"bbo_{_leg}_age_ms"] = None
 
             self._mts_tag_bar_session(_rt_bar)
             self._mts_tick(enriched_bar=_rt_bar)
@@ -9305,33 +9325,39 @@ class FuturesMonitor:
             # candidate.  Absent BBO keys pass (legacy bars keep
             # recording as CANDIDATE).
             _reject_reason = None
-            _q_age = bar_dict.get("quote_age_ms")
-            if _q_age is not None:
+            _bbo_keys = ("bbo_near_bid", "bbo_near_ask",
+                         "bbo_far_bid", "bbo_far_ask")
+            for _k in _bbo_keys:
+                _v = bar_dict.get(_k)
+                if _v is None:
+                    _reject_reason = "BBO_MISSING"
+                    break
                 try:
-                    _max_age = float(getattr(
-                        strategy, "_max_quote_age_ms", 30000) or 30000)
-                    if float(_q_age) > _max_age:
-                        _reject_reason = "STALE_QUOTE"
+                    _numeric = float(_v)
                 except (TypeError, ValueError):
-                    _reject_reason = "STALE_QUOTE"
+                    _reject_reason = "BBO_NONFINITE"
+                    break
+                if not math.isfinite(_numeric):
+                    _reject_reason = "BBO_NONFINITE"
+                    break
+                if _numeric <= 0:
+                    _reject_reason = "BBO_INVALID"
+                    break
+            _max_age = float(getattr(
+                strategy, "_max_quote_age_ms", 30000) or 30000)
             if _reject_reason is None:
-                _bbo_present = [k for k in
-                                ("near_bid", "near_ask", "far_bid",
-                                 "far_ask") if k in bar_dict]
-                for _k in _bbo_present:
-                    _v = bar_dict.get(_k)
-                    if _v is None:
+                for _age_key in ("bbo_near_age_ms", "bbo_far_age_ms"):
+                    _age = bar_dict.get(_age_key)
+                    if _age is None:
                         _reject_reason = "BBO_MISSING"
                         break
-                    if isinstance(_v, float) and (
-                            math.isnan(_v) or math.isinf(_v)):
-                        _reject_reason = "BBO_NONFINITE"
+                    try:
+                        if float(_age) > _max_age:
+                            _reject_reason = "STALE_QUOTE"
+                            break
+                    except (TypeError, ValueError):
+                        _reject_reason = "BBO_MISSING"
                         break
-                    if _v == 0 or _v == "":
-                        _reject_reason = "BBO_INVALID"
-                        break
-                if _reject_reason is None and 0 < len(_bbo_present) < 4:
-                    _reject_reason = "BBO_MISSING"
             _action = "SELL_NEAR_BUY_FAR" if _z > 0 else "BUY_NEAR_SELL_FAR"
             _audit = {
                 "event_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
@@ -9348,9 +9374,13 @@ class FuturesMonitor:
                 "spread_slope": bar_dict.get("spread_slope"),
                 "velocity_ema": bar_dict.get("velocity_ema"),
                 "atr": bar_dict.get("atr"), "regime": bar_dict.get("regime"),
-                "near_bid": bar_dict.get("near_bid"), "near_ask": bar_dict.get("near_ask"),
-                "far_bid": bar_dict.get("far_bid"), "far_ask": bar_dict.get("far_ask"),
-                "quote_age_ms": bar_dict.get("quote_age_ms"),
+                "near_bid": bar_dict.get("bbo_near_bid"),
+                "near_ask": bar_dict.get("bbo_near_ask"),
+                "far_bid": bar_dict.get("bbo_far_bid"),
+                "far_ask": bar_dict.get("bbo_far_ask"),
+                "quote_age_ms": max(
+                    (bar_dict.get("bbo_near_age_ms") or 0),
+                    (bar_dict.get("bbo_far_age_ms") or 0)),
                 "pair_skew_ms": bar_dict.get("pair_skew_ms"),
             }
             from core.entry_research_store import record_entry_observation
