@@ -9328,8 +9328,8 @@ class FuturesMonitor:
             # P1-C: stale / invalid quotes reject the candidate, but the
             # rejection is RECORDED (decision=REJECT + standardized
             # reason) so the research ledger explains every dropped
-            # candidate.  Absent BBO keys pass (legacy bars keep
-            # recording as CANDIDATE).
+            # candidate.  Missing BBO keys reject as BBO_MISSING; this
+            # entry-only view never falls back to close/last prices.
             _reject_reason = None
             _bbo_keys = ("bbo_near_bid", "bbo_near_ask",
                          "bbo_far_bid", "bbo_far_ask")
