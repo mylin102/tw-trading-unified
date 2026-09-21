@@ -179,8 +179,8 @@ def test_far_tick_bar_keeps_cached_near_and_far_bidask(mock_monitor):
     mock_monitor.on_tick("TFE", _tick_without_bbo("TMFI6", 44050.0))
 
     bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
-    assert (bar["near_bid"], bar["near_ask"]) == (44299.0, 44301.0)
-    assert (bar["far_bid"], bar["far_ask"]) == (44049.0, 44051.0)
+    assert (bar["bbo_near_bid"], bar["bbo_near_ask"]) == (44299.0, 44301.0)
+    assert (bar["bbo_far_bid"], bar["bbo_far_ask"]) == (44049.0, 44051.0)
 
 
 def test_bar_without_bidask_never_uses_close_and_gate_reports_missing(
@@ -195,9 +195,9 @@ def test_bar_without_bidask_never_uses_close_and_gate_reports_missing(
     bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
     assert bar["far_close_rt"] == 44050.0
     assert all(bar.get(key) is None for key in (
-        "near_bid", "near_ask", "far_bid", "far_ask"))
+        "bbo_near_bid", "bbo_near_ask", "bbo_far_bid", "bbo_far_ask"))
     assert 44050.0 not in tuple(bar.get(key) for key in (
-        "near_bid", "near_ask", "far_bid", "far_ask"))
+        "bbo_near_bid", "bbo_near_ask", "bbo_far_bid", "bbo_far_ask"))
 
     captured = []
     import core.entry_research_store as store
@@ -209,3 +209,35 @@ def test_bar_without_bidask_never_uses_close_and_gate_reports_missing(
         strategy, bar, pd.Timestamp("2026-09-21 10:00:00"))
     assert captured[-1]["decision"] == "REJECT"
     assert captured[-1]["rejection_reason"] == "BBO_MISSING"
+
+
+def test_entry_research_view_rejects_stale_cached_bidask(mock_monitor, monkeypatch):
+    mock_monitor.dry_run = False
+    mock_monitor.cfg["mts"]["enabled"] = True
+    mock_monitor._mts_tick = MagicMock()
+    stale_at = time.time() - 31.0
+    mock_monitor.market_data["TMF"] = {
+        "bid": 44299.0, "ask": 44301.0, "bidask_at": stale_at,
+        "local_arrival_at": time.time(),
+    }
+    mock_monitor.market_data["TMF_FAR"] = {
+        "bid": 44049.0, "ask": 44051.0, "bidask_at": stale_at,
+        "local_arrival_at": time.time(),
+    }
+    mock_monitor.on_tick("TFE", _tick_without_bbo("TMFI6", 44050.0))
+    bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
+    assert bar["bbo_near_age_ms"] >= 30000
+    assert bar["bbo_far_age_ms"] >= 30000
+
+    captured = []
+    import core.entry_research_store as store
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    bar.update({"spread_z": 2.0, "entry_z": 1.0})
+    strategy = type("Strategy", (), {
+        "_entry_z": 1.0, "_trade_id": None, "_max_quote_age_ms": 30000,
+    })()
+    mock_monitor._record_mts_entry_research_candidate(
+        strategy, bar, pd.Timestamp("2026-09-21 10:00:00"))
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "STALE_QUOTE"
