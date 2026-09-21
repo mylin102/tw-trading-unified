@@ -2759,8 +2759,11 @@ class FuturesMonitor:
                 _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
                 for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
                     _at = _slot.get("bidask_at")
-                    _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _at is not None else None
-                    _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _at is not None else None
+                    _tick_at = _slot.get("tick_bbo_at")
+                    _bidask_is_latest = (_at is not None and (
+                        _tick_at is None or float(_at) >= float(_tick_at)))
+                    _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _bidask_is_latest else None
+                    _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _bidask_is_latest else None
                     try:
                         _rt_bar[f"bbo_{_leg}_age_ms"] = max(0.0, (_now_t - float(_at)) * 1000.0)
                     except (TypeError, ValueError):
@@ -2962,8 +2965,11 @@ class FuturesMonitor:
             _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
             for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
                 _at = _slot.get("bidask_at")
-                _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _at is not None else None
-                _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _at is not None else None
+                _tick_at = _slot.get("tick_bbo_at")
+                _bidask_is_latest = (_at is not None and (
+                    _tick_at is None or float(_at) >= float(_tick_at)))
+                _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _bidask_is_latest else None
+                _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _bidask_is_latest else None
                 try:
                     _rt_bar[f"bbo_{_leg}_age_ms"] = max(0.0, (_now_t - float(_at)) * 1000.0)
                 except (TypeError, ValueError):
