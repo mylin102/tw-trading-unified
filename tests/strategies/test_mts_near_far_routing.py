@@ -241,3 +241,23 @@ def test_entry_research_view_rejects_stale_cached_bidask(mock_monitor, monkeypat
         strategy, bar, pd.Timestamp("2026-09-21 10:00:00"))
     assert captured[-1]["decision"] == "REJECT"
     assert captured[-1]["rejection_reason"] == "STALE_QUOTE"
+
+
+def test_entry_view_rejects_tick_bbo_newer_than_bidask(mock_monitor):
+    mock_monitor.dry_run = False
+    mock_monitor.cfg["mts"]["enabled"] = True
+    mock_monitor._mts_tick = MagicMock()
+    mock_monitor.market_data["TMF"] = {
+        "bid": 44299.0, "ask": 44301.0, "bidask_at": time.time(),
+        "local_arrival_at": time.time(),
+    }
+    mock_monitor.market_data["TMF_FAR"] = {
+        "bid": 44049.0, "ask": 44051.0, "bidask_at": time.time() - 1.0,
+        "local_arrival_at": time.time(),
+    }
+
+    mock_monitor.on_tick("TFE", create_mock_tick("TMFI6", 44050.0))
+
+    bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
+    assert bar["bbo_far_bid"] is None
+    assert bar["bbo_far_ask"] is None
