@@ -1603,6 +1603,8 @@ def run_system(dry_run=False, config_name="futures"):
             from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback, safe_subscribe
             _tmf_tick_fn = tick_dispatcher(futures_mons, om, feed_health, tx_bar_builder)
             _tmf_bidask_fn = bidask_dispatcher(futures_mons, om, sk_engine)
+            _session_tick_callback = _tmf_tick_fn
+            _session_bidask_callback = _tmf_bidask_fn
 
             # Install GlobalCallbackAdapter so MTX ticks are routed to passive collector AND tick_dispatcher
             if _mtx_runtime is not None:
@@ -1620,6 +1622,8 @@ def run_system(dry_run=False, config_name="futures"):
                     return _gca_adapter.on_tick(*a)
                 set_tick_callback(api, _gca_tick_wrapper)
                 set_bidask_callback(api, _mtx_runtime.adapter.on_bidask)
+                _session_tick_callback = _gca_tick_wrapper
+                _session_bidask_callback = _mtx_runtime.adapter.on_bidask
                 console.print("[green]✅ GlobalCallbackAdapter installed (TMF + MTX routing with fallback dispatch)[/green]")
 
                 # Start MTX runtime (resolves contracts, binds routes, starts writer)
@@ -1725,6 +1729,80 @@ def run_system(dry_run=False, config_name="futures"):
         # [P0 Fix] Setup connection event monitoring
         _setup_event_callback(api, futures_mons, om)
         console.print("[green]✅ Connection event callback registered[/green]")
+
+        # A dead SolClient cannot be repaired by calling login() again on the
+        # same Shioaji object (2026-09-22 incident: login returned success,
+        # then list_positions immediately remained SessionNotEstablished).
+        # Build and verify a replacement object, restore every callback and
+        # subscription, then atomically publish it.  No order API is called.
+        if api is not None:
+            from core.shioaji_session import (
+                SessionReconnectController, _login as _session_login,
+                install_replacement_api)
+            _session_reconnect = SessionReconnectController(
+                max_attempts=3, backoff_seconds=(1.0, 2.0))
+
+            def _session_event(event, **payload):
+                for _mon in futures_mons:
+                    try:
+                        _mon._append_mts_event(event, **payload)
+                    except Exception:
+                        pass
+
+            def _restore_session_channels(candidate):
+                set_tick_callback(candidate, _session_tick_callback)
+                set_bidask_callback(candidate, _session_bidask_callback)
+                if not register_order_callback(candidate, futures_mons, om):
+                    raise RuntimeError("order callback registration failed")
+                _setup_event_callback(candidate, futures_mons, om)
+                for _mon in futures_mons:
+                    for _contract in (getattr(_mon, "contract", None),
+                                      getattr(_mon, "far_contract", None)):
+                        if _contract is not None:
+                            safe_subscribe(candidate, _contract,
+                                           quote_type="tick")
+                            safe_subscribe(candidate, _contract,
+                                           quote_type="bidask")
+                for _key in ("MTX", "C", "P"):
+                    _contract = om.monitor.active_contracts.get(_key)
+                    if _contract is not None:
+                        safe_subscribe(candidate, _contract,
+                                       quote_type="tick")
+                        if _key != "MTX":
+                            safe_subscribe(candidate, _contract,
+                                           quote_type="bidask")
+
+            def _request_session_reconnect(exc, **evidence):
+                nonlocal api
+                _quarantine_for_handoff(futures_mons,
+                                        reason="SESSION_RECONNECT_PENDING")
+                _session_event("SESSION_RECONNECT_TRIGGERED", **evidence)
+                _old_api = api
+                _new_api = _session_reconnect.reconnect(
+                    exc, api_factory=sj.Shioaji,
+                    login=_session_login,
+                    restore=_restore_session_channels,
+                    verify=lambda candidate: candidate.list_positions(
+                        account=candidate.futopt_account) is not None,
+                    emit=_session_event)
+                if _new_api is None:
+                    return False
+                if not install_replacement_api(_old_api, _new_api):
+                    _session_event("SESSION_RECONNECT_FAILED",
+                                   error_type="SESSION_SWAP_RACE")
+                    return False
+                api = _new_api
+                for _mon in futures_mons:
+                    _mon.api = _new_api
+                    if getattr(_mon, "client", None) is not None:
+                        _mon.client.api = _new_api
+                om.api = _new_api
+                om.monitor.api = _new_api
+                _session_event("SESSION_RECONNECT_READY", **evidence)
+                return True
+
+            for _mon in futures_mons:
+                _mon._session_reconnect_callback = _request_session_reconnect
         # Re-enable when futures MTS is stable and options logic is revised.
         _options_enabled = False
         if _options_enabled:

@@ -9,7 +9,7 @@ import logging
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +29,80 @@ _lock = threading.Lock()
 _fetch_lock = threading.Lock()
 _is_fetching = False
 _system_status = SystemReadiness.BOOTING
+
+
+def is_session_death_error(exc: BaseException) -> bool:
+    """Return True only for errors that prove the broker session is dead.
+
+    Generic timeouts and provider 5xx responses remain degraded reads; they
+    must not create a login storm.  Shioaji exposes the terminal condition
+    either through its exception type or the SolClient sub-code text.
+    """
+    _name = type(exc).__name__.lower()
+    _text = str(exc).lower()
+    return (
+        "sessionnotestablished" in _text
+        or "session not established" in _text
+        or "shioajiconnectionerror" in _name
+        or "shioajiconnectionerror" in _text
+    )
+
+
+class SessionReconnectController:
+    """Single-flight, bounded replacement-session recovery.
+
+    The controller never submits, cancels, or mutates an order.  Callers
+    provide only login, callback/subscription restoration and a read-only
+    verification probe.  Exhaustion is sticky until process restart or an
+    explicit successful recovery, preventing repeated call sites from
+    turning one outage into an unbounded login loop.
+    """
+
+    def __init__(self, *, max_attempts: int = 3,
+                 backoff_seconds=(1.0, 2.0), sleep=time.sleep):
+        self.max_attempts = max(1, int(max_attempts))
+        self.backoff_seconds = tuple(float(v) for v in backoff_seconds)
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._attempts = 0
+        self._exhausted = False
+
+    def reconnect(self, exc: BaseException, *, api_factory: Callable,
+                  login: Callable, restore: Callable, verify: Callable,
+                  emit: Callable):
+        if not is_session_death_error(exc) or self._exhausted:
+            return None
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            while self._attempts < self.max_attempts:
+                self._attempts += 1
+                _attempt = self._attempts
+                emit("SESSION_RECONNECT_ATTEMPT", attempt=_attempt,
+                     max_attempts=self.max_attempts)
+                try:
+                    candidate = api_factory()
+                    login(candidate)
+                    restore(candidate)
+                    if not verify(candidate):
+                        raise RuntimeError("replacement session verification failed")
+                    emit("SESSION_RECONNECT_OK", attempt=_attempt)
+                    self._attempts = 0
+                    self._exhausted = False
+                    return candidate
+                except Exception as reconnect_exc:
+                    emit("SESSION_RECONNECT_FAILED", attempt=_attempt,
+                         max_attempts=self.max_attempts,
+                         error_type=type(reconnect_exc).__name__)
+                    if self._attempts < self.max_attempts:
+                        _idx = min(self._attempts - 1,
+                                   len(self.backoff_seconds) - 1)
+                        if self.backoff_seconds:
+                            self._sleep(self.backoff_seconds[_idx])
+            self._exhausted = True
+            return None
+        finally:
+            self._lock.release()
 
 # IPC: Shared state file to communicate between trading-system and dashboard processes
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +158,16 @@ def get_api() -> sj.Shioaji:
                 raise
             _api = candidate
         return _api
+
+
+def install_replacement_api(expected, replacement) -> bool:
+    """Atomically replace the dead singleton after verified reconstruction."""
+    global _api
+    with _lock:
+        if _api is not expected:
+            return False
+        _api = replacement
+        return True
 
 def _load_env_credentials():
     """載入 Shioaji 憑證與環境變數，支援多重路徑 Fallback (包含隔離 worktree 與 runtime 目錄)

@@ -4817,6 +4817,10 @@ class FuturesMonitor:
         capture_ok = ((snapshot.get("fetch_status") or {}).get("capture")
                       == "OK")
         if not capture_ok:
+            _errors = snapshot.get("errors") or {}
+            self._request_session_reconnect(
+                RuntimeError("; ".join(str(v) for v in _errors.values())),
+                source="watchdog_broker_truth")
             reason = "BROKER_QUERY_UNAVAILABLE"
             try:
                 self._append_mts_event("WATCHDOG_BROKER_QUERY_UNAVAILABLE",
@@ -5061,6 +5065,8 @@ class FuturesMonitor:
             except Exception as exc:
                 box["state"] = "REFRESH_EXCEPTION"
                 box["error"] = type(exc).__name__
+                self._request_session_reconnect(
+                    exc, source="futures_trade_refresh")
             finally:
                 done.set()
                 lock.release()
@@ -5123,6 +5129,26 @@ class FuturesMonitor:
             pass
         self._last_futures_refresh = dict(result, rows=None)
         return result
+
+    def _request_session_reconnect(self, exc, *, source: str) -> bool:
+        """Forward proven session death to the one bounded reconnect owner."""
+        from core.shioaji_session import is_session_death_error
+        if not is_session_death_error(exc):
+            return False
+        _callback = getattr(self, "_session_reconnect_callback", None)
+        if not callable(_callback):
+            return False
+        try:
+            _callback(exc, source=source)
+            return True
+        except Exception as reconnect_exc:
+            try:
+                self._append_mts_event(
+                    "SESSION_RECONNECT_FAILED", source=source,
+                    error_type=type(reconnect_exc).__name__)
+            except Exception:
+                pass
+            return False
 
     def _record_refresh_telemetry(self, result):
         self._last_futures_refresh = dict(result, rows=None)
