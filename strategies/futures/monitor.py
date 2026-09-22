@@ -269,6 +269,11 @@ class ExecutionContextSyncFatal(RuntimeError):
     quarantine; an order-capable process must not continue."""
 
 
+# 2026-09-23 hermes: entry marketable-offset hard cap (was 3) — measured p95 quote drift
+# supports up to 5 ticks; worst case 5 ticks = 50 TWD vs ~500-700 TWD expected edge.
+_MAX_ENTRY_OFFSET_TICKS = 5
+
+
 class FuturesMonitor:
 
     def _bbo_generation_tag(self):
@@ -10536,7 +10541,7 @@ class FuturesMonitor:
         _pricing = {
             "reference_spread": _spread,
             "entry_offset_ticks": entry_offset_ticks,
-            "max_entry_offset_ticks": 3,
+            "max_entry_offset_ticks": _MAX_ENTRY_OFFSET_TICKS,
             "tick_size": tick_size,
             "near_quote_age_ms": bar_dict.get("bbo_near_age_ms"),
             "far_quote_age_ms": bar_dict.get("bbo_far_age_ms"),
@@ -10584,7 +10589,7 @@ class FuturesMonitor:
                 or not math.isfinite(_tick) or _tick <= 0):
             _reject_pricing("ENTRY_PRICE_CONFIG_INVALID")
             return
-        if _offset > 3:
+        if _offset > _MAX_ENTRY_OFFSET_TICKS:
             _reject_pricing("ENTRY_PRICE_OFFSET_EXCEEDS_MAX")
             return
 
