@@ -112,6 +112,26 @@ def _read_canonical_mts_state() -> tuple[dict | None, str, str]:
     return _state, "OK", _path
 
 
+def _quick_mts_summary_presentation(
+    is_live_runtime: bool, state: dict | None, status: str, path: str
+) -> dict:
+    """Describe the quick MTS panel without mislabelling LIVE broker scope."""
+    if is_live_runtime:
+        return {
+            "level": "info",
+            "message": "LIVE MTS 狀態以券商查詢為準；持倉與委託顯示於下方券商即時摘要。",
+        }
+    if isinstance(state, dict):
+        return {"level": "state", "message": ""}
+    return {
+        "level": "error",
+        "message": (
+            f"⚠️ MTS 狀態不可用：{status} · state_path={path} · "
+            "不使用 legacy/tmp fallback。"
+        ),
+    }
+
+
 # ── [weak_bear_trend Monitor] Import auto_select monitoring panel ──
 def render_weak_bear_panel():
     """Render weak_bear_trend and auto_select monitoring panel."""
@@ -5209,7 +5229,12 @@ elif _selected_product == "TMF":
         else (None, "LIVE_BROKER_SCOPE", "—")
     )
     st.subheader("📌 MTS 即時持倉摘要")
-    if isinstance(_quick_mts_state, dict):
+    _quick_presentation = _quick_mts_summary_presentation(
+        _quick_is_live_runtime, _quick_mts_state,
+        _quick_mts_status, _quick_mts_path)
+    if _quick_presentation["level"] == "info":
+        st.info(_quick_presentation["message"])
+    elif isinstance(_quick_mts_state, dict):
         _quick_has_pos = bool(_quick_mts_state.get("has_position"))
         _q1, _q2, _q3, _q4 = st.columns(4)
         _q1.metric("狀態", _quick_mts_state.get("state", "UNKNOWN"))
@@ -5221,9 +5246,7 @@ elif _selected_product == "TMF":
             f"{'雙腿持倉' if _quick_has_pos else 'FLAT'} · "
             f"state_path={_quick_mts_path}")
     else:
-        st.error(
-            f"⚠️ MTS 狀態不可用：{_quick_mts_status} · "
-            f"state_path={_quick_mts_path} · 不使用 legacy/tmp fallback。")
+        st.error(_quick_presentation["message"])
 
     # ── Calendar Spread 顯示 ──
     ft, _ = load_futures_trades()
