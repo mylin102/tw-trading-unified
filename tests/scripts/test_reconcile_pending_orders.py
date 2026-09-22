@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import types
+import time
 
 import pytest
 
@@ -49,6 +50,14 @@ class FakeBroker:
 
     def has_position(self, symbol):
         return symbol in self._pos
+
+
+class SnapshotBroker:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def capture_snapshot(self, *, session_id):
+        return {**self.snapshot, "session_id": session_id}
 
 
 def _write(tmp_path, orders):
@@ -152,6 +161,46 @@ def test_dry_run_does_not_write(tmp_path):
     res = reconcile(p, broker=FakeBroker(), dry_run=True)
     assert res["cancelled"] == ["ORD-1"]
     assert open(p, encoding="utf-8").read() == before
+
+
+def test_submitted_ioc_is_included_and_converges_to_received_not_filled(tmp_path):
+    order = {
+        **BASE, "order_id": "ORD-20260922-000130",
+        "status": "submitted", "broker_order_id": "8e91b753",
+    }
+    p = _write(tmp_path, [order])
+    snapshot = {
+        "source": "live_broker",
+        "captured_at": int(time.time() * 1000),
+        "fetch_status": {"capture": "OK"},
+        "query_failures": [], "errors": {},
+        "positions": [], "open_orders": [], "broker_trades": [],
+    }
+
+    result = reconcile(p, broker=SnapshotBroker(snapshot))
+
+    assert result["cancelled"] == ["ORD-20260922-000130"]
+    saved = json.loads(open(p, encoding="utf-8").read())
+    assert saved[0]["status"] == "received_not_filled"
+    assert saved[0]["broker_order_id"] == "8e91b753"
+
+
+def test_submitted_ioc_unavailable_snapshot_is_retained(tmp_path):
+    order = {**BASE, "order_id": "ORD-UNAVAILABLE", "status": "submitted"}
+    p = _write(tmp_path, [order])
+    snapshot = {
+        "source": "live_broker",
+        "captured_at": int(time.time() * 1000),
+        "fetch_status": {"capture": "FAIL"},
+        "query_failures": ["POSITIONS_UNAVAILABLE"],
+        "positions": [], "open_orders": [], "broker_trades": [],
+    }
+
+    result = reconcile(p, broker=SnapshotBroker(snapshot))
+
+    assert result["cancelled"] == []
+    assert result["retained"] == ["ORD-UNAVAILABLE"]
+    assert json.loads(open(p, encoding="utf-8").read())[0]["status"] == "submitted"
 
 
 def test_write_is_atomic_with_backup(tmp_path):
