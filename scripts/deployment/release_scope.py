@@ -13,6 +13,51 @@ class ReleaseScopeError(RuntimeError):
     pass
 
 
+def plan_auxiliary_repin(pm2_rows: list[dict], names: list[str]) -> list[dict]:
+    """Plan auxiliary re-registration without reviving intentionally stopped apps."""
+    live = {str(row.get("name")): row for row in pm2_rows if isinstance(row, dict)}
+    plan: list[dict] = []
+    for name in names:
+        row = live.get(str(name)) or {}
+        status = str((row.get("pm2_env") or {}).get("status") or "missing")
+        if status == "stopped":
+            plan.append({"name": str(name), "action": "preserve-stopped"})
+        elif status == "online":
+            plan.append({"name": str(name), "action": "repin"})
+        else:
+            raise ReleaseScopeError(
+                f"auxiliary app {name} has unsupported pre-deploy status={status}")
+    return plan
+
+
+def verify_auxiliary_release_apps(
+    pm2_rows: list[dict], before_rows: list[dict], names: list[str], expected_sha: str
+) -> None:
+    """Verify stopped apps stayed stopped and online apps were re-pinned online."""
+    after = {str(row.get("name")): row for row in pm2_rows if isinstance(row, dict)}
+    before = {str(row.get("name")): row for row in before_rows if isinstance(row, dict)}
+    failures: list[str] = []
+    for name in names:
+        pre = (before.get(str(name)) or {}).get("pm2_env") or {}
+        post = (after.get(str(name)) or {}).get("pm2_env") or {}
+        pre_status = str(pre.get("status") or "missing")
+        post_status = str(post.get("status") or "missing")
+        actual = str(post.get("LRC_RELEASE_SHA") or "<missing>")
+        if pre_status == "stopped":
+            if post_status != "stopped":
+                failures.append(
+                    f"{name}(preserved-stopped violated: status={post_status})")
+        elif pre_status == "online":
+            if post_status != "online" or actual != expected_sha:
+                failures.append(
+                    f"{name}(must-be-online status={post_status},actual_sha={actual},"
+                    f"expected_sha={expected_sha})")
+        else:
+            failures.append(f"{name}(unsupported pre-deploy status={pre_status})")
+    if failures:
+        raise ReleaseScopeError("auxiliary release verification failed: " + ", ".join(failures))
+
+
 def _inside(path: object, root: str) -> bool:
     if not isinstance(path, str) or not path:
         return False
@@ -89,6 +134,15 @@ def main() -> int:
     verify.add_argument("--scope", required=True)
     verify.add_argument("--pm2-json", required=True)
     verify.add_argument("--expected-sha", required=True)
+    plan = sub.add_parser("plan-aux")
+    plan.add_argument("--scope", required=True)
+    plan.add_argument("--pm2-json", required=True)
+    plan.add_argument("--primary", required=True)
+    verify_aux = sub.add_parser("verify-aux")
+    verify_aux.add_argument("--scope", required=True)
+    verify_aux.add_argument("--before-pm2-json", required=True)
+    verify_aux.add_argument("--pm2-json", required=True)
+    verify_aux.add_argument("--expected-sha", required=True)
     args = parser.parse_args()
     try:
         if args.command == "select":
@@ -104,11 +158,25 @@ def main() -> int:
             Path(tmp).write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
             os.replace(tmp, args.out)
             print(" ".join(apps))
-        else:
+        elif args.command == "verify":
             scope = _read(args.scope)
             verify_release_apps(_read(args.pm2_json), list(scope.get("apps") or []),
                                 args.expected_sha)
             print("release scope identity OK: " + " ".join(scope["apps"]))
+        elif args.command == "plan-aux":
+            scope = _read(args.scope)
+            names = [name for name in scope.get("apps") or []
+                     if name != args.primary]
+            for item in plan_auxiliary_repin(_read(args.pm2_json), names):
+                print(f"{item['name']}\t{item['action']}")
+        else:
+            scope = _read(args.scope)
+            names = [name for name in scope.get("apps") or []
+                     if name != scope.get("primary")]
+            verify_auxiliary_release_apps(
+                _read(args.pm2_json), _read(args.before_pm2_json), names,
+                args.expected_sha)
+            print("auxiliary release state OK: " + " ".join(names))
     except (KeyError, OSError, ValueError, ReleaseScopeError) as exc:
         print(f"[RELEASE_SCOPE] FAIL: {exc}", file=sys.stderr)
         return 4

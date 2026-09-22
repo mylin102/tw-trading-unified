@@ -74,6 +74,14 @@ def test_deploy_script_forbids_restart_and_update_env_and_has_aux_stage():
     assert "stage REPIN_AUX" in executable
 
 
+def test_deploy_script_uses_state_aware_aux_plan_and_verification():
+    text = (Path(__file__).parents[2] / "scripts" / "deployment" /
+            "deploy_release.sh").read_text(encoding="utf-8")
+    assert "release_scope.py plan-aux" in text
+    assert "release_scope.py verify-aux" in text
+    assert "preserved=stopped" in text
+
+
 def test_aux_repin_preserves_stopped_and_repins_online_apps():
     rows = _pm2()
     rows[1]["pm2_env"]["status"] = "stopped"
@@ -87,6 +95,7 @@ def test_aux_repin_preserves_stopped_and_repins_online_apps():
 
 def test_aux_repin_requires_online_same_release_sha_for_previously_online():
     before = _pm2()
+    before[1]["pm2_env"]["status"] = "online"
     after = _pm2()
     after[1]["pm2_env"].update(status="online", LRC_RELEASE_SHA="new")
     verify_auxiliary_release_apps(

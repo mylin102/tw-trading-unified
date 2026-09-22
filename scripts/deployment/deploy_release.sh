@@ -345,23 +345,35 @@ stage REPIN_AUX
 if [ "$DRY_RUN" = 1 ]; then
   log "DRY-RUN would re-register same-release pinned auxiliary apps, then verify every scoped SHA"
 else
-  AUX_APPS="$($PYTHON_BIN -B -c "import json,sys; s=json.load(open(sys.argv[1])); print(' '.join(x for x in s['apps'] if x != sys.argv[2]))" "$RELEASE_SCOPE_FILE" "$APP")" \
-    || fail 9 "cannot read auxiliary release scope"
-  for AUX_APP in $AUX_APPS; do
+  AUX_PLAN_FILE="$ARTIFACT_DIR/deploy_aux_plan.tsv"
+  "$PYTHON_BIN" -B scripts/deployment/release_scope.py plan-aux \
+      --scope "$RELEASE_SCOPE_FILE" \
+      --pm2-json "$ARTIFACT_DIR/deploy_pm2_jlist.json" \
+      --primary "$APP" > "$AUX_PLAN_FILE" \
+      || fail 9 "cannot determine auxiliary pre-deploy states"
+  while IFS=$'\t' read -r AUX_APP AUX_ACTION; do
+    [ -n "$AUX_APP" ] || continue
+    if [ "$AUX_ACTION" = "preserve-stopped" ]; then
+      log "aux app $AUX_APP preserved=stopped"
+      continue
+    fi
+    [ "$AUX_ACTION" = "repin" ] \
+      || fail 9 "unsupported auxiliary action=$AUX_ACTION app=$AUX_APP"
     log "re-pinning auxiliary app=$AUX_APP sha=$EXPECTED_SHA"
     run "$PM2_BIN" delete "$AUX_APP" || fail 9 "pm2 delete failed for auxiliary app=$AUX_APP"
     run "$PM2_BIN" start ecosystem.config.js --only "$AUX_APP" \
       || fail 9 "pm2 start failed for auxiliary app=$AUX_APP"
-  done
+  done < "$AUX_PLAN_FILE"
   run "$PM2_BIN" save || fail 9 "pm2 save failed after auxiliary re-pin"
   "$PM2_BIN" jlist > "$ARTIFACT_DIR/deploy_pm2_after_aux.json" 2>/dev/null \
     || fail 9 "pm2 jlist failed after auxiliary re-pin"
-  "$PYTHON_BIN" -B scripts/deployment/release_scope.py verify \
+  "$PYTHON_BIN" -B scripts/deployment/release_scope.py verify-aux \
       --scope "$RELEASE_SCOPE_FILE" \
+      --before-pm2-json "$ARTIFACT_DIR/deploy_pm2_jlist.json" \
       --pm2-json "$ARTIFACT_DIR/deploy_pm2_after_aux.json" \
       --expected-sha "$EXPECTED_SHA" \
       || fail 9 "same-release PM2 identity mismatch"
-  log "same-release auxiliary apps re-pinned and verified"
+  log "same-release auxiliary apps re-pinned/preserved and verified"
 fi
 
 # ── 8 GATE_POST ──────────────────────────────────────────────────────────────
