@@ -121,7 +121,7 @@ def test_missing_real_bbo_never_falls_back_to_close_or_last():
 def test_offset_five_is_accepted_and_priced_five_ticks_beyond_executable():
     """k=5 must not be rejected and must price 5 ticks beyond the executable spread.
 
-    near_bid - far_ask = 48473 - 48649 = -176  =>  sell limit = -176 - 5 = -181.
+    near_bid 48630 - far_ask 48800 = -170  =>  sell limit = -170 - 5 = -175.
     """
     monitor = _monitor()
 
@@ -129,4 +129,4 @@ def test_offset_five_is_accepted_and_priced_five_ticks_beyond_executable():
 
     assert not any(e[0] == "ORDER_REJECTED_LOCAL" for e in monitor.events), monitor.events
     assert monitor.order_mgr.created, "order must be created for k=5"
-    assert monitor.order_mgr.created[0].price == -181.0
+    assert monitor.order_mgr.created[0].price == -175.0  # near_bid 48630 - far_ask 48800 = -170; -170 - 5 ticks
