@@ -1,5 +1,6 @@
 """RED: restart reconciliation consumes one canonical broker snapshot."""
 import json
+import time
 
 from scripts.reconcile_pending_orders import reconcile
 
@@ -30,9 +31,11 @@ def test_reconcile_uses_one_snapshot_for_all_pending_orders(tmp_path):
          "broker_order_id": "B-2"},
     ]), encoding="utf-8")
     broker = SnapshotBroker({
-        "source": "live_broker", "session_id": "sess", "captured_at": 1,
+        "source": "live_broker", "session_id": "sess",
+        "captured_at": int(time.time() * 1000),
         "positions": [], "open_orders": [], "trades": [],
     })
     result = reconcile(str(path), broker=broker)
     assert broker.calls == 1
-    assert result["cancelled"] == ["ORD-1", "ORD-2"]
+    assert result["cancelled"] == []
+    assert result["retained"] == ["ORD-1", "ORD-2"]

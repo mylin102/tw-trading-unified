@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Reconcile stale pending MTS orders at restart time.
 
-Problem: an order can be saved with status=pending_submit while the
-broker already cancelled it.  BUT `cancelled_at` alone is NOT broker
+Problem: an order can be saved with status=pending_submit/submitted while
+the broker already completed an IOC with zero fill.  BUT local timestamps
+alone are NOT broker
 evidence: core/order_management/order.py cancel() also stamps it
 (local watchdog cancel while the broker actually filled is a known
 historical failure).  Marking such an order cancelled would corrupt
@@ -12,14 +13,14 @@ This script therefore requires EXPLICIT broker terminal evidence:
 
   - broker probe (read-only Shioaji query) MUST be available; if the
     probe fails or is absent -> fail-closed: NO changes at all.
-  - For each pending_submit order (cancelled_at irrelevant — broker
+  - For each pending_submit/submitted order (local state irrelevant — broker
     query is the truth):
       broker still lists the order as open  -> leave + warn (in-flight)
       broker shows a position on the symbol -> leave + quarantine
           (local cancel was wrong; the order FILLED)
-      broker shows neither                   -> mark BROKER_NOT_FOUND
+      submitted + broker shows neither       -> RECEIVED_NOT_FILLED
           (terminal, audit kept, never resubmit)
-  - pending_submit WITHOUT cancelled_at     -> always left untouched.
+      pending_submit without completed evidence -> retain.
 
 Atomic write-back (backup + tmp + os.replace).  Exit code 0 always so
 a reconcile hiccup never blocks the restart.
@@ -101,7 +102,8 @@ def reconcile(orders_file, broker=None, dry_run=False):
             session_id=f"restart-reconcile:{os.getpid()}:{time.time_ns()}"
         )
     for order in orders:
-        if order.get("status") != "pending_submit":
+        local_status = str(order.get("status") or "").lower()
+        if local_status not in {"pending_submit", "submitted"}:
             continue
         oid = order.get("order_id")
         if broker is None:
@@ -110,18 +112,27 @@ def reconcile(orders_file, broker=None, dry_run=False):
             continue
         if snapshot is not None:
             decision = reconcile_order(order, snapshot)
-            if decision.action != "MARK_TERMINAL":
+            if decision.action not in {
+                    "MARK_TERMINAL", "APPLY_TERMINAL",
+                    "APPLY_ZERO_FILL_TERMINAL"}:
                 retained.append(oid)
                 continue
-            # Broker evidence proves neither this order nor a position exists.
-            # Keep the historical record but make the terminal disposition
-            # explicit; never interpret this as a fill or resubmit.
-            order["status"] = "BROKER_NOT_FOUND"
+            terminal = {
+                "FILLED": "filled",
+                "CANCELLED": "cancelled",
+                "REJECTED": "rejected",
+                "EXPIRED": "expired",
+                "RECEIVED_NOT_FILLED": "received_not_filled",
+                "BROKER_NOT_FOUND": "BROKER_NOT_FOUND",
+            }.get(decision.state)
+            if terminal is None:
+                retained.append(oid)
+                continue
+            # Preserve the original order and idempotency identity while
+            # applying only the broker-proven terminal disposition.
+            order["status"] = terminal
             order["reconciled_at"] = datetime.now().isoformat()
-            order["reconcile_note"] = (
-                "phantom pending: broker confirms neither open order nor "
-                "position (BROKER_NOT_FOUND, RECONCILE_REQUIRED)"
-            )
+            order["reconcile_note"] = decision.reason
             changed.append(oid)
             continue
         broker_id = order.get("broker_order_id")
@@ -132,14 +143,15 @@ def reconcile(orders_file, broker=None, dry_run=False):
         if broker.has_position(symbol):
             retained.append(oid)  # local state wrong; the order filled
             continue
-        # The broker has NEITHER the open order NOR a position for this
-        # symbol: the pending is phantom (cancelled_at presence is
-        # irrelevant — the broker query is the truth).  Mark terminal —
-        # never treated as a successful fill, never resubmitted — the
-        # full record stays for audit.
-        order["status"] = "BROKER_NOT_FOUND"
+        # Legacy probes have no atomic snapshot metadata.  Preserve their
+        # historical pending-submit behavior, but a submitted IOC with a
+        # receipt and broker-flat result converges to zero-fill terminal.
+        order["status"] = ("received_not_filled" if local_status == "submitted"
+                           else "BROKER_NOT_FOUND")
         order["reconciled_at"] = datetime.now().isoformat()
         order["reconcile_note"] = (
+            "fresh broker confirms no working order, fill, or position"
+            if local_status == "submitted" else
             "phantom pending: broker confirms neither open order nor "
             "position (BROKER_NOT_FOUND, RECONCILE_REQUIRED)")
         changed.append(oid)
@@ -228,7 +240,8 @@ def main():
     result = reconcile(orders_file, broker=broker, dry_run=args.dry_run)
     tag = "DRY-RUN " if args.dry_run else ""
     if result["cancelled"]:
-        print(f"[reconcile] {tag}marked BROKER_NOT_FOUND (terminal, audit kept): {result['cancelled']}")
+        print(f"[reconcile] {tag}applied broker-proven terminal state "
+              f"(audit kept): {result['cancelled']}")
     if result["retained"]:
         print(f"[reconcile] {tag}retained (no broker proof): {result['retained']}")
     if not result["cancelled"] and not result["retained"]:

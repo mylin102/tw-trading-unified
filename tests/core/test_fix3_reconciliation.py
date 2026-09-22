@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import time
 
 from core.order_lifecycle_reconciler import reconcile_order
 from core.order_management.order import Order, OrderSide, OrderStatus, OrderType
@@ -26,6 +27,9 @@ def evidence(*, status=None, deal_quantity=0, deals=None, positions=None,
              mismatch=False, broker_order_id="B-IOC-1"):
     return {
         "source": "live_broker",
+        "captured_at": int(time.time() * 1000),
+        "fetch_status": {"capture": "OK"},
+        "query_failures": [],
         "query_evidence": {
             "order_query": query,
             "combo_status": query,

@@ -1849,11 +1849,12 @@ class OrderManager:
         APPLY_TERMINAL decisions (explicit broker terminal state) map
         onto the OrderStatus terminal members.  RETAIN /
         RECONCILE_REQUIRED are left untouched — fail-closed.  Only
-        PENDING_SUBMIT orders are considered (mirrors
+        PENDING_SUBMIT and SUBMITTED orders are considered (mirrors
         scripts/reconcile_pending_orders.py)."""
         changed: List[Dict[str, Any]] = []
         for order in list(self.active_orders.values()):
-            if order.status != OrderStatus.PENDING_SUBMIT:
+            if order.status not in (
+                    OrderStatus.PENDING_SUBMIT, OrderStatus.SUBMITTED):
                 continue
             decision = reconcile_order(order, snapshot)
             action = getattr(decision, "action", "")
@@ -1861,18 +1862,19 @@ class OrderManager:
                 order.status = OrderStatus.BROKER_NOT_FOUND
                 changed.append({"order_id": order.order_id,
                                 "action": "MARK_TERMINAL"})
-            elif action == "APPLY_TERMINAL":
+            elif action in ("APPLY_TERMINAL", "APPLY_ZERO_FILL_TERMINAL"):
                 terminal = {
                     "FILLED": OrderStatus.FILLED,
                     "CANCELLED": OrderStatus.CANCELLED,
                     "REJECTED": OrderStatus.REJECTED,
                     "EXPIRED": OrderStatus.EXPIRED,
+                    "RECEIVED_NOT_FILLED": OrderStatus.RECEIVED_NOT_FILLED,
                 }.get(getattr(decision, "state", ""))
                 if terminal is None:
                     continue  # unknown terminal state — fail-closed
                 order.status = terminal
                 changed.append({"order_id": order.order_id,
-                                "action": "APPLY_TERMINAL"})
+                                "action": action})
             else:
                 continue  # RETAIN / RECONCILE_REQUIRED — fail-closed
             del self.active_orders[order.order_id]

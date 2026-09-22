@@ -1,4 +1,5 @@
 """RED/GREEN tests for the Phase 2 broker lifecycle decision contract."""
+import time
 from core.order_lifecycle_reconciler import (
     LifecycleDecision,
     reconcile_order,
@@ -16,7 +17,8 @@ def _local(**overrides):
 
 def _snap(*, positions=(), open_orders=(), trades=(), source="live_broker"):
     return {
-        "source": source, "session_id": "sess-1", "captured_at": 1,
+        "source": source, "session_id": "sess-1",
+        "captured_at": int(time.time() * 1000),
         "positions": list(positions), "open_orders": list(open_orders),
         "trades": list(trades),
     }
