@@ -6,6 +6,8 @@ absent — e.g. Shioaji session-cache residuals, callback gap) stayed
 pending_submit forever.  This slice wires the decision into the periodic
 live snapshot reconcile (fail-closed: RETAIN everywhere else).
 """
+import time
+
 from core.order_management.order import (
     Order, OrderSide, OrderStatus, OrderType)
 from core.order_management.order_manager import OrderManager
@@ -25,6 +27,7 @@ def _snapshot(positions=None, open_orders=None, trades=None,
               source="live_broker", capture_ok=True):
     snap = {
         "source": source,
+        "captured_at": int(time.time() * 1000),
         "fetch_status": {"capture": "OK" if capture_ok else "FAIL"},
         "positions": list(positions or []),
         "open_orders": list(open_orders or []),
@@ -48,17 +51,15 @@ def _mgr(*orders):
     return m
 
 
-def test_phantom_pending_marked_broker_not_found():
-    """Order + position both absent at the broker (only shell residuals in
-    the snapshot) -> the phantom pending is terminal (BROKER_NOT_FOUND)."""
+def test_pending_submit_without_completed_window_is_retained():
+    """Absence alone does not prove that a never-receipted submit is terminal."""
     mgr = _mgr(_order())
     snap = _snapshot(positions=[], open_orders=_shell_rows(),
                      trades=_shell_rows())
     changed = mgr.reconcile_pending_terminal(snap)
-    assert len(changed) == 1 and changed[0]["action"] == "MARK_TERMINAL"
-    assert len(mgr.completed) == 1
-    assert mgr.completed[0].status == OrderStatus.BROKER_NOT_FOUND
-    assert "ORD-1" not in mgr.active_orders
+    assert changed == []
+    assert mgr.completed == []
+    assert mgr.active_orders["ORD-1"].status == OrderStatus.PENDING_SUBMIT
 
 
 def test_phantom_pending_retained_when_position_present():
@@ -91,29 +92,28 @@ def test_invalid_snapshot_fails_closed():
 
 def test_non_pending_orders_untouched():
     mgr = _mgr(
-        _order("ORD-S", status=OrderStatus.SUBMITTED),
+        _order("ORD-P", status=OrderStatus.PARTIAL_FILLED),
         _order("ORD-F", status=OrderStatus.FILLED),
         _order("ORD-C", status=OrderStatus.CANCELLED),
     )
     snap = _snapshot(positions=[], open_orders=_shell_rows(),
                      trades=_shell_rows())
     assert mgr.reconcile_pending_terminal(snap) == []
-    assert mgr.active_orders["ORD-S"].status == OrderStatus.SUBMITTED
+    assert mgr.active_orders["ORD-P"].status == OrderStatus.PARTIAL_FILLED
     assert mgr.active_orders["ORD-F"].status == OrderStatus.FILLED
     assert mgr.active_orders["ORD-C"].status == OrderStatus.CANCELLED
 
 
-def test_explicit_broker_terminal_state_applied():
-    """A matched open-order row with an explicit terminal state (Cancelled)
-    maps onto the OrderStatus terminal member (APPLY_TERMINAL)."""
+def test_pending_submit_terminal_without_zero_fill_evidence_is_retained():
+    """A never-confirmed submit needs more than a Cancelled label."""
     mgr = _mgr(_order())
     snap = _snapshot(positions=[],
                      open_orders=[{"ordno": "cfafb0a7", "code": "TMFI6",
                                    "action": "Sell", "quantity": 1,
                                    "status": "Cancelled"}])
     changed = mgr.reconcile_pending_terminal(snap)
-    assert len(changed) == 1 and changed[0]["action"] == "APPLY_TERMINAL"
-    assert mgr.completed[0].status == OrderStatus.CANCELLED
+    assert changed == []
+    assert mgr.active_orders["ORD-1"].status == OrderStatus.PENDING_SUBMIT
 
 
 def test_monitor_snapshot_reconcile_invokes_pending_terminal():

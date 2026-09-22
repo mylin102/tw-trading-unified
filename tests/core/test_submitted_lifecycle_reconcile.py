@@ -102,6 +102,14 @@ def test_submitted_working_order_retained_and_matching_fill_applied():
     }]))
     assert filled.completed[0].status == OrderStatus.FILLED
 
+    cancelled_zero_fill = _manager(_order())
+    cancelled_zero_fill.reconcile_pending_terminal(_snapshot(broker_trades=[{
+        "broker_order_id": "8e91b753", "status": "Cancelled",
+        "filled_quantity": 0, "deals": [],
+    }]))
+    assert (cancelled_zero_fill.completed[0].status
+            == OrderStatus.RECEIVED_NOT_FILLED)
+
 
 def test_partial_filled_is_always_retained():
     manager = _manager(_order(OrderStatus.PARTIAL_FILLED))

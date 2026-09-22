@@ -7,6 +7,9 @@ does not submit, cancel, mutate a broker, or write files.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import math
+import time
 from typing import Any
 
 
@@ -86,13 +89,43 @@ def _status(row: Any) -> str:
 
 
 def _valid_snapshot(snapshot: Any) -> bool:
-    return (
-        isinstance(snapshot, dict)
-        and snapshot.get("source") == "live_broker"
-        and not snapshot.get("capture_error")
-        and isinstance(snapshot.get("positions"), list)
-        and isinstance(snapshot.get("open_orders"), list)
-    )
+    """Require fresh, complete broker truth; unrelated app mode is ignored."""
+    if (not isinstance(snapshot, dict)
+            or snapshot.get("source") != "live_broker"
+            or snapshot.get("capture_error")
+            or snapshot.get("query_failures")
+            or snapshot.get("errors")
+            or not isinstance(snapshot.get("positions"), list)
+            or not isinstance(snapshot.get("open_orders"), list)):
+        return False
+    fetch_status = snapshot.get("fetch_status")
+    if (fetch_status is not None
+            and (not isinstance(fetch_status, dict)
+                 or fetch_status.get("capture") != "OK")):
+        return False
+    captured_at = snapshot.get("captured_at")
+    try:
+        if isinstance(captured_at, str):
+            parsed = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            captured_s = parsed.timestamp()
+        else:
+            captured_s = float(captured_at)
+            if captured_s > 10_000_000_000:
+                captured_s /= 1000.0
+    except (TypeError, ValueError, OverflowError):
+        return False
+    age_s = time.time() - captured_s
+    return math.isfinite(age_s) and -1.0 <= age_s <= 60.0
+
+
+def _position_codes(local_order: Any) -> set[str]:
+    codes = {str(_value(local_order, "symbol") or "")}
+    legs = _value(local_order, "combo_legs")
+    if isinstance(legs, list):
+        codes.update(str(_value(leg, "symbol", "code") or "") for leg in legs)
+    return {code for code in codes if code}
 
 
 def _positions_unchanged(local_order: Any, snapshot: dict[str, Any]) -> bool:
@@ -158,19 +191,23 @@ def reconcile_order(local_order: Any, snapshot: dict[str, Any], *,
     active protection and forbids resubmission.
     """
     order_id = str(_value(local_order, "order_id") or "")
+    local_ids = _identities(local_order)
+    identity = next(iter(sorted(local_ids)), None)
+    local_status = str(getattr(_value(local_order, "status"), "value",
+                               _value(local_order, "status")) or "").lower()
+    if not _valid_snapshot(snapshot):
+        return LifecycleDecision(order_id, "PENDING_UNCONFIRMED", "RETAIN",
+                                 "BROKER_EVIDENCE_UNAVAILABLE", identity)
     evidence = _query_evidence(snapshot)
     if reconciliation_window_complete is not None:
         evidence = {**evidence, "window_complete": reconciliation_window_complete}
-    local_ids = _identities(local_order)
-    identity = next(iter(sorted(local_ids)), None)
-    if not isinstance(snapshot, dict) or snapshot.get("source") != "live_broker":
-        return LifecycleDecision(order_id, "PENDING_UNCONFIRMED", "RETAIN",
-                                 "BROKER_EVIDENCE_UNAVAILABLE", identity)
     if evidence.get("mismatch"):
         return LifecycleDecision(order_id, "UNKNOWN", "RETAIN",
                                  "BROKER_LOCAL_EVIDENCE_MISMATCH", identity)
     if not evidence:
-        rows = list(snapshot.get("trades") or []) + list(snapshot.get("open_orders") or [])
+        rows = (list(snapshot.get("broker_trades") or [])
+                + list(snapshot.get("trades") or [])
+                + list(snapshot.get("open_orders") or []))
         matched = next((row for row in rows if _identities(row) & local_ids), None)
         if matched is not None:
             evidence = {
@@ -178,6 +215,9 @@ def reconcile_order(local_order: Any, snapshot: dict[str, Any], *,
                 "order_status": _status(matched),
                 "broker_order_id": _preferred_identity(matched, _identities(matched) & local_ids),
                 "receipt": True,
+                "deal_quantity": _value(
+                    matched, "deal_quantity", "filled_quantity", "filled_qty"),
+                "deals": _value(matched, "deals") or [],
             }
         else:
             evidence = {"query_available": True}
@@ -193,11 +233,18 @@ def reconcile_order(local_order: Any, snapshot: dict[str, Any], *,
     if status in {"FILLED", "PARTIAL_FILLED"}:
         return LifecycleDecision(order_id, status, "RETAIN" if status == "PARTIAL_FILLED" else "APPLY_TERMINAL",
                                  "EXPLICIT_BROKER_DEAL_STATUS", identity)
+    _submitted_terminal_zero_fill = False
     if status in {"CANCELLED", "CANCELED", "EXPIRED", "INACTIVE", "FAILED"}:
         decision = _decide_terminal(local_order, snapshot, evidence,
                                     "CANCELLED" if status == "CANCELED" else status,
                                     identity)
-        if decision is not None:
+        _deal_qty = evidence.get("deal_quantity")
+        _submitted_terminal_zero_fill = (
+            local_status == "submitted"
+            and status in {"CANCELLED", "CANCELED", "EXPIRED", "INACTIVE"}
+            and (_deal_qty is None or int(_deal_qty) == 0)
+            and _deals_empty(evidence.get("deals")))
+        if decision is not None and not _submitted_terminal_zero_fill:
             return decision
 
     has_callback = bool(evidence.get("callbacks"))
@@ -216,13 +263,18 @@ def reconcile_order(local_order: Any, snapshot: dict[str, Any], *,
             and _positions_unchanged(local_order, snapshot)):
         return LifecycleDecision(order_id, "NOT_SENT", "RETAIN_AUDIT",
                                  "LOCAL_EXCEPTION_NO_RECEIPT_NO_BROKER_EVIDENCE", None)
-    if status or evidence.get("order_query_result") is False:
+    if ((status and not _submitted_terminal_zero_fill)
+            or evidence.get("order_query_result") is False):
         return LifecycleDecision(order_id, "PENDING_UNCONFIRMED", "RETAIN",
                                  "RECONCILIATION_INCOMPLETE", identity)
-    symbol = _value(local_order, "symbol")
-    if symbol and any(str(_value(pos, "code")) == str(symbol)
-                      for pos in snapshot.get("positions", [])):
+    position_codes = _position_codes(local_order)
+    if any(str(_value(pos, "code")) in position_codes
+           for pos in snapshot.get("positions", [])):
         return LifecycleDecision(order_id, "PENDING_UNCONFIRMED", "RETAIN",
                                  "BROKER_POSITION_PRESENT", identity)
+    if local_status == "submitted":
+        return LifecycleDecision(
+            order_id, "RECEIVED_NOT_FILLED", "APPLY_ZERO_FILL_TERMINAL",
+            "FRESH_BROKER_ORDER_DEAL_POSITION_ABSENT", identity)
     return LifecycleDecision(order_id, "PENDING_UNCONFIRMED", "RETAIN",
                              "BROKER_ORDER_NOT_FOUND_REQUIRES_WINDOW", identity)
