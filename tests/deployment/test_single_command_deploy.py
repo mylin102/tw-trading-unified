@@ -21,6 +21,7 @@ import pytest
 
 REPO_SRC = Path(__file__).resolve().parents[2]
 DEPLOY_SRC = REPO_SRC / "scripts" / "deployment" / "deploy_release.sh"
+RELEASE_SCOPE_SRC = REPO_SRC / "scripts" / "deployment" / "release_scope.py"
 IMPACT_SRC = REPO_SRC / "scripts" / "ci" / "contract_impact.py"
 
 
@@ -44,6 +45,9 @@ def _stub_bin(tmp: Path, running_sha: str = "BASE",
     pm2_log = tmp / "pm2_calls.log"
     _write(bin_dir / "node", f"""#!/usr/bin/env bash
 printf 'node %s\\n' "$*" >> {tmp / 'node_calls.log'}
+if printf '%s' "$*" | grep -q 'process.stdout.write'; then
+  printf '%s' '[{{"name":"trading-system","cwd":"{tmp / 'repo'}","script":"taskpolicy","env":{{"LRC_RELEASE_SHA":"candidate"}}}}]'
+fi
 exit {0 if node_ok else 1}
 """, exec_bit=True)
     _write(bin_dir / "pm2", f"""#!/usr/bin/env bash
@@ -53,7 +57,8 @@ case "$1" in
   delete|save) exit 0 ;;
   jlist)
     if grep -q "pm2 start" {pm2_log} 2>/dev/null; then st={pm2_start_status}; else st=stopped; fi
-    printf '[{{"name":"trading-system","pm2_env":{{"status":"%s","LRC_RELEASE_SHA":"{running_sha}"}}}}]' "$st"
+    if grep -q "pm2 start" {pm2_log} 2>/dev/null; then sha="$LRC_RELEASE_SHA"; else sha="{running_sha}"; fi
+    printf '[{{"name":"trading-system","pm2_env":{{"status":"%s","LRC_RELEASE_SHA":"%s","pm_cwd":"{tmp / 'repo'}"}}}}]' "$st" "$sha"
     ;;
   stop|start) exit 0 ;;
 esac
@@ -73,6 +78,7 @@ def _layout(tmp: Path, *, gate_pre_rc: int = 0, gate_post_rc: int = 0,
     (repo / "scripts" / "deployment").mkdir(parents=True)
     shutil.copy2(DEPLOY_SRC, repo / "scripts" / "deployment" / "deploy_release.sh")
     (repo / "scripts" / "deployment" / "deploy_release.sh").chmod(0o755)
+    shutil.copy2(RELEASE_SCOPE_SRC, repo / "scripts" / "deployment" / "release_scope.py")
     (repo / "scripts" / "ci").mkdir(parents=True, exist_ok=True)
     shutil.copy2(IMPACT_SRC, repo / "scripts" / "ci" / "contract_impact.py")
     (repo / "PHASE1_FINAL_FREEZE.md").write_text("manifest\n")
