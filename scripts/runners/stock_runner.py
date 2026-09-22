@@ -32,6 +32,32 @@ LOCKFILE = "/tmp/stock_runner_singleton.lock"
 # PM2 stop_exit_codes=[0] → 75 triggers PM2 autorestart (fresh session).
 _EXIT_RECOVERABLE = 75
 
+# ── Loop cadence (restored 2026-09-22 Hermes takeover) ────────────────
+# agy's re-derivation dropped resolve_loop_interval + the interval constants,
+# which broke tests/test_stock_performance.py and changed the loop cadence.
+DEFAULT_LOOP_INTERVAL_SEC = 30
+MIN_LOOP_INTERVAL_SEC = 10
+
+
+def resolve_loop_interval(config):
+    """Return a safe stock-monitor loop interval from the loaded config."""
+    raw = (config or {}).get("loop_interval_sec", DEFAULT_LOOP_INTERVAL_SEC)
+    try:
+        interval = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid loop_interval_sec=%r; using default %ss", raw, DEFAULT_LOOP_INTERVAL_SEC)
+        return DEFAULT_LOOP_INTERVAL_SEC
+
+    if interval < MIN_LOOP_INTERVAL_SEC:
+        logger.warning(
+            "loop_interval_sec=%s is below minimum %ss; clamping to minimum",
+            raw,
+            MIN_LOOP_INTERVAL_SEC,
+        )
+        return MIN_LOOP_INTERVAL_SEC
+    return int(interval) if interval.is_integer() else interval
+
+
 
 def check_singleton():
     """Ensure only ONE stock_runner is running using a fixed lockfile."""
@@ -182,7 +208,7 @@ def run_stock_monitor(dry_run=False):
                         )
                         sys.exit(_EXIT_RECOVERABLE)
 
-            time.sleep(1)
+            time.sleep(resolve_loop_interval(sm.cfg))
 
     except KeyboardInterrupt:
         console.print("[yellow]Stopping Stock Monitor (User Interrupt)...[/yellow]")
