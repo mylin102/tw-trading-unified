@@ -22,8 +22,9 @@
 #   6 STOP        pm2 stop <app> and confirm stopped
 #   7 RECONCILE   scripts/reconcile_pending_orders.py (fail-closed)
 #   8 START       pm2 start <app> with the pinned env (never --update-env)
-#   9 GATE_POST   check_deployment.py --phase post_startup
-#  10 VERIFY      verify_live_context.py: live_ready + live_order_allowed + pinned sha
+#   9 REPIN_AUX   re-register same-release pinned auxiliary apps + verify every pin
+#  10 GATE_POST   check_deployment.py --phase post_startup
+#  11 VERIFY      verify_live_context.py: live_ready + live_order_allowed + pinned sha
 #
 # Safety properties (audited 2026-09-20):
 #   * tools are NOT overridable — `git` and `pm2` resolve from PATH and every
@@ -36,7 +37,7 @@
 #     checked; a failing `.env` or an unrecorded FULL verification aborts.
 set -u -o pipefail
 
-TOTAL_STAGES=10
+TOTAL_STAGES=11
 CURRENT_STAGE="init"
 STAGE_NO=0
 DRY_RUN=0
@@ -86,6 +87,7 @@ run() {  # run [--allow-fail] <cmd...>
 }
 
 ARTIFACT_DIR="$RUNTIME_DIR/logs"
+RELEASE_SCOPE_FILE="$ARTIFACT_DIR/deploy_release_scope.json"
 log "repo=$REPO_DIR runtime=$RUNTIME_DIR app=$APP dry_run=$DRY_RUN"
 
 # ── 1 PREFLIGHT ───────────────────────────────────────────────────────────────
@@ -134,6 +136,16 @@ if [ "$DRY_RUN" = 0 ]; then
       > "$ARTIFACT_DIR/deploy_ecosystem_check.out" 2>&1; then
     fail 2 "ecosystem.config.js rejects this release dir/env — refusing to continue (no downtime): see $ARTIFACT_DIR/deploy_ecosystem_check.out"
   fi
+  NODE_ENV=production TRADING_PYTHON_BIN="$PYTHON_BIN" TRADING_RUNTIME_DIR="$RUNTIME_DIR" \
+      LRC_RELEASE_SHA="$( "$GIT_BIN" rev-parse HEAD 2>/dev/null || echo '')" \
+      node -e 'process.stdout.write(JSON.stringify(require("./ecosystem.config.js").apps))' \
+      > "$ARTIFACT_DIR/deploy_ecosystem_apps.json" \
+      || fail 2 "cannot inspect ecosystem release scope"
+  "$PYTHON_BIN" -B scripts/deployment/release_scope.py select \
+      --ecosystem-json "$ARTIFACT_DIR/deploy_ecosystem_apps.json" \
+      --pm2-json "$ARTIFACT_DIR/deploy_pm2_jlist.json" \
+      --release-root "$REPO_DIR" --primary "$APP" --out "$RELEASE_SCOPE_FILE" \
+      || fail 2 "cannot select same-release PM2 apps"
   log "pre-stop checks OK (ecosystem config validated, credentials loaded)"
 fi
 
@@ -328,7 +340,31 @@ if [ "$DRY_RUN" = 0 ]; then
   log "app online"
 fi
 
-# ── 7 GATE_POST ──────────────────────────────────────────────────────────────
+# ── 7 REPIN_AUX ─────────────────────────────────────────────────────────────
+stage REPIN_AUX
+if [ "$DRY_RUN" = 1 ]; then
+  log "DRY-RUN would re-register same-release pinned auxiliary apps, then verify every scoped SHA"
+else
+  AUX_APPS="$($PYTHON_BIN -B -c "import json,sys; s=json.load(open(sys.argv[1])); print(' '.join(x for x in s['apps'] if x != sys.argv[2]))" "$RELEASE_SCOPE_FILE" "$APP")" \
+    || fail 9 "cannot read auxiliary release scope"
+  for AUX_APP in $AUX_APPS; do
+    log "re-pinning auxiliary app=$AUX_APP sha=$EXPECTED_SHA"
+    run "$PM2_BIN" delete "$AUX_APP" || fail 9 "pm2 delete failed for auxiliary app=$AUX_APP"
+    run "$PM2_BIN" start ecosystem.config.js --only "$AUX_APP" \
+      || fail 9 "pm2 start failed for auxiliary app=$AUX_APP"
+  done
+  run "$PM2_BIN" save || fail 9 "pm2 save failed after auxiliary re-pin"
+  "$PM2_BIN" jlist > "$ARTIFACT_DIR/deploy_pm2_after_aux.json" 2>/dev/null \
+    || fail 9 "pm2 jlist failed after auxiliary re-pin"
+  "$PYTHON_BIN" -B scripts/deployment/release_scope.py verify \
+      --scope "$RELEASE_SCOPE_FILE" \
+      --pm2-json "$ARTIFACT_DIR/deploy_pm2_after_aux.json" \
+      --expected-sha "$EXPECTED_SHA" \
+      || fail 9 "same-release PM2 identity mismatch"
+  log "same-release auxiliary apps re-pinned and verified"
+fi
+
+# ── 8 GATE_POST ──────────────────────────────────────────────────────────────
 stage GATE_POST
 SESSION_GEN="$("$PYTHON_BIN" -B -c "
 import json,os,sys
@@ -343,17 +379,17 @@ else
       --session-generation "$SESSION_GEN" --allow-existing-mts-position \
       --json > "$ARTIFACT_DIR/deploy_gate_post.json" 2>"$ARTIFACT_DIR/deploy_gate_post.err"
   GATE_RC=$?
-  [ $GATE_RC -eq 0 ] || fail 9 "gate post_startup NOT_READY (rc=$GATE_RC) — see $ARTIFACT_DIR/deploy_gate_post.err"
+  [ $GATE_RC -eq 0 ] || fail 10 "gate post_startup NOT_READY (rc=$GATE_RC) — see $ARTIFACT_DIR/deploy_gate_post.err"
   log "gate post_startup READY"
 fi
 
-# ── 8 VERIFY ─────────────────────────────────────────────────────────────────
+# ── 9 VERIFY ─────────────────────────────────────────────────────────────────
 stage VERIFY
 if [ "$DRY_RUN" = 1 ]; then
   log "DRY-RUN would run: verify_live_context.py --runtime-dir $RUNTIME_DIR --expected-sha $EXPECTED_SHA"
 else
   run "$PYTHON_BIN" -B scripts/deployment/verify_live_context.py --runtime-dir "$RUNTIME_DIR" \
-    --expected-sha "$EXPECTED_SHA" || fail 10 "live context verification failed"
+    --expected-sha "$EXPECTED_SHA" || fail 11 "live context verification failed"
 fi
 
 if [ "$DRY_RUN" = 1 ]; then
