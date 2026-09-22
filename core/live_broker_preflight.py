@@ -208,12 +208,24 @@ def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
     average cost) / pnl so a later consumer can render live UPL and
     the leg identity without fabricating cost."""
     try:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_positions", "before",
+                            source="core.live_broker_preflight._safe_positions")
         raw_positions = api.list_positions(account=account)
     except TypeError:
         # Compatibility with the installed SDK/test doubles whose bound
         # account parameter is positional-only.  The account object is still
         # resolved and passed; this does not permit an unbound query.
         raw_positions = api.list_positions(account)
+    except Exception as exc:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_positions", "error",
+                            source="core.live_broker_preflight._safe_positions",
+                            error=exc)
+        raise
+    from core.shioaji_session import observe_broker_call
+    observe_broker_call(api, "list_positions", "after",
+                        source="core.live_broker_preflight._safe_positions")
     return [
         {
             "code": getattr(p, "code", None),
@@ -229,9 +241,21 @@ def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
 
 def _safe_open_orders(api: Any, account: Any) -> list[dict[str, Any]]:
     try:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_trades", "before",
+                            source="core.live_broker_preflight._safe_open_orders")
         trades = list(api.list_trades())
     except TypeError:
         trades = list(api.list_trades(account=account))
+    except Exception as exc:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_trades", "error",
+                            source="core.live_broker_preflight._safe_open_orders",
+                            error=exc)
+        raise
+    from core.shioaji_session import observe_broker_call
+    observe_broker_call(api, "list_trades", "after",
+                        source="core.live_broker_preflight._safe_open_orders")
     terminal = {"Filled", "Cancelled", "Expired", "Done"}
     return [
         {

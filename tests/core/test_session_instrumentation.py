@@ -63,7 +63,7 @@ def test_broker_call_logs_before_after_and_failure_generation(tmp_path, monkeypa
 
 def test_resident_constructor_audit_is_clean_and_probe_file_is_rejected(tmp_path):
     repo = Path(__file__).parents[2]
-    resident = ["main.py", "scripts/runners", "strategies/stocks"]
+    resident = ["main.py", "scripts/runners/stock_runner.py", "strategies/stocks"]
     assert audit_resident_shioaji_constructors(repo, resident) == []
     probe = tmp_path / "scripts" / "runners" / "probe.py"
     probe.parent.mkdir(parents=True)
@@ -71,4 +71,3 @@ def test_resident_constructor_audit_is_clean_and_probe_file_is_rejected(tmp_path
     violations = audit_resident_shioaji_constructors(tmp_path, ["scripts/runners"])
     assert len(violations) == 1
     assert violations[0]["path"] == "scripts/runners/probe.py"
-

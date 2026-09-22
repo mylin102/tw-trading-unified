@@ -7,6 +7,9 @@ import threading
 import time
 import logging
 import os
+import ast
+import json
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
@@ -29,6 +32,124 @@ _lock = threading.Lock()
 _fetch_lock = threading.Lock()
 _is_fetching = False
 _system_status = SystemReadiness.BOOTING
+
+_session_generation = 0
+_session_records: dict[int, int] = {}
+_last_successful_login_generation: int | None = None
+_instrument_lock = threading.Lock()
+
+
+def _session_event_path() -> Path:
+    return Path(os.getenv("MTS_SESSION_EVENT_LOG_PATH") or
+                os.getenv("MTS_EVENT_LOG_PATH") or
+                str(_PROJECT_ROOT / "logs" / "mts_spread_events.jsonl"))
+
+
+def _session_event(event: str, *, api=None, source: str = "", account=None,
+                   **fields) -> dict:
+    api_id = id(api) if api is not None else None
+    if account is None and api is not None:
+        account_obj = getattr(api, "futopt_account", None)
+        account = (getattr(account_obj, "account_id", None)
+                   or getattr(account_obj, "person_id", None)
+                   or getattr(account_obj, "account", None))
+    record = {
+        "event": event,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "thread": threading.get_ident(),
+        "thread_name": threading.current_thread().name,
+        "api_object_id": api_id,
+        "account": account,
+        "source": source or "core.shioaji_session",
+        "session_generation": _session_records.get(api_id) if api_id else None,
+        "last_successful_login_generation": _last_successful_login_generation,
+        **fields,
+    }
+    path = _session_event_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _instrument_lock:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        logger.warning("[SESSION_INSTRUMENTATION_WRITE_FAILED] %s", exc)
+    return record
+
+
+def observe_api_created(api, *, source: str = "", account=None) -> dict:
+    """Record one Shioaji object creation and assign a process-local generation."""
+    global _session_generation
+    with _instrument_lock:
+        _session_generation += 1
+        generation = _session_generation
+        _session_records[id(api)] = generation
+    return _session_event("SESSION_API_CREATED", api=api, source=source,
+                          account=account)
+
+
+def observe_login(api, *, source: str = "", account=None, success: bool,
+                  error: BaseException | None = None) -> dict:
+    """Record login result without changing authentication or readiness semantics."""
+    global _last_successful_login_generation
+    generation = _session_records.get(id(api))
+    if success:
+        _last_successful_login_generation = generation
+    event = _session_event(
+        "SESSION_LOGIN", api=api, source=source, account=account,
+        success=bool(success), error_type=type(error).__name__ if error else None,
+        error_text=str(error)[:240] if error else None)
+    if success:
+        event["last_successful_login_generation"] = _last_successful_login_generation
+    return event
+
+
+def observe_logout(api, *, source: str = "", account=None) -> dict:
+    """Record logout before the object is discarded."""
+    return _session_event("SESSION_LOGOUT", api=api, source=source,
+                          account=account)
+
+
+def observe_broker_call(api, operation: str, phase: str, *, source: str = "",
+                        error: BaseException | None = None) -> dict:
+    """Record read/order API boundaries; this helper never invokes the broker."""
+    return _session_event(
+        "BROKER_CALL", api=api, source=source, operation=operation,
+        phase=phase, error_type=type(error).__name__ if error else None,
+        error_text=str(error)[:240] if error else None)
+
+
+def audit_resident_shioaji_constructors(repo_root: str | Path,
+                                        resident_paths: list[str]) -> list[dict]:
+    """AST audit: resident code may not construct/login Shioaji directly."""
+    root = Path(repo_root).resolve()
+    violations: list[dict] = []
+    files: list[Path] = []
+    for relative in resident_paths:
+        target = root / relative
+        if target.is_file() and target.suffix == ".py":
+            files.append(target)
+        elif target.is_dir():
+            files.extend(sorted(target.rglob("*.py")))
+    for path in files:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            direct_ctor = (isinstance(node.func, ast.Attribute)
+                           and node.func.attr == "Shioaji")
+            direct_login = (isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "login")
+            if direct_ctor or direct_login:
+                violations.append({
+                    "path": str(path.relative_to(root)),
+                    "line": node.lineno,
+                    "kind": "constructor" if direct_ctor else "login",
+                })
+    return violations
 
 
 def is_session_death_error(exc: BaseException) -> bool:
@@ -82,6 +203,8 @@ class SessionReconnectController:
                      max_attempts=self.max_attempts)
                 try:
                     candidate = api_factory()
+                    observe_api_created(candidate,
+                                        source="SessionReconnectController.reconnect")
                     login(candidate)
                     restore(candidate)
                     if not verify(candidate):
@@ -149,6 +272,7 @@ def get_api() -> sj.Shioaji:
     with _lock:
         if _api is None:
             candidate = sj.Shioaji()
+            observe_api_created(candidate, source="core.shioaji_session.get_api")
             try:
                 _login(candidate)
             except Exception:
@@ -166,6 +290,8 @@ def install_replacement_api(expected, replacement) -> bool:
     with _lock:
         if _api is not expected:
             return False
+        observe_api_created(replacement,
+                            source="core.shioaji_session.install_replacement_api")
         _api = replacement
         return True
 
@@ -203,10 +329,15 @@ def _login(api: sj.Shioaji):
 
     # Login
     from core.broker.shioaji_compat import safe_login
-    safe_login(api, api_key, secret_key, contracts_timeout=10000)
+    try:
+        safe_login(api, api_key, secret_key, contracts_timeout=10000)
+        _activate_futopt_ca(api, ca_path, ca_passwd)
+    except Exception as exc:
+        observe_login(api, source="core.shioaji_session._login", success=False,
+                      error=exc)
+        raise
+    observe_login(api, source="core.shioaji_session._login", success=True)
     logger.info(f"[session] Logged in (attempt 1)")
-
-    _activate_futopt_ca(api, ca_path, ca_passwd)
     logger.info("[session] CA activated for futures account")
 
 def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q):
@@ -366,6 +497,7 @@ def logout():
             except Exception:
                 session_registry.invalidate_all()   # force global revocation
                 raise
+            observe_logout(_api, source="core.shioaji_session.logout")
             try:
                 _api.logout()
                 logger.info("[session] Logged out cleanly")

@@ -363,7 +363,18 @@ class ShioajiClient:
                 octype=_octype,
                 account=self.api.futopt_account,
             )
-            trade = self.api.place_order(contract, order)
+            from core.shioaji_session import observe_broker_call
+            observe_broker_call(self.api, "place_order", "before",
+                                source="squeeze_futures.data.shioaji_client._place_order_unchecked")
+            try:
+                trade = self.api.place_order(contract, order)
+            except Exception as exc:
+                observe_broker_call(self.api, "place_order", "error",
+                                    source="squeeze_futures.data.shioaji_client._place_order_unchecked",
+                                    error=exc)
+                raise
+            observe_broker_call(self.api, "place_order", "after",
+                                source="squeeze_futures.data.shioaji_client._place_order_unchecked")
             if trade is None:
                 raise AdapterOrderError(
                     code="ADAPTER_ORDER_NO_TRADE",
@@ -522,8 +533,19 @@ class ShioajiClient:
             account=self.api.futopt_account,
         )
         try:
+            from core.shioaji_session import observe_broker_call
+            observe_broker_call(self.api, "place_comboorder", "before",
+                                source="squeeze_futures.data.shioaji_client.place_combo_order_object")
             trade = self.api.place_comboorder(combo_contract, combo_order)
+            observe_broker_call(self.api, "place_comboorder", "after",
+                                source="squeeze_futures.data.shioaji_client.place_combo_order_object")
         except Exception as exc:
+            try:
+                observe_broker_call(self.api, "place_comboorder", "error",
+                                    source="squeeze_futures.data.shioaji_client.place_combo_order_object",
+                                    error=exc)
+            except Exception:
+                pass
             raise AdapterOrderError(
                 code="ADAPTER_COMBO_ORDER_FAILED",
                 context={"method": "place_combo_order_object"}) from exc
