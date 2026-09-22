@@ -2545,7 +2545,12 @@ def test_e2e_live_entry_retains_behavior(monkeypatch):
     strat._has_position = False
 
     monitor._submit_mts_order_signal(
-        signal, strat, {}, __import__("datetime").datetime.now())
+        signal, strat, {
+            "spread": -155.0,
+            "bbo_near_bid": 46410.0, "bbo_near_ask": 46411.0,
+            "bbo_far_bid": 46565.0, "bbo_far_ask": 46566.0,
+            "bbo_near_age_ms": 10.0, "bbo_far_age_ms": 10.0,
+        }, __import__("datetime").datetime.now())
 
     # the entry path submits to the adapter as before (authorization flows)
     assert len(monitor.api.calls) == 2
@@ -2644,7 +2649,10 @@ def test_live_entry_shadow_store_is_observational(monkeypatch, tmp_path):
         signal, strat,
         {"near_close": 46411.0, "far_close": 46566.0,
          "spread": -155.0, "spread_z": 3.42,
-         "spread_std": 41.8, "atr": 51.2},
+         "spread_std": 41.8, "atr": 51.2,
+         "bbo_near_bid": 46410.0, "bbo_near_ask": 46411.0,
+         "bbo_far_bid": 46565.0, "bbo_far_ask": 46566.0,
+         "bbo_near_age_ms": 10.0, "bbo_far_age_ms": 10.0},
         __import__("datetime").datetime.now())
 
     assert len(monitor.api.calls) == 2

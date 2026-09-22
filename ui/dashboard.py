@@ -4,6 +4,7 @@ tw-trading-unified — 整合儀表板 v2
 4 tabs: 總覽 / 期貨 / 選擇權 / 設定
 """
 import sys
+import datetime as _identity_datetime
 from pathlib import Path as _Path
 from core.runtime_paths import (
     runtime_logs,
@@ -13,8 +14,39 @@ from core.runtime_paths import (
     validate_runtime_state,
 )
 sys.path.insert(0, str(_Path(__file__).parent.parent))
-from core.runtime_paths import enforce_runtime_identity
-enforce_runtime_identity(__file__)
+from core.runtime_paths import check_runtime_identity
+
+
+def _dashboard_identity_presentation(
+    ok, actual_sha, expected_sha, checked_at
+):
+    if ok:
+        return {"level": "normal", "render_release_panels": True, "message": ""}
+    return {
+        "level": "stale",
+        "render_release_panels": False,
+        "message": (
+            "🚨 STALE — 本頁與執行中的 release 不一致（部署進行中或未完成） · "
+            f"expected_sha={expected_sha} · actual_sha={actual_sha} · "
+            f"checked_at={checked_at} · 不讀取 legacy/tmp fallback"
+        ),
+    }
+
+
+_identity_ok, _identity_actual, _identity_expected, _identity_reason = (
+    check_runtime_identity(__file__))
+_identity_checked_at = _identity_datetime.datetime.now().astimezone().isoformat(
+    timespec="seconds")
+_identity_presentation = _dashboard_identity_presentation(
+    _identity_ok, _identity_actual, _identity_expected, _identity_checked_at)
+
+if not _identity_presentation["render_release_panels"]:
+    import streamlit as st
+    st.set_page_config(page_title="Trading Unified — STALE", page_icon="🚨",
+                       layout="wide")
+    st.error(_identity_presentation["message"])
+    st.caption(_identity_reason)
+    st.stop()
 
 import streamlit as st
 import plotly.graph_objects as go

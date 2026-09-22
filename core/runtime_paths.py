@@ -20,6 +20,57 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CANONICAL_RELEASE_ROOT = "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release15"
 
 
+def check_runtime_identity(
+    source_file: Optional[str] = None,
+) -> tuple[bool, str, str, str]:
+    """Return dashboard-safe identity evidence without weakening enforcement.
+
+    Production trading code continues to call ``enforce_runtime_identity``;
+    this non-raising view exists only so the dashboard can render a stale
+    deployment warning instead of exposing release-dependent values.
+    """
+    source_dir = (os.path.dirname(os.path.abspath(source_file))
+                  if source_file else _REPO_ROOT)
+    try:
+        repo_root = os.path.realpath(subprocess.check_output(
+            ["git", "-C", source_dir, "rev-parse", "--show-toplevel"],
+            text=True, stderr=subprocess.DEVNULL).strip())
+    except (OSError, subprocess.CalledProcessError):
+        message = "RUNTIME_IDENTITY_REJECTED: cannot resolve repository root"
+        return False, "<unresolved>", "<repository>", message
+    forbidden = ("/tmp", "/private/tmp")
+    if any(repo_root == root or repo_root.startswith(root + os.sep)
+           for root in forbidden):
+        message = f"RUNTIME_IDENTITY_REJECTED: source tree is temporary: {repo_root}"
+        return False, repo_root, "<non-temporary repository>", message
+    if os.environ.get("NODE_ENV") != "production":
+        return True, repo_root, repo_root, ""
+
+    expected_root = os.path.realpath(
+        os.environ.get("TRADING_CANONICAL_ROOT", _CANONICAL_RELEASE_ROOT))
+    cwd = os.path.realpath(os.getcwd())
+    if repo_root != expected_root or cwd != expected_root:
+        message = ("RUNTIME_IDENTITY_REJECTED: "
+                   f"repo_root={repo_root} cwd={cwd} expected={expected_root}")
+        return False, f"repo_root={repo_root};cwd={cwd}", expected_root, message
+
+    expected_sha = os.environ.get("LRC_RELEASE_SHA")
+    if not expected_sha:
+        return True, "<unpinned>", "<unpinned>", ""
+    try:
+        actual_sha = subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        message = "RUNTIME_IDENTITY_REJECTED: cannot resolve release SHA"
+        return False, "<unresolved>", expected_sha, message
+    if actual_sha != expected_sha:
+        message = ("RUNTIME_IDENTITY_REJECTED: "
+                   f"actual_sha={actual_sha} expected_sha={expected_sha}")
+        return False, actual_sha, expected_sha, message
+    return True, actual_sha, expected_sha, ""
+
+
 def enforce_runtime_identity(source_file: Optional[str] = None) -> None:
     """Fail closed when production code is launched from a temp worktree."""
     source_dir = (os.path.dirname(os.path.abspath(source_file))
