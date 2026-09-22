@@ -61,6 +61,20 @@ def test_broker_call_logs_before_after_and_failure_generation(tmp_path, monkeypa
     assert calls[-1]["error_type"] == "RuntimeError"
 
 
+def test_paper_two_session_owners_are_observable_without_broker_login(tmp_path, monkeypatch):
+    path = tmp_path / "two-owners.jsonl"
+    monkeypatch.setenv("MTS_SESSION_EVENT_LOG_PATH", str(path))
+    first, second = FakeAPI(), FakeAPI()
+    observe_api_created(first, source="paper.owner_a")
+    observe_login(first, source="paper.owner_a", success=True)
+    observe_api_created(second, source="paper.owner_b")
+    observe_login(second, source="paper.owner_b", success=True)
+    events = [event for event in _events(path) if event["event"] == "SESSION_LOGIN"]
+    assert len(events) == 2
+    assert {event["api_object_id"] for event in events} == {id(first), id(second)}
+    assert events[0]["session_generation"] != events[1]["session_generation"]
+
+
 def test_resident_constructor_audit_is_clean_and_probe_file_is_rejected(tmp_path):
     repo = Path(__file__).parents[2]
     resident = ["main.py", "scripts/runners/stock_runner.py", "strategies/stocks"]
