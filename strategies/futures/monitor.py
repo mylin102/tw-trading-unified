@@ -10365,7 +10365,11 @@ class FuturesMonitor:
                     near_code=_near_code, far_code=_far_code,
                     near_side=_near_side, far_side=_far_side,
                     near_price=_near_close, far_price=_far_close,
-                    bar_dict=bar_dict, ts=_ts, snapshot=_snap)
+                    bar_dict=bar_dict, ts=_ts, snapshot=_snap,
+                    entry_offset_ticks=getattr(
+                        strategy, "_params", {}).get(
+                            "entry_marketable_offset_ticks", 2),
+                    tick_size=_TICK)
 
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting ENTRY orders (MKP Range Market): NEAR={_near_side}, FAR={_far_side}[/yellow]")
             
@@ -10504,6 +10508,7 @@ class FuturesMonitor:
     def _submit_mts_combo_entry(
         self, *, trade_id, action, reason, near_code, far_code,
         near_side, far_side, near_price, far_price, bar_dict, ts, snapshot,
+        entry_offset_ticks=2, tick_size=1.0,
     ):
         """Submit one MTS combo lifecycle.
 
@@ -10525,9 +10530,84 @@ class FuturesMonitor:
                 "ORDER_REJECTED_LOCAL", trade_id=trade_id,
                 strategy="MTS_ENTRY", reason="COMBO_PRICE_NONFINITE")
             return
-        # Combo net price follows the leg order: near - far for Buy-near,
-        # far - near for Sell-near.  The broker receives per-leg actions.
-        _combo_price = _spread if action == "BUY_NEAR_SELL_FAR" else -_spread
+        # Entry pricing is intentionally isolated from ``_rt_bar``.  Only the
+        # entry-research BBO view is allowed here: those fields originate from
+        # real BidAsk callbacks and never fall back to close/last prices.
+        _pricing = {
+            "reference_spread": _spread,
+            "entry_offset_ticks": entry_offset_ticks,
+            "max_entry_offset_ticks": 3,
+            "tick_size": tick_size,
+            "near_quote_age_ms": bar_dict.get("bbo_near_age_ms"),
+            "far_quote_age_ms": bar_dict.get("bbo_far_age_ms"),
+        }
+
+        def _reject_pricing(reason):
+            self._append_mts_event(
+                "ORDER_REJECTED_LOCAL", trade_id=trade_id,
+                strategy="MTS_ENTRY", reason=reason, **_pricing)
+
+        _bbo = {}
+        for _name in ("near_bid", "near_ask", "far_bid", "far_ask"):
+            _raw = bar_dict.get(f"bbo_{_name}")
+            if _raw is None:
+                _reject_pricing("ENTRY_BBO_MISSING")
+                return
+            try:
+                _value = float(_raw)
+            except (TypeError, ValueError):
+                _reject_pricing("ENTRY_BBO_INVALID")
+                return
+            if not math.isfinite(_value) or _value <= 0:
+                _reject_pricing("ENTRY_BBO_INVALID")
+                return
+            _bbo[_name] = _value
+        for _age_name in ("near_quote_age_ms", "far_quote_age_ms"):
+            try:
+                _age = float(_pricing[_age_name])
+            except (TypeError, ValueError):
+                _reject_pricing("ENTRY_BBO_MISSING")
+                return
+            if not math.isfinite(_age) or _age < 0:
+                _reject_pricing("ENTRY_BBO_INVALID")
+                return
+            if _age > 500.0:
+                _reject_pricing("ENTRY_BBO_STALE")
+                return
+        try:
+            _offset = int(entry_offset_ticks)
+            _tick = float(tick_size)
+        except (TypeError, ValueError):
+            _reject_pricing("ENTRY_PRICE_CONFIG_INVALID")
+            return
+        if (_offset != entry_offset_ticks or _offset < 0
+                or not math.isfinite(_tick) or _tick <= 0):
+            _reject_pricing("ENTRY_PRICE_CONFIG_INVALID")
+            return
+        if _offset > 3:
+            _reject_pricing("ENTRY_PRICE_OFFSET_EXCEEDS_MAX")
+            return
+
+        if action == "SELL_NEAR_BUY_FAR":
+            _executable_spread = _bbo["near_bid"] - _bbo["far_ask"]
+            _raw_limit = _executable_spread - (_offset * _tick)
+            _combo_price = math.floor(_raw_limit / _tick) * _tick
+        elif action == "BUY_NEAR_SELL_FAR":
+            _executable_spread = _bbo["near_ask"] - _bbo["far_bid"]
+            _raw_limit = _executable_spread + (_offset * _tick)
+            _combo_price = math.ceil(_raw_limit / _tick) * _tick
+        else:
+            _reject_pricing("ENTRY_ACTION_INVALID")
+            return
+        _pricing.update({
+            "executable_spread": _executable_spread,
+            "entry_offset_ticks": _offset,
+            "limit_price": _combo_price,
+            "near_bid": _bbo["near_bid"],
+            "near_ask": _bbo["near_ask"],
+            "far_bid": _bbo["far_bid"],
+            "far_ask": _bbo["far_ask"],
+        })
         _combo_legs = [
             {"symbol": near_code, "side": str(_near_value).lower(),
              "quantity": 1},
@@ -10573,7 +10653,7 @@ class FuturesMonitor:
             intent_id=_order.intent_id, symbol=_order.symbol,
             side=_near_value, type="time_spread", price=_combo_price,
             qty=1, strategy="MTS_ENTRY", trade_id=trade_id,
-            combo_legs=_combo_legs, ref_ohlc=snapshot)
+            combo_legs=_combo_legs, ref_ohlc=snapshot, **_pricing)
         if not self._submit_via_gateway(_order):
             self._pending_lifecycle_orders.pop(_order.order_id, None)
             self._mts_pending_fills.pop(trade_id, None)
@@ -10592,7 +10672,7 @@ class FuturesMonitor:
         self._append_mts_event(
             "COMBO_ORDER_SUBMITTED", order_id=_order.order_id,
             trade_id=trade_id, strategy="MTS_ENTRY", combo_legs=_combo_legs,
-            price=_combo_price)
+            price=_combo_price, **_pricing)
         self._append_mts_event(
             "ENTRY_SUBMITTED",
             order_id=_order.order_id,
