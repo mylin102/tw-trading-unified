@@ -129,3 +129,115 @@ def detect_double_bottom(df: pd.DataFrame, tolerance: float = 0.05) -> Dict:
     """Detects a Double Bottom (W) pattern."""
     # Placeholder for Wave 2
     return {"status": False, "reason": "not_implemented"}
+
+
+def detect_vcp(
+    df: pd.DataFrame,
+    min_pivots: int = 3,
+    max_pivots: int = 4,
+    check_volume: bool = True,
+    order: int = 5,
+) -> Dict:
+    """
+    Detects a Volatility Contraction Pattern (VCP) per Minervini.
+
+    Conditions:
+    1. Price above MA50 (uptrend prerequisite)
+    2. At least min_pivots local maxima in the lookback window
+    3. Each successive contraction depth < previous (strictly decreasing)
+    4. Each successive volume mean < previous (if check_volume=True)
+    5. pivot_price = High of the last (most recent) pivot → breakout target
+
+    Args:
+        df          : Daily OHLCV DataFrame, capitalized columns (Open/High/Low/Close/Volume)
+        min_pivots  : Minimum number of pivot highs required (default 3 = 2 contractions)
+        max_pivots  : Maximum pivots to consider from most recent (default 4)
+        check_volume: If True, volume must also contract across pivots (default True)
+        order       : argrelextrema order for peak detection (default 5)
+
+    Returns:
+        Dict with keys: status, type, pivot_price, n_pivots, contractions, last_depth
+        or status=False with a reason string.
+
+    2026-09-21 Antigravity: initial implementation.
+    """
+    if df.empty or len(df) < 60:
+        return {"status": False, "reason": "insufficient_data"}
+
+    prices = df["Close"]
+
+    # 1. Uptrend prerequisite: close must be above MA50
+    ma50 = prices.rolling(50).mean().iloc[-1]
+    if prices.iloc[-1] < ma50:
+        return {"status": False, "reason": "below_ma50"}
+
+    # 2. Find local maxima (pivot highs) using scipy argrelextrema
+    highs = df["High"].values
+    maxima_idx = argrelextrema(highs, np.greater, order=order)[0]
+
+    if len(maxima_idx) < min_pivots:
+        return {
+            "status": False,
+            "reason": f"too_few_pivots: {len(maxima_idx)} < {min_pivots}",
+        }
+
+    # Take only the most recent max_pivots pivots to stay within the base
+    pivot_idx = maxima_idx[-max_pivots:]
+
+    # 3. Measure each inter-pivot contraction (high-to-low range / high)
+    contractions = []
+    for i in range(len(pivot_idx) - 1):
+        left  = int(pivot_idx[i])
+        right = int(pivot_idx[i + 1])
+        segment  = df.iloc[left : right + 1]
+        seg_high = float(segment["High"].max())
+        seg_low  = float(segment["Low"].min())
+        if seg_high <= 0:
+            continue
+        depth    = (seg_high - seg_low) / seg_high
+        vol_mean = float(segment["Volume"].mean()) if check_volume else None
+        contractions.append({
+            "depth":     depth,
+            "vol_mean":  vol_mean,
+            "left_idx":  left,
+            "right_idx": right,
+        })
+
+    if len(contractions) < min_pivots - 1:
+        return {"status": False, "reason": "insufficient_contractions"}
+
+    # 4. Each contraction depth must be strictly decreasing
+    for i in range(1, len(contractions)):
+        if contractions[i]["depth"] >= contractions[i - 1]["depth"]:
+            return {
+                "status": False,
+                "reason": (
+                    f"contraction_not_decreasing at step {i}: "
+                    f"{contractions[i]['depth']:.3f} >= {contractions[i - 1]['depth']:.3f}"
+                ),
+            }
+
+    # 5. Volume mean must also contract across pivots (if enabled)
+    if check_volume:
+        for i in range(1, len(contractions)):
+            v_curr = contractions[i]["vol_mean"]
+            v_prev = contractions[i - 1]["vol_mean"]
+            if v_curr is not None and v_prev is not None and v_curr >= v_prev:
+                return {
+                    "status": False,
+                    "reason": (
+                        f"volume_not_decreasing at step {i}: "
+                        f"{v_curr:.0f} >= {v_prev:.0f}"
+                    ),
+                }
+
+    pivot_price = float(df["High"].iloc[pivot_idx[-1]])
+
+    return {
+        "status":       True,
+        "type":         "vcp",
+        "pivot_price":  pivot_price,
+        "n_pivots":     len(pivot_idx),
+        "contractions": contractions,
+        "last_depth":   contractions[-1]["depth"],
+    }

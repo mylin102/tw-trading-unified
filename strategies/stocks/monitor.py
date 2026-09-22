@@ -443,23 +443,66 @@ class StockMonitor:
             console.print(f"[yellow]⚠️ Market regime check failed: {e}[/yellow]")
 
     def _filter_watchlist_by_strength(self):
-        """第二招：只留成交量大 + 開盤強勢的標的"""
+        """只留達最低流動性門檻 + 開盤強勢的標的。
+
+        Gate 1（硬性絕對門檻）: snap.total_amount >= min_daily_amount
+            — 確保可執行整股市價單不影響盤
+            — 預設 5000 萬台幣；可由 stocks.canslim.min_daily_amount 覆蓋
+            — 非盤中（api=None）直接回傳完整 watchlist，不打 API
+        Gate 2（相對排名）: 按成交金額降序，取前半（現有邏輯不變）
+
+        已持倉股票（position_tickers）由 run_iteration 的獨立路徑保護，
+        不受此過濾影響（check_risk 永遠執行）。
+
+        2026-09-20 Antigravity: added Gate 1 absolute volume threshold.
+        """
         if self.api is None:
-            return self.watchlist
+            return self.watchlist  # 非盤中 fallback：跳過過濾，不打 API
+
+        # 讀取門檻（可 YAML 覆蓋；預設 5000 萬台幣日成交金額）
+        # 在 stocks.yaml 加入 stocks.canslim.min_daily_amount: 50000000 可覆蓋
+        canslim_cfg = self.cfg.get("stocks", {}).get("canslim", {})
+        min_daily_amount = canslim_cfg.get("min_daily_amount", 50_000_000)
+
         scored = []
+        filtered_out = []
         for ticker in self.watchlist:
             try:
                 contract = self.api.Contracts.Stocks[ticker]
                 snap = self.api.snapshots([contract])[0]
-                if snap.total_amount > 0 and snap.close > snap.open:
+
+                # Gate 1: 硬性日成交金額門檻（絕對值）
+                if snap.total_amount < min_daily_amount:
+                    filtered_out.append(ticker)
+                    continue
+
+                # Gate 2: 開盤強勢（現有條件）
+                if snap.close > snap.open:
                     scored.append((ticker, snap.total_amount))
-            except Exception:
+            except Exception as e:
                 self._record_analysis_failure(ticker, e)
-        # 按成交金額排序，取前半
+
+        if filtered_out:
+            console.print(
+                f"[yellow]⚠️ Volume filter: excluded {len(filtered_out)} tickers "
+                f"(daily amount < {min_daily_amount:,} TWD): {filtered_out}[/yellow]"
+            )
+
+        # Gate 2: 相對排名，取前半（現有邏輯不變）
         scored.sort(key=lambda x: -x[1])
         max_tickers = max(3, len(self.watchlist) // 2)
         result = [t for t, _ in scored[:max_tickers]]
-        return result if result else self.watchlist
+
+        # Fallback：若全部被過濾（門檻設太高或盤前量不足），
+        # 回傳原始 watchlist + 告警，避免系統空轉。
+        if not result:
+            console.print(
+                "[bold yellow]⚠️ Volume filter removed ALL tickers — "
+                "falling back to full watchlist. Check min_daily_amount setting.[/bold yellow]"
+            )
+            return self.watchlist
+
+        return result
 
     def _check_date_reset(self):
         """Check if date has changed and reset daily stats."""
@@ -685,6 +728,18 @@ class StockMonitor:
                     else:
                         console.print(f"[yellow]⚠️ API returned empty data for {ticker}[/yellow]")
                 except Exception as e:
+                    # 2026-09-18 Antigravity session-health RCA (Layer-1 fix):
+                    # Session death (SessionNotEstablished / SDK_SESSION_CLOSED)
+                    # MUST NOT be silenced into a cache fallback.  Swallowing it
+                    # here causes run_iteration() to return normally, which then
+                    # triggers record_success() on a dead session — the root cause
+                    # of the 1327-iteration silent loop bug.
+                    # Re-raise so the outer ticker handler and ultimately the
+                    # runner's health tracker can classify and block entry.
+                    # MUTATION GATE: removing this block makes the test RED.
+                    from core.broker_health import classify_broker_error, BrokerErrorClass
+                    if classify_broker_error(e) == BrokerErrorClass.SDK_SESSION_CLOSED:
+                        raise  # propagate — do NOT fall through to cache
                     console.print(f"[dim]📋 API kbars failed: {e}[/dim]")
                 finally:
                     _sk1.setdefaulttimeout(_orig_to1)
@@ -896,6 +951,14 @@ class StockMonitor:
                             console.print(f"[dim]🛡️ Entry blocked: {ticker} {edge_res['reason']}[/dim]")
                         
             except Exception as e:
+                # 2026-09-22 Hermes takeover: Layer-2 session-death guard.  agy's Layer-2
+                # block was lost when the slice was re-derived on the true base; without
+                # it the outer per-ticker handler swallows session death, run_iteration()
+                # returns normally, and the runner never records SESSION_INVALID.
+                # MUTATION GATE: removing this block makes the propagation tests RED.
+                from core.broker_health import classify_broker_error, BrokerErrorClass
+                if classify_broker_error(e) == BrokerErrorClass.SDK_SESSION_CLOSED:
+                    raise  # propagate to the run_iteration caller
                 pass
 
         self._finish_analysis_round()

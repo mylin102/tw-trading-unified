@@ -17,36 +17,21 @@ from rich.console import Console
 BASE = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(BASE))
 
-from core.shioaji_session import get_api, logout
+from core.shioaji_session import get_api, logout, _login  # _login: relogin needs direct re-auth call
+from core.broker_health import BrokerHealthTracker, HealthState
 from strategies.stocks.monitor import StockMonitor
 
 console = Console()
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOOP_INTERVAL_SEC = 30
-MIN_LOOP_INTERVAL_SEC = 10
-
-
-def resolve_loop_interval(config):
-    """Return a safe stock-monitor loop interval from the loaded config."""
-    raw = (config or {}).get("loop_interval_sec", DEFAULT_LOOP_INTERVAL_SEC)
-    try:
-        interval = float(raw)
-    except (TypeError, ValueError):
-        logger.warning("Invalid loop_interval_sec=%r; using default %ss", raw, DEFAULT_LOOP_INTERVAL_SEC)
-        return DEFAULT_LOOP_INTERVAL_SEC
-
-    if interval < MIN_LOOP_INTERVAL_SEC:
-        logger.warning(
-            "loop_interval_sec=%s is below minimum %ss; clamping to minimum",
-            raw,
-            MIN_LOOP_INTERVAL_SEC,
-        )
-        return MIN_LOOP_INTERVAL_SEC
-    return int(interval) if interval.is_integer() else interval
-
 # ── GSD: Singleton Lock ─────────────────────────────────────────────
 LOCKFILE = "/tmp/stock_runner_singleton.lock"
+
+# ── Session health constants ─────────────────────────────────────────
+# Exit code 75 = EX_TEMPFAIL: recoverable temporary failure.
+# PM2 stop_exit_codes=[0] → 75 triggers PM2 autorestart (fresh session).
+_EXIT_RECOVERABLE = 75
+
 
 def check_singleton():
     """Ensure only ONE stock_runner is running using a fixed lockfile."""
@@ -66,13 +51,65 @@ def check_singleton():
             with open(LOCKFILE, 'r') as f:
                 existing_pid = f.read().strip()
             console.print(f"[bold red]🔒 Another stock_runner (PID={existing_pid}) is already running. Exiting.[/bold red]")
-        except:
+        except Exception:
             console.print("[bold red]🔒 Another stock_runner is already running. Exiting.[/bold red]")
         sys.exit(1)
+
+
+def _attempt_relogin(api, tracker: BrokerHealthTracker) -> bool:
+    """Try to re-establish a dead Shioaji session (fail-closed design).
+
+    Uses the existing _login() function from core.shioaji_session — no new
+    logic, just wiring.  Returns True if relogin + probe succeeded, False otherwise.
+    Caller must NOT place any orders until this returns True.
+    """
+    gen = tracker.begin_recovery()
+    if gen is None:
+        # Another recovery is already in progress (should not happen in
+        # single-threaded runner, but guard defensively).
+        console.print("[yellow]⚠️ Recovery already in progress, skipping duplicate attempt.[/yellow]")
+        return False
+
+    console.print(f"[bold yellow]🔄 Session dead — attempting relogin (generation={gen})...[/yellow]")
+    try:
+        # Step A: re-authenticate the existing api object in-place.
+        _login(api)
+        # Step B: post-relogin probe — verify session is truly usable, not
+        # just "login call didn't raise".  A successful _login() result does
+        # not guarantee the transport is alive (e.g. CA error after login).
+        if not _probe_session(api):
+            raise RuntimeError("Post-relogin probe failed: session still dead after _login()")
+        tracker.finish_recovery(gen, ok=True)
+        console.print("[bold green]✅ Session re-established and probe passed.[/bold green]")
+        return True
+    except Exception as exc:
+        console.print(f"[bold red]❌ Relogin/probe failed: {exc}[/bold red]")
+        tracker.finish_recovery(gen, ok=False)
+        return False
+
+
+def _probe_session(api) -> bool:
+    """Lightweight read-only probe to verify session liveness post-relogin.
+
+    Calls api.list_accounts() — pure read, no subscriptions, no orders.
+    Returns True if the session responds; False if still dead.
+
+    Design: this prevents record_success() being called on a session where
+    _login() returned without error but the underlying transport is still dead.
+    """
+    try:
+        _ = api.list_accounts()
+        return True
+    except Exception:
+        return False
+
 
 def run_stock_monitor(dry_run=False):
     api = None
     lock_fd = check_singleton()
+
+    # Instantiate the existing health tracker (梯級 2: reuse, don't rewrite).
+    tracker = BrokerHealthTracker(relogin_max_attempts=3)
 
     try:
         console.print("[bold green]🍎 Starting Standalone Stock Monitor...[/bold green]")
@@ -80,6 +117,7 @@ def run_stock_monitor(dry_run=False):
         # 1. Login
         api = get_api()
         console.print("[green]✅ Shioaji session established for Stocks[/green]")
+        tracker.record_success()  # warm up the healthy state
 
         # 2. Initialize Monitor
         sm = StockMonitor(
@@ -87,20 +125,64 @@ def run_stock_monitor(dry_run=False):
             config_path=os.path.join(BASE, "config", "stocks.yaml"),
             dry_run=dry_run
         )
-        
+
         # [GSD Fix] 啟動時執行標準設置（包含恢復部位與保存狀態）
         sm.setup()
         sm._save_orders_file()
 
-        # 3. Execution Loop
+        # 3. Execution Loop — now with session health detection
         while True:
             try:
+                # Block entry if session is in a non-HEALTHY / non-RECOVERED state.
+                # This is the fail-closed gate: no orders while session is unknown.
+                if tracker.entry_blocked:
+                    console.print(
+                        f"[bold yellow]⛔ Entry blocked (health={tracker.state.value}), "
+                        "skipping iteration.[/bold yellow]"
+                    )
+                    time.sleep(5)
+                    continue
+
                 sm.run_iteration()
+                # Successful iteration: tell the tracker the session is alive.
+                tracker.record_success()
+
             except Exception as e:
-                console.print(f"[bold red]Error in run_iteration: {e}[/bold red]")
+                # ── Session health classification (梯級 2: existing classifier) ──
+                health_state = tracker.record_failure(e)
+                console.print(
+                    f"[bold red]Error in run_iteration: {e} "
+                    f"[health={health_state.value}, "
+                    f"class={tracker.last_error_class.value if tracker.last_error_class else 'UNKNOWN'}]"
+                    "[/bold red]"
+                )
                 import traceback
                 console.print(traceback.format_exc())
-            time.sleep(resolve_loop_interval(sm.cfg))
+
+                # ── Session death: fail-closed relogin path ──────────────────
+                if health_state == HealthState.SESSION_INVALID:
+                    # tracker.relogin_max_attempts guards total attempts via
+                    # tracker.consecutive_failures (already incremented above).
+                    if tracker.consecutive_failures <= tracker.relogin_max_attempts:
+                        ok = _attempt_relogin(api, tracker)
+                        if ok:
+                            # Session alive again; clear error state and resume.
+                            tracker.record_success()
+                            continue
+                        # Relogin failed; tracker.state is now DEGRADED.
+                        # Stay in the loop: next iteration will hit entry_blocked.
+
+                    else:
+                        # Exhausted relogin budget — escalate to process restart.
+                        tracker.escalate_to_restart()
+                        console.print(
+                            f"[bold red]💀 Relogin budget exhausted "
+                            f"({tracker.relogin_max_attempts} attempts). "
+                            f"Exiting with code {_EXIT_RECOVERABLE} for PM2 autorestart.[/bold red]"
+                        )
+                        sys.exit(_EXIT_RECOVERABLE)
+
+            time.sleep(1)
 
     except KeyboardInterrupt:
         console.print("[yellow]Stopping Stock Monitor (User Interrupt)...[/yellow]")
