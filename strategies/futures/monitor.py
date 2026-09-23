@@ -161,6 +161,35 @@ def _extract_bbo(quote_obj):
     return (None, None, "DATA_QUALITY_BLOCKED")
 
 
+def _bbo_reject_reason(bar_dict: dict, max_age_ms: float):
+    """Single mapper: entry-BBO bar fields -> rejection reason (or None).
+
+    BBO_MISSING / BBO_NONFINITE / BBO_INVALID / STALE_QUOTE.
+    """
+    for _k in ("bbo_near_bid", "bbo_near_ask", "bbo_far_bid", "bbo_far_ask"):
+        _v = bar_dict.get(_k)
+        if _v is None:
+            return "BBO_MISSING"
+        try:
+            _n = float(_v)
+        except (TypeError, ValueError):
+            return "BBO_NONFINITE"
+        if not math.isfinite(_n):
+            return "BBO_NONFINITE"
+        if _n <= 0:
+            return "BBO_INVALID"
+    for _k in ("bbo_near_age_ms", "bbo_far_age_ms"):
+        _a = bar_dict.get(_k)
+        if _a is None:
+            return "BBO_MISSING"
+        try:
+            if float(_a) > max_age_ms:
+                return "STALE_QUOTE"
+        except (TypeError, ValueError):
+            return "BBO_MISSING"
+    return None
+
+
 def _entry_bbo_view(slot: dict, now: float) -> dict:
     """Entry BBO for one leg: BidAsk fields only (ticks write tick_*, never bid/ask).
     Freshness is age_ms for the consumers' gates; do not re-add an ordering rule."""
@@ -2897,6 +2926,10 @@ class FuturesMonitor:
                 _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
                 for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
                     _view = _entry_bbo_view(_slot, _now_t)
+                    _rt_bar[f"bbo_{_leg}_state"] = (
+                        "NO_BIDASK" if _slot.get("bidask_at") is None else (
+                            "NO_SIDE" if (_slot.get("bid") is None or _slot.get("ask") is None)
+                            else "OK"))
                     _rt_bar[f"bbo_{_leg}_bid"] = _view["bid"]
                     _rt_bar[f"bbo_{_leg}_ask"] = _view["ask"]
                     _rt_bar[f"bbo_{_leg}_age_ms"] = _view["age_ms"]
@@ -3097,6 +3130,10 @@ class FuturesMonitor:
             _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
             for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
                 _view = _entry_bbo_view(_slot, _now_t)
+                _rt_bar[f"bbo_{_leg}_state"] = (
+                    "NO_BIDASK" if _slot.get("bidask_at") is None else (
+                        "NO_SIDE" if (_slot.get("bid") is None or _slot.get("ask") is None)
+                        else "OK"))
                 _rt_bar[f"bbo_{_leg}_bid"] = _view["bid"]
                 _rt_bar[f"bbo_{_leg}_ask"] = _view["ask"]
                 _rt_bar[f"bbo_{_leg}_age_ms"] = _view["age_ms"]
@@ -9482,40 +9519,9 @@ class FuturesMonitor:
             # reason) so the research ledger explains every dropped
             # candidate.  Missing BBO keys reject as BBO_MISSING; this
             # entry-only view never falls back to close/last prices.
-            _reject_reason = None
-            _bbo_keys = ("bbo_near_bid", "bbo_near_ask",
-                         "bbo_far_bid", "bbo_far_ask")
-            for _k in _bbo_keys:
-                _v = bar_dict.get(_k)
-                if _v is None:
-                    _reject_reason = "BBO_MISSING"
-                    break
-                try:
-                    _numeric = float(_v)
-                except (TypeError, ValueError):
-                    _reject_reason = "BBO_NONFINITE"
-                    break
-                if not math.isfinite(_numeric):
-                    _reject_reason = "BBO_NONFINITE"
-                    break
-                if _numeric <= 0:
-                    _reject_reason = "BBO_INVALID"
-                    break
-            _max_age = float(getattr(
-                strategy, "_max_quote_age_ms", 30000) or 30000)
-            if _reject_reason is None:
-                for _age_key in ("bbo_near_age_ms", "bbo_far_age_ms"):
-                    _age = bar_dict.get(_age_key)
-                    if _age is None:
-                        _reject_reason = "BBO_MISSING"
-                        break
-                    try:
-                        if float(_age) > _max_age:
-                            _reject_reason = "STALE_QUOTE"
-                            break
-                    except (TypeError, ValueError):
-                        _reject_reason = "BBO_MISSING"
-                        break
+            _reject_reason = _bbo_reject_reason(
+                bar_dict,
+                float(getattr(strategy, "_max_quote_age_ms", 30000) or 30000))
             _action = "SELL_NEAR_BUY_FAR" if _z > 0 else "BUY_NEAR_SELL_FAR"
             _audit = {
                 "event_time": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
@@ -10666,6 +10672,9 @@ class FuturesMonitor:
             "tick_size": tick_size,
             "near_quote_age_ms": bar_dict.get("bbo_near_age_ms"),
             "far_quote_age_ms": bar_dict.get("bbo_far_age_ms"),
+            # 2026-09-23 diagnostics: which of "no BidAsk ever" / "side missing" it is
+            "near_bbo_state": bar_dict.get("bbo_near_state"),
+            "far_bbo_state": bar_dict.get("bbo_far_state"),
         }
 
         def _reject_pricing(reason):
