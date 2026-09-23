@@ -102,3 +102,47 @@ def test_save_bar_missing_slot_never_derives_quote_from_close(tmp_path, monkeypa
     assert pd.isna(record["near_bid"])
     assert pd.isna(record["far_ask"])
     assert record["near_entry_bbo_state"] == "NO_BIDASK"
+
+
+def test_save_bar_persists_title_case_indicator_values(tmp_path, monkeypatch):
+    mon = FuturesMonitor.__new__(FuturesMonitor)
+    mon.dry_run = False
+    mon.live_trading = False
+    mon.ticker = "TMF"
+    mon.market_data = {"TMF": {}, "TMF_FAR": {}}
+    mon._indicator_cols = None
+    mon._indicators_migrated = True
+    mon._last_saved_ts = None
+    monkeypatch.setattr("strategies.futures.monitor.runtime_logs", lambda *parts: str(tmp_path))
+    monkeypatch.setattr("strategies.futures.monitor.time", SimpleNamespace(time=lambda: 1001.0))
+
+    row = pd.Series({
+        "Close": 48352.0,
+        "High": 48360.0,
+        "Low": 48340.0,
+        "Open": 48345.0,
+        "Volume": 321.0,
+        "Spread": -160.0,
+        "Spread Z": 2.25,
+        "ATR": 71.5,
+        "ATR Raw": 70.25,
+        "ATR Used": 72.5,
+        "VWAP": 48300.0,
+        "Sqz On": True,
+        "Momentum": 1.75,
+    }, name=pd.Timestamp("2026-09-23 14:45:00"))
+
+    mon._save_bar(row, score=4.5, regime="NORMAL")
+    frame = pd.read_csv(next(Path(tmp_path).glob("TMF_*_PAPER_indicators.csv")))
+    record = frame.iloc[-1]
+    expected = {
+        "High": 48360.0, "Low": 48340.0, "Open": 48345.0,
+        "Volume": 321.0, "spread": -160.0, "spread_z": 2.25,
+        "score": 4.5, "atr": 71.5, "atr_raw": 70.25,
+        "atr_used": 72.5,
+    }
+    for column, value in expected.items():
+        assert pd.notna(record[column]), column
+        assert record[column] == value
+    assert record["near_entry_bbo_state"] == "NO_BIDASK"
+    assert record["far_entry_bbo_state"] == "NO_BIDASK"
