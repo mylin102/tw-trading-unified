@@ -39,6 +39,21 @@ _last_successful_login_generation: int | None = None
 _instrument_lock = threading.Lock()
 
 
+def _safe_session_account(api):
+    """Read account identity without touching auth-gated SDK properties unsafely."""
+    try:
+        account_obj = getattr(api, "futopt_account", None)
+    except Exception:
+        # A freshly constructed Shioaji object can raise Not authenticated when
+        # its account property is inspected.  Instrumentation must never run
+        # ahead of login or change the login path's outcome.
+        return None
+    return (getattr(account_obj, "account_id", None)
+            or getattr(account_obj, "person_id", None)
+            or getattr(account_obj, "account", None)
+            or account_obj)
+
+
 def _session_event_path() -> Path:
     return Path(os.getenv("MTS_SESSION_EVENT_LOG_PATH") or
                 os.getenv("MTS_EVENT_LOG_PATH") or
@@ -49,10 +64,7 @@ def _session_event(event: str, *, api=None, source: str = "", account=None,
                    **fields) -> dict:
     api_id = id(api) if api is not None else None
     if account is None and api is not None:
-        account_obj = getattr(api, "futopt_account", None)
-        account = (getattr(account_obj, "account_id", None)
-                   or getattr(account_obj, "person_id", None)
-                   or getattr(account_obj, "account", None))
+        account = _safe_session_account(api)
     record = {
         "event": event,
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -330,8 +342,11 @@ def _login(api: sj.Shioaji):
     # Login
     from core.broker.shioaji_compat import safe_login
     try:
-        safe_login(api, api_key, secret_key, contracts_timeout=10000)
+        login_result = safe_login(api, api_key, secret_key, contracts_timeout=10000)
+        if not login_result:
+            raise RuntimeError("Shioaji login returned unsuccessful result")
         _activate_futopt_ca(api, ca_path, ca_passwd)
+        _verify_request_readiness(api)
     except Exception as exc:
         observe_login(api, source="core.shioaji_session._login", success=False,
                       error=exc)
@@ -339,6 +354,24 @@ def _login(api: sj.Shioaji):
     observe_login(api, source="core.shioaji_session._login", success=True)
     logger.info(f"[session] Logged in (attempt 1)")
     logger.info("[session] CA activated for futures account")
+
+
+def _verify_request_readiness(api: sj.Shioaji) -> None:
+    """Prove the authenticated object can service a read-only account request."""
+    list_positions = getattr(api, "list_positions", None)
+    if not callable(list_positions):
+        raise RuntimeError("request readiness failed: list_positions unavailable")
+    account = _safe_session_account(api)
+    try:
+        try:
+            result = list_positions(account=account)
+        except TypeError:
+            result = list_positions()
+    except Exception as exc:
+        raise RuntimeError(
+            f"request readiness failed: {type(exc).__name__}: {exc}") from exc
+    if result is None:
+        raise RuntimeError("request readiness failed: list_positions returned None")
 
 def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q):
     """Child process worker: logs in and fetches contracts to populate the local disk cache.
