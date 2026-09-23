@@ -171,3 +171,50 @@ def test_combo_wire_price_type_is_honoured_and_defaults_to_lmt():
     # missing / unknown -> conservative LMT
     assert wire_price_type_for(SimpleNamespace()) == _sj.FuturesPriceType.LMT
     assert wire_price_type_for(SimpleNamespace(wire_price_type="NOPE")) == _sj.FuturesPriceType.LMT
+
+
+def test_far_quote_age_within_the_far_limit_is_accepted():
+    monitor = _monitor()
+
+    _submit(monitor, near_age=100, far_age=1200)   # far leg is thin: 1.2s must still pass
+
+    assert monitor.order_mgr.created, "a 1.2s-old far quote must be usable"
+    audit = _event(monitor, "COMBO_ORDER_INTENT_CREATED")
+    assert audit["far_quote_age_ms"] == 1200
+
+
+def test_far_quote_age_beyond_the_far_limit_is_rejected():
+    monitor = _monitor()
+
+    _submit(monitor, near_age=100, far_age=1600)
+
+    assert monitor.order_mgr.created == []
+    rejected = _event(monitor, "ORDER_REJECTED_LOCAL")
+    assert rejected["reason"] == "ENTRY_BBO_STALE"
+    assert rejected["far_quote_age_ms"] == 1600
+
+
+def test_near_quote_age_keeps_the_tight_limit():
+    monitor = _monitor()
+
+    _submit(monitor, near_age=600, far_age=20)     # near stays at 500ms
+
+    assert monitor.order_mgr.created == []
+    assert _event(monitor, "ORDER_REJECTED_LOCAL")["reason"] == "ENTRY_BBO_STALE"
+
+
+def test_per_leg_limits_are_read_from_config():
+    from strategies.futures.monitor import entry_bbo_age_limits
+
+    assert entry_bbo_age_limits(None) == (500.0, 1500.0)
+    assert entry_bbo_age_limits({"mts": {}}) == (500.0, 1500.0)
+    assert entry_bbo_age_limits(
+        {"mts": {"entry_bbo_max_age_ms_near": 250,
+                 "entry_bbo_max_age_ms_far": 2000}}) == (250.0, 2000.0)
+
+    monitor = _monitor()
+    monitor.cfg = {"mts": {"entry_bbo_max_age_ms_near": 250,
+                           "entry_bbo_max_age_ms_far": 2000}}
+    _submit(monitor, near_age=300, far_age=1900)   # near 300 > configured 250
+    assert monitor.order_mgr.created == []
+    assert _event(monitor, "ORDER_REJECTED_LOCAL")["reason"] == "ENTRY_BBO_STALE"
