@@ -37,6 +37,15 @@ class AdapterOrderError(Exception):
         self.context = context
 
 
+def wire_price_type_for(order) -> "sj.FuturesPriceType":
+    """Map the order's requested wire price type to the SDK enum.
+
+    Fail-safe: anything unknown or missing falls back to LMT (the historical behaviour).
+    """
+    name = str(getattr(order, "wire_price_type", "LMT") or "LMT").upper()
+    return getattr(sj.FuturesPriceType, name, sj.FuturesPriceType.LMT)
+
+
 class ShioajiClient:
     def __init__(self):
         self.api = None
@@ -516,7 +525,7 @@ class ShioajiClient:
             action=sj.Action.Sell,
             price=float(getattr(order, "price", 0) or 0),
             quantity=int(getattr(order, "quantity", 1)),
-            price_type=sj.FuturesPriceType.LMT,
+            price_type=wire_price_type_for(order),
             order_type=sj.OrderType.IOC,
             octype=sj.FuturesOCType.Auto,
             account=self.api.futopt_account,
