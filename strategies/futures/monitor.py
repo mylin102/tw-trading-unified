@@ -190,21 +190,50 @@ def _bbo_reject_reason(bar_dict: dict, max_age_ms: float):
     return None
 
 
+def _entry_bbo_from_bar_or_slots(monitor, bar_dict):
+    """ONE source for the entry BBO (the fix for the starved entry path).
+
+    The bar handed to the pricing path is not always the runtime bar the
+    BidAsk callbacks fill, so when it carries no BBO the live per-leg BidAsk
+    view is used instead.  Never falls back to close/last; ticks never fill it.
+    """
+    out = {}
+    for _leg in ("near", "far"):
+        for _f in ("bid", "ask"):
+            out[f"{_leg}_{_f}"] = (bar_dict or {}).get(f"bbo_{_leg}_{_f}")
+        out[f"{_leg}_age_ms"] = (bar_dict or {}).get(f"bbo_{_leg}_age_ms")
+        out[f"{_leg}_state"] = (bar_dict or {}).get(f"bbo_{_leg}_state")
+    if all(out[f"{_leg}_{_f}"] is not None for _leg in ("near", "far")
+           for _f in ("bid", "ask")):
+        return out
+    _now = time.time()
+    _md = getattr(monitor, "market_data", None) or {}
+    for _leg, _key in (("near", str(getattr(monitor, "ticker", ""))),
+                       ("far", str(getattr(monitor, "ticker", "")) + "_FAR")):
+        _v = _entry_bbo_view(_md.get(_key) or {}, _now)
+        out[f"{_leg}_bid"] = _v["bid"]
+        out[f"{_leg}_ask"] = _v["ask"]
+        out[f"{_leg}_age_ms"] = _v["age_ms"]
+        out[f"{_leg}_state"] = _v["state"]
+    return out
+
+
 def _entry_bbo_view(slot: dict, now: float) -> dict:
     """Entry BBO for one leg: BidAsk fields only (ticks write tick_*, never bid/ask).
     Freshness is age_ms for the consumers' gates; do not re-add an ordering rule."""
-    
     _slot = slot or {}
     _at = _slot.get("bidask_at")
     _bid = _slot.get("bid")
     _ask = _slot.get("ask")
-    if _at is None or _bid is None or _ask is None:
-        return {"bid": None, "ask": None, "age_ms": None}
+    if _at is None:
+        return {"bid": None, "ask": None, "age_ms": None, "state": "NO_BIDASK"}
+    if _bid is None or _ask is None:
+        return {"bid": None, "ask": None, "age_ms": None, "state": "NO_SIDE"}
     try:
         _age_ms = int(round(max(0.0, (now - float(_at)) * 1000.0)))
     except (TypeError, ValueError):
-        return {"bid": None, "ask": None, "age_ms": None}
-    return {"bid": _bid, "ask": _ask, "age_ms": _age_ms}
+        return {"bid": None, "ask": None, "age_ms": None, "state": "NO_SIDE"}
+    return {"bid": _bid, "ask": _ask, "age_ms": _age_ms, "state": "OK"}
 
 
 def _bbo_tick_fields(tick, bbo_now: float | None = None,
@@ -10665,16 +10694,16 @@ class FuturesMonitor:
         # Entry pricing is intentionally isolated from ``_rt_bar``.  Only the
         # entry-research BBO view is allowed here: those fields originate from
         # real BidAsk callbacks and never fall back to close/last prices.
+        _bbo_src = _entry_bbo_from_bar_or_slots(self, bar_dict)
         _pricing = {
             "reference_spread": _spread,
             "entry_offset_ticks": entry_offset_ticks,
             "max_entry_offset_ticks": _MAX_ENTRY_OFFSET_TICKS,
             "tick_size": tick_size,
-            "near_quote_age_ms": bar_dict.get("bbo_near_age_ms"),
-            "far_quote_age_ms": bar_dict.get("bbo_far_age_ms"),
-            # 2026-09-23 diagnostics: which of "no BidAsk ever" / "side missing" it is
-            "near_bbo_state": bar_dict.get("bbo_near_state"),
-            "far_bbo_state": bar_dict.get("bbo_far_state"),
+            "near_quote_age_ms": _bbo_src["near_age_ms"],
+            "far_quote_age_ms": _bbo_src["far_age_ms"],
+            "near_bbo_state": _bbo_src["near_state"],
+            "far_bbo_state": _bbo_src["far_state"],
         }
 
         def _reject_pricing(reason):
@@ -10684,7 +10713,7 @@ class FuturesMonitor:
 
         _bbo = {}
         for _name in ("near_bid", "near_ask", "far_bid", "far_ask"):
-            _raw = bar_dict.get(f"bbo_{_name}")
+            _raw = _bbo_src[_name]
             if _raw is None:
                 _reject_pricing("ENTRY_BBO_MISSING")
                 return
