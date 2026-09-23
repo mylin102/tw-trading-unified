@@ -1,4 +1,5 @@
 import json
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +23,35 @@ def test_contract_puts_entry_columns_first_and_preserves_unknowns_last():
     assert ordered_indicator_columns(["unknown", "spread_z", "timestamp"])[0:2] == [
         "timestamp", "spread_z"
     ]
-    assert ordered_indicator_columns(["unknown", "spread_z", "timestamp"])[-1] == "unknown"
+    assert "unknown" not in ordered_indicator_columns(["unknown", "spread_z", "timestamp"])
+
+
+def test_dashboard_contract_is_deduplicated_and_bounded():
+    assert len(FUTURES_INDICATOR_COLUMNS) <= 45
+    assert len(FUTURES_INDICATOR_COLUMNS) == len(set(FUTURES_INDICATOR_COLUMNS))
+    removed = {
+        "bear_align", "bull_align", "price_vs_vwap_pct", "recent_high",
+        "recent_low", "router_regime", "in_pb_zone",
+        "is_structural_breakout", "macd_rising", "opening_bearish",
+        "trading_day", "router_bias", "fired", "squeeze_release",
+        "breakout_strength", "breakout_strength_atr", "atr_floor",
+        "bb_lower", "bb_upper", "mom_prev", "mom_state", "amount",
+        "mount", "volume",
+    }
+    assert removed.isdisjoint(FUTURES_INDICATOR_COLUMNS)
+
+
+def test_removed_columns_do_not_return_to_dashboard_usecols():
+    dashboard_path = Path(__file__).parents[2] / "ui" / "dashboard.py"
+    tree = ast.parse(dashboard_path.read_text(encoding="utf-8"))
+    usecols = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "_FUTURES_USECOLS" for t in node.targets):
+                usecols = set(ast.literal_eval(node.value))
+                break
+    assert usecols is not None
+    assert set(FUTURES_INDICATOR_COLUMNS) == usecols
 
 
 def test_save_bar_uses_bidask_slots_for_quote_columns(tmp_path, monkeypatch):
