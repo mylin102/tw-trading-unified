@@ -161,6 +161,23 @@ def _extract_bbo(quote_obj):
     return (None, None, "DATA_QUALITY_BLOCKED")
 
 
+def _entry_bbo_view(slot: dict, now: float) -> dict:
+    """Entry BBO for one leg: BidAsk fields only (ticks write tick_*, never bid/ask).
+    Freshness is age_ms for the consumers' gates; do not re-add an ordering rule."""
+    
+    _slot = slot or {}
+    _at = _slot.get("bidask_at")
+    _bid = _slot.get("bid")
+    _ask = _slot.get("ask")
+    if _at is None or _bid is None or _ask is None:
+        return {"bid": None, "ask": None, "age_ms": None}
+    try:
+        _age_ms = int(round(max(0.0, (now - float(_at)) * 1000.0)))
+    except (TypeError, ValueError):
+        return {"bid": None, "ask": None, "age_ms": None}
+    return {"bid": _bid, "ask": _ask, "age_ms": _age_ms}
+
+
 def _bbo_tick_fields(tick, bbo_now: float | None = None,
                         generation_id: str | None = None) -> dict:
     """Return bid/ask/tick_bbo_at fields for a tick IF it carries a real
@@ -192,7 +209,7 @@ def _bbo_tick_fields(tick, bbo_now: float | None = None,
         return {}  # crossed book — never write a crossed BBO
     if bbo_now is None:
         bbo_now = time.time()
-    _out = {"bid": _b, "ask": _a, "tick_bbo_at": bbo_now}
+    _out = {"tick_bid": _b, "tick_ask": _a, "tick_bbo_at": bbo_now}
     if generation_id is not None:
         _out["generation_id"] = generation_id
     return _out
@@ -2879,16 +2896,10 @@ class FuturesMonitor:
                 _near_bbo = self.market_data.get(self.ticker, {})
                 _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
                 for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
-                    _at = _slot.get("bidask_at")
-                    _tick_at = _slot.get("tick_bbo_at")
-                    _bidask_is_latest = (_at is not None and (
-                        _tick_at is None or float(_at) >= float(_tick_at)))
-                    _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _bidask_is_latest else None
-                    _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _bidask_is_latest else None
-                    try:
-                        _rt_bar[f"bbo_{_leg}_age_ms"] = max(0.0, (_now_t - float(_at)) * 1000.0)
-                    except (TypeError, ValueError):
-                        _rt_bar[f"bbo_{_leg}_age_ms"] = None
+                    _view = _entry_bbo_view(_slot, _now_t)
+                    _rt_bar[f"bbo_{_leg}_bid"] = _view["bid"]
+                    _rt_bar[f"bbo_{_leg}_ask"] = _view["ask"]
+                    _rt_bar[f"bbo_{_leg}_age_ms"] = _view["age_ms"]
                 
                 self._mts_tag_bar_session(_rt_bar)
                 self._mts_tick(enriched_bar=_rt_bar)
@@ -3085,16 +3096,10 @@ class FuturesMonitor:
             _near_bbo = self.market_data.get(self.ticker, {})
             _far_bbo = self.market_data.get(f"{self.ticker}_FAR", {})
             for _leg, _slot in (("near", _near_bbo), ("far", _far_bbo)):
-                _at = _slot.get("bidask_at")
-                _tick_at = _slot.get("tick_bbo_at")
-                _bidask_is_latest = (_at is not None and (
-                    _tick_at is None or float(_at) >= float(_tick_at)))
-                _rt_bar[f"bbo_{_leg}_bid"] = _slot.get("bid") if _bidask_is_latest else None
-                _rt_bar[f"bbo_{_leg}_ask"] = _slot.get("ask") if _bidask_is_latest else None
-                try:
-                    _rt_bar[f"bbo_{_leg}_age_ms"] = max(0.0, (_now_t - float(_at)) * 1000.0)
-                except (TypeError, ValueError):
-                    _rt_bar[f"bbo_{_leg}_age_ms"] = None
+                _view = _entry_bbo_view(_slot, _now_t)
+                _rt_bar[f"bbo_{_leg}_bid"] = _view["bid"]
+                _rt_bar[f"bbo_{_leg}_ask"] = _view["ask"]
+                _rt_bar[f"bbo_{_leg}_age_ms"] = _view["age_ms"]
 
             self._mts_tag_bar_session(_rt_bar)
             self._mts_tick(enriched_bar=_rt_bar)
