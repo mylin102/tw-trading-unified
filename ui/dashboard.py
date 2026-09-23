@@ -94,6 +94,10 @@ from core.dashboard_positions import (
     option_order_matches_open_position,
     summarize_combo_legs,
 )
+from core.futures_indicator_contract import (
+    FUTURES_INDICATOR_COLUMNS,
+    ordered_indicator_columns,
+)
 import subprocess
 import time
 from pathlib import Path
@@ -3165,23 +3169,19 @@ def make_pnl_chart(pnl_df, title):
 # ── Futures indicators column whitelist (load_futures_indicators usecols) ──
 # Only columns actually read by dashboard render/logic.
 _FUTURES_USECOLS = [
-    "timestamp", "Close", "High", "Low", "Open", "Volume",
-    "close", "high", "low", "open", "volume",
-    "atr", "atr_10", "atr_raw", "atr_floor", "atr_used",
-    "vwap", "score", "regime", "momentum", "sqz_on", "fired",
-    "spread_z", "far_close",
-    "bb_up", "bb_low", "bb_mid",
-    "ema_200_up", "ema_fast", "ema_slow",
-    "squeeze_release", "price_vs_vwap", "volume_spike",
-    "trend_strength_raw", "breakout_strength_atr",
-    "bear_breakout_strength_atr",
-    "bull_align", "bear_align",
-    "trading_day",
-    "high_20_prev", "low_20_prev",
-    "session",
+    "timestamp", "near_bid", "near_ask", "near_bidask_age_ms",
+    "near_entry_bbo_state", "far_bid", "far_ask", "far_bidask_age_ms",
+    "far_entry_bbo_state", "close", "spread", "spread_z", "sqz_on",
+    "momentum", "atr_used", "vwap", "regime", "session",
+    "Close", "High", "Low", "Open", "Volume", "atr", "atr_raw",
+    "bb_low", "bb_mid", "bb_up", "bearish_align", "bullish_align",
+    "bear_breakout", "bear_breakout_strength_atr", "bull_breakout",
+    "day_max", "day_min", "ema_fast", "ema_slow",
+    "high_20_prev", "low_20_prev", "macd_hist", "mom_velo",
+    "price_vs_vwap", "rsi", "score", "trend_strength_raw",
 ]
 # The minimal set guaranteed to exist in CSV for fast-path usecols
-_FUTURES_USECOLS_ESSENTIAL = ["timestamp", "Close", "High", "Low", "Open", "Volume", "atr", "vwap", "score", "regime", "momentum", "sqz_on", "fired", "trading_day"]
+_FUTURES_USECOLS_ESSENTIAL = ["timestamp", "Close", "High", "Low", "Open", "Volume", "atr", "vwap", "score", "regime", "momentum", "sqz_on"]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -5019,18 +5019,8 @@ elif _selected_product == "TMF":
 
             sqz_label = "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放"
             
-            # [Breakout V2] 突破強度與結構顯示
-            bs_atr = float(last.get("breakout_strength_atr", 0.0) or 0.0)
-            bear_bs_atr = float(last.get("bear_breakout_strength_atr", 0.0) or 0.0)
-            is_bull_struct = last.get("is_bull_structural_breakout", 0)
-            is_bear_struct = last.get("is_bear_structural_breakout", 0)
-            
-            if is_bull_struct == 1:
-                bs_label = f"🚀 {bs_atr:.2f} ATR"
-            elif is_bear_struct == 1:
-                bs_label = f"💀 {bear_bs_atr:.2f} ATR"
-            else:
-                bs_label = f"{max(bs_atr, bear_bs_atr):.2f} ATR"
+            strength = float(last.get("trend_strength_raw", 0.0) or 0.0)
+            bs_label = f"{strength:.2f}"
             
             sqz_color = None
         else:
@@ -5045,8 +5035,8 @@ elif _selected_product == "TMF":
 
         fc1.metric("Close", f"{cl_val:.0f}")
         fc2.metric("Score", f"{sc_val:.1f}")
-        bull_align = last.get("bull_align", last.get("bullish_align", False))
-        bear_align = last.get("bear_align", last.get("bearish_align", False))
+        bull_align = last.get("bullish_align", False)
+        bear_align = last.get("bearish_align", False)
         trend = "🟢多頭" if bull_align else ("🔴空頭" if bear_align else "⚪中性")
         fc3.metric("趨勢", trend)
         fc4.metric("Sqz狀態", sqz_label)
@@ -5054,18 +5044,16 @@ elif _selected_product == "TMF":
         fc6.metric("突破強度", bs_label)
 
         # [P1] Single Source of Truth: Router Perspective
-        r_bias = last.get("router_bias", "N/A")
-        r_regime = last.get("router_regime", "N/A")
-        st.caption(f"🎯 **Router Ground Truth**: Regime=`{r_regime}` | Bias=`{r_bias}`")
+        r_regime = last.get("regime", "N/A")
+        st.caption(f"🎯 **Router Ground Truth**: Regime=`{r_regime}` | Bias=`{bias}`")
 
         # ATR reference — show calculation chain for breakout_strength debug
         atr_val = last.get("atr", 0.0) or 0.0
         atr_raw = last.get("atr_raw", atr_val) or atr_val
-        atr_floor = last.get("atr_floor", 0.0) or 0.0
+        atr_floor = close * 0.0015 if (close := (last.get("Close", last.get("close", 0)) or 0)) else 0.0
         atr_used = last.get("atr_used", atr_val) or atr_val
 
         # breakout_strength_atr = max(0, close - high_20_prev) / atr_used
-        close = last.get("Close", last.get("close", 0)) or 0
         high_20_prev = last.get("high_20_prev", 0) or 0
         _bs_numerator = max(0, close - high_20_prev)
         _bs_denominator = atr_used if atr_used > 0 else 1.0
@@ -5076,28 +5064,22 @@ elif _selected_product == "TMF":
             f"BS=({close:.0f}-{high_20_prev:.0f})/{atr_used:.1f}={_bs_numerator/_bs_denominator:.4f}"
         )
 
-        if data_fresh and "fired" in last and last.get("fired", False) is True:
-            st.success("🔥 **FIRE — 壓縮釋放！**")
-        
         # ═══ Strategy-Annotated Indicator Table ═══════════════════════════
         # Group indicator columns by which strategy uses them, sort by group.
         _strategy_indicator_groups = {
             "📊 Squeeze": {
-                "sqz_on", "sqz_fire", "fired", "momentum",
-                "bb_up", "bb_upper", "bb_low", "bb_lower", "bb_mid", "bb_middle",
+                "sqz_on", "momentum", "bb_up", "bb_low", "bb_mid",
                 "lr_curve",
             },
             "📈 Trend": {
                 "adx", "ema_fast", "ema_slow", "mom_velo", "mom_state",
-                "breakout_strength", "breakout_strength_atr",
-                "body_size_atr",
+                "trend_strength_raw",
             },
             "🔁 MeanRev": {
-                "rsi", "bb_up", "bb_upper", "bb_low", "bb_lower", "bb_mid", "bb_middle",
+                "rsi", "bb_up", "bb_low", "bb_mid",
             },
             "🧠 ML/Feature": {
-                "macd_hist", "macd_rising", "score",
-                "bearish_align", "bullish_align", "bear_align", "bull_align",
+                "macd_hist", "score", "bearish_align", "bullish_align",
             },
             "🌊 Spread": {
                 "spread_z", "spread_std", "vwap_z", "far_close",
@@ -5105,15 +5087,13 @@ elif _selected_product == "TMF":
             },
         }
         # Common indicators used by many strategies — group under general
-        _general_cols = {"atr", "vwap", "volume_spike", "price_vs_vwap",
-                         "recent_high", "recent_low"}
+        _general_cols = {"atr", "vwap", "price_vs_vwap"}
         # Router / meta columns — always at end
-        _meta_cols = {"regime", "router_regime", "bias", "router_bias",
-                      "trading_day", "session", "timestamp", "bars_since_open"}
+        _meta_cols = {"regime", "session", "timestamp"}
 
         def _group_key(col: str) -> int:
             """Return sort key: general(0) → squeeze(1) → trend(2) → meanrev(3) → ml(4) → spread(5) → meta(6) → other(9)"""
-            if col.lower() in {"open", "high", "low", "close", "volume", "amount"}:
+            if col in {"Open", "High", "Low", "Close", "Volume", "close"}:
                 return -2
             if col in _general_cols:
                 return -1
@@ -5125,7 +5105,7 @@ elif _selected_product == "TMF":
             return 9
 
         def _strategy_label(col: str) -> str:
-            if col.lower() in {"open", "high", "low", "close", "volume", "amount"}:
+            if col in {"Open", "High", "Low", "Close", "Volume", "close"}:
                 return ""
             if col in _general_cols:
                 return "共用"
@@ -5137,8 +5117,13 @@ elif _selected_product == "TMF":
             return ""
 
         # Build column order
-        _available_cols = [c for c in f_df.columns]
-        _display_cols = sorted(_available_cols, key=_group_key)
+        # Render the producer's fixed contract. Missing quote columns remain
+        # visible as N/A instead of being filled from close/tick fallbacks.
+        for _contract_col in FUTURES_INDICATOR_COLUMNS:
+            if _contract_col not in f_df.columns:
+                f_df[_contract_col] = pd.NA
+        _available_cols = [c for c in FUTURES_INDICATOR_COLUMNS if c in f_df.columns]
+        _display_cols = ordered_indicator_columns(_available_cols)
 
         # Build strategy header row (one label per column)
         _header_labels = [_strategy_label(c) for c in _display_cols]
@@ -5195,7 +5180,7 @@ elif _selected_product == "TMF":
         for _, row in _tail.iterrows():
             _html_parts.append("<tr>")
             for c in _display_cols:
-                v = row[c] if pd.notna(row[c]) else ""
+                v = row[c] if pd.notna(row[c]) else "N/A"
                 _html_parts.append(
                     f"<td style='padding:1px 4px; white-space:nowrap; text-align:right; "
                     f"border:1px solid #ddd;'>{v}</td>"
