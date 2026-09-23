@@ -99,6 +99,21 @@ def test_real_both_leg_callbacks_required_for_recovery(setup):
     assert mon._exit_only_bbo_slots()['far']['ask'] == 101
 
 
+def test_post_callback_readiness_failure_is_also_bounded(setup):
+    mon, clock, ready, subscribe = setup
+    mon._refresh_runtime_status()
+    clock[0] = 161
+    mon._refresh_runtime_status()
+    clock[0] = 162
+    mon.on_bidask(None, quote('TMFJ6'))
+    mon.on_bidask(None, quote('TMFK6'))
+    ready.side_effect = RuntimeError('NotReady')
+    for _ in range(20):
+        mon._refresh_runtime_status()
+    assert ready.call_count == 2
+    assert mon._bidask_health == 'READINESS_FAILED'
+
+
 @pytest.mark.parametrize('code,bid,ask,reason', [
     ('OTHER', 100, 101, 'CONTRACT_MISMATCH'),
     ('TMFJ6', 102, 101, 'INVALID_BBO'),
