@@ -94,6 +94,10 @@ from core.dashboard_positions import (
     option_order_matches_open_position,
     summarize_combo_legs,
 )
+from core.futures_indicator_contract import (
+    FUTURES_INDICATOR_COLUMNS,
+    ordered_indicator_columns,
+)
 import subprocess
 import time
 from pathlib import Path
@@ -5137,8 +5141,13 @@ elif _selected_product == "TMF":
             return ""
 
         # Build column order
-        _available_cols = [c for c in f_df.columns]
-        _display_cols = sorted(_available_cols, key=_group_key)
+        # Render the producer's fixed contract. Missing quote columns remain
+        # visible as N/A instead of being filled from close/tick fallbacks.
+        for _contract_col in FUTURES_INDICATOR_COLUMNS:
+            if _contract_col not in f_df.columns:
+                f_df[_contract_col] = pd.NA
+        _available_cols = list(f_df.columns)
+        _display_cols = ordered_indicator_columns(_available_cols)
 
         # Build strategy header row (one label per column)
         _header_labels = [_strategy_label(c) for c in _display_cols]
@@ -5195,7 +5204,7 @@ elif _selected_product == "TMF":
         for _, row in _tail.iterrows():
             _html_parts.append("<tr>")
             for c in _display_cols:
-                v = row[c] if pd.notna(row[c]) else ""
+                v = row[c] if pd.notna(row[c]) else "N/A"
                 _html_parts.append(
                     f"<td style='padding:1px 4px; white-space:nowrap; text-align:right; "
                     f"border:1px solid #ddd;'>{v}</td>"

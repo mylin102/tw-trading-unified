@@ -55,6 +55,7 @@ from core.strategy_registry import StrategyRegistry
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.bar_utils import attach_bar_metadata, build_canonical_bar_frames, build_preferred_canonical_bar_frames, resample_ohlcv
+from core.futures_indicator_contract import FUTURES_INDICATOR_COLUMNS, ordered_indicator_columns
 from core.date_utils import get_taifex_futures_hhmm, is_taifex_futures_market_open, get_taifex_futures_session_type, get_session_date_str
 from core.spread_loader import get_spread_loader
 from squeeze_futures.data.shioaji_client import AdapterOrderError, ShioajiClient
@@ -11770,11 +11771,7 @@ class FuturesMonitor:
                 for c in missing:
                     df[c] = pd.NA
             
-            # 2026-06-23 Gemini CLI: Sort columns to keep a stable order but ensure timestamp is first
-            cols = sorted(list(df.columns))
-            if "timestamp" in cols:
-                cols.remove("timestamp")
-                cols = ["timestamp"] + cols
+            cols = ordered_indicator_columns(list(df.columns))
             df = df.reindex(columns=cols)
             df.to_csv(path, index=False)
             
@@ -11816,6 +11813,31 @@ class FuturesMonitor:
             "in_pb_zone": row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False),
         })
 
+        # Entry quote columns are a projection of the validated BidAsk slots.
+        # They intentionally never read tick/close values and never touch the
+        # dedicated exit-only quote cache.
+        _now = time.time()
+        _near_entry_bbo = _entry_bbo_view(
+            getattr(self, "market_data", {}).get(str(self.ticker), {}), _now)
+        _far_entry_bbo = _entry_bbo_view(
+            getattr(self, "market_data", {}).get(f"{self.ticker}_FAR", {}), _now)
+        data.update({
+            "near_bid": _near_entry_bbo["bid"],
+            "near_ask": _near_entry_bbo["ask"],
+            "near_bidask_age_ms": _near_entry_bbo["age_ms"],
+            "near_entry_bbo_state": _near_entry_bbo["state"],
+            "far_bid": _far_entry_bbo["bid"],
+            "far_ask": _far_entry_bbo["ask"],
+            "far_bidask_age_ms": _far_entry_bbo["age_ms"],
+            "far_entry_bbo_state": _far_entry_bbo["state"],
+            "spread": row.get("spread"),
+            "spread_z": row.get("spread_z"),
+            "sqz_on": row.get("sqz_on"),
+            "momentum": row.get("momentum"),
+            "atr_used": row.get("atr_used"),
+            "vwap": row.get("vwap"),
+        })
+
         # [BUG FIX DIAGNOSTIC] Check what data dict contains before writing
         console.print(
             f"[dim][SAVE_BAR_CHECK] ts={data.get('timestamp')} "
@@ -11838,32 +11860,7 @@ class FuturesMonitor:
             # [BUG FIX 2026-05-13] Canonical column order for indicator CSV.
             # Never use sorted(data.keys()) — alpha sort puts Close before timestamp,
             # causing column misalignment between first-time header and subsequent appends.
-            CANONICAL_INDICATOR_COLS = [
-                "timestamp", "Close", "High", "Low", "Open", "Volume", "amount",
-                "atr", "atr_floor", "atr_raw", "atr_used",
-                "bb_low", "bb_lower", "bb_mid", "bb_up", "bb_upper",
-                "bear_align", "bear_breakout", "bear_breakout_strength", "bear_breakout_strength_atr",
-                "bearish_align", "breakout_strength", "breakout_strength_atr",
-                "bull_align", "bull_breakout", "bullish_align",
-                "close", "d_val", "day_max", "day_min", "day_open",
-                "ema_200_up", "ema_fast", "ema_filter", "ema_macro", "ema_slow",
-                "fired",
-                "high", "high_20_prev",
-                "in_bear_pb_zone", "in_bull_pb_zone", "in_pb_zone",
-                "intraday_strength_pct", "is_bear_structural_breakout", "is_bull_structural_breakout",
-                "is_new_high", "is_new_low", "is_structural_breakout",
-                "k_val",
-                "low", "low_20_prev",
-                "macd_hist", "macd_line", "macd_rising", "macd_signal",
-                "mom_prev", "mom_state", "mom_velo", "momentum",
-                "open", "opening_bearish", "opening_bullish",
-                "price_vs_vwap", "price_vs_vwap_pct",
-                "recent_high", "recent_low",
-                "regime", "router_bias", "router_regime", "rsi", "rsv",
-                "score", "session", "squeeze_release", "sqz_on",
-                "trading_day", "trend_strength_raw",
-                "volume", "volume_spike", "vwap",
-            ]
+            CANONICAL_INDICATOR_COLS = FUTURES_INDICATOR_COLUMNS
             
             # 2026-08-26 (feature precision cleanup, rev2): normalize float
             # columns to meaningful precision BEFORE writing.  Raw pandas
