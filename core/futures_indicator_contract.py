@@ -4,12 +4,11 @@ CORE_COLUMNS = (
     "timestamp",
     "near_bid", "near_ask", "near_bidask_age_ms", "near_entry_bbo_state",
     "far_bid", "far_ask", "far_bidask_age_ms", "far_entry_bbo_state",
-    "close", "spread", "spread_z",
+    "close", "open", "high", "low", "volume", "spread", "spread_z",
     "sqz_on", "momentum", "atr_used", "vwap", "regime", "session",
 )
 
 REST_COLUMNS = (
-    "Close", "High", "Low", "Open", "Volume",
     "atr", "atr_raw",
     "bb_low", "bb_mid", "bb_up",
     "bearish_align", "bullish_align",
