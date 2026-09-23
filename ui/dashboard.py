@@ -3168,20 +3168,9 @@ def make_pnl_chart(pnl_df, title):
 
 # ── Futures indicators column whitelist (load_futures_indicators usecols) ──
 # Only columns actually read by dashboard render/logic.
-_FUTURES_USECOLS = [
-    "timestamp", "near_bid", "near_ask", "near_bidask_age_ms",
-    "near_entry_bbo_state", "far_bid", "far_ask", "far_bidask_age_ms",
-    "far_entry_bbo_state", "close", "spread", "spread_z", "sqz_on",
-    "momentum", "atr_used", "vwap", "regime", "session",
-    "Close", "High", "Low", "Open", "Volume", "atr", "atr_raw",
-    "bb_low", "bb_mid", "bb_up", "bearish_align", "bullish_align",
-    "bear_breakout", "bear_breakout_strength_atr", "bull_breakout",
-    "day_max", "day_min", "ema_fast", "ema_slow",
-    "high_20_prev", "low_20_prev", "macd_hist", "mom_velo",
-    "price_vs_vwap", "rsi", "score", "trend_strength_raw",
-]
+_FUTURES_USECOLS = list(FUTURES_INDICATOR_COLUMNS)
 # The minimal set guaranteed to exist in CSV for fast-path usecols
-_FUTURES_USECOLS_ESSENTIAL = ["timestamp", "Close", "High", "Low", "Open", "Volume", "atr", "vwap", "score", "regime", "momentum", "sqz_on"]
+_FUTURES_USECOLS_ESSENTIAL = ["timestamp", "close", "open", "high", "low", "volume", "atr", "vwap", "score", "regime", "momentum", "sqz_on"]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
