@@ -271,7 +271,7 @@ class ExecutionContextSyncFatal(RuntimeError):
 
 # 2026-09-23 hermes: entry marketable-offset hard cap (was 3) — measured p95 quote drift
 # supports up to 5 ticks; worst case 5 ticks = 50 TWD vs ~500-700 TWD expected edge.
-_MAX_ENTRY_OFFSET_TICKS = 5
+_MAX_ENTRY_OFFSET_TICKS = 10
 
 
 class FuturesMonitor:

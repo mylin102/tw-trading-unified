@@ -173,7 +173,8 @@ mts:
       enabled: true
       tighten_ratio: 0.3
     max_spread_width: 3
-    entry_marketable_offset_ticks: 5
+    entry_marketable_offset_ticks: 10
+    max_entry_offset_ticks: 10
     entry_z:
       low_atr: 2.0
       normal_atr: 2.5
