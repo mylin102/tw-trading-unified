@@ -175,7 +175,7 @@ mts:
     max_spread_width: 3
     entry_marketable_offset_ticks: 10
     entry_price_type_day: MKT
-    entry_price_type_night: LMT
+    entry_price_type_night: MKT
     max_entry_offset_ticks: 10
     entry_z:
       low_atr: 2.0
