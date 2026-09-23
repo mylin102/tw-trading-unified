@@ -100,13 +100,13 @@ def test_stale_submission_bbo_is_rejected_before_order_creation():
 def test_offset_above_hard_max_is_rejected_before_order_creation():
     monitor = _monitor()
 
-    _submit(monitor, offset_ticks=6)
+    _submit(monitor, offset_ticks=11)
 
     assert monitor.order_mgr.created == []
     rejected = _event(monitor, "ORDER_REJECTED_LOCAL")
     assert rejected["reason"] == "ENTRY_PRICE_OFFSET_EXCEEDS_MAX"
-    assert rejected["entry_offset_ticks"] == 6
-    assert rejected["max_entry_offset_ticks"] == 5
+    assert rejected["entry_offset_ticks"] == 11
+    assert rejected["max_entry_offset_ticks"] == 10
 
 
 def test_missing_real_bbo_never_falls_back_to_close_or_last():
@@ -130,3 +130,17 @@ def test_offset_five_is_accepted_and_priced_five_ticks_beyond_executable():
     assert not any(e[0] == "ORDER_REJECTED_LOCAL" for e in monitor.events), monitor.events
     assert monitor.order_mgr.created, "order must be created for k=5"
     assert monitor.order_mgr.created[0].price == -175.0  # near_bid 48630 - far_ask 48800 = -170; -170 - 5 ticks
+
+
+def test_offset_ten_is_accepted_and_priced_ten_ticks_beyond_executable():
+    """Raised cap: entries may be priced up to 10 ticks beyond the executable side.
+
+    near_bid 48630 - far_ask 48800 = -170  =>  sell limit = -170 - 10 = -180.
+    """
+    monitor = _monitor()
+
+    _submit(monitor, offset_ticks=10)
+
+    assert not any(e[0] == "ORDER_REJECTED_LOCAL" for e in monitor.events), monitor.events
+    assert monitor.order_mgr.created, "order must be created for k=10"
+    assert monitor.order_mgr.created[0].price == -180.0
