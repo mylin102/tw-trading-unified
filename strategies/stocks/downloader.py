@@ -1,10 +1,7 @@
-import os
 import sys
 import pandas as pd
 from pathlib import Path
 from datetime import timedelta
-import shioaji as sj
-from dotenv import load_dotenv
 import yaml
 
 # Ensure project root is in path
@@ -89,17 +86,10 @@ def run_update_all():
     2026-08-18 Gemini CLI: 統一採用 core.shioaji_session.get_api() 獲取已認證 Session (SSOT)，
     修復 Shioaji.login() unexpected keyword argument contracts_timeout 錯誤。
     """
-    try:
-        from core.shioaji_session import get_api
-        api = get_api()
-    except Exception as e:
-        print(f"⚠️ core.shioaji_session.get_api() failed: {e}. Fallback to direct login.")
-        from core.shioaji_session import _load_env_credentials
-        _load_env_credentials()
-        user_id = os.getenv('SHIOAJI_API_KEY') or os.getenv('SHIOAJI_PERSON_ID')
-        password = os.getenv('SHIOAJI_SECRET_KEY') or os.getenv('SHIOAJI_PASSWD')
-        api = sj.Shioaji()
-        api.login(user_id, password)
+    from core.shioaji_session import get_api
+    # Resident stock code must share the one session authority.  A failed
+    # shared login is fail-closed; never create a second Shioaji owner here.
+    api = get_api()
 
     # Load watchlist from config
     with open(ROOT / "config" / "stocks.yaml", "r", encoding="utf-8") as f:

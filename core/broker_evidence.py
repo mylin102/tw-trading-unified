@@ -26,6 +26,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from core.shioaji_session import observe_broker_call
+
 # Terminal statuses used by the existing snapshot paths.  PendingSubmit is
 # deliberately ABSENT: a pending row is open evidence, never terminal.
 TERMINAL_TRADE_STATUSES = frozenset({"Filled", "Cancelled", "Expired", "Done"})
@@ -222,11 +224,18 @@ def capture_session_snapshot(api: Any, *, session_id: str) -> dict[str, Any]:
     positions: list[Any] = []
     trades: list[Any] = []
     try:
+        observe_broker_call(api, "list_positions", "before",
+                            source="core.broker_evidence.capture_session_snapshot")
         try:
             positions = list(api.list_positions(account=account))
         except TypeError:
             positions = list(api.list_positions())
+        observe_broker_call(api, "list_positions", "after",
+                            source="core.broker_evidence.capture_session_snapshot")
     except Exception as exc:
+        observe_broker_call(api, "list_positions", "error",
+                            source="core.broker_evidence.capture_session_snapshot",
+                            error=exc)
         return {
             "source": "unavailable",
             "capture_error": True,
@@ -234,11 +243,18 @@ def capture_session_snapshot(api: Any, *, session_id: str) -> dict[str, Any]:
             "error": f"list_positions: {type(exc).__name__}: {exc}",
         }
     try:
+        observe_broker_call(api, "list_trades", "before",
+                            source="core.broker_evidence.capture_session_snapshot")
         try:
             trades = list(api.list_trades(account=account))
         except TypeError:
             trades = list(api.list_trades())
+        observe_broker_call(api, "list_trades", "after",
+                            source="core.broker_evidence.capture_session_snapshot")
     except Exception as exc:
+        observe_broker_call(api, "list_trades", "error",
+                            source="core.broker_evidence.capture_session_snapshot",
+                            error=exc)
         return {
             "source": "unavailable",
             "capture_error": True,
