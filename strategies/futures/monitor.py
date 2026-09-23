@@ -11765,7 +11765,7 @@ class FuturesMonitor:
             if unnamed_cols:
                 df = df.drop(columns=unnamed_cols)
             
-            missing = [c for c in new_data_keys if c not in df.columns]
+            missing = [c for c in FUTURES_INDICATOR_COLUMNS if c not in df.columns]
             if missing:
                 console.print(f" [yellow]🛡️ Migrating indicator CSV: adding {missing}[/yellow] ")
                 for c in missing:
@@ -11794,23 +11794,13 @@ class FuturesMonitor:
         
         # 1. Prepare Data
         data = row.to_dict()
-        if "trading_day" in data and data["trading_day"] is not None:
-            td = data["trading_day"]
-            data["trading_day"] = td.isoformat() if hasattr(td, "isoformat") else str(td)
-            
         data.update({
             "timestamp": str(row.name),
             "session": get_session(now),
             "score": score,
             "regime": regime,
-            "router_regime": row.get("router_regime", regime),
-            "router_bias": row.get("router_bias", "UNKNOWN"),
-            "volume_spike": float(row.get("volume_spike", row.get("volume", 1))),
             "trend_strength_raw": float(row.get("trend_strength_raw", row.get("trend", 0))),
-            "open": row.get("Open", 0), "high": row.get("High", 0), "low": row.get("Low", 0), "close": row.get("Close", 0),
-            "volume": row.get("Volume", 0), "amount": row.get("Amount", 0),
-            "bull_align": row.get("bullish_align", False), "bear_align": row.get("bearish_align", False),
-            "in_pb_zone": row.get("in_bull_pb_zone", False) or row.get("in_bear_pb_zone", False),
+            "close": row.get("Close", 0),
         })
 
         # Entry quote columns are a projection of the validated BidAsk slots.
@@ -11837,6 +11827,8 @@ class FuturesMonitor:
             "atr_used": row.get("atr_used"),
             "vwap": row.get("vwap"),
         })
+        for _contract_col in FUTURES_INDICATOR_COLUMNS:
+            data.setdefault(_contract_col, pd.NA)
 
         # [BUG FIX DIAGNOSTIC] Check what data dict contains before writing
         console.print(
@@ -11923,7 +11915,7 @@ class FuturesMonitor:
 
             if not path.exists():
                 # First time: Write header with canonical column order
-                cols = [c for c in CANONICAL_INDICATOR_COLS if c in data]
+                cols = list(CANONICAL_INDICATOR_COLS)
                 self._indicator_cols = cols
                 pd.DataFrame([data])[cols].to_csv(path, index=False)
                 self._last_saved_ts = current_ts

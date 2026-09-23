@@ -13,7 +13,7 @@ from core.futures_indicator_contract import (
 from strategies.futures.monitor import FuturesMonitor, _entry_bbo_view
 
 
-def test_contract_puts_entry_columns_first_and_preserves_unknowns_last():
+def test_contract_puts_entry_columns_first_and_drops_unknowns():
     assert list(FUTURES_INDICATOR_COLUMNS[:18]) == [
         "timestamp", "near_bid", "near_ask", "near_bidask_age_ms",
         "near_entry_bbo_state", "far_bid", "far_ask", "far_bidask_age_ms",
