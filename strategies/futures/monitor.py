@@ -11794,13 +11794,25 @@ class FuturesMonitor:
         
         # 1. Prepare Data
         data = row.to_dict()
+        def _indicator_key(value):
+            return str(value).strip().casefold().replace(" ", "_")
+
+        _row_by_key = {_indicator_key(key): value for key, value in data.items()}
+
+        def _row_value(*names, default=None):
+            for name in names:
+                key = _indicator_key(name)
+                if key in _row_by_key:
+                    return _row_by_key[key]
+            return default
+
         data.update({
             "timestamp": str(row.name),
             "session": get_session(now),
             "score": score,
             "regime": regime,
-            "trend_strength_raw": float(row.get("trend_strength_raw", row.get("trend", 0))),
-            "close": row.get("Close", 0),
+            "trend_strength_raw": float(_row_value("trend_strength_raw", "trend", default=0)),
+            "close": _row_value("close", default=0),
         })
 
         # Entry quote columns are a projection of the validated BidAsk slots.
@@ -11815,20 +11827,21 @@ class FuturesMonitor:
             "near_bid": _near_entry_bbo["bid"],
             "near_ask": _near_entry_bbo["ask"],
             "near_bidask_age_ms": _near_entry_bbo["age_ms"],
-            "near_entry_bbo_state": _near_entry_bbo["state"],
+            "near_entry_bbo_state": _near_entry_bbo.get("state") or "NO_BIDASK",
             "far_bid": _far_entry_bbo["bid"],
             "far_ask": _far_entry_bbo["ask"],
             "far_bidask_age_ms": _far_entry_bbo["age_ms"],
-            "far_entry_bbo_state": _far_entry_bbo["state"],
-            "spread": row.get("spread"),
-            "spread_z": row.get("spread_z"),
-            "sqz_on": row.get("sqz_on"),
-            "momentum": row.get("momentum"),
-            "atr_used": row.get("atr_used"),
-            "vwap": row.get("vwap"),
+            "far_entry_bbo_state": _far_entry_bbo.get("state") or "NO_BIDASK",
+            "spread": _row_value("spread"),
+            "spread_z": _row_value("spread_z"),
+            "sqz_on": _row_value("sqz_on"),
+            "momentum": _row_value("momentum"),
+            "atr_used": _row_value("atr_used"),
+            "vwap": _row_value("vwap"),
         })
         for _contract_col in FUTURES_INDICATOR_COLUMNS:
-            data.setdefault(_contract_col, pd.NA)
+            if _contract_col not in data:
+                data[_contract_col] = _row_value(_contract_col, default=pd.NA)
 
         # [BUG FIX DIAGNOSTIC] Check what data dict contains before writing
         console.print(
