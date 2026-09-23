@@ -1649,14 +1649,107 @@ class FuturesMonitor:
     def _refresh_runtime_status(self):
         from core.shioaji_session import SystemReadiness
 
+        self._check_bidask_liveness()
         warn = getattr(self, "STALE_WARN_SECS", self.MONITOR.get("stale_tick_warn_secs", 120))
         tmf_age = self._tmf_feed_age_secs()
-        if tmf_age > warn:
+        if tmf_age > warn or getattr(self, "_bidask_health", None) in (
+                "STALE", "RECOVERING", "READINESS_FAILED", "RESTART_REQUIRED"):
             self._set_runtime_status(SystemReadiness.DEGRADED)
         elif self.is_trading_ready:
             self._set_runtime_status(SystemReadiness.TRADING)
         else:
             self._set_runtime_status(SystemReadiness.TRADING)
+
+    def _check_bidask_liveness(self):
+        """Detect usable BidAsk starvation independently of the tick watchdog.
+
+        No login/logout or order action. A subscribe return is not recovery:
+        both legs must deliver new validated callbacks, then request readiness
+        must pass. Exhaustion stays visible for controlled operator recovery.
+        """
+        if self.dry_run or self.api is None:
+            return
+        now = time.monotonic()
+        if not hasattr(self, "_bidask_watch_started"):
+            self._bidask_watch_started = now
+        slots = [self.market_data.get(self.ticker, {})]
+        if getattr(self, "far_contract", None) is not None:
+            slots.append(self.market_data.get(self.ticker + "_FAR", {}))
+        received = [s.get("bidask_received_at") for s in slots]
+        fresh = all(isinstance(t, (int, float)) and 0 <= now - t < 60
+                    for t in received)
+        attempts = getattr(self, "_bidask_recovery_attempts", 0)
+        if fresh:
+            if attempts:
+                # Require callback evidence newer than the latest attempt.
+                if not all(t > self._bidask_last_attempt for t in received):
+                    return
+                # Verify request readiness exactly once per recovery attempt:
+                # repeated failures must not re-verify on every status refresh.
+                if getattr(self, "_bidask_verified_attempt", None) == attempts:
+                    return
+                self._bidask_verified_attempt = attempts
+                try:
+                    from core.shioaji_session import _verify_request_readiness
+                    _verify_request_readiness(self.api)
+                except Exception:
+                    self._bidask_health = "READINESS_FAILED"
+                    return
+            self._bidask_health = "HEALTHY"
+            self._bidask_recovery_attempts = 0
+            self._bidask_verified_attempt = None
+            return
+        ages = [now - (t if isinstance(t, (int, float)) else self._bidask_watch_started)
+                for t in received]
+        if max(ages) < 60 or self._tmf_feed_age_secs() >= 60:
+            return
+        if now - getattr(self, "_bidask_stale_warn_at", float('-inf')) >= 60:
+            self._bidask_stale_warn_at = now
+            self._bidask_stale_count = getattr(self, "_bidask_stale_count", 0) + 1
+            logger.warning("[BIDASK_STREAM_STALE] ticker=%s ages=%s count=%s",
+                           self.ticker, ages, self._bidask_stale_count)
+            self._append_mts_event("BIDASK_STREAM_STALE", ages_seconds=ages,
+                                   count=self._bidask_stale_count)
+        if now < getattr(self, "_bidask_next_attempt", 0):
+            return
+        if attempts >= 3:
+            if getattr(self, "_bidask_health", None) != "RESTART_REQUIRED":
+                self._append_mts_event("BIDASK_RECOVERY_EXHAUSTED",
+                                       action="CONTROLLED_RESTART_REQUIRED")
+            self._bidask_health = "RESTART_REQUIRED"
+            return
+        self._bidask_recovery_attempts = attempts + 1
+        self._bidask_last_attempt = now
+        self._bidask_next_attempt = now + 60 * (2 ** attempts)
+        self._bidask_health = "STALE"
+        try:
+            from core.shioaji_session import _verify_request_readiness
+            from core.broker.shioaji_compat import safe_subscribe
+            _verify_request_readiness(self.api)
+            for contract in (self.contract, self.far_contract):
+                if contract is not None:
+                    safe_subscribe(self.api, contract, quote_type='bidask')
+            self._bidask_health = "RECOVERING"
+            self._append_mts_event("BIDASK_RESUBSCRIBE_ATTEMPT", attempt=attempts + 1)
+        except Exception as exc:
+            self._bidask_health = "READINESS_FAILED"
+            self._append_mts_event("BIDASK_RESUBSCRIBE_FAILED", attempt=attempts + 1,
+                                   error_type=type(exc).__name__)
+
+    def _record_bidask_drop(self, reason, code):
+        """Count every rejection; rate-limit warning/event per reason, not code."""
+        counts = getattr(self, "_bidask_drop_counts", {})
+        counts[reason] = counts.get(reason, 0) + 1
+        self._bidask_drop_counts = counts
+        times = getattr(self, "_bidask_drop_warn_at", {})
+        now = time.monotonic()
+        if now - times.get(reason, float('-inf')) >= 60:
+            times[reason] = now
+            self._bidask_drop_warn_at = times
+            logger.warning("[BIDASK_DROPPED] reason=%s code=%s count=%s",
+                           reason, code, counts[reason])
+            self._append_mts_event("BIDASK_DROPPED", reason=reason,
+                                   code=code, count=counts[reason])
 
     def _check_futures_contract_staleness(self):
         """[Wave 1 Fix] Check if MXF ticks are stale and attempt recovery.
@@ -2332,10 +2425,16 @@ class FuturesMonitor:
             _bbo_cache = _extract_bbo(bidask) if bidask is not None else None
             _nset_cache = getattr(self, "_canonical_near_codes", set())
             _fset_cache = getattr(self, "_canonical_far_codes", set())
-            if _bbo_cache and _bbo_cache[2] == "BBO_VALID":
-                _key = (str(getattr(self, "ticker", "TMF")) if _code_cache in _nset_cache
+            _key = (str(getattr(self, "ticker", "TMF")) if _code_cache in _nset_cache
                         else str(getattr(self, "ticker", "TMF")) + "_FAR" if _code_cache in _fset_cache
                         else None)
+            _valid = (_bbo_cache and _bbo_cache[2] == "BBO_VALID"
+                      and all(math.isfinite(v) for v in _bbo_cache[:2]))
+            if not _key:
+                self._record_bidask_drop("CONTRACT_MISMATCH", _code_cache)
+            elif not _valid:
+                self._record_bidask_drop("INVALID_BBO", _code_cache)
+            if _valid:
                 if _key:
                     _slot = self.market_data.setdefault(_key, {})
                     # 2026-08-27 (reconnect verification): tag the BBO cache
