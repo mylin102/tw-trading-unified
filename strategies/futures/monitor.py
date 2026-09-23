@@ -98,6 +98,23 @@ import threading
 _thread_local = threading.local()
 
 
+def entry_wire_price_type(cfg: dict, bar: dict) -> str:
+    """Wire price type for the MTS entry: day session may ask for MKT, otherwise LMT.
+
+    Fail-safe: anything unknown or missing falls back to LMT (the historical behaviour).
+    """
+    allowed = {"LMT", "MKP", "MKT"}
+    try:
+        from core.date_utils import is_night_session
+        ts = (bar or {}).get("time")
+        night = bool(is_night_session(ts)) if ts is not None else False
+    except Exception:
+        night = False
+    key = "entry_price_type_night" if night else "entry_price_type_day"
+    value = str((cfg or {}).get(key) or "").upper()
+    return value if value in allowed else "LMT"
+
+
 def _extract_bbo(quote_obj):
     """Pure BBO extractor with explicit quote-quality classification.
 
@@ -10623,6 +10640,9 @@ class FuturesMonitor:
             _order = self.order_mgr.create_order(
                 symbol=f"{near_code}-{far_code}", side=near_side,
                 order_type=OrderType.MKP, quantity=1, price=_combo_price,
+                wire_price_type=entry_wire_price_type(
+                    (getattr(self, "cfg", None) or {}).get("mts", {}).get("params", {}) or {},
+                    locals().get("bar_dict") or {}),
                 strategy="MTS_ENTRY", truth_source="broker_combo",
                 combo_legs=_combo_legs, combo_strategy="TIME_SPREAD")
             _order.position_baseline = self._capture_mts_position_baseline()

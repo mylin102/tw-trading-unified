@@ -144,3 +144,30 @@ def test_offset_ten_is_accepted_and_priced_ten_ticks_beyond_executable():
     assert not any(e[0] == "ORDER_REJECTED_LOCAL" for e in monitor.events), monitor.events
     assert monitor.order_mgr.created, "order must be created for k=10"
     assert monitor.order_mgr.created[0].price == -180.0
+
+
+def test_entry_wire_price_type_is_day_mkt_night_lmt():
+    """Day session must request a market (MKT) wire price type; night stays limit (LMT)."""
+    from strategies.futures.monitor import entry_wire_price_type
+
+    on = {"time": "2026-09-23T10:30:00+08:00"}
+    off = {"time": "2026-09-23T21:30:00+08:00"}
+    cfg = {"entry_price_type_day": "MKT", "entry_price_type_night": "LMT"}
+    assert entry_wire_price_type(cfg, on) == "MKT"
+    assert entry_wire_price_type(cfg, off) == "LMT"
+    # unknown / missing values fall back to the conservative limit type
+    assert entry_wire_price_type({}, on) == "LMT"
+
+
+def test_combo_wire_price_type_is_honoured_and_defaults_to_lmt():
+    """The client must send the requested wire price_type (and default to LMT)."""
+    from types import SimpleNamespace
+    import shioaji as _sj
+    from strategies.futures.squeeze_futures.data.shioaji_client import wire_price_type_for
+
+    assert wire_price_type_for(SimpleNamespace(wire_price_type="MKT")) == _sj.FuturesPriceType.MKT
+    assert wire_price_type_for(SimpleNamespace(wire_price_type="mkp")) == _sj.FuturesPriceType.MKP
+    assert wire_price_type_for(SimpleNamespace(wire_price_type="LMT")) == _sj.FuturesPriceType.LMT
+    # missing / unknown -> conservative LMT
+    assert wire_price_type_for(SimpleNamespace()) == _sj.FuturesPriceType.LMT
+    assert wire_price_type_for(SimpleNamespace(wire_price_type="NOPE")) == _sj.FuturesPriceType.LMT
