@@ -243,21 +243,26 @@ def test_entry_research_view_rejects_stale_cached_bidask(mock_monitor, monkeypat
     assert captured[-1]["rejection_reason"] == "STALE_QUOTE"
 
 
-def test_entry_view_rejects_tick_bbo_newer_than_bidask(mock_monitor):
+def test_entry_view_never_uses_a_tick_bbo_as_entry_evidence(mock_monitor):
+    """UPDATED 2026-09-23 (docs/specs/quote-store-view-refactor.md): the tick-ordering
+    rule was replaced by SOURCE SEPARATION — the tick path writes tick_* keys and can no
+    longer contaminate the BidAsk slot.  Preserved intent: a tick-borne BBO never becomes
+    entry evidence; freshness is judged by the consumers' thresholds.
+    """
     mock_monitor.dry_run = False
     mock_monitor.cfg["mts"]["enabled"] = True
     mock_monitor._mts_tick = MagicMock()
+    now = time.time()
     mock_monitor.market_data["TMF"] = {
-        "bid": 44299.0, "ask": 44301.0, "bidask_at": time.time(),
-        "local_arrival_at": time.time(),
+        "bid": 44299.0, "ask": 44301.0, "bidask_at": now, "local_arrival_at": now,
     }
     mock_monitor.market_data["TMF_FAR"] = {
-        "bid": 44049.0, "ask": 44051.0, "bidask_at": time.time() - 1.0,
-        "local_arrival_at": time.time(),
+        "bid": 44049.0, "ask": 44051.0, "bidask_at": now - 0.5, "local_arrival_at": now,
     }
 
     mock_monitor.on_tick("TFE", create_mock_tick("TMFI6", 44050.0))
 
     bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
-    assert bar["bbo_far_bid"] is None
-    assert bar["bbo_far_ask"] is None
+    assert bar["bbo_far_bid"] == 44049.0
+    assert bar["bbo_far_ask"] == 44051.0
+    assert 400 <= bar["bbo_far_age_ms"] < 30000

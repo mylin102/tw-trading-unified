@@ -314,7 +314,7 @@ class TestOnTickBidaskAt:
         mon._processed_flag_ids = set()
         return mon
 
-    def test_on_tick_near_tick_writes_tick_bbo_at(self, monkeypatch):
+    def test_on_tick_near_tick_writes_tick_bbo_at_and_tick_keys(self, monkeypatch):
         """A tick carrying real buy_price/sell_price must write bidask_at
         into the near / near-alias / code slots (single shared timestamp)."""
         import strategies.futures.monitor as monitor_mod
@@ -337,8 +337,8 @@ class TestOnTickBidaskAt:
 
         for _key in ("TMF", "TMF_NEAR", "TMFF6"):
             _slot = mon.market_data.get(_key, {})
-            assert _slot.get("bid") == 20999.0, (_key, _slot)
-            assert _slot.get("ask") == 21001.0, (_key, _slot)
+            assert _slot.get("tick_bid") == 20999.0, (_key, _slot)
+            assert _slot.get("tick_ask") == 21001.0, (_key, _slot)
             # 2026-08-27 (codex v4): ticks write tick_bbo_at, NEVER
             # bidask_at — BidAsk callback freshness is on_bidask-only.
             assert _slot.get("tick_bbo_at") is not None, \
@@ -348,7 +348,7 @@ class TestOnTickBidaskAt:
             assert abs(_slot["tick_bbo_at"] - _now) < 2.0, \
                 f"{_key} tick_bbo_at drifted: {_slot['tick_bbo_at']} vs {_now}"
 
-    def test_on_tick_far_tick_writes_tick_bbo_at(self):
+    def test_on_tick_far_tick_writes_tick_bbo_at_and_tick_keys(self):
         """A far tick with real BBO writes bidask_at into TMF_FAR + code."""
         from unittest.mock import patch as _patch
         mon = self._on_tick_monitor()
@@ -366,7 +366,7 @@ class TestOnTickBidaskAt:
 
         for _key in ("TMF_FAR", "TMFG6"):
             _slot = mon.market_data.get(_key, {})
-            assert _slot.get("bid") == 21099.0, (_key, _slot)
+            assert _slot.get("tick_bid") == 21099.0, (_key, _slot)
             assert _slot.get("tick_bbo_at") is not None, \
                 f"{_key} missing tick_bbo_at: {_slot}"
             assert _slot.get("bidask_at") is None, \
