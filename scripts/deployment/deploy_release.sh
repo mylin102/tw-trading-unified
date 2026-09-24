@@ -241,7 +241,8 @@ GATE_ARGS=(--release-dir "$REPO_DIR" --runtime-dir "$RUNTIME_DIR" --pid-file "$P
            --position-state "$FLAT_SNAPSHOT" --margin-evidence "$FLAT_SNAPSHOT" \
            --config-profile "$CONFIG_PROFILE" --config-hash "$CONFIG_HASH" \
            --monitor strategies/futures/monitor.py
-           --expected-sha "$LRC_RELEASE_SHA" --manifest "$MANIFEST")
+           --expected-sha "$LRC_RELEASE_SHA" --manifest "$MANIFEST"
+           --allow-existing-mts-position)
 if [ "$DRY_RUN" = 1 ]; then
   log "DRY-RUN would run: $PYTHON_BIN -B scripts/deployment/check_deployment.py --phase pre_deploy ${GATE_ARGS[*]} --json"
   log "DRY-RUN: the pre-deploy gate is NOT executed in dry-run — nothing is verified"
