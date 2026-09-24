@@ -2912,3 +2912,46 @@ def test_mts_combo_entry_creates_the_order_with_its_wire_price_type(monkeypatch)
     assert order.wire_price_type == expected
     _wire = wire_price_type_for(order)
     assert getattr(_wire, "name", _wire) == "LMT"
+
+
+def test_local_construction_failure_records_the_masked_exception(monkeypatch):
+    """The rejection event must carry the exception it swallowed.
+
+    On 2026-09-24 a TypeError raised inside this broad ``except`` was recorded
+    only as COMBO_LIFECYCLE_CREATE_FAILED, so 1,154 live entry rejections
+    carried no clue about their cause and were invisible in the logs.
+    """
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_live_ctx())
+    strategy = SimpleNamespace(
+        _has_position=False, _lifecycle="SUBMITTING",
+        _trade_id="mts-auto-masked-exception")
+    signal = SimpleNamespace(action="SELL_NEAR_BUY_FAR", reason="TMF_SPREAD_WIDE")
+    bar = {
+        "near_close": 48115.0, "far_close": 48247.0,
+        "spread": -132.0, "spread_z": 4.08, "atr": 51.0,
+        "bbo_near_bid": 48110.0, "bbo_near_ask": 48120.0,
+        "bbo_far_bid": 48240.0, "bbo_far_ask": 48260.0,
+        "bbo_near_age_ms": 10.0, "bbo_far_age_ms": 10.0,
+    }
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open", lambda: True)
+    monitor._mts_block_entry_if_open_position = lambda *_a, **_k: False
+    monitor._capture_mts_position_baseline = lambda: []
+
+    def _raise_create(*_args, **_kwargs):
+        raise TypeError(
+            "OrderManager.create_order() got an unexpected keyword argument "
+            "'wire_price_type'")
+
+    monitor.order_mgr.create_order = _raise_create
+
+    import datetime as _dt
+    monitor._submit_mts_order_signal(signal, strategy, bar, _dt.datetime.now())
+
+    rejected = [e for e in events if e[0] == "ORDER_REJECTED_LOCAL"]
+    assert len(rejected) == 1, events
+    payload = rejected[0][1]
+    assert payload["reason"] == "COMBO_LIFECYCLE_CREATE_FAILED"
+    assert payload["error_type"] == "TypeError"
+    assert "wire_price_type" in payload["error"]
