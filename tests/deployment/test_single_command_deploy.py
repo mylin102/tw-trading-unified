@@ -478,3 +478,22 @@ def test_evidence_stage_propagates_the_capture_rc(tmp_path):
     assert r.returncode == 5, f"expected the helper rc 5, got {r.returncode}: {r.stdout}{r.stderr}"
     assert "stage=EVIDENCE rc=5" in r.stderr, r.stderr
     assert "pm2 stop" not in (pm2_log.read_text() if pm2_log.exists() else "")
+
+
+def test_pre_and_post_gates_allow_a_reconciled_position(tmp_path):
+    """A broker-held, exactly-reconciled spread must not make the deploy
+    impossible: pre_deploy needs the same allowance post_startup already has
+    (the live 2026-09-24 spread is held while the local model is flat)."""
+    bin_dir, _ = _stub_bin(tmp_path, running_sha="PLACEHOLDER")
+    repo = _layout(tmp_path, deployed_change="tests")
+    bin_dir, _ = _stub_bin(
+        tmp_path, running_sha=(tmp_path / "base_sha").read_text().strip())
+    r = _run(tmp_path, repo, bin_dir)
+    assert r.returncode == 0, r.stdout + r.stderr
+    pre = [l for l in (tmp_path / "gate_calls.log").read_text().splitlines()
+           if "--phase pre_deploy" in l]
+    post = [l for l in (tmp_path / "gate_calls.log").read_text().splitlines()
+            if "--phase post_startup" in l]
+    assert pre and post, (pre, post)
+    assert "--allow-existing-mts-position" in pre[0], pre[0]
+    assert "--allow-existing-mts-position" in post[0], post[0]
