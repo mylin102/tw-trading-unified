@@ -66,5 +66,5 @@ def test_live_canonical_block_present_in_worktree():
     source = Path(__file__).parents[2] / "ui" / "dashboard.py"
     text = source.read_text(encoding="utf-8")
     assert "_live_canonical_position_allowed(_ctx_live, _canon)" in text
-    assert '_mts_state_file = None if _live_runtime else "/tmp/mts_position_state.json"' in text
+    assert ('_mts_state_file = None if _live_runtime else mts_position_state_path()' in text)
     assert "broker_snapshot_canonical.json" in text

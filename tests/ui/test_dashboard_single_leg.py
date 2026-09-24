@@ -24,6 +24,8 @@ def test_single_remaining_far_leg_is_not_flat():
         }],
         {"canonical_input_hash": "abc123", "captured_at": 1786956218970},
         {"release_stop_points": 229.0, "trail_distance_points": 91.6},
+        # the reconciled pair is the evidence for WHICH leg was released
+        ["TMFH6", "TMFI6"],
     )
     assert state["has_position"] is True
     assert state["release_state"] == "SINGLE_LEG"
