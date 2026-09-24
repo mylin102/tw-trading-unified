@@ -10540,6 +10540,7 @@ class FuturesMonitor:
                     near_side=_near_side, far_side=_far_side,
                     near_price=_near_close, far_price=_far_close,
                     bar_dict=bar_dict, ts=_ts, snapshot=_snap,
+                    strategy=strategy,
                     entry_offset_ticks=getattr(
                         strategy, "_params", {}).get(
                             "entry_marketable_offset_ticks", 2),
@@ -10682,7 +10683,7 @@ class FuturesMonitor:
     def _submit_mts_combo_entry(
         self, *, trade_id, action, reason, near_code, far_code,
         near_side, far_side, near_price, far_price, bar_dict, ts, snapshot,
-        entry_offset_ticks=2, tick_size=1.0,
+        strategy=None, entry_offset_ticks=2, tick_size=1.0,
     ):
         """Submit one MTS combo lifecycle.
 
@@ -10807,6 +10808,17 @@ class FuturesMonitor:
                 f"mts-entry:{trade_id}:{near_code}:{far_code}:{action}"
             )
         except Exception as exc:
+            # No order object, broker receipt, or exposure exists when local
+            # construction fails.  Clear the speculative pre-submit marker so
+            # the next valid signal is evaluated instead of being rejected by
+            # TMFSpread.on_bar() as permanently MTS_BUSY.
+            if getattr(strategy, "_has_position", False) is not True:
+                strategy._has_position = False
+                strategy._lifecycle = "FLAT"
+                strategy._entry_ts = None
+                strategy._entry_time_monotonic = 0.0
+                strategy._entry_guard_start_ms = 0.0
+                strategy._entry_ts_ms = 0.0
             self._append_mts_event(
                 "ORDER_REJECTED_LOCAL", trade_id=trade_id,
                 strategy="MTS_ENTRY", reason="COMBO_LIFECYCLE_CREATE_FAILED")
