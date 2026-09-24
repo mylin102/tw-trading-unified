@@ -1404,6 +1404,52 @@ def test_s1_exit_only_entry_blocked_after_hydration_zero_submit(monkeypatch):
     assert blocked and blocked[-1][1].get("reason") == "EXIT_ONLY_ENTRY_BLOCKED"
 
 
+def test_entry_create_failure_does_not_leave_strategy_busy(monkeypatch):
+    """A local order-construction failure must not poison future evaluation."""
+    from types import SimpleNamespace
+    import strategies.futures.monitor as monitor_mod
+
+    monitor, events = _monitor(_live_ctx())
+    strategy = SimpleNamespace(
+        _has_position=False,
+        _lifecycle="SUBMITTING",
+        _trade_id="mts-auto-local-create-failure",
+    )
+    signal = SimpleNamespace(
+        action="SELL_NEAR_BUY_FAR", reason="TMF_SPREAD_WIDE",
+    )
+    bar = {
+        "near_close": 44905.0,
+        "far_close": 45038.5,
+        "spread": -133.5,
+        "spread_z": 3.5,
+        "atr": 50.0,
+        "bbo_near_bid": 44900.0,
+        "bbo_near_ask": 44910.0,
+        "bbo_far_bid": 45030.0,
+        "bbo_far_ask": 45050.0,
+        "bbo_near_age_ms": 10.0,
+        "bbo_far_age_ms": 10.0,
+    }
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor._mts_block_entry_if_open_position = lambda *_args: False
+    monitor._capture_mts_position_baseline = lambda: []
+
+    def _raise_create(*_args, **_kwargs):
+        raise RuntimeError("local order construction failure")
+
+    monitor.order_mgr.create_order = _raise_create
+    monitor._submit_mts_order_signal(signal, strategy, bar, __import__(
+        "datetime").datetime.now())
+
+    assert strategy._has_position is False
+    assert strategy._lifecycle == "FLAT"
+    assert any(e[0] == "ORDER_REJECTED_LOCAL" and
+               e[1].get("reason") == "COMBO_LIFECYCLE_CREATE_FAILED"
+               for e in events)
+
+
 def test_s1_e2e_mts_tick_exit_stays_pending_without_quarantine_proof(
         monkeypatch, tmp_path):
     """[S1 repair P0] integrated _mts_tick: local ledger FLAT + valid
