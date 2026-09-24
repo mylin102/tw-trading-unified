@@ -19,6 +19,32 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
+def freeze_validated_bytes(artifact: str, out_path: str) -> str:
+    """Freeze the exact bytes validated here and return the frozen path.
+
+    The running owner rewrites the live diagnostics artifact every few seconds
+    (measured ~10 s cadence on 2026-09-24), so the gate must consume a frozen
+    copy instead of re-reading a path that can change between its own two reads.
+    Writes atomically so a reader never sees a partial file.
+    """
+    frozen = Path(out_path).with_suffix(".snapshot.json")
+    pending = frozen.with_name(frozen.name + ".tmp")
+    with open(artifact, "rb") as src, open(pending, "wb") as dst:
+        dst.write(src.read())
+        dst.flush()
+        os.fsync(dst.fileno())
+    os.replace(pending, frozen)
+    return str(frozen)
+
+
+def freeze_and_report(artifact, out_path: str, payload: dict) -> dict:
+    """Point the gate payload at the frozen copy of the validated bytes."""
+    frozen = freeze_validated_bytes(str(artifact), out_path)
+    payload["captured_from"] = str(artifact)
+    payload["artifact"] = frozen
+    return payload
+
+
 def _emit(payload: dict, out_path: str) -> int:
     """Write the payload atomically; stdout keeps whatever the broker printed."""
     import os as _os
@@ -72,8 +98,11 @@ def main() -> int:
         "failed_checks": list(preflight.get("failed_checks") or []),
     }
     if artifact.is_file():
+        # The gate consumes the artfiact through this payload key (both
+        # --position-state and --margin-evidence), so it must be the frozen copy.
+        out = freeze_and_report(artifact, args.out, out)
         try:
-            art = json.loads(artifact.read_text(encoding="utf-8"))
+            art = json.loads(Path(out["artifact"]).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             art = {}
         positions = art.get("positions") or []
