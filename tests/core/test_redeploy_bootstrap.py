@@ -381,3 +381,72 @@ def test_apply_still_refuses_unknown_audit(env):
     assert "unacceptable ctx audit state" in r.stderr or \
         "unacceptable ctx audit state" in r.stdout
 
+
+
+_RECONCILED_HOLDING = {
+    "canonical_legs": [
+        {"code": "TMFH6", "side": "SHORT", "qty": 1, "avg_cost": 48176.0},
+        {"code": "TMFI6", "side": "LONG", "qty": 1, "avg_cost": 48320.0},
+    ],
+    "source": "broker_reconciled_record",
+    "captured_at": 1790253493941,
+    "canonical_input_hash": "c" * 64,
+}
+_TWO_LEGS = [
+    {"account": "futures", "code": "TMFH6", "quantity": 1,
+     "direction": "Action.Sell", "avg_cost": 48176.0},
+    {"account": "futures", "code": "TMFI6", "quantity": 1,
+     "direction": "Action.Buy", "avg_cost": 48320.0},
+]
+
+
+def _reconciled_env(env, **over):
+    pf = _write_snapshot(env["tmp"], positions=_TWO_LEGS)
+    _write_ctx(env["rt"], {
+        **_STALE_CTX, "requested_mode": "live",
+        "canonical_holding": _RECONCILED_HOLDING,
+        "audit_reasons": ["SESSION_LOGOUT", "SESSION_RECONNECT_PENDING",
+                          "POST_STARTUP_GATE_FAILED", "GUARD_POSITION_NOT_FLAT"],
+        **over})
+    return ["--runtime-dir", str(env["rt"]), "--pid-file", str(env["pid"]),
+            "--position-state", str(pf), "--margin-evidence", str(pf),
+            "--config-profile", str(env["prof"]),
+            "--config-hash", env["prof_hash"]]
+
+
+def test_reconciled_position_with_reconnect_pending_is_resettable(env):
+    """Live 2026-09-24 deadlock: the app held a broker-reconciled spread AND a
+    SESSION_RECONNECT_PENDING audit (written by the process we stopped).
+    pre_deploy refused the stale ctx; the only tool that clears a stale ctx
+    (this bootstrap) refused the reconnect flag — so the deploy could never run
+    with a real position, and the position had no managing path."""
+    args = _reconciled_env(env) + ["--allow-existing-mts-position",
+                                   "--retry-post-startup-gate"]
+    # a failed startup gate is never retried by a bare dry-run: the operator
+    # must be explicit (--retry-post-startup-gate AND --apply)
+    dry = _run(env["tmp"], *args)
+    assert dry.returncode != 0, dry.stdout + dry.stderr
+    assert "ctx NOT modified" in dry.stdout
+    assert json.loads((env["rt"] / "execution_context.json").read_text()) \
+        ["audit_reasons"] == ["SESSION_LOGOUT", "SESSION_RECONNECT_PENDING",
+                              "POST_STARTUP_GATE_FAILED", "GUARD_POSITION_NOT_FLAT"]
+
+    applied = _run(env["tmp"], *args, "--apply")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["live_order_allowed"] is False
+    assert cur["session_id"] is None
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert cur["canonical_holding"] == _RECONCILED_HOLDING, (
+        "broker truth must survive the reset: pre_deploy and the startup gate "
+        "accept a non-flat account only against these legs")
+
+
+def test_reconciled_position_without_the_allowance_still_refuses(env):
+    args = _reconciled_env(env) + ["--retry-post-startup-gate", "--apply"]
+    r = _run(env["tmp"], *args)
+    assert r.returncode != 0
+    assert "flat" in (r.stdout + r.stderr).lower()
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert "GUARD_POSITION_NOT_FLAT" in cur["audit_reasons"]
