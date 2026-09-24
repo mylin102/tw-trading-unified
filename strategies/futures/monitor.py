@@ -8283,18 +8283,36 @@ class FuturesMonitor:
         reason = str(payload.get("errmsg") or payload.get("reason") or "")
 
         if is_futures_deal:
+            _raw_price = payload.get("price")
+            fill_price = None
+            if _raw_price is not None and _raw_price != "":
+                try:
+                    fill_price = float(_raw_price)
+                except (TypeError, ValueError):
+                    fill_price = None
             try:
-                fill_price = float(payload.get("price") or 0)
                 fill_qty = int(payload.get("quantity") or 0)
             except (TypeError, ValueError):
-                return
-            if fill_price <= 0 or fill_qty <= 0:
+                fill_qty = 0
+            # A futures calendar spread is quoted as near-minus-far, so its
+            # fill price is legitimately NEGATIVE.  On 2026-09-24 a real -144
+            # fill was rejected here as INVALID_PRICE_OR_QUANTITY, so the entry
+            # never reached the fills ledger and the position was later reset
+            # to FLAT while the broker still held the spread.  Reject only a
+            # missing/non-numeric/zero price, a non-finite price, or a
+            # non-positive quantity — and always record what was rejected.
+            if (fill_price is None or fill_price == 0.0
+                    or not math.isfinite(fill_price) or fill_qty <= 0):
                 try:
                     self._append_mts_event(
                         "FDEAL_CALLBACK_REJECTED",
                         observation_type="FDEAL_CALLBACK",
                         normalization_result="REJECTED",
-                        rejection_reason="INVALID_PRICE_OR_QUANTITY")
+                        rejection_reason="INVALID_PRICE_OR_QUANTITY",
+                        raw_price=_raw_price,
+                        raw_quantity=payload.get("quantity"),
+                        broker_order_id=broker_order_id,
+                        ordno=ordno, seqno=seqno)
                 except Exception:
                     pass
                 return
