@@ -63,6 +63,14 @@ _ACCEPTABLE_STALE = {
     # older LRC_RELEASE_SHA. Fresh canonical broker evidence and the sealed
     # profile remain mandatory before resetting this stale context.
     "RELEASE_IDENTITY_MISMATCH",
+    # A stopped process can leave a reconnect in flight (2026-09-24: the app
+    # was quarantined on a broker-held spread and carried this flag).  The flag
+    # is unreachable without every other guard passing — a fresh live_broker
+    # snapshot, the sealed profile, no live pid — and the reset only ever
+    # writes LIVE_QUARANTINED with session_id=None, so accepting it cannot
+    # promote live trading.  Refusing it deadlocked the recovery: pre_deploy
+    # needed the stale ctx cleared and this tool was the only one that clears.
+    "SESSION_RECONNECT_PENDING",
 }
 _BLOCKING_AUDIT = {"SAFETY_STOP_RECONCILE_PENDING"}
 _BOOTSTRAP_REASON = "REDEPLOY_BOOTSTRAP"
@@ -237,6 +245,14 @@ def main() -> int:
         "config_hash": profile_hash,
         "state_namespace": "live",
     }
+    # Broker truth recorded by the operator act (record_reconciled_holding.py)
+    # must survive the reset: pre_deploy and the in-process startup gate accept
+    # a non-flat account only against these legs.  It is evidence, not stale
+    # process state.
+    _holding = (ctx or {}).get("canonical_holding")
+    if isinstance(_holding, dict) and _holding.get("canonical_legs"):
+        new_ctx["canonical_holding"] = _holding
+
     p = _ctx_path(rt)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(new_ctx, ensure_ascii=False), encoding="utf-8")
