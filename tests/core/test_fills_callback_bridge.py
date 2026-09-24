@@ -259,3 +259,44 @@ def test_options_never_registers_order_callback_directly():
     assert "set_order_callback(self.on_order_event)" not in src
     assert "set_order_callback(" not in src
     assert "_ensure_central_dispatcher_ownership" in src
+
+
+# ── live 2026-09-24: a spread fill is quoted NEGATIVE ──
+
+def test_negative_spread_price_deal_is_applied():
+    """RED: the real -144 calendar-spread fill was rejected as
+    INVALID_PRICE_OR_QUANTITY, so the entry never reached the ledger and the
+    position was later reset to FLAT while the broker still held the spread."""
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    mon = _monitor_with(manager)
+    applied = []
+    _orig = manager.apply_deal_fill
+    manager.apply_deal_fill = lambda *a, **k: (applied.append(k), _orig(*a, **k))[1]
+
+    mon.on_order_event(SimpleNamespace(value="FDEAL"),
+                       _deal_data(price=-144.0, trade_id="deal-neg-1"))
+
+    assert len(applied) == 1, [e for e in mon.events]
+    assert applied[0]["fill_price"] == -144.0
+    assert applied[0]["fill_qty"] == 1
+    assert not [e for e in mon.events if e[0] == "FDEAL_CALLBACK_REJECTED"]
+
+
+def test_rejected_deal_records_the_offending_values():
+    """A rejection must name the values it rejected (the live rejection carried
+    only a reason, which is why this was invisible for a full session)."""
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    mon = _monitor_with(manager)
+    manager.apply_deal_fill = lambda *a, **k: None
+
+    mon.on_order_event(SimpleNamespace(value="FDEAL"), _deal_data(price=None))
+
+    rejected = [e for e in mon.events if e[0] == "FDEAL_CALLBACK_REJECTED"]
+    assert len(rejected) == 1, mon.events
+    payload = rejected[0][1]
+    assert payload["rejection_reason"] == "INVALID_PRICE_OR_QUANTITY"
+    assert payload["raw_price"] is None
+    assert payload["raw_quantity"] == 1
+    assert payload["broker_order_id"] == "BRK-1"
