@@ -10798,11 +10798,14 @@ class FuturesMonitor:
             _order = self.order_mgr.create_order(
                 symbol=f"{near_code}-{far_code}", side=near_side,
                 order_type=OrderType.MKP, quantity=1, price=_combo_price,
-                wire_price_type=entry_wire_price_type(
-                    (getattr(self, "cfg", None) or {}).get("mts", {}).get("params", {}) or {},
-                    locals().get("bar_dict") or {}),
                 strategy="MTS_ENTRY", truth_source="broker_combo",
                 combo_legs=_combo_legs, combo_strategy="TIME_SPREAD")
+            # create_order() takes no wire_price_type argument: the wire price type
+            # is an Order attribute read by the adapter
+            # (shioaji_client.wire_price_type_for(order); defaults to LMT).
+            _order.wire_price_type = entry_wire_price_type(
+                (getattr(self, "cfg", None) or {}).get("mts", {}).get("params", {}) or {},
+                bar_dict or {})
             _order.position_baseline = self._capture_mts_position_baseline()
             _order.idempotency_key = (
                 f"mts-entry:{trade_id}:{near_code}:{far_code}:{action}"
