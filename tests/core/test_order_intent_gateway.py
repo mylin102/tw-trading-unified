@@ -2850,3 +2850,65 @@ def test_exit_intent_failed_leg_never_submitted(tmp_path):
     st = log.get(iid)["legs"]["NEAR"]["status"]
     assert st == "UNKNOWN"
     assert st != "SUBMITTED"
+
+
+def test_mts_combo_entry_creates_the_order_with_its_wire_price_type(monkeypatch):
+    """RED (live defect): every MTS combo entry died during local construction.
+
+    ``OrderManager.create_order()`` has no ``wire_price_type`` parameter — the
+    wire price type is an *attribute* that the adapter reads
+    (``shioaji_client.wire_price_type_for``).  Passing it as a keyword raises
+    TypeError inside the caller's broad ``except``, so every live entry was
+    recorded as ORDER_REJECTED_LOCAL/COMBO_LIFECYCLE_CREATE_FAILED (measured
+    live on 2026-09-24: 1,154 occurrences, zero orders created).
+    """
+    import strategies.futures.monitor as monitor_mod
+    from strategies.futures.monitor import entry_wire_price_type
+    from strategies.futures.squeeze_futures.data.shioaji_client import (
+        wire_price_type_for,
+    )
+
+    monitor, events = _monitor(_live_ctx())
+    strategy = SimpleNamespace(
+        _has_position=False,
+        _lifecycle="SUBMITTING",
+        _trade_id="mts-auto-wire-price-type",
+    )
+    signal = SimpleNamespace(
+        action="SELL_NEAR_BUY_FAR", reason="TMF_SPREAD_WIDE",
+    )
+    bar = {
+        "near_close": 48115.0,
+        "far_close": 48247.0,
+        "spread": -132.0,
+        "spread_z": 4.08,
+        "atr": 51.0,
+        "bbo_near_bid": 48110.0,
+        "bbo_near_ask": 48120.0,
+        "bbo_far_bid": 48240.0,
+        "bbo_far_ask": 48260.0,
+        "bbo_near_age_ms": 10.0,
+        "bbo_far_age_ms": 10.0,
+    }
+    monkeypatch.setattr(monitor_mod, "is_taifex_futures_market_open",
+                        lambda: True)
+    monitor._mts_block_entry_if_open_position = lambda *_args, **_kwargs: False
+    monitor._capture_mts_position_baseline = lambda: []
+
+    import datetime as _dt
+    monitor._submit_mts_order_signal(signal, strategy, bar, _dt.datetime.now())
+
+    # the local construction must not fail: no local rejection at all ...
+    assert [e for e in events if e[0] == "ORDER_REJECTED_LOCAL"] == []
+    # ... and the combo order object must exist, carrying the wire price type
+    combo_orders = [o for o in monitor.order_mgr.active_orders.values()
+                    if "-" in o.symbol]
+    assert len(combo_orders) == 1, sorted(
+        o.symbol for o in monitor.order_mgr.active_orders.values())
+    order = combo_orders[0]
+    expected = entry_wire_price_type(
+        (monitor.cfg.get("mts") or {}).get("params") or {}, bar)
+    assert expected == "LMT"          # cfg carries no entry_price_type_day
+    assert order.wire_price_type == expected
+    _wire = wire_price_type_for(order)
+    assert getattr(_wire, "name", _wire) == "LMT"
