@@ -42,7 +42,7 @@ class _FakeApi:
         self.calls = []
 
     # ── the only broker surfaces the read-only adapter may use ──
-    def update_status(self, account=None, /, **kw):
+    def update_status(self, account=None, **kw):
         if account is None:
             raise TypeError("account is required")
         self.calls.append("update_status")
@@ -51,20 +51,20 @@ class _FakeApi:
         self.status_refreshed = True
         return SimpleNamespace(status="OK")
 
-    def list_positions(self, account=None, /, **kw):
+    def list_positions(self, account=None, **kw):
         if account is None:
             raise TypeError("account is required")
         self.calls.append("list_positions")
         # Observed 2026-09-24: without update_status the fresh session view is empty
         return list(self._legs) if self.status_refreshed else []
 
-    def list_trades(self, account=None, /, **kw):
+    def list_trades(self, account=None, **kw):
         if account is None:
             raise TypeError("account is required")
         self.calls.append("list_trades")
         return []
 
-    def margin(self, account=None, /, **kw):
+    def margin(self, account=None, **kw):
         if account is None:
             raise TypeError("account is required")
         return SimpleNamespace(available_margin=302520.0, equity_amount=1_000_000.0,
