@@ -10812,7 +10812,7 @@ class FuturesMonitor:
             # construction fails.  Clear the speculative pre-submit marker so
             # the next valid signal is evaluated instead of being rejected by
             # TMFSpread.on_bar() as permanently MTS_BUSY.
-            if getattr(strategy, "_has_position", False) is not True:
+            if strategy is not None and getattr(strategy, "_has_position", False) is not True:
                 strategy._has_position = False
                 strategy._lifecycle = "FLAT"
                 strategy._entry_ts = None
