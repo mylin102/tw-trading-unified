@@ -14,6 +14,13 @@ from core.live_broker_preflight import _safe_positions
 class _KeywordOnlyApi:
     """Fake api that accepts ONLY keyword arguments (positional raises)."""
 
+
+    def update_status(self, account=None, **kw):
+        """SDK surface: the capture refreshes the account view first."""
+        if account is None:
+            raise TypeError("account is required")
+        return {"status": "OK"}
+
     def list_positions(self, *, account):
         if account != "A-1":
             raise AssertionError("wrong account")

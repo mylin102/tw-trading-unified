@@ -42,7 +42,7 @@ class _FakeApi:
         self.calls = []
 
     # ── the only broker surfaces the read-only adapter may use ──
-    def update_status(self, account=None, **kw):
+    def update_status(self, account=None, /, **kw):
         if account is None:
             raise TypeError("account is required")
         self.calls.append("update_status")
@@ -51,20 +51,20 @@ class _FakeApi:
         self.status_refreshed = True
         return SimpleNamespace(status="OK")
 
-    def list_positions(self, account=None, **kw):
+    def list_positions(self, account=None, /, **kw):
         if account is None:
             raise TypeError("account is required")
         self.calls.append("list_positions")
         # Observed 2026-09-24: without update_status the fresh session view is empty
         return list(self._legs) if self.status_refreshed else []
 
-    def list_trades(self, account=None, **kw):
+    def list_trades(self, account=None, /, **kw):
         if account is None:
             raise TypeError("account is required")
         self.calls.append("list_trades")
         return []
 
-    def margin(self, account=None, **kw):
+    def margin(self, account=None, /, **kw):
         if account is None:
             raise TypeError("account is required")
         return SimpleNamespace(available_margin=302520.0, equity_amount=1_000_000.0,
@@ -154,20 +154,23 @@ def test_unrefreshable_account_status_fails_closed(preflight_env):
 
 
 def test_empty_capture_after_a_real_holding_is_flagged(preflight_env):
-    """Tonight's hole: the prior live_broker holding artifact has no `scope`."""
+    """Tonight's hole: the RUNNING app's artifact carries the account hash but no
+    `scope`, so the drift guard must not depend on that key."""
     import json
-    prior = {"source": "live_broker", "account_identity_hash": "a" * 64,
-             "positions": [{"account": "futures", "code": "TMFJ6", "quantity": 1,
-                            "direction": "Sell", "avg_cost": 48176.0, "pnl": 1.0}],
-             "open_orders": []}
     d = preflight_env / "exports/trades/live/diagnostics"
-    d.mkdir(parents=True, exist_ok=True)
+
+    # 1. a real holding capture (the account's 2 legs)
+    lbp.run_once(lambda: _FakeApi(), request_id="TEST-HOLD", product="TMF")
+    prior = json.loads((d / "broker_snapshot_canonical.json").read_text())
+    assert prior["source"] == "live_broker" and len(prior["positions"]) == 2
+    prior.pop("scope", None)                 # the app's artifact has no scope
     (d / "broker_snapshot_canonical.json").write_text(json.dumps(prior))
 
-    api = _FakeApi(legs=[])
-    resp = lbp.run_once(lambda: api, request_id="TEST-DRIFT", product="TMF")
+    # 2. the same account now reads empty -> ambiguous, never proof of flat
+    resp = lbp.run_once(lambda: _FakeApi(legs=[]), request_id="TEST-DRIFT", product="TMF")
 
     assert resp["preflight"]["passed"] is False
     assert "POSITIONS_EMPTY_AFTER_PRIOR_HOLDING" in resp["preflight"]["failed_checks"]
-    art = _canonical(preflight_env)
+    art = json.loads((d / "broker_snapshot_canonical.json").read_text())
     assert art["source"] == "unavailable"
+    assert art["positions"] is None

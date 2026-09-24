@@ -23,6 +23,13 @@ class _FakeApi:
         self._failing = failing
         self.calls = []
 
+
+    def update_status(self, account=None, **kw):
+        """SDK surface: the capture refreshes the account view first."""
+        if account is None:
+            raise TypeError("account is required")
+        return {"status": "OK"}
+
     def list_positions(self, acct=None):
         self.calls.append("list_positions")
         if self._failing:

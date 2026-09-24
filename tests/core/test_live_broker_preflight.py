@@ -11,6 +11,13 @@ class Api:
         self.futopt_account = SimpleNamespace(person_id="p", broker_id="b", account_id="a")
         self.Contracts = SimpleNamespace(Futures={"TMF": []})
         self.calls = []
+
+    def update_status(self, account=None, **kw):
+        """SDK surface: the capture refreshes the account view first."""
+        if account is None:
+            raise TypeError("account is required")
+        return {"status": "OK"}
+
     def list_positions(self, account): self.calls.append("positions"); return []
     def list_trades(self): self.calls.append("trades"); return []
     def margin(self, account): self.calls.append("margin"); return SimpleNamespace(available_margin=1, equity_amount=2, risk_indicator=3)

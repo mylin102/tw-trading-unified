@@ -161,6 +161,13 @@ def test_safe_positions_preserves_direction_and_avg_cost():
             self.pnl = pnl
 
     class _Api:
+
+        def update_status(self, account=None, **kw):
+            """SDK surface: the capture refreshes the account view first."""
+            if account is None:
+                raise TypeError("account is required")
+            return {"status": "OK"}
+
         def list_positions(self, account):
             return [_Pos("TMFH6", 1, 46077.0, "Sell", 1850.0),
                     _Pos("TMFI6", 1, 45231.0, "Buy", -1740.0)]
@@ -302,6 +309,7 @@ def test_post_startup_canonical_reconciles_current_session_live_upl(
     class _Api:
         futopt_account = _Acct()
         stock_account = None
+
 
         def list_positions(self, acct):
             return [_SnapPos("TMFH6", 1, 46077.0, "Sell", 1850.0),
@@ -614,6 +622,7 @@ def test_safe_positions_emits_canonical_direction():
             self.pnl = pnl
 
     class _Api:
+
         def list_positions(self, account):
             return [_Pos("TMFH6", 1, 46077.0, _CEnumAction("Sell"), 1850.0),
                     _Pos("TMFI6", 1, 45231.0,
@@ -640,6 +649,7 @@ def test_dashboard_authorization_generation_uses_canonical_direction():
             self.pnl = pnl
 
     class _Api:
+
         def list_positions(self, account):
             return [_Pos("TMFH6", 1, 46077.0, _CEnumAction("Sell"), 1850.0),
                     _Pos("TMFI6", 1, 45231.0,

@@ -138,6 +138,13 @@ class _FakeApi:
             return list(self._list_accounts_accounts)
         return [self.futopt_account]
 
+
+    def update_status(self, account=None, **kw):
+        """SDK surface: the capture refreshes the account view first."""
+        if account is None:
+            raise TypeError("account is required")
+        return {"status": "OK"}
+
     def list_positions(self, account):
         self.calls.append("list_positions")
         return [] if self._flat else [_Position("TMFH6", 1)]

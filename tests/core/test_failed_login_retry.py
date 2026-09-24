@@ -58,6 +58,13 @@ def test_post_start_login_smoke_reaches_readiness_after_authentication(monkeypat
             self.authenticated = True
             return True
 
+
+        def update_status(self, account=None, **kw):
+            """SDK surface: the capture refreshes the account view first."""
+            if account is None:
+                raise TypeError("account is required")
+            return {"status": "OK"}
+
         def list_positions(self, *, account):
             self.position_queries += 1
             assert account == "paper-account"
@@ -110,6 +117,7 @@ def test_post_start_login_smoke_rejects_readiness_failure(monkeypatch):
 
     class Api:
         futopt_account = "paper-account"
+
 
         def list_positions(self, *, account):
             raise RuntimeError("SessionNotEstablished")

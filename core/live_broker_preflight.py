@@ -214,6 +214,9 @@ def _update_status(api: Any, account: Any) -> Any:
     try:
         return api.update_status(account=account)
     except TypeError:
+        # the installed SDK exposes `account` as POSITIONAL-ONLY
+        # (update_status(self, /, account=None, ...)) and returns None on
+        # success — a None return is NOT a failure.
         return api.update_status(account)
 
 
@@ -386,9 +389,13 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     # evidence needed to distinguish an account mapping issue from login loss.
     # The account status MUST be refreshed first: a fresh session's view is
     # empty until then, and an empty read is not evidence of a flat account.
-    _status = query("UPDATE_STATUS", lambda: _update_status(api, account), None)
-    if _status is None:
-        query_failures.append("ACCOUNT_STATUS_UNAVAILABLE")
+    try:
+        _update_status(api, account)
+    except Exception as _exc:
+        # Fail closed: without a refreshed account view the position list is
+        # not evidence (an empty read must never be recorded as a flat account).
+        query_failures.append(
+            f"ACCOUNT_STATUS_UNAVAILABLE: {type(_exc).__name__}: {_exc}")
     positions = query("POSITIONS", lambda: _safe_positions(api, account), None)
     open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), None)
     if positions is None:

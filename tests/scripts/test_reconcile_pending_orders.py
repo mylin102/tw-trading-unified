@@ -224,6 +224,13 @@ def test_broker_probe_queries_fail_closed_on_exception():
         def list_trades(self):
             raise RuntimeError("query failed")
 
+
+        def update_status(self, account=None, **kw):
+            """SDK surface: the capture refreshes the account view first."""
+            if account is None:
+                raise TypeError("account is required")
+            return {"status": "OK"}
+
         def list_positions(self, **kwargs):
             raise RuntimeError("query failed")
 

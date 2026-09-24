@@ -47,6 +47,13 @@ def _make_api(positions, trades):
     class _Api:
         futopt_account = object()
 
+
+        def update_status(self, account=None, **kw):
+            """SDK surface: the capture refreshes the account view first."""
+            if account is None:
+                raise TypeError("account is required")
+            return {"status": "OK"}
+
         def list_positions(self, acct=None):
             calls.append("list_positions")
             return positions
@@ -103,6 +110,7 @@ def test_pre_submit_proof_query_failure_blocks(monkeypatch):
 
     class _FailingApi:
         futopt_account = object()
+
 
         def list_positions(self, acct=None):
             raise RuntimeError("broker session down")

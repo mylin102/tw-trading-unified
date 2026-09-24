@@ -21,6 +21,13 @@ class _KeywordOnlyApi:
     def stock_account(self):
         return None
 
+
+    def update_status(self, account=None, **kw):
+        """SDK surface: the capture refreshes the account view first."""
+        if account is None:
+            raise TypeError("account is required")
+        return {"status": "OK"}
+
     def list_positions(self, *, account):
         return [SimpleNamespace(code="TMFI6", direction="Sell", quantity=1,
                                 price=46016.0, pnl=760.0)]
