@@ -4281,35 +4281,81 @@ def _mts_direction_label(state: dict) -> str:
     return "?"
 
 
-def _build_live_broker_mts_state(positions: list, canonical: dict,
-                                 params: dict | None = None) -> dict | None:
-    """Build broker-authoritative MTS state, including a remaining leg."""
-    params = params if isinstance(params, dict) else {}
+# TAIFEX month codes are A=Jan ... L=Dec, and the contract pair ROLLS every
+# month, so near/far must be derived from the broker snapshot itself: a
+# hardcoded literal pair silently renders a real position as FLAT once the
+# pair rolls (2026-09-24: the broker held TMFJ6/TMFK6 while the literal
+# {"TMFH6", "TMFI6"} matched nothing -> _broker_snapshot_flat -> FLAT panel).
+_TAIFEX_MONTH_CODES = "ABCDEFGHIJKL"
+# sort key for a leg whose contract code does not parse: kept visible (never
+# silently dropped) but ordered after every parseable month.
+_UNPARSED_CONTRACT_KEY = (9999, 99)
+
+
+def _contract_sort_key(code) -> tuple:
+    """Sort key (year, month) for a TAIFEX contract code; () if unparseable."""
+    _match = re.search(r"([A-La-l])(\d{1,2})$", str(code or ""))
+    if not _match:
+        return ()
+    _month = _TAIFEX_MONTH_CODES.index(_match.group(1).upper()) + 1
+    _year = int(_match.group(2))
+    return (2000 + _year if _year < 100 else _year, _month)
+
+
+def _ordered_futures_legs(positions: list) -> list:
+    """Broker futures rows with open quantity, ordered near month -> far month."""
     rows = [p for p in (positions or [])
             if isinstance(p, dict)
             and p.get("account") == "futures"
-            and p.get("code") in {"TMFH6", "TMFI6"}
             and int(p.get("quantity", 0) or 0) > 0]
-    by_code = {p.get("code"): p for p in rows}
-    if len(by_code) not in (1, 2):
+    return sorted(rows,
+                  key=lambda p: _contract_sort_key(p.get("code"))
+                  or _UNPARSED_CONTRACT_KEY)
+
+
+def _build_live_broker_mts_state(positions: list, canonical: dict,
+                                 params: dict | None = None,
+                                 pair_codes: list | None = None) -> dict | None:
+    """Build broker-authoritative MTS state, including a remaining leg.
+
+    ``pair_codes`` (optional) is the reconciled spread's contract pair, and is
+    needed only by the single-leg branch: with one leg left, the snapshot alone
+    cannot say whether the remaining month is the near or the far leg, so the
+    released leg is decided by that pair and is never fabricated from a stale
+    literal.
+    """
+    params = params if isinstance(params, dict) else {}
+    rows = _ordered_futures_legs(positions)
+    if len(rows) not in (1, 2):
         return None
 
-    def _field(code, name, missing=None):
-        row = by_code.get(code)
-        return row.get(name, missing) if row else missing
+    _released = None
+    _near = rows[0]
+    _far = rows[1] if len(rows) == 2 else {}
+    if len(rows) == 1:
+        _remaining = str(_near.get("code") or "")
+        _pair = sorted({str(_code) for _code in (pair_codes or []) if _code}
+                       | {_remaining}, key=_contract_sort_key)
+        if len(_pair) == 2:
+            _released = "far" if _remaining == _pair[0] else "near"
+        if _released == "near":
+            _near, _far = {}, _near      # the remaining month is the far leg
+
+    def _field(row, name, missing=None):
+        return row.get(name, missing)
 
     state = {
         "has_position": True,
-        "near_entry": _field("TMFH6", "avg_cost", 0.0),
-        "far_entry": _field("TMFI6", "avg_cost", 0.0),
-        "near_upl": _field("TMFH6", "pnl"),
-        "far_upl": _field("TMFI6", "pnl"),
-        "near_side": _field("TMFH6", "direction"),
-        "far_side": _field("TMFI6", "direction"),
-        "action": f'{_field("TMFH6", "direction", "?")} / '
-                   f'{_field("TMFI6", "direction", "?")}',
-        "release_state": "BOTH_HELD" if len(by_code) == 2 else "SINGLE_LEG",
-        "position_phase": "SPREAD" if len(by_code) == 2 else "SINGLE_LEG",
+        "near_entry": _field(_near, "avg_cost", 0.0),
+        "far_entry": _field(_far, "avg_cost", 0.0),
+        "near_upl": _field(_near, "pnl"),
+        "far_upl": _field(_far, "pnl"),
+        "near_side": _field(_near, "direction"),
+        "far_side": _field(_far, "direction"),
+        "action": f'{_field(_near, "direction", "?")} / '
+                   f'{_field(_far, "direction", "?")}',
+        "release_state": "BOTH_HELD" if len(rows) == 2 else "SINGLE_LEG",
+        "position_phase": "SPREAD" if len(rows) == 2 else "SINGLE_LEG",
         "trade_id": "broker-reconciled-" +
                     str(canonical.get("canonical_input_hash", ""))[:16],
         "reason": "broker_snapshot",
@@ -4320,15 +4366,11 @@ def _build_live_broker_mts_state(positions: list, canonical: dict,
         "atr": params.get("atr_current") or params.get("atr") or
                _latest_live_atr(),
     }
-    if len(by_code) == 1:
-        remaining = next(iter(by_code))
-        state["released_leg"] = "near" if remaining == "TMFI6" else "far"
-        state["near_status"] = "OPEN" if remaining == "TMFH6" else "RELEASED"
-        state["far_status"] = "OPEN" if remaining == "TMFI6" else "RELEASED"
+    if len(rows) == 1:
+        state["released_leg"] = _released
+        state["near_status"] = "RELEASED" if _released == "near" else "OPEN"
+        state["far_status"] = "RELEASED" if _released == "far" else "OPEN"
     return state
-
-
-
 
 
 def _pending_live_mts_exit_orders(canonical: dict) -> list[dict]:
@@ -4343,7 +4385,8 @@ def _pending_live_mts_exit_orders(canonical: dict) -> list[dict]:
     rows = []
     seen = set()
     for order in canonical.get("open_orders") or []:
-        if not isinstance(order, dict) or order.get("code") not in {"TMFH6", "TMFI6"}:
+        if not isinstance(order, dict) or not str(order.get("code") or "") \
+                .startswith(str(_TICKER or "TMF")):
             continue
         status = order.get("status")
         if isinstance(status, dict):
@@ -5502,13 +5545,18 @@ elif _selected_product == "TMF":
                                  / "broker_snapshot_canonical.json").read_text())
             _broker_open_orders = _pending_live_mts_exit_orders(_canon)
             _fut = [p for p in (_canon.get("positions") or [])
-                    if p.get("account") == "futures" and p.get("code") in {"TMFH6", "TMFI6"}
+                    if p.get("account") == "futures"
+                    and str(p.get("code") or "").startswith(str(_TICKER or "TMF"))
                     and int(p.get("quantity", 0) or 0) > 0]
             if _live_canonical_position_allowed(_ctx_live, _canon):
                 _live_mts_params = (futures_cfg.get("mts", {}).get("params", {})
                                     if isinstance(futures_cfg, dict) else {})
                 _broker_mts_state = _build_live_broker_mts_state(
-                    _fut, _canon, _live_mts_params)
+                    _fut, _canon, _live_mts_params,
+                    [leg.get("code") for leg in
+                     ((_ctx_live.get("canonical_holding") or {})
+                      .get("canonical_legs") or [])
+                     if isinstance(leg, dict)])
                 if _broker_mts_state is None and not _canon.get("open_orders"):
                     # A current, successful broker snapshot with no complete
                     # spread is authoritative FLAT/partial evidence.  Do
@@ -5711,8 +5759,12 @@ elif _selected_product == "TMF":
                 except Exception:
                     _live_upl = None
                 if _live_upl is not None:
-                    _nr = _live_upl["legs"]["TMFH6"]["pnl"]
-                    _fr = _live_upl["legs"]["TMFI6"]["pnl"]
+                    _upl_legs = _live_upl.get("legs") or {}
+                    _upl_codes = sorted(_upl_legs, key=_contract_sort_key)
+                    _nr = ((_upl_legs.get(_upl_codes[0]) or {}).get("pnl")
+                           if _upl_codes else None)
+                    _fr = ((_upl_legs.get(_upl_codes[1]) or {}).get("pnl")
+                           if len(_upl_codes) > 1 else None)
                 elif isinstance(_broker_mts_state, dict) and _broker_mts_state.get("has_position"):
                     _nr = _broker_mts_state.get("near_upl")
                     _fr = _broker_mts_state.get("far_upl")
@@ -6864,7 +6916,7 @@ elif _selected_product == "MXF":
     st.subheader("📊 微台 (TMF) 與 小台 (MXF) 即時數據對照 (Real-time Cross-Product Audit)")
     
     comp_data = [
-        {"商品名稱": "微台 (TMF)", "契約標的": "TMFH6 (近月) / TMFI6 (遠月)", "最小跳動": "1 點 = 10 TWD", "監控角色": "🎯 MTS 主力執行對沖", "連線狀態": "🟢 LIVE ACTIVE"},
+        {"商品名稱": "微台 (TMF)", "契約標的": "TMF 近月／遠月 (依券商持倉)", "最小跳動": "1 點 = 10 TWD", "監控角色": "🎯 MTS 主力執行對沖", "連線狀態": "🟢 LIVE ACTIVE"},
         {"商品名稱": "小台 (MXF / MTX)", "契約標的": f"{mxf_data.get('near_code', 'MXFH6')} (近月) / {mxf_data.get('far_code', 'MXFI6')} (遠月)", "最小跳動": "1 點 = 50 TWD", "監控角色": "📡 被動行情與備援比對", "連線狀態": "🟢 PASSIVE SYNC"},
     ]
     st.table(pd.DataFrame(comp_data))

@@ -256,7 +256,9 @@ def _read_live_session_upl(rt: dict) -> dict | None:
         if _age > 60:
             return None
         _legs = _d.get("legs") or {}
-        if not {"TMFH6", "TMFI6"}.issubset(_legs.keys()):
+        # any rolled contract pair (not a literal month pair); 2 legs means
+        # the spread is complete -- 2026-09-24 TMFJ6/TMFK6 was rejected here
+        if len(_legs) != 2:
             return None
         for _leg in _legs.values():
             _pnl = _leg.get("pnl")
@@ -309,7 +311,9 @@ def _broker_canonical_complete(canon: dict, rt: dict) -> bool:
         _legs = {p.get("code"): p for p in (canon.get("positions") or [])
                  if p.get("account") == "futures"
                  and str(p.get("code") or "").startswith("TMF")}
-        if not {"TMFH6", "TMFI6"}.issubset(_legs.keys()):
+        # any rolled contract pair (not a literal month pair); 2 legs means
+        # the spread is complete -- 2026-09-24 TMFJ6/TMFK6 was rejected here
+        if len(_legs) != 2:
             return False
         for _leg in _legs.values():
             if not (_leg.get("direction")
