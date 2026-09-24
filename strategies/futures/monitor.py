@@ -10822,9 +10822,13 @@ class FuturesMonitor:
                 strategy._entry_time_monotonic = 0.0
                 strategy._entry_guard_start_ms = 0.0
                 strategy._entry_ts_ms = 0.0
+            # The masked cause is part of the evidence: without it a live
+            # rejection rate is unexplainable (2026-09-24: 1,154 rejections,
+            # cause invisible).
             self._append_mts_event(
                 "ORDER_REJECTED_LOCAL", trade_id=trade_id,
-                strategy="MTS_ENTRY", reason="COMBO_LIFECYCLE_CREATE_FAILED")
+                strategy="MTS_ENTRY", reason="COMBO_LIFECYCLE_CREATE_FAILED",
+                error_type=type(exc).__name__, error=str(exc))
             return
 
         self._pending_lifecycle_orders[_order.order_id] = {
