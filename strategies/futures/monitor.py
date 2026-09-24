@@ -13141,6 +13141,20 @@ class FuturesMonitor:
                 break
         return _result
 
+    @staticmethod
+    def _broker_truth_is_flat(auth) -> bool:
+        """True only when the live broker authority PROVED the account flat.
+
+        Erasing a local position is a destructive act: a local fills ledger may
+        be incomplete (2026-09-24: a real spread fill was rejected downstream,
+        the ledger read "closed", and the position was reset to FLAT while the
+        broker still held TMFJ6/TMFK6).  Any non-FLAT or unknown authority is
+        NOT proof of flatness, so the local position must be kept.
+        """
+        _status = getattr(auth, "status", None)
+        _value = getattr(_status, "value", _status)
+        return str(_value or "").upper() == "FLAT"
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
@@ -13296,8 +13310,9 @@ class FuturesMonitor:
                         f"[bold red]🚨 [MTS_SPLIT_BRAIN] Fills recovery failed — "
                         f"emergency flatten still available[/bold red]"
                     )
-        elif _state_has_pos and not _fills_open \
-                and not _exit_only_authority_active:
+        elif (_state_has_pos and not _fills_open
+                and not _exit_only_authority_active
+                and self._broker_truth_is_flat(_early_broker_auth)):
             console.print(
                 f"[bold yellow]⚠️ [MTS_SPLIT_BRAIN] State says POSITION but fills says closed. "
                 f"Resetting to FLAT.[/bold yellow]"
