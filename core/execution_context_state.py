@@ -39,6 +39,12 @@ SCHEMA_KEYS = (
     "canonical_holding",
 )
 
+# Fields that record BROKER TRUTH rather than process state.  They are written
+# by an operator act (scripts/deployment/record_reconciled_holding.py) and are
+# read by the deployment gates to accept a non-flat account; a ctx writer that
+# does not mention them must not erase them.
+DURABLE_EVIDENCE_KEYS = ("canonical_holding", "exit_only_capability")
+
 # field -> (type, required)
 _TYPE_RULES = {
     "requested_mode": (str, True),
@@ -173,19 +179,21 @@ def persist_execution_context(ctx_dict: dict, *, runtime_dir: str | None = None,
     """
     path = _path(runtime_dir)
     payload = dict(ctx_dict)
+    try:
+        with open(path, encoding="utf-8") as _f:
+            _prev = json.load(_f)
+        if not isinstance(_prev, dict):
+            _prev = {}
+    except (OSError, ValueError):
+        _prev = {}
     prev_revision = payload.get("revision")
     if not (isinstance(prev_revision, int)
             and not isinstance(prev_revision, bool)):
         # derive from the file's last committed revision (single-writer
         # canonical file); missing/unreadable -> fresh revision 1
-        try:
-            with open(path, encoding="utf-8") as _f:
-                _old = json.load(_f)
-            _old_rev = _old.get("revision") if isinstance(_old, dict) else None
-            if isinstance(_old_rev, int) and not isinstance(_old_rev, bool):
-                prev_revision = _old_rev
-        except (OSError, ValueError):
-            prev_revision = None
+        _old_rev = _prev.get("revision")
+        prev_revision = (_old_rev if isinstance(_old_rev, int)
+                         and not isinstance(_old_rev, bool) else None)
     payload["revision"] = (
         int(prev_revision) + 1
         if isinstance(prev_revision, int) and not isinstance(prev_revision, bool)
@@ -196,6 +204,13 @@ def persist_execution_context(ctx_dict: dict, *, runtime_dir: str | None = None,
     for key in SCHEMA_KEYS:
         if key not in payload:
             payload[key] = None
+    # Broker-truth evidence is durable: a writer that does not mention it must
+    # not erase it (2026-09-24: the app's own publish nulled canonical_holding,
+    # so the startup gate refused GUARD_POSITION_NOT_FLAT on a broker position
+    # that had been recorded minutes earlier).
+    for key in DURABLE_EVIDENCE_KEYS:
+        if payload.get(key) is None and isinstance(_prev.get(key), dict):
+            payload[key] = _prev[key]
     errs = _validate(payload)
     if errs:
         raise ValueError("; ".join(errs))
