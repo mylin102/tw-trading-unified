@@ -78,7 +78,7 @@ def test_canonical_artifact_captured_at_epoch_ms_int():
 
 def test_canonical_input_hash_content_addressed():
     """The hash is deterministic, change-sensitive and exactly the
-    sha256 of the sorted JSON of the five canonical inputs."""
+    sha256 of the sorted JSON of the persisted artifact."""
     from core.live_broker_preflight import derive_canonical_gate_artifact
 
     r1 = _response()
@@ -87,15 +87,13 @@ def test_canonical_input_hash_content_addressed():
     assert art1["canonical_input_hash"] == art2["canonical_input_hash"]
 
     _snap = r1["snapshot"]
-    _cap_ms = art1["captured_at"]
-    _expected = hashlib.sha256(json.dumps({
-        "account_identity_hash": _snap["account_id_hash"],
-        "positions": _snap["positions"],
-        "open_orders": _snap["open_orders"],
-        "available_margin": _snap["margin"]["available_margin"],
-        "captured_at": _cap_ms,
-    }, sort_keys=True, ensure_ascii=False, default=str).encode(
-        "utf-8")).hexdigest()
+    # UPDATED 2026-09-25: the digest covers the WHOLE persisted artifact (minus
+    # the digest itself).  record_reconciled_holding re-hashes the file it is
+    # given, so a digest over a smaller payload made a real holding
+    # un-adoptable (CANONICAL_HASH_MISMATCH).
+    _expected = hashlib.sha256(json.dumps(
+        dict(art1, canonical_input_hash=None), sort_keys=True,
+        ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
     assert art1["canonical_input_hash"] == _expected
 
     # a changed position changes the digest (content-addressed)

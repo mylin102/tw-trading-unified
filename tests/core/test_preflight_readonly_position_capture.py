@@ -1,3 +1,4 @@
+import pathlib
 """RED/GREEN: the read-only preflight must observe a REAL broker position.
 
 Live 2026-09-24 23:52: the deployment evidence capture (core.live_broker_preflight
@@ -174,3 +175,37 @@ def test_empty_capture_after_a_real_holding_is_flagged(preflight_env):
     art = json.loads((d / "broker_snapshot_canonical.json").read_text())
     assert art["source"] == "unavailable"
     assert art["positions"] is None
+
+
+def test_the_recorder_adopts_the_capture(preflight_env):
+    """End-to-end: record_reconciled_holding.validate() is the consumer that
+    writes ctx.canonical_holding; it must accept our artifact unchanged."""
+    import importlib.util
+    import sys
+    spec = importlib.util.spec_from_file_location(
+        "record_reconciled_holding",
+        pathlib.Path("scripts/deployment/record_reconciled_holding.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["record_reconciled_holding"] = mod
+    spec.loader.exec_module(mod)
+
+    lbp.run_once(lambda: _FakeApi(), request_id="TEST-ADOPT", product="TMF")
+    art = preflight_env / "exports/trades/live/diagnostics/broker_snapshot_canonical.json"
+    holding, refusal = mod.validate(art, {"requested_mode": "live"})
+
+    assert refusal == "", refusal
+    assert [(l["code"], l["side"], l["qty"], l["avg_cost"]) for l in holding["canonical_legs"]] == [
+        ("TMFJ6", "SHORT", 1, 48176.0), ("TMFK6", "LONG", 1, 48320.0)]
+
+
+def test_the_artifact_digest_covers_every_persisted_key(preflight_env):
+    import hashlib
+    import json
+    lbp.run_once(lambda: _FakeApi(), request_id="TEST-DIGEST", product="TMF")
+    art = json.loads((preflight_env / "exports/trades/live/diagnostics"
+                      / "broker_snapshot_canonical.json").read_text())
+    assert {"session_id", "session_scope", "fetch_status"} <= set(art)
+    expected = hashlib.sha256(json.dumps(
+        dict(art, canonical_input_hash=None), sort_keys=True,
+        ensure_ascii=False, default=str).encode()).hexdigest()
+    assert art["canonical_input_hash"] == expected

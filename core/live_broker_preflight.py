@@ -529,10 +529,7 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
         "captured_at": _cap_ms,
     }
     _capture_ok = {"capture": "OK"}
-    _canonical_input_hash = hashlib.sha256(
-        json.dumps(_canonical_input, sort_keys=True, ensure_ascii=False,
-                   default=str).encode("utf-8")).hexdigest()
-    return {
+    artifact = {
         "source": "live_broker",
         "mode": "live",
         "positions": _positions,
@@ -541,11 +538,19 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
         "scope": "futopt",
         "captured_at": _cap_ms,
         "available_margin": _margin,
-        "canonical_input_hash": _canonical_input_hash,
         "session_id": str(response.get("request_id") or ""),
         "session_scope": "read_only_capture",
         "fetch_status": _capture_ok,
     }
+    # The content address must cover every key that is persisted, because the
+    # consumer that adopts a held position (record_reconciled_holding) re-hashes
+    # the whole file: a digest over an earlier, smaller payload can never match
+    # (session_id/session_scope/fetch_status were outside it), so a live capture
+    # was structurally un-adoptable.
+    artifact["canonical_input_hash"] = hashlib.sha256(
+        json.dumps(dict(artifact, canonical_input_hash=None), sort_keys=True,
+                   ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+    return artifact
 
 
 def run_once(api_factory: Any, *, request_id: str | None = None, product: str = "TMF") -> dict[str, Any]:
