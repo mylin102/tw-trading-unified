@@ -114,21 +114,24 @@ def test_incident_gate_reconstruct_not_reset():
     auth = MtsAuthorityState(MtsAuthority.OPEN, trade_id="mts-auto-091403-145",
                              near_qty=-1, far_qty=1, near_side="SHORT", far_side="LONG")
     action = gate_decision_pre_signal(auth, state_has_pos=False,
-                                      strat_has_pos=True, strat_trade_id="mts-auto-091403-145")
+                                      strat_has_pos=True, strat_trade_id="mts-auto-091403-145",
+                                      broker_flat_proven=True)
     assert action == MtsGateAction.RECONSTRUCT
 
 
 def test_true_divergence_resets():
     auth = MtsAuthorityState(MtsAuthority.FLAT)
     action = gate_decision_pre_signal(auth, state_has_pos=False,
-                                      strat_has_pos=True, strat_trade_id="t-x")
+                                      strat_has_pos=True, strat_trade_id="t-x",
+                                      broker_flat_proven=True)
     assert action == MtsGateAction.RESET_STRATEGY
 
 
 def test_ledger_unreadable_never_resets():
     auth = MtsAuthorityState(MtsAuthority.UNKNOWN)
     action = gate_decision_pre_signal(auth, state_has_pos=False,
-                                      strat_has_pos=True, strat_trade_id="t-x")
+                                      strat_has_pos=True, strat_trade_id="t-x",
+                                      broker_flat_proven=True)
     assert action == MtsGateAction.PASS, "UNKNOWN must never reset"
 
 
@@ -136,7 +139,8 @@ def test_strategy_lost_position_reconstructs():
     auth = MtsAuthorityState(MtsAuthority.OPEN, trade_id="t-live",
                              near_qty=-1, far_qty=1, near_side="SHORT", far_side="LONG")
     action = gate_decision_pre_signal(auth, state_has_pos=False,
-                                      strat_has_pos=False, strat_trade_id=None)
+                                      strat_has_pos=False, strat_trade_id=None,
+                                      broker_flat_proven=True)
     assert action == MtsGateAction.RECONSTRUCT
 
 
@@ -144,7 +148,8 @@ def test_stale_strategy_trade_reconstructs():
     auth = MtsAuthorityState(MtsAuthority.OPEN, trade_id="t-new",
                              near_qty=-1, far_qty=1, near_side="SHORT", far_side="LONG")
     action = gate_decision_pre_signal(auth, state_has_pos=True,
-                                      strat_has_pos=True, strat_trade_id="t-old")
+                                      strat_has_pos=True, strat_trade_id="t-old",
+                                      broker_flat_proven=True)
     assert action == MtsGateAction.RECONSTRUCT
 
 

@@ -13809,7 +13809,20 @@ class FuturesMonitor:
         _bar_dict["_mts_authority_status"] = str(getattr(_gate_auth, "status", "UNKNOWN"))
         _pre_action = gate_decision_pre_signal(
             _gate_auth, _gate_state_has_pos, _strat_has_pos, _strat_tid,
+            broker_flat_proven=self._broker_truth_is_flat(_broker_auth),
         )
+        if (_pre_action == MtsGateAction.PASS and _strat_has_pos
+                and getattr(_gate_auth, "status", None) is MtsAuthority.FLAT
+                and not self._broker_truth_is_flat(_broker_auth)
+                and time.monotonic() - getattr(
+                    self, "_position_authority_withheld_ts", 0.0) > 30.0):
+            # Ledger says FLAT while the broker does not prove flat: the local
+            # position is KEPT (2026-09-24 22:54 erasure).  Rate-limited trail.
+            self._position_authority_withheld_ts = time.monotonic()
+            console.print(
+                "[yellow][POSITION_AUTHORITY] ledger FLAT but broker flat not "
+                "proven — keeping local position (no reset)[/yellow]"
+            )
         if _pre_action == MtsGateAction.RESET_STRATEGY:
             console.print(
                 f"[bold yellow]⚠️ [POSITION_AUTHORITY] Ledger FLAT + memory open "

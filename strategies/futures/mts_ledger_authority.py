@@ -165,10 +165,23 @@ def gate_decision_pre_signal(
     state_has_pos: bool,
     strat_has_pos: bool,
     strat_trade_id: Optional[str],
+    *,
+    broker_flat_proven: Optional[bool],
 ) -> MtsGateAction:
-    """Pre-signal gate: reset / reconstruct / pass before on_bar runs."""
+    """Pre-signal gate: reset / reconstruct / pass before on_bar runs.
+
+    ``broker_flat_proven`` is the live broker authority's flat proof and is a
+    REQUIRED keyword argument: a ledger-derived FLAT is LOCAL evidence only and
+    can be incomplete (2026-09-24: a real negative-priced spread fill was
+    dropped, the ledger read closed, and the local position was erased at 22:54
+    while the broker still held both legs).  Erasing a local position therefore
+    requires a broker flat proof; False/None (broker holds, or the query is
+    unavailable) withholds the reset - an unavailable query is not flat.
+    """
     if strat_has_pos:
         if auth.status == MtsAuthority.FLAT:
+            if not broker_flat_proven:
+                return MtsGateAction.PASS      # local flat alone is not proof
             return MtsGateAction.RESET_STRATEGY   # true divergence
         if auth.status in (MtsAuthority.OPEN, MtsAuthority.SINGLE_LEG):
             if auth.trade_id == strat_trade_id and state_has_pos:

@@ -117,6 +117,7 @@ def test_abandoned_authority_is_flat_before_pre_signal_gate(monkeypatch):
     assert filtered.trade_id == TRADE_ID
     assert gate_decision_pre_signal(
         filtered, state_has_pos=False, strat_has_pos=False, strat_trade_id=None,
+        broker_flat_proven=True,
     ) is MtsGateAction.PASS
 
 
@@ -130,4 +131,5 @@ def test_non_abandoned_authority_still_reconstructs():
     assert gate_decision_pre_signal(
         filtered, state_has_pos=False, strat_has_pos=False,
         strat_trade_id=None,
+        broker_flat_proven=True,
     ) is MtsGateAction.RECONSTRUCT
