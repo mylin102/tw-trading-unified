@@ -202,6 +202,21 @@ def _canonical_direction(raw: Any) -> str | None:
     return None
 
 
+def _update_status(api: Any, account: Any) -> Any:
+    """Refresh the broker's account/position view before reading it.
+
+    A freshly logged-in session exposes an EMPTY position/order view until the
+    broker is asked for the account status; reading before this returned [] for
+    a real two-leg spread (2026-09-24 23:52) and the capture recorded that
+    empty read as a live_broker success.  Keyword-first to match the documented
+    Shioaji call convention, with the positional fallback other adapters use.
+    """
+    try:
+        return api.update_status(account=account)
+    except TypeError:
+        return api.update_status(account)
+
+
 def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
     """Preserve broker position identity: code / qty / direction
     (canonical buy/sell) / avg_cost (Shioaji's Position.price is the
@@ -228,7 +243,12 @@ def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
                         source="core.live_broker_preflight._safe_positions")
     return [
         {
+            # `account`/`quantity` are the deployment gate's canonical row shape;
+            # `qty` is the recorder's.  Emitting both keeps one artifact usable
+            # by every consumer instead of each one re-deriving identity.
+            "account": "futures",
             "code": getattr(p, "code", None),
+            "quantity": getattr(p, "quantity", None),
             "qty": getattr(p, "quantity", None),
             "direction": _canonical_direction(
                 getattr(p, "direction", None)),
@@ -364,6 +384,11 @@ def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any
     # Keep successfully completed evidence when one broker endpoint is down.
     # A failed check remains a failed preflight; it must not erase the useful
     # evidence needed to distinguish an account mapping issue from login loss.
+    # The account status MUST be refreshed first: a fresh session's view is
+    # empty until then, and an empty read is not evidence of a flat account.
+    _status = query("UPDATE_STATUS", lambda: _update_status(api, account), None)
+    if _status is None:
+        query_failures.append("ACCOUNT_STATUS_UNAVAILABLE")
     positions = query("POSITIONS", lambda: _safe_positions(api, account), None)
     open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), None)
     if positions is None:
@@ -478,6 +503,7 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
             "source": "unavailable",
             "mode": "unavailable",
             "capture_error": True,
+            "fetch_status": {"capture": "FAIL", "reasons": [_reason]},
             "error": _reason,
             "positions": None,
             "open_orders": None,
@@ -495,6 +521,7 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
         "available_margin": _margin,
         "captured_at": _cap_ms,
     }
+    _capture_ok = {"capture": "OK"}
     _canonical_input_hash = hashlib.sha256(
         json.dumps(_canonical_input, sort_keys=True, ensure_ascii=False,
                    default=str).encode("utf-8")).hexdigest()
@@ -510,6 +537,7 @@ def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
         "canonical_input_hash": _canonical_input_hash,
         "session_id": str(response.get("request_id") or ""),
         "session_scope": "read_only_capture",
+        "fetch_status": _capture_ok,
     }
 
 
@@ -556,7 +584,11 @@ def run_once(api_factory: Any, *, request_id: str | None = None, product: str = 
                         and _prior_path.exists()):
                     _prior = json.loads(_prior_path.read_text(encoding="utf-8"))
                     _same_scope = (
-                        _prior.get("scope") == "futopt"
+                        # `scope` is optional: the RUNNING app's canonical
+                        # artifact carries the account hash but no scope, and
+                        # requiring it let the first false-flat overwrite real
+                        # evidence (2026-09-24 23:52).
+                        _prior.get("scope", "futopt") == "futopt"
                         and bool(_prior.get("account_identity_hash"))
                         and _prior.get("account_identity_hash")
                         == snapshot.get("account_id_hash")
