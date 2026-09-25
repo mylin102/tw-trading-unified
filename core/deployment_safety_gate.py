@@ -376,8 +376,15 @@ def guard_flat_no_pending(position_state_path: str,
     _positions = _relevant(positions, "positions")
     _open_orders = _relevant(open_orders, "open_orders")
 
+    # The MTS scope is the FUTURES rows (see the account-scope note above).
+    # Passing the unfiltered list made the reconciled-spread path unreachable
+    # for any account that also holds stock: is_reconciled_mts_position()
+    # requires len(positions) in (1, 2), so the app's own post-startup gate
+    # quarantined a real TMFJ6/TMFK6 spread on every boot (2026-09-25 01:42)
+    # while the deploy gate -- whose read-only capture has futures rows only --
+    # passed.  Stock rows stay in the evidence, they just never decide MTS.
     if is_reconciled_mts_position(
-            positions if isinstance(positions, list) else _positions,
+            _positions if isinstance(positions, list) else positions,
             _open_orders, ctx_data, allow_existing_mts_position,
             reject_stale_two_leg=reject_stale_two_leg):
         return _pass("flat_snapshot", "existing MTS position broker-reconciled")
