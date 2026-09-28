@@ -2251,7 +2251,7 @@ class FuturesMonitor:
                 return
 
             # Determine today's trading day and code
-            trading_day = get_trading_day_str(datetime.now())
+            trading_day = get_session_date_str(datetime.now())
             code = getattr(self.contract, "code", self.ticker) if self.contract else self.ticker
 
             from squeeze_futures.data.tick_writer import read_raw_ticks
@@ -12179,7 +12179,7 @@ class FuturesMonitor:
         """[GSD Data Safety] Save raw shioaji kbars response to CSV."""
         try:
             if self._kbar_writer is None:
-                trading_day = get_trading_day_str(datetime.now())
+                trading_day = get_session_date_str(datetime.now())
                 code = getattr(self.contract, "code", self.ticker)
                 self._kbar_writer = RawKbarWriter(code, trading_day)
 

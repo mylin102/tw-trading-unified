@@ -141,18 +141,3 @@ def read_raw_ticks(contract_code: str, trading_day: str) -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
-
-
-# ── Helper to determine the trading day string ──
-
-def get_trading_day_str(now: Optional[datetime] = None) -> str:
-    """Return YYYYMMDD trading-day string.
-    Taiwan futures trading day rolls at 05:00 local time.
-    """
-    if now is None:
-        now = datetime.now()
-    # If before 5 AM, it's still yesterday's trading day
-    if now.hour < 5:
-        from datetime import timedelta
-        return (now - timedelta(days=1)).strftime("%Y%m%d")
-    return now.strftime("%Y%m%d")
