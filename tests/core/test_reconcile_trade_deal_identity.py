@@ -72,15 +72,30 @@ def test_broker_trade_without_deal_identity_lands_the_fill():
     assert result["reconciled"][0]["fills_added"] == 1
 
 
-def test_broker_trade_without_deal_identity_is_idempotent():
-    """Replaying the same broker row must not double-book the fill."""
+def test_broker_trade_without_deal_identity_is_deduped_while_still_active():
+    """The same broker deal replayed while the order is still ACTIVE must be
+    booked exactly once: the synthesized identity (not the order lifecycle) is
+    what makes it idempotent.
+
+    Quantity 2 with a 1-lot deal keeps the order out of `completed`, so the
+    replay really re-enters the deal loop instead of being filtered out by
+    order resolution.
+    """
     manager = OrderManager(mode="live")
-    order = _submitted_order(manager)
+    order = manager.create_order(
+        symbol="TMFJ6", side=OrderSide.BUY, order_type=OrderType.MKP,
+        quantity=2, strategy="MTS_EXIT",
+    )
+    order.submit(BROKER_ORDER_ID, broker_order_id=BROKER_ORDER_ID,
+                 seqno=SEQNO, ordno=ORDNO)
+    row = _trade_row(quantity=1)
 
     manager.reconcile_broker_state(
-        filled_trades=[_trade_row()], source="live_broker_reconcile")
+        filled_trades=[row], source="live_broker_reconcile")
+    assert order.filled_quantity == 1
+
     manager.reconcile_broker_state(
-        filled_trades=[_trade_row()], source="live_broker_reconcile")
+        filled_trades=[row], source="live_broker_reconcile")
 
     assert order.filled_quantity == 1
     assert len(order.fills) == 1
