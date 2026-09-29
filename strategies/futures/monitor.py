@@ -13608,6 +13608,13 @@ class FuturesMonitor:
         # reconstruct lifecycle from broker state to prevent split-brain.
         # Guard: only reconcile when local FLAT + broker has position + strategy is MTS-capable.
         _broker_pos = getattr(self.trader, "position", 0)
+        # Authority is BROKER truth, not the local mirror: trader.position is
+        # fed only by fills, so a dropped fill leaves it stale.  2026-09-29:
+        # both combined-exit legs filled at the broker (48063 / 48206) while the
+        # local exit fills were refused, the mirror stayed -1, and this recovery
+        # re-opened a spread the broker had already closed - in the very same
+        # tick in which POSITION_AUTHORITY had forced FLAT on broker truth.
+        _broker_flat_proven = self._broker_truth_is_flat(_early_broker_auth)
         _has_pos = bool(getattr(strategy, "_has_position", False))
         _lc = getattr(strategy, "_lifecycle_oca", None)
         
@@ -13620,7 +13627,7 @@ class FuturesMonitor:
 
         if (
             not _has_pos
-            and _broker_pos != 0
+            and not _broker_flat_proven
             and not _in_cooldown
             and _lc is not None
             and hasattr(_lc, 'phase')
@@ -13666,7 +13673,7 @@ class FuturesMonitor:
                 atr=0.0,
                 lifecycle=lifecycle_to_dict(strategy._lifecycle_oca),
             )
-            console.print(f"[bold yellow]♻️ [BROKER_RECONCILED] broker_pos={_broker_pos} → lifecycle restored to {strategy._lifecycle_oca.phase.value}[/bold yellow]")
+            console.print(f"[bold yellow]♻️ [BROKER_RECONCILED] broker_pos={_broker_pos} broker_truth={'FLAT' if _broker_flat_proven else 'NOT_FLAT'} → lifecycle restored to {strategy._lifecycle_oca.phase.value}[/bold yellow]")
 
         # ADR-010 Sprint 4C: CANCELING_SIBLING → SIBLING_CANCELED → SINGLE_LEG + trail ARMED
         # Paper mode: cancel is sync-confirmed, transition immediately on next tick.
