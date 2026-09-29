@@ -11832,7 +11832,7 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[red]Schema migration failed:[/red] {e}")
 
-    def _save_bar(self, row, score, regime):
+    def _save_bar(self, row, score, regime, spread_z=None):
         log_dir = runtime_logs("market_data")
         os.makedirs(log_dir, exist_ok=True)
         
@@ -11894,7 +11894,7 @@ class FuturesMonitor:
             "far_bidask_age_ms": _far_entry_bbo["age_ms"],
             "far_entry_bbo_state": _far_entry_bbo.get("state") or "NO_BIDASK",
             "spread": _spread,
-            "spread_z": _row_value("spread_z"),
+            "spread_z": spread_z if spread_z is not None else _row_value("spread_z"),
             "sqz_on": _row_value("sqz_on"),
             "momentum": _row_value("momentum"),
             "atr_used": _row_value("atr_used"),
@@ -16926,7 +16926,7 @@ class FuturesMonitor:
                 _skip_save = not _has_atr_raw
                 
             if not _skip_save:
-                self._save_bar(last_5m, score, regime)
+                self._save_bar(last_5m, score, regime, spread_z=_bar_dict.get("spread_z"))
             self.last_processed_bar = timestamp
             self._bar_counter += 1
             console.print(f"[bold blue][FuturesMonitor] New Bar: {timestamp} close={last_price:.0f} score={score:.1f}[/bold blue]")
