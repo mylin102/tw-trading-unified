@@ -13365,6 +13365,14 @@ class FuturesMonitor:
             except: pass
             
         # 2026-05-27 Gemini CLI: Override CSV with real-time prices for tick-level MTS management
+        # 2026-09-29 Hermes Agent: record WHERE the decision marks came from.
+        # A missing rt value used to silently fall back to the last closed 5m bar
+        # or a CSV value (2026-09-29 09:01: a 132-point stale near mark turned a
+        # -1 point combined exit into a "+126 points" intercept).
+        _bar_dict["near_price_source"] = (
+            "LIVE_TICK" if "near_close_rt" in _bar_dict else "BAR_CLOSE")
+        _bar_dict["far_price_source"] = (
+            "LIVE_TICK" if "far_close_rt" in _bar_dict else "BAR_CLOSE")
         if "near_close_rt" in _bar_dict:
             _bar_dict["near_close"] = _bar_dict["near_close_rt"]
             _bar_dict["near_high"] = _bar_dict.get("near_high_rt", _bar_dict["near_close"])

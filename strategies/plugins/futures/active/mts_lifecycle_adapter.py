@@ -195,6 +195,11 @@ class LifecycleContext:
     # release_leg matching the ATR-selected leg. The ATR threshold itself is
     # unchanged (still the trigger); live/unknown modes never set this flag.
     release_trend_gate_enabled: bool = False
+    # 2026-09-29 Hermes Agent: mark freshness at decision time.  The Policy J
+    # release-stop intercept is an optimisation and must not be chosen on marks
+    # known to be the last closed bar.  Unset (paper/backtest/replay) stays
+    # permissive so no existing caller changes behaviour.
+    marks_live: bool = True
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -727,6 +732,7 @@ class MtsLifecycleAdapter:
                         if not (0.0 <= _r_dec_age <= 10000.0 and 0.0 <= _r_win_age <= 10000.0):
                             trend_reversal_confirmed = None
         ctx = LifecycleContext(
+            marks_live=bool(strategy_state.get("marks_live", True)),
             near_pnl_pts=near_pnl,
             far_pnl_pts=far_pnl,
             floating_pnl_pts=floating_pnl,

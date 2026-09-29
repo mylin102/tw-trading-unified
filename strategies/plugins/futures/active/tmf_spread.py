@@ -4928,6 +4928,12 @@ class TMFSpread(StrategyBase):
             _adapter_input = LifecycleEvaluationInput(
                 strategy_state={
                     "policy_j_guard_just_completed": bool(getattr(self, "_pj_guard_just_completed", False)),
+                    # 2026-09-29 Hermes Agent: mark freshness for the intercept
+                    # gate. Unknown provenance (paper/backtest) stays permissive.
+                    "marks_live": (
+                        str(bar.get("near_price_source") or "") != "BAR_CLOSE"
+                        and str(bar.get("far_price_source") or "") != "BAR_CLOSE"
+                    ),
                     "near_pnl_pts": _n_pnl,
                     "far_pnl_pts": _f_pnl,
                     "floating_pnl_pts": current_pnl,
