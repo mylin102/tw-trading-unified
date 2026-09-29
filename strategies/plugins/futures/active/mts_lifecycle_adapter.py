@@ -342,6 +342,20 @@ def _check_combined_upl_trail_candidate(
         near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
         far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
         if (near_hit or far_hit) and (ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd or total_net_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd):
+            # 2026-09-29 Hermes Agent: this intercept is an OPTIMISATION - never
+            # pick it on marks known to be the last closed bar.  Declining here
+            # leaves the ordinary release candidate to win by priority, so the
+            # protective single-leg stop still fires (fail-closed for the
+            # optimisation only, never for risk control).
+            if not getattr(ctx, "marks_live", True):
+                logger.warning(
+                    "[POLICY_J_INTERCEPT_BLOCKED_STALE_MARK] near_hit=%s far_hit=%s "
+                    "Total Net PnL (%.1f TWD) >= Activation (%.1f TWD) but the "
+                    "decision marks are a closed bar - fall back to the release",
+                    near_hit, far_hit, total_net_pnl_twd,
+                    ctx.combined_upl_activation_net_pnl_twd,
+                )
+                return []
             logger.info(
                 "[POLICY_J_RELEASE_INTERCEPT] Single leg hit release stop (near_hit=%s far_hit=%s) "
                 "but Total Net PnL (%.1f TWD) >= Activation (%.1f TWD) -> Intercept with COMBINED_EXIT",
