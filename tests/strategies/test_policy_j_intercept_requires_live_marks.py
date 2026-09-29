@@ -98,3 +98,57 @@ def test_dataclass_field_default_is_permissive(marks_live, expected):
     """The new field must default permissively (True) and be overridable."""
     ctx = LifecycleContext(**{**_INCIDENT, "marks_live": marks_live})
     assert bool(ctx.marks_live) is expected
+
+
+
+# ── real-path wiring (build_context), added after the A/B caught the gap ───────
+
+def test_build_context_reads_marks_live_from_the_strategy_state():
+    """The shipped path: the adapter must carry the flag it is given."""
+    from datetime import datetime
+
+    from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+        ContextBuildStatus,
+        LifecycleEvaluationInput,
+        MtsLifecycleAdapter,
+    )
+
+    adapter = MtsLifecycleAdapter()
+    lifecycle = _lifecycle()
+    base_time = datetime(2026, 9, 29, 9, 1, 42)
+    state = {
+        "last_applied_event_time": base_time.isoformat(),
+        "marks_live": False,
+    }
+    ctx, diag = adapter.build_context(LifecycleEvaluationInput(
+        strategy_state=state,
+        market_event={"event_time": base_time.isoformat()},
+        lifecycle=lifecycle,
+        execution_mode="BACKTEST",
+    ))
+
+    assert diag.build_status == ContextBuildStatus.VALID
+    assert ctx is not None
+    assert ctx.marks_live is False
+
+
+def test_build_context_defaults_marks_live_true_when_absent():
+    """Backward compatibility on the shipped path."""
+    from datetime import datetime
+
+    from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+        LifecycleEvaluationInput,
+        MtsLifecycleAdapter,
+    )
+
+    adapter = MtsLifecycleAdapter()
+    base_time = datetime(2026, 9, 29, 9, 1, 42)
+    ctx, _diag = adapter.build_context(LifecycleEvaluationInput(
+        strategy_state={"last_applied_event_time": base_time.isoformat()},
+        market_event={"event_time": base_time.isoformat()},
+        lifecycle=_lifecycle(),
+        execution_mode="BACKTEST",
+    ))
+
+    assert ctx is not None
+    assert ctx.marks_live is True
