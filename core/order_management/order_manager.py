@@ -1513,11 +1513,32 @@ class OrderManager:
             # No deal identity means this observation is ambiguous.  Keep the
             # raw refreshed Trade and its confirmed quantity, but do not
             # manufacture a fill, price, or PnL from an order identity.
-        for deal in deals:
+        for _deal_index, deal in enumerate(deals):
             deal_id = self._extract_value(deal, "deal_id", "trade_id", "fill_id")
             broker_trade_id = self._extract_value(deal, "broker_trade_id", "trade_id")
             exchange_fill_id = self._extract_value(deal, "exchange_fill_id", "fill_id")
             exchange_seq = self._extract_value(deal, "exchange_seq", "seq")
+
+            fill_price = float(self._extract_value(deal, "price", "avg_price") or 0)
+            fill_qty = int(self._extract_value(deal, "quantity", "qty") or 0)
+            if fill_qty <= 0:
+                continue
+
+            if not any((deal_id, broker_trade_id, exchange_fill_id, exchange_seq)):
+                # Single-leg futures trade snapshots can return deal detail with
+                # price/quantity only (no deal identity) - the fill is then
+                # refused as BROKER_RECEIPT_IDENTITY_MISSING and never booked
+                # (2026-09-29 combined exit: both legs Filled at the broker,
+                # ledger stayed 0).  Derive the identity from broker content
+                # only, mirroring broker-position:{...} / _build_combo_fill_identity:
+                # the same snapshot always yields the same key, so the fill is
+                # booked exactly once and nothing is guessed.
+                _anchor = broker_order_id or seqno or ordno
+                if not _anchor:
+                    continue
+                deal_id = broker_trade_id = exchange_fill_id = (
+                    f"broker-trade:{_anchor}:{_deal_index}:{fill_price}:{fill_qty}")
+
             if self._has_fill_identity(
                 order,
                 deal_id=deal_id,
@@ -1527,12 +1548,7 @@ class OrderManager:
             ):
                 continue
 
-            fill_price = float(self._extract_value(deal, "price", "avg_price") or 0)
-            fill_qty = int(self._extract_value(deal, "quantity", "qty") or 0)
-            if fill_qty <= 0:
-                continue
-
-            self.apply_deal_fill(
+            _applied = self.apply_deal_fill(
                 order.order_id,
                 deal_id=deal_id,
                 fill_price=fill_price,
@@ -1546,7 +1562,10 @@ class OrderManager:
                 source=source or "reconcile",
                 reason=reason,
             )
-            fills_added += 1
+            # A refused deal is not an applied fill (false fills_added made the
+            # MTS close-from-reconciled-fills path act on evidence it never had).
+            if _applied is not None:
+                fills_added += 1
 
         # A terminal broker status remains terminal even if deal detail was
         # partial or omitted.  For Cancelled/Rejected/Expired, apply the
