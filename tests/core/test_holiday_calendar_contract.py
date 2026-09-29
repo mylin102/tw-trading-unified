@@ -42,6 +42,19 @@ def test_fetch_holidays_merges_the_shipped_calendar():
     assert OFFICIAL_2026 <= {str(x) for x in fetch_holidays()}
 
 
+def test_settlement_days_are_closed_by_operator_decision():
+    """2026-02-12 / 02-13 -- broker calendar: settlement days, market closed.
+
+    The exchange table lists only the 放假日; the broker calendar additionally
+    stops trading on the two 交割結算 days and the operator ruled them closed.
+    A day the app believes is open but which has no data is what turned
+    2026-09-25 into a four-day outage, so these must be closed too.
+    """
+    assert {"2026-02-12", "2026-02-13"} <= _shipped()
+    assert is_taifex_futures_market_open(datetime(2026, 2, 12, 10, 0)) is False
+    assert is_taifex_futures_market_open(datetime(2026, 2, 13, 10, 0)) is False
+
+
 def test_the_exchange_is_closed_on_the_holidays_that_killed_it():
     for day in ("2026-09-25", "2026-09-28", "2026-10-09", "2026-10-26", "2026-02-17"):
         y, m, d = (int(x) for x in day.split("-"))
