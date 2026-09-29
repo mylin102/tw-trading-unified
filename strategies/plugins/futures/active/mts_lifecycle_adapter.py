@@ -746,7 +746,7 @@ class MtsLifecycleAdapter:
                         if not (0.0 <= _r_dec_age <= 10000.0 and 0.0 <= _r_win_age <= 10000.0):
                             trend_reversal_confirmed = None
         ctx = LifecycleContext(
-            marks_live=bool(strategy_state.get("marks_live", True)),
+            marks_live=bool(state.get("marks_live", True)),
             near_pnl_pts=near_pnl,
             far_pnl_pts=far_pnl,
             floating_pnl_pts=floating_pnl,
