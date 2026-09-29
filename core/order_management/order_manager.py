@@ -1525,6 +1525,10 @@ class OrderManager:
                 continue
 
             if not any((deal_id, broker_trade_id, exchange_fill_id, exchange_seq)):
+                # A synthesized identity must never turn a price-less deal into
+                # a booked fill: no broker price means no fill (fail-closed).
+                if fill_price <= 0:
+                    continue
                 # Single-leg futures trade snapshots can return deal detail with
                 # price/quantity only (no deal identity) - the fill is then
                 # refused as BROKER_RECEIPT_IDENTITY_MISSING and never booked
