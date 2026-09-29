@@ -92,6 +92,19 @@ def test_save_bar_persists_the_ohlcv_values_under_the_canonical_names(log_dir):
     assert record["atr_used"] == 72.5 and record["atr"] == 71.5
 
 
+def test_save_bar_derives_spread_from_near_far_close(log_dir):
+    mon = _monitor()
+    row = _row().drop(labels=["spread", "spread_z"])
+    row["near_close"] = 48274.0
+    row["far_close"] = 48435.0
+
+    mon._save_bar(row, score=4.5, regime="NORMAL")
+
+    record = _saved(log_dir).iloc[-1]
+    assert pd.notna(record["spread"])
+    assert record["spread"] == -161.0
+
+
 def test_saved_csv_has_no_case_duplicates(log_dir):
     mon = _monitor()
     mon._save_bar(_row(), score=4.5, regime="NORMAL")
