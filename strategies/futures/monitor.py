@@ -11857,6 +11857,16 @@ class FuturesMonitor:
                     return _row_by_key[key]
             return default
 
+        _spread = _row_value("spread")
+        if _spread is None or pd.isna(_spread):
+            _near_close = _row_value("near_close")
+            _far_close = _row_value("far_close")
+            try:
+                if _near_close is not None and _far_close is not None:
+                    _spread = float(_near_close) - float(_far_close)
+            except (TypeError, ValueError):
+                _spread = pd.NA
+
         data.update({
             "timestamp": str(row.name),
             "session": get_session(now),
@@ -11883,7 +11893,7 @@ class FuturesMonitor:
             "far_ask": _far_entry_bbo["ask"],
             "far_bidask_age_ms": _far_entry_bbo["age_ms"],
             "far_entry_bbo_state": _far_entry_bbo.get("state") or "NO_BIDASK",
-            "spread": _row_value("spread"),
+            "spread": _spread,
             "spread_z": _row_value("spread_z"),
             "sqz_on": _row_value("sqz_on"),
             "momentum": _row_value("momentum"),
