@@ -105,6 +105,20 @@ def test_save_bar_derives_spread_from_near_far_close(log_dir):
     assert record["spread"] == -161.0
 
 
+def test_save_bar_persists_decision_spread_z_from_caller(log_dir):
+    mon = _monitor()
+    row = _row().drop(labels=["spread_z"])
+    decision_z = 3.75
+
+    # This is the value produced by the decision bar and passed through the
+    # real _save_bar call contract; it must not be reconstructed from CSV.
+    mon._save_bar(row, score=4.5, regime="NORMAL", spread_z=decision_z)
+
+    record = _saved(log_dir).iloc[-1]
+    assert pd.notna(record["spread_z"])
+    assert record["spread_z"] == decision_z
+
+
 def test_saved_csv_has_no_case_duplicates(log_dir):
     mon = _monitor()
     mon._save_bar(_row(), score=4.5, regime="NORMAL")
