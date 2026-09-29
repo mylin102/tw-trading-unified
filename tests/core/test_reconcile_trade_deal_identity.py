@@ -97,3 +97,20 @@ def test_rejected_deal_is_not_counted_as_applied(monkeypatch):
 
     assert order.filled_quantity == 0
     assert result["reconciled"][0]["fills_added"] == 0
+
+
+def test_priceless_deal_is_never_booked_on_a_synthesized_identity():
+    """A deal that carries quantity but no price must not be booked.
+
+    Synthesizing an identity must not create a fill whose price was never
+    reported by the broker (that would fabricate PnL).  RED at the identity
+    commit: the deal is booked at 0.0.
+    """
+    manager = OrderManager(mode="live")
+    order = _submitted_order(manager)
+
+    manager.reconcile_broker_state(
+        filled_trades=[_trade_row(price=None)], source="live_broker_reconcile")
+
+    assert order.filled_quantity == 0
+    assert order.fills == []
