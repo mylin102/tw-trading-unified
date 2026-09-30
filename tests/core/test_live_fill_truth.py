@@ -21,6 +21,12 @@ def test_confirmed_release_then_exit_preserves_actual_provenance(tmp_path, monke
     strategy._trade_id = 'broker-entry-anchor'
     mon = FuturesMonitor.__new__(FuturesMonitor)
     mon.live_trading = live
+    from core.order_intent_gateway import OrderIntentGateway
+    persisted = []
+    mon._order_intent_gateway = OrderIntentGateway(durable_intents={
+        'release': {'state': 'SUBMITTED', 'strategy': 'MTS_RELEASE'},
+        'exit': {'state': 'SUBMITTED', 'strategy': 'MTS_EXIT'},
+    }, record_cb=lambda view: persisted.append(view))
     mon.ticker = 'TMF'
     mon.contract = SimpleNamespace(code='TMFH6')
     mon.far_contract = SimpleNamespace(code='TMFI6')
@@ -59,6 +65,9 @@ def test_confirmed_release_then_exit_preserves_actual_provenance(tmp_path, monke
         assert [r['broker_deal_id'] for r in rows] == ['receipt-release', 'receipt-exit']
         assert all(not r.get('paper_fill_id') for r in rows)
         assert all(not str(r.get('parent_combo_order_id') or '').startswith('PAPER-') for r in rows)
+        assert mon._order_intent_gateway.intent_state('release') == 'FILLED'
+        assert mon._order_intent_gateway.intent_state('exit') == 'FILLED'
+        assert len(persisted) == 2  # repeated receipts cannot persist twice
     else:
         assert all(r['execution_source'] == 'PAPER_EXIT_FILL' for r in rows)
         assert all(r['paper_fill_id'].startswith('PF-') for r in rows)
