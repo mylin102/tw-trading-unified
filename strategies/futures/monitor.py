@@ -6625,6 +6625,64 @@ class FuturesMonitor:
         temporary.replace(path)
         return trade_id
 
+    def _complete_broker_flat_reconciliation(self, snapshot, strategy) -> bool:
+        """Reentrant flat reconciliation, never a mode/authorization promotion.
+
+        Four proofs: current authenticated broker flat, zero open orders,
+        all durable gateway intents settled, and atomically persisted current
+        canonical holding. Unknown data or persistence failure keeps the gate.
+        """
+        from dataclasses import replace
+        from core.execution_context_state import read_execution_context, persist_execution_context
+        from core.channel_safety import get_safety_state
+        ctx = getattr(self, '_execution_context', None)
+        gateway = getattr(self, '_order_intent_gateway', None)
+        if (ctx is None or gateway is None
+                or getattr(ctx, 'requested_mode', '') != 'live'
+                or getattr(ctx, 'effective_mode', '') != 'live_ready'
+                or getattr(ctx, 'live_order_allowed', False) is not True
+                or getattr(strategy, '_has_position', True) is not False
+                or getattr(self, '_pending_lifecycle_orders', None) != {}):
+            return False
+        captured = self._to_epoch_ms(snapshot.get('captured_at'))
+        if (snapshot.get('source') != 'live_broker' or snapshot.get('mode') != 'live'
+                or (snapshot.get('fetch_status') or {}).get('capture') != 'OK'
+                or snapshot.get('positions') != [] or snapshot.get('open_orders') != []
+                or not snapshot.get('canonical_input_hash')
+                or not getattr(ctx, 'session_id', None)
+                or snapshot.get('session_id') != ctx.session_id
+                or not getattr(ctx, 'account_id_hash', None)
+                or snapshot.get('account_identity_hash') != ctx.account_id_hash
+                or captured is None or not 0 <= time.time()*1000-captured <= 15000):
+            return False
+        intents = gateway.durable_view()
+        for rec in intents.values():
+            if rec.get('state') == 'REJECTED':
+                continue
+            if (rec.get('state') != 'FILLED' or not rec.get('broker_order_id')
+                    or not rec.get('broker_deal_id') or not rec.get('reconciliation_id')):
+                return False
+        durable = read_execution_context()
+        if (durable.get('session_id') != ctx.session_id
+                or durable.get('account_id_hash') != ctx.account_id_hash
+                or (durable.get('gateway_intents') or {}) != intents):
+            return False
+        canonical = {'status':'RECONCILED', 'reason':'BROKER_FLAT_INTENTS_SETTLED',
+                     'source':'live_broker', 'captured_at':snapshot['captured_at'],
+                     'evidence_hash':snapshot['canonical_input_hash'],
+                     'canonical_legs':[], 'raw_broker_legs':[], 'raw_local_legs':[]}
+        try:
+            updated = replace(ctx, canonical_holding=canonical)
+            payload = updated.to_dict()
+            payload['gateway_intents'] = intents
+            persist_execution_context(payload)
+        except Exception as exc:
+            logger.warning('[FLAT_RECONCILIATION_PENDING] %s', type(exc).__name__)
+            return False
+        self._execution_context = updated
+        get_safety_state().set_reconciled()
+        return True
+
     def _refresh_live_broker_authority(self, strategy):
         """Use the current authenticated broker snapshot as LIVE MTS truth.
 
@@ -6752,6 +6810,7 @@ class FuturesMonitor:
                 far_side=None,
                 current_trade_id=None)
             self._live_broker_authority_at = _now
+            self._complete_broker_flat_reconciliation(_snap, strategy)
             return self._live_broker_authority
         def _side(row):
             text = str(row.get("direction") or "").lower()
