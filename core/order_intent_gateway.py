@@ -37,6 +37,7 @@ PENDING_SUBMIT = "PENDING_SUBMIT"
 SUBMITTED = "SUBMITTED"
 PENDING_RECONCILE = "PENDING_RECONCILE"
 REJECTED = "REJECTED"
+FILLED = "FILLED"
 
 EXIT_STRATEGIES: frozenset = frozenset({"MTS_EXIT", "MTS_RELEASE"})
 
@@ -322,3 +323,37 @@ class OrderIntentGateway:
     def intent_state(self, intent_id: str) -> Optional[str]:
         rec = self._intents.get(intent_id)
         return rec["state"] if rec else None
+
+    def reconcile_confirmed_fill(self, intent_id: str, *, broker_order_id: str,
+                                 deal_id: str, symbol: str, side: str,
+                                 quantity: int) -> bool:
+        """Terminalize an exit from its confirmed full broker receipt only.
+
+        This never issues authorization, resubmits, or enables new entries.
+        Historical intents have no symbol/side/quantity bindings; their
+        caller must be the already matched OrderManager full-fill callsite.
+        """
+        rec = self._intents.get(intent_id)
+        if (rec is None or rec.get('strategy') not in EXIT_STRATEGIES
+                or not isinstance(broker_order_id, str) or not broker_order_id
+                or not isinstance(deal_id, str) or not deal_id
+                or not isinstance(symbol, str) or not symbol
+                or side not in ('buy', 'sell')
+                or type(quantity) is not int or quantity <= 0):
+            return False
+        for field, value in (('broker_order_id', broker_order_id), ('symbol', symbol),
+                             ('side', side), ('quantity', quantity)):
+            if rec.get(field) is not None and rec[field] != value:
+                return False
+        if rec['state'] == FILLED:
+            return rec.get('broker_deal_id') == deal_id
+        if rec['state'] not in (SUBMITTED, PENDING_RECONCILE, PENDING_SUBMIT):
+            return False
+        previous = dict(rec)
+        rec.update(state=FILLED, broker_order_id=broker_order_id,
+                   broker_deal_id=deal_id, symbol=symbol, side=side,
+                   quantity=quantity, reconciliation_id='broker-fill:' + deal_id)
+        if not self._record(intent_id):
+            self._intents[intent_id] = previous
+            return False
+        return True

@@ -7931,6 +7931,23 @@ class FuturesMonitor:
         # [MTS] Check if this fill completes a spread entry (automated or manual)
         # Must be called BEFORE early returns to ensure tracking dictionary is updated
         price = float(event.fill_price or 0)
+        # The matched OrderManager FULL-fill callback is the receipt boundary.
+        # Partial/quote/paper updates must not terminalize durable live intents.
+        if (getattr(self, 'live_trading', False)
+                and event.status == OrderStatus.FILLED
+                and math.isfinite(price) and price > 0 and event.fill_qty > 0
+                and getattr(event, 'broker_order_id', None)
+                and getattr(event, 'deal_id', None)):
+            _gw = getattr(self, '_order_intent_gateway', None)
+            if _gw is not None:
+                _order = self._get_lifecycle_order(event.order_id)
+                _qty = (getattr(_order, 'filled_quantity', 0)
+                        if _order is not None else event.fill_qty)
+                _gw.reconcile_confirmed_fill(
+                    event.order_id, broker_order_id=event.broker_order_id,
+                    deal_id=event.deal_id, symbol=str(event.symbol),
+                    side=str(getattr(event.side, 'value', event.side)).lower(),
+                    quantity=_qty)
         self._check_mts_multi_leg_fill(event.order_id, price)
         self._maybe_complete_emergency_command(event, price)
 
