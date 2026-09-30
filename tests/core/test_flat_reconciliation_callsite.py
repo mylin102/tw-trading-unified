@@ -25,6 +25,9 @@ def test_actual_broker_flat_refresh_requires_all_reconciliation_proofs(tmp_path,
            'broker_deal_id':'confirmed-receipt', 'reconciliation_id':'broker-fill:confirmed-receipt'}
     if block == 'pending': rec['state'] = 'SUBMITTED'
     mon._order_intent_gateway = OrderIntentGateway(durable_intents={'exit':rec})
+    initial = mon._execution_context.to_dict()
+    initial['gateway_intents'] = mon._order_intent_gateway.durable_view()
+    state.persist_execution_context(initial, runtime_dir=str(tmp_path))
     snap = _snap([])
     snap.update(source='live_broker', mode='live', session_id='current-session',
         account_identity_hash='account', canonical_input_hash='evidence-hash', captured_at=int(time.time()*1000))
