@@ -94,6 +94,24 @@ def _matching_position(positions: list[dict[str, Any]], symbol: str) -> dict[str
     return None
 
 
+def _canonical_side(value: Any) -> str:
+    """Normalize a broker position direction to canonical LONG/SHORT.
+
+    Shioaji 1.5.5 FuturePosition.direction stringifies to 'Action.Buy' /
+    'Action.Sell' (a qualified enum string, not the bare name), so the
+    snapshot direction never equals the premise's LONG/SHORT after a naive
+    upper().  Map 'Action.Buy'/'Buy'/'BUY'/'LONG' -> LONG and
+    'Action.Sell'/'Sell'/'SELL'/'SHORT' -> SHORT; unknown values are returned
+    upper-cased so the caller still fails closed.
+    """
+    v = str(value or "").upper()
+    if "BUY" in v:
+        return "LONG"
+    if "SELL" in v:
+        return "SHORT"
+    return v
+
+
 def evaluate_release_precondition(intent: ReleaseIntent,
                                   broker_snapshot: dict[str, Any]) -> GuardDecision:
     """Require live broker truth to satisfy the intent's premise."""
@@ -118,7 +136,8 @@ def evaluate_release_precondition(intent: ReleaseIntent,
             actual_qty = abs(int((target or {}).get("qty") or (target or {}).get("quantity") or 0))
         except (TypeError, ValueError):
             expected_qty, actual_qty = 0, 0
-        actual_side = str((target or {}).get("side") or (target or {}).get("direction") or "").upper()
+        actual_side = _canonical_side(
+            (target or {}).get("side") or (target or {}).get("direction"))
         ok = bool(target and actual_side == expected_side and actual_qty >= expected_qty)
 
     if not ok:
