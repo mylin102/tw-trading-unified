@@ -865,13 +865,13 @@ def route_futures_signal(
         except Exception as e:
             notes.append(f"{name}: error in on_bar ({e})")
             import traceback
-            console.print(f"[red][Router error] {name}.on_bar: {e}[/red]")
-            console.print(f"[dim]{''.join(traceback.format_exception(type(e), e, e.__traceback__)).strip()}[/dim]")
+            logger.error(f"[Router error] {name}.on_bar: {e}")
+            logger.error(''.join(traceback.format_exception(type(e), e, e.__traceback__)).strip())
             # [StrategyError] Log strategy name, reason, df_5m ready state, bar count
             df_5m = getattr(context.market, 'df_5m', None)
             df_5m_ready = f"ready(len={len(df_5m)})" if df_5m is not None and not df_5m.empty else "none/empty"
             bar_count = getattr(context, 'bar_counter', -1)
-            console.print(f"[bold yellow][StrategyError] name={name} reason={e} df_5m={df_5m_ready} bar_count={bar_count}[/bold yellow]")
+            logger.error(f"[StrategyError] name={name} reason={e} df_5m={df_5m_ready} bar_count={bar_count}")
             # Also log to attribution if recorder is present
             log_router_event(
                 recorder=recorder,
