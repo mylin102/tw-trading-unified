@@ -105,9 +105,9 @@ def _canonical_side(value: Any) -> str:
     upper-cased so the caller still fails closed.
     """
     v = str(value or "").upper()
-    if "BUY" in v:
+    if v in ("BUY", "ACTION.BUY"):
         return "LONG"
-    if "SELL" in v:
+    if v in ("SELL", "ACTION.SELL"):
         return "SHORT"
     return v
 
