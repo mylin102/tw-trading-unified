@@ -525,7 +525,12 @@ def test_reconnect_code12_recert_failure_returns_false(monkeypatch):
     def fake_sleep(s):
         main._connection_dropped = False  # auto-reconnect completes
 
-    monkeypatch.setattr(main.time, "sleep", fake_sleep)
+    # Patching time.sleep globally lets unrelated background workers invoke
+    # fake_sleep before the reconnect call and clear _connection_dropped.
+    # Give only main's real reconnect callsite an isolated clock facade.
+    reconnect_clock = SimpleNamespace(**vars(main.time))
+    reconnect_clock.sleep = fake_sleep
+    monkeypatch.setattr(main, "time", reconnect_clock)
     m = _monitor_stub(_ready_ctx())
     m.far_contract = SimpleNamespace(code="TMFI6")
     m.config_path = "/tmp/futures_test.yaml"
