@@ -6595,6 +6595,10 @@ class FuturesMonitor:
         """
         path = _mts_position_state_path().with_name("mts_broker_lifecycle_identity.json")
         account = snapshot.get("account_identity_hash")
+        if not account:
+            # No authenticated account binding: attribution may use the old
+            # deterministic local fallback, but must not mint a durable anchor.
+            return self._stable_broker_trade_id(account, rows)
         if rows and (len({r.get("code") for r in rows}) != len(rows)
                      or any(not isinstance(r.get("avg_cost"), (int, float))
                             or not math.isfinite(r["avg_cost"]) or r["avg_cost"] <= 0
@@ -8054,7 +8058,7 @@ class FuturesMonitor:
                 "source_order_id": event.order_id,
                 "broker_slip_id": getattr(event, "ordno", None),
                 "broker_deal_seq": getattr(event, "seqno", None),
-                "broker_execution_time": str(getattr(event, "timestamp", "")),
+                "broker_observed_at": str(getattr(event, "timestamp", "")),
             }
         stop_loss = pending.get("stop_loss")
         break_even_trigger = pending.get("break_even_trigger")
@@ -8587,7 +8591,8 @@ class FuturesMonitor:
                         pending[f"{leg}_fill_provenance"] = {
                             "mode": "live", "execution_source": "BROKER_FILL",
                             "price_source": "BROKER_FILL", "paper_fill_id": None,
-                            "broker_order_id": getattr(order, "broker_order_id", None),
+                            "broker_order_id": (raw.get('trade_id')
+                                                or getattr(order, "broker_order_id", None)),
                             "source_order_id": order.order_id,
                             "instrument_code": symbol,
                             "receipt_identity": receipt["identity"],
