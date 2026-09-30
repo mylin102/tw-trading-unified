@@ -8504,6 +8504,21 @@ class FuturesMonitor:
             if pending.get("combo_order_id") == order.order_id:
                 pending["near_fill_price"] = prices[0]
                 pending["far_fill_price"] = prices[1]
+                if getattr(self, "live_trading", False):
+                    for leg, symbol in zip(("near", "far"), expected):
+                        receipt = receipts[symbol]
+                        raw = receipt["payload"]
+                        pending[f"{leg}_fill_provenance"] = {
+                            "mode": "live", "execution_source": "BROKER_FILL",
+                            "price_source": "BROKER_FILL", "paper_fill_id": None,
+                            "broker_order_id": getattr(order, "broker_order_id", None),
+                            "source_order_id": order.order_id,
+                            "instrument_code": symbol,
+                            "receipt_identity": receipt["identity"],
+                            "broker_id_source": "DETERMINISTIC_RECEIPT",
+                            "broker_deal_id": raw.get("deal_id"),
+                            "broker_deal_seq": raw.get("exchange_seq"),
+                        }
                 break
 
         combo_identity = "combo-callback:" + hashlib.sha256(
@@ -16382,7 +16397,9 @@ class FuturesMonitor:
                 # 2026-06-24 Gemini CLI: Pass far price source metadata to ensure complete execution logging.
                 _kwargs = {
                     "near_price" + "_source": data.get("near_price" + "_source", "UNSET"),
-                    "far_price" + "_source": data.get("far_price" + "_source", "UNSET")
+                    "far_price" + "_source": data.get("far_price" + "_source", "UNSET"),
+                    "near_fill_provenance": data.get("near_fill_provenance"),
+                    "far_fill_provenance": data.get("far_fill_provenance"),
                 }
                 _mts_strat.sync_position(
                     trade_id=trade_id, 

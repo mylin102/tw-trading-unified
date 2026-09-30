@@ -2797,8 +2797,10 @@ class TMFSpread(StrategyBase):
         self._trail_exit_start_time = 0.0
 
         # [GSD] Log confirmed fills and ENTRY event
-        _append_fill(self._ticker, "NEAR", "NEAR", self._near_side, 1, near_entry, "ENTRY", trade_id, spread_z=entry_spread_z)
-        _append_fill(self._ticker, "FAR", "FAR", self._far_side, 1, far_entry, "ENTRY", trade_id, spread_z=entry_spread_z)
+        _append_fill(self._ticker, "NEAR", "NEAR", self._near_side, 1, near_entry, "ENTRY", trade_id,
+                     spread_z=entry_spread_z, **(kwargs.get("near_fill_provenance") or {}))
+        _append_fill(self._ticker, "FAR", "FAR", self._far_side, 1, far_entry, "ENTRY", trade_id,
+                     spread_z=entry_spread_z, **(kwargs.get("far_fill_provenance") or {}))
         # 2026-05-27 Gemini CLI: Use dynamic multiplier for event logging
         _mult = get_point_value(self._ticker)
         # 2026-06-23 Gemini CLI: Retrieve price sources with dynamic keys and default to UNSET to satisfy AST checks
