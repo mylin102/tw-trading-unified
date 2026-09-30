@@ -1,4 +1,12 @@
 from types import SimpleNamespace
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_durable_broker_identity(tmp_path, monkeypatch):
+    # Broker lifecycle attribution is now durable; snapshots from another
+    # test/account history must not leak into this fresh-monitor contract.
+    monkeypatch.setenv("MTS_STATE_PATH", str(tmp_path / "position.json"))
 
 
 def _snapshot(canonical_hash, positions):
