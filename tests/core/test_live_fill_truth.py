@@ -89,3 +89,52 @@ def test_broker_refresh_keeps_entry_identity_through_partial_close(tmp_path, mon
     snap['positions'] = _two_leg_snap()['positions'][1:]
     restarted._live_broker_authority_at = 0
     assert restarted._refresh_live_broker_authority(_strategy()).trade_id != anchor
+
+
+def test_streamed_combo_uses_real_entry_sync_writer(tmp_path, monkeypatch):
+    from tests.core.test_fills_callback_bridge import _monitor_with, _LiveFDealPayload
+    from tests.strategies.test_tmf_spread_atr import _setup_armed
+    from core.order_management.order_manager import OrderManager
+    from core.order_management.order import Order, OrderSide, OrderType
+    import strategies.plugins.futures.active.tmf_spread as plugin
+    monkeypatch.setattr(plugin,'_MTS_FILL_LOG',str(tmp_path/'fills.jsonl'))
+    monkeypatch.setattr(plugin,'_write_mts_state',lambda **kw:None)
+    monkeypatch.setattr(plugin,'_append_event',lambda *a,**kw:None)
+    monkeypatch.setattr(plugin,'_authorized_fill_mode',lambda:'live')
+    manager=OrderManager(mode='paper')  # in-memory broker receipts, never submit
+    order=Order('TMFJ6-TMFK6',OrderSide.BUY,OrderType.MKP,1,
+                order_id='combo',strategy='MTS_ENTRY',truth_source='broker_combo',
+                combo_legs=[{'symbol':'TMFJ6','side':'buy','quantity':1},
+                            {'symbol':'TMFK6','side':'sell','quantity':1}])
+    manager.active_orders['combo']=order
+    order.submit('2a97043a',broker_order_id='2a97043a',ordno='2a97043a')
+    mon=_monitor_with(manager)
+    strategy,_=_setup_armed(tmp_path)
+    mon._registry={'tmf_spread':strategy}
+    mon.live_trading=True
+    mon.cfg={}
+    mon.ticker='TMF'
+    mon._execution_context=SimpleNamespace(effective_mode='live_ready')
+    mon._pending_lifecycle_orders={}
+    mon._applied_lifecycle_deals=set()
+    mon._manual_trade_status='READY'
+    mon._maybe_complete_emergency_command=lambda *a,**kw:None
+    mon._check_oco_release_fill=lambda *a,**kw:None
+    mon._save_orders_file_wrapper=lambda:None
+    mon._submit_release_oco_bracket=lambda *a,**kw:None
+    mon._mts_pending_fills={'entry-anchor':{'combo_order_id':'combo','combo':True,
+        'combo_legs':order.combo_legs,'near_filled':False,'far_filled':False,
+        'side':'LONG','spread_side':'BUY_NEAR_SELL_FAR','near_label':'LONG','far_label':'SHORT'}}
+    mon._wire_order_callbacks()
+    callbacks=[_LiveFDealPayload(trade_id='2a97043a',seqno='787254',ordno=None,
+                exchange_seq=None,action=side,code=code,price=price,quantity=1,combo=True,
+                ts=1790733370.414+i*.036)
+               for i,(code,side,price) in enumerate([('TMFJ6','Buy',48605.),('TMFK6','Sell',48754.)])]
+    for callback in callbacks*2:
+        mon.on_order_event(SimpleNamespace(name='FuturesDeal',value='FDEAL'),callback)
+    rows=[json.loads(line) for line in (tmp_path/'fills.jsonl').read_text().splitlines()]
+    assert len(rows)==2
+    assert [r['price'] for r in rows]==[48605.,48754.]
+    assert all(r['execution_source']=='BROKER_FILL' for r in rows)
+    assert all(r['broker_order_id']=='2a97043a' for r in rows)
+    assert all(not r.get('paper_fill_id') for r in rows)
