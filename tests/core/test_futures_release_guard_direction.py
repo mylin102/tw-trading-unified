@@ -77,3 +77,15 @@ def test_hold_leg_still_fails_closed_on_missing_target():
     d = evaluate_release_precondition(_intent("TMFJ6", "LONG"), snap)
     assert d.allowed is False
     assert d.reason == "BROKER_PREMISE_MISMATCH"
+
+
+def test_hold_leg_rejects_unknown_directions_containing_buy_or_sell():
+    for direction, side in (("BUYXX", "LONG"), ("NOT_BUY", "LONG"),
+                            ("SELLXX", "SHORT"), ("NOT_SELL", "SHORT")):
+        snap = _snapshot([
+            {"account": "futures", "code": "TMFJ6", "quantity": 1,
+             "direction": direction},
+        ])
+        decision = evaluate_release_precondition(_intent("TMFJ6", side), snap)
+        assert decision.allowed is False, direction
+        assert decision.reason == "BROKER_PREMISE_MISMATCH"
