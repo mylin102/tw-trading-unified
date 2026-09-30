@@ -243,21 +243,6 @@ class ExecutionContext:
         # persisted EXIT_ONLY capability can never authorize or submit.
         raise LiveOrderBlocked(
             f"EFFECTIVE_MODE_NOT_ORDER_AUTHORIZED (effective={self.effective_mode})")
-        if getattr(order, "strategy", None) not in {"MTS_EXIT", "MTS_RELEASE"}:
-            raise LiveOrderBlocked("EXIT_ONLY_STRATEGY_BLOCKED")
-        symbol = getattr(order, "symbol", None)
-        side = getattr(getattr(order, "side", None), "value", getattr(order, "side", None))
-        quantity = getattr(order, "quantity", None)
-        for allowed in cap.get("allowed_orders", ()):
-            if not isinstance(allowed, dict):
-                continue
-            if (symbol == allowed.get("symbol")
-                    and str(side).lower() == str(allowed.get("side", "")).lower()
-                    and isinstance(quantity, int)
-                    and not isinstance(quantity, bool)
-                    and 0 < quantity <= allowed.get("remaining_qty", 0)):
-                return
-        raise LiveOrderBlocked("EXIT_ONLY_ORDER_SCOPE_MISMATCH")
 
     def assert_entry_allowed(self) -> None:
         """Raise EntryBlocked if paper drain is in progress.

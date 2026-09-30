@@ -786,7 +786,7 @@ def route_futures_signal(
     if regime_result.regime == "BEAR":
         _bear_bs = context.market.last_bar.get("bear_breakout_strength", 0) if context.market.last_bar else 0
         _vwap_dist = context.market.last_bar.get("price_vs_vwap", 0) if context.market.last_bar else 0
-        console.print(
+        logger.info(
             f"[yellow][BearRoute] regime=BEAR bias={regime_result.bias} "
             f"bear_bs={_bear_bs:.3f} vwap_dist={_vwap_dist:.4f} "
             f"candidates={candidates}[/yellow]"
@@ -1043,8 +1043,8 @@ def route_futures_signal(
                 regime=regime_result.regime,
                 bias=regime_result.bias,
                 candidates=candidates,
-                winner=selected_name,
-                winner_action=selected_signal.action if selected_signal else None,
+                winner=name,
+                winner_action=getattr(signal, 'action', None),
                 strategy_evals=_evals,
                 system_status=sys_status
             )
