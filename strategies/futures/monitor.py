@@ -6586,6 +6586,45 @@ class FuturesMonitor:
             })
         return _ids
 
+    def _broker_lifecycle_trade_id(self, snapshot, rows):
+        """Broker-bound attribution anchor survives partial close and restart.
+
+        This is attribution only, never position authority. A successful flat
+        capture clears it. Every reuse requires same account and an exact
+        subset of the broker inventory (contract, direction, qty, cost).
+        """
+        path = _mts_position_state_path().with_name("mts_broker_lifecycle_identity.json")
+        account = snapshot.get("account_identity_hash")
+        if rows and (len({r.get("code") for r in rows}) != len(rows)
+                     or any(not isinstance(r.get("avg_cost"), (int, float))
+                            or not math.isfinite(r["avg_cost"]) or r["avg_cost"] <= 0
+                            for r in rows)):
+            return self._stable_broker_trade_id(account, rows)
+        inventory = {str(r["code"]): [str(r.get("direction") or "").lower(),
+                     int(r["quantity"]), float(r.get("avg_cost") or 0)] for r in rows}
+        anchor = {}
+        try:
+            anchor = json.loads(path.read_text())
+        except (OSError, ValueError):
+            pass
+        prior = anchor.get("inventory") or {}
+        continuing = (bool(account) and anchor.get("account_identity_hash") == account
+                      and bool(inventory) and bool(anchor.get("trade_id"))
+                      and all(prior.get(code) == value for code, value in inventory.items()))
+        trade_id = (anchor["trade_id"] if continuing else
+                    "broker-lifecycle-" + uuid.uuid4().hex[:16] if anchor else
+                    self._stable_broker_trade_id(account, rows))
+        payload = {"account_identity_hash": account, "trade_id": trade_id,
+                   "inventory": inventory, "snapshot_hash": snapshot.get("canonical_input_hash")}
+        # Empty inventory invalidates continuity without fabricating an exit.
+        if not inventory:
+            payload["trade_id"] = None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True))
+        temporary.replace(path)
+        return trade_id
+
     def _refresh_live_broker_authority(self, strategy):
         """Use the current authenticated broker snapshot as LIVE MTS truth.
 
@@ -6703,6 +6742,7 @@ class FuturesMonitor:
             self._live_broker_flat_proven = True
             self._broker_authority_degraded = False
             strategy._broker_truth_flat = True
+            self._broker_lifecycle_trade_id(_snap, [])
             self._live_broker_authority = MtsAuthorityState(
                 status=MtsAuthority.FLAT,
                 trade_id=None,
@@ -6722,8 +6762,7 @@ class FuturesMonitor:
             return None
 
         _snapshot_hash = _snap.get("canonical_input_hash")
-        _trade_id = self._stable_broker_trade_id(
-            _snap.get("account_identity_hash"), _rows)
+        _trade_id = self._broker_lifecycle_trade_id(_snap, _rows)
 
         if len(_rows) == 1:
             # A broker-verified remaining leg is an exit-only authority.  Do
@@ -7927,6 +7966,20 @@ class FuturesMonitor:
         # 2026-06-22 Gemini CLI: Use fill_qty to match OrderEvent
         lots = int(event.fill_qty)
         reason = pending.get("reason")
+        _fill_provenance = None
+        if (getattr(self, "live_trading", False)
+                and getattr(event, "broker_order_id", None)
+                and getattr(event, "deal_id", None)):
+            _fill_provenance = {
+                "mode": "live", "execution_source": "BROKER_FILL",
+                "price_source": "BROKER_FILL", "paper_fill_id": None,
+                "broker_order_id": event.broker_order_id,
+                "broker_deal_id": event.deal_id,
+                "source_order_id": event.order_id,
+                "broker_slip_id": getattr(event, "ordno", None),
+                "broker_deal_seq": getattr(event, "seqno", None),
+                "broker_execution_time": str(getattr(event, "timestamp", "")),
+            }
         stop_loss = pending.get("stop_loss")
         break_even_trigger = pending.get("break_even_trigger")
         trail_points = pending.get("trail_points")
@@ -7944,7 +7997,8 @@ class FuturesMonitor:
                  elif signal == "EXIT" or _pending_strat == "MTS_EXIT":
                      _mts_strat = self._registry.get("tmf_spread")
                      if _mts_strat:
-                         _mts_strat._reset(reason="trail_exit_confirmed", exit_price=price)
+                         _mts_strat._reset(reason="trail_exit_confirmed", exit_price=price,
+                                          **({"fill_provenance": _fill_provenance} if _fill_provenance else {}))
                          console.print(f"[bold green]✅ [MTS_SYNC] Trailing exit CONFIRMED: {event.order_id}[/bold green]")
                      # 2026-07-08 Hermes Agent: only reset force exit inflight if this fill
                      # was triggered by the risk control gate (not a normal trail exit).
@@ -7970,7 +8024,10 @@ class FuturesMonitor:
                          if _rem_price <= 0:
                              _rem_price = _mts_strat._far_entry if _leg == "near" else _mts_strat._near_entry
                              
-                         _mts_strat.sync_release(leg=_leg, price=_rem_price, release_price=price, event_time=getattr(event, "timestamp", None))
+                         _mts_strat.sync_release(leg=_leg, price=_rem_price, release_price=price,
+                                                event_time=getattr(event, "timestamp", None),
+                                                order_id=event.order_id,
+                                                **({"fill_provenance": _fill_provenance} if _fill_provenance else {}))
                          console.print(f"[bold green]✅ [MTS_SYNC] Release CONFIRMED: {event.order_id} ({_leg}) with remaining leg price {_rem_price}[/bold green]")
 
                  # 2026-06-09 JVS Claw: Fix symbol matching for NEAR/FAR legs

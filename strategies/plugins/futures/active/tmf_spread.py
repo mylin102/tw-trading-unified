@@ -825,7 +825,8 @@ def _fill_provenance_defaults(trade_id: str, fill_type: str) -> dict:
         "mode": _authorized_fill_mode(),
         "session_id": _ctx.get("session_id"),
         "generation_id": _ctx.get("process_start_id"),
-        "parent_combo_order_id": f"PAPER-COMBO-{_tid}" if _tid else None,
+        "parent_combo_order_id": (
+            f"PAPER-COMBO-{_tid}" if _tid and _authorized_fill_mode() != "live" else None),
         "release_group_id": f"MTS-RG-{_tid}" if _tid else None,
     }
 
@@ -900,13 +901,15 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             # mislabeled live and vice versa.
             "mode": _prov["mode"],
             "execution_source": (
+                "UNVERIFIED_LIVE_FILL" if _prov["mode"] == "live" else
                 "PAPER_EXIT_FILL"
                 if str(fill_type).upper() in ("EXIT", "RELEASE",
                                               "COMBINED_EXIT",
                                               "COMBINED_EXIT_SETTLED")
                 else "PAPER_COMBO_FILL"),
-            "paper_fill_id": extra_fields.pop("paper_fill_id", None)
-            or f"PF-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{leg.upper()}",
+            "paper_fill_id": (None if _prov["mode"] == "live" else
+                extra_fields.pop("paper_fill_id", None)
+                or f"PF-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{leg.upper()}"),
             "parent_combo_order_id": extra_fields.pop(
                 "parent_combo_order_id", None) or _prov["parent_combo_order_id"],
             "leg_role": str(leg).upper(),
@@ -2961,7 +2964,8 @@ class TMFSpread(StrategyBase):
         self._broker_recovery_snapshot_hash = snapshot_hash
 
     def sync_release(self, leg: str | Leg, price: float, release_price: float = 0.0,
-                     order_id: str = "", event_time: datetime | None = None) -> None:
+                     order_id: str = "", event_time: datetime | None = None,
+                     fill_provenance: dict | None = None) -> None:
         """
         Synchronize state after a leg release (PARTIAL_EXIT) is confirmed.
         Transitions lifecycle from RELEASE_NEAR/FAR to TRAILING mode.
@@ -3036,11 +3040,12 @@ class TMFSpread(StrategyBase):
             realized_pnl=_realized,
             leg_mfe=_leg_mfe,
             leg_mae=_leg_mae,
-            price_source=_LIVE_TICK,
+            price_source=(fill_provenance or {}).get("price_source", _LIVE_TICK),
             quote_age_ms=0.0,
             near_pnl=_release_near_pnl,
             far_pnl=_release_far_pnl,
             spread_pnl=_release_spread_pnl,
+            **{k: v for k, v in (fill_provenance or {}).items() if k != "price_source"},
         )
 
         logger.info("[MTS_RELEASE_SYNC] leg_released=%s rem_side=%s price=%s release_price=%s realized_pnl=%s lifecycle=%s trade_id=%s",
@@ -6133,7 +6138,8 @@ class TMFSpread(StrategyBase):
         return None
 
     # 2026-06-25 Gemini CLI: Support passing exit_ts for backtests to avoid E-Core cooldown block
-    def _reset(self, reason: str | None = None, exit_ts: datetime | None = None, exit_price: float | None = None) -> None:
+    def _reset(self, reason: str | None = None, exit_ts: datetime | None = None,
+               exit_price: float | None = None, fill_provenance: dict | None = None) -> None:
         # 2026-06-18 Gemini CLI: Fix AttributeError - StrategyBase has no 'config' attribute.
         # Fallback to TMF if _ticker is not yet initialized.
         _ticker = getattr(self, '_ticker', "TMF")
@@ -6189,11 +6195,12 @@ class TMFSpread(StrategyBase):
                 post_release_mfe=_pr_mfe,
                 post_release_mae=_pr_mae,
                 post_release_giveback=_pr_giveback,
-                price_source=_LIVE_TICK,
+                price_source=(fill_provenance or {}).get("price_source", _LIVE_TICK),
                 quote_age_ms=0.0,
                 # P1 (codex): decision-event correlation rides the fill record
                 event_id=getattr(self, "_pj_exit_event_id", None),
                 winner=getattr(self, "_pj_exit_winner", None),
+                **{k: v for k, v in (fill_provenance or {}).items() if k != "price_source"},
             )
 
         # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
