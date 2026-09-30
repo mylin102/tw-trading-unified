@@ -12187,7 +12187,8 @@ class FuturesMonitor:
             return default
 
         _spread = _row_value("spread")
-        if _spread is None or pd.isna(_spread):
+        if (_spread is None or pd.isna(_spread)
+                or (isinstance(_spread, str) and not _spread.strip())):
             _near_close = _row_value("near_close")
             _far_close = _row_value("far_close")
             try:
@@ -13734,6 +13735,7 @@ class FuturesMonitor:
             _spread_std = _bar_dict.get("spread_std", 0.0)
             if _spread_std > 0:
                 _rt_spread = _bar_dict["near_close"] - _bar_dict["far_close"]
+                _bar_dict["spread"] = _rt_spread
                 _bar_dict["spread_z"] = (_rt_spread - _spread_ma) / _spread_std
 
         # Research wiring: dz / spread_slope / velocity_ema into the bar
@@ -17241,6 +17243,9 @@ class FuturesMonitor:
                 except Exception as _exc:
                     console.print(f"[dim][BAR_SOURCE_FALLBACK] CSV read failed: {_exc}[/dim]")
 
+        # S4b option A: MTS persists the same decision bar after _mts_tick.
+        # Counter/dedup semantics stay at the original poll boundary.
+        _save_mts_bar = False
         # Log bar (即便每分鐘更新也行，存檔邏輯會處理)
         if self.last_processed_bar is not None and self.last_processed_bar == timestamp:
             if self._bar_counter % 5 == 0:
@@ -17262,7 +17267,10 @@ class FuturesMonitor:
                 _skip_save = not _has_atr_raw
                 
             if not _skip_save:
-                self._save_bar(last_5m, score, regime)
+                if _mts_enabled and not self.dry_run:
+                    _save_mts_bar = True
+                else:
+                    self._save_bar(last_5m, score, regime)
             self.last_processed_bar = timestamp
             self._bar_counter += 1
             console.print(f"[bold blue][FuturesMonitor] New Bar: {timestamp} close={last_price:.0f} score={score:.1f}[/bold blue]")
@@ -17286,6 +17294,12 @@ class FuturesMonitor:
                 _mts_bar["far_low_rt"] = self._far_current_bar.get("low", _mts_bar["far_close_rt"])
             self._mts_tag_bar_session(_mts_bar)
             self._mts_tick(enriched_bar=_mts_bar)
+            if _save_mts_bar:
+                _decision_row = last_5m.copy()
+                for _field in ("near_close", "far_close", "spread", "spread_z"):
+                    if _field in _mts_bar:
+                        _decision_row[_field] = _mts_bar[_field]
+                self._save_bar(_decision_row, score, regime)
             return
 
         # 2. Position management
