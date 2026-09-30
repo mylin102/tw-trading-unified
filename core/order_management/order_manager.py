@@ -11,6 +11,7 @@ import logging
 import os
 import json
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
@@ -162,7 +163,7 @@ class OrderManager:
                 return value
             if isinstance(value, datetime):
                 return value.isoformat()
-            if isinstance(value, dict):
+            if isinstance(value, Mapping):
                 return {key: serialize(item) for key, item in value.items()}
             if isinstance(value, (list, tuple, set)):
                 return [serialize(item) for item in value]
@@ -178,7 +179,7 @@ class OrderManager:
 
         if payload is None:
             return None
-        if isinstance(payload, dict):
+        if isinstance(payload, Mapping):
             return serialize(payload)
         if hasattr(payload, "__dict__"):
             return serialize(payload)
@@ -1789,7 +1790,7 @@ class OrderManager:
                 broker_trade_id=fill_identity,
                 exchange_fill_id=fill_identity,
             ):
-                self.apply_deal_fill(
+                _applied = self.apply_deal_fill(
                     order.order_id,
                     deal_id=fill_identity,
                     fill_price=self._combo_fill_price(combo_trade, order),
@@ -1802,7 +1803,8 @@ class OrderManager:
                     source=source or "combo_reconcile",
                     reason=reason,
                 )
-                fills_added += 1
+                if _applied is not None:
+                    fills_added += 1
 
         self._record_audit(
             order,

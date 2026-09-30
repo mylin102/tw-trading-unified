@@ -8277,7 +8277,7 @@ class FuturesMonitor:
             pass
 
         broker_order_id = (payload.get("id") or payload.get("broker_order_id")
-                           or payload.get("order_id"))
+                           or payload.get("order_id") or payload.get("trade_id"))
         ordno = payload.get("ordno")
         seqno = payload.get("seqno")
         reason = str(payload.get("errmsg") or payload.get("reason") or "")
@@ -8326,6 +8326,17 @@ class FuturesMonitor:
                 return
             _dedupe_order = self.order_mgr._resolve_order(
                 None, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
+            if (_dedupe_order is not None
+                    and getattr(_dedupe_order, "combo_legs", None)):
+                _handled, order = self._apply_combo_deal_callback(
+                    _dedupe_order, payload, fill_price=fill_price,
+                    fill_qty=fill_qty)
+                if _handled:
+                    if order is not None:
+                        self._leg_lock_apply_order_event(
+                            order, getattr(order, "status", None),
+                            fill_qty=fill_qty)
+                    return
             if _dedupe_order is not None and not self._fills_bridge_mark_seen(
                     _dedupe_order, _deal_id, seqno,
                     exchange_seq=payload.get("exchange_seq")):
@@ -8370,6 +8381,102 @@ class FuturesMonitor:
         if _updated_order is not None:
             self._leg_lock_apply_order_event(
                 _updated_order, getattr(_updated_order, "status", None))
+
+    def _apply_combo_deal_callback(self, order, payload, *, fill_price, fill_qty):
+        """Land a two-leg combo only after both broker leg receipts arrive.
+
+        Shioaji emits one FDEAL per leg and both receipts share ``trade_id``.
+        Applying the first receipt as the quantity-one combo would close the
+        lifecycle before the second leg and would also make ``trade_id`` an
+        invalid per-leg dedupe key.  Buffer the broker-authored leg receipts,
+        then apply one aggregate combo fill with a deterministic identity made
+        from both receipts.  No price is inferred: an invalid leg was rejected
+        by the caller before this method is entered.
+        """
+        legs = list(getattr(order, "combo_legs", None) or [])
+        if len(legs) != 2:
+            return False, None
+
+        code = str(payload.get("full_code") or payload.get("code") or "")
+        expected = [str(leg.get("symbol") or leg.get("code") or "")
+                    for leg in legs]
+        if code not in expected:
+            self._append_mts_event(
+                "FDEAL_CALLBACK_REJECTED",
+                observation_type="FDEAL_CALLBACK",
+                normalization_result="REJECTED",
+                rejection_reason="COMBO_LEG_NOT_IN_ORDER",
+                broker_order_id=getattr(order, "broker_order_id", None),
+                code=code,
+            )
+            return True, None
+
+        identity_fields = {
+            key: payload.get(key)
+            for key in ("trade_id", "exchange_seq", "ordno", "seqno",
+                        "code", "full_code", "price", "quantity", "ts")
+        }
+        leg_identity = "broker-trade:" + hashlib.sha256(
+            json.dumps(identity_fields, sort_keys=True, default=str,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+
+        buffers = getattr(self, "_combo_fdeal_receipts", None)
+        if buffers is None:
+            buffers = self._combo_fdeal_receipts = {}
+        receipts = buffers.setdefault(order.order_id, {})
+        previous = receipts.get(code)
+        if previous is not None and previous["identity"] == leg_identity:
+            return True, None
+        receipts[code] = {
+            "identity": leg_identity,
+            "price": float(fill_price),
+            "quantity": int(fill_qty),
+            "payload": dict(payload),
+        }
+        if any(symbol not in receipts for symbol in expected):
+            return True, None
+
+        quantities = [receipts[symbol]["quantity"] for symbol in expected]
+        required = [int(leg.get("quantity") or 0) for leg in legs]
+        if any(q < need or need <= 0 for q, need in zip(quantities, required)):
+            return True, None
+
+        prices = [receipts[symbol]["price"] for symbol in expected]
+        for pending in (getattr(self, "_mts_pending_fills", None) or {}).values():
+            if pending.get("combo_order_id") == order.order_id:
+                pending["near_fill_price"] = prices[0]
+                pending["far_fill_price"] = prices[1]
+                break
+
+        combo_identity = "combo-callback:" + hashlib.sha256(
+            "|".join(sorted(receipts[symbol]["identity"]
+                            for symbol in expected)).encode("utf-8")
+        ).hexdigest()[:24]
+        if self.order_mgr._has_fill_identity(
+                order, deal_id=combo_identity,
+                broker_trade_id=combo_identity,
+                exchange_fill_id=combo_identity):
+            return True, None
+
+        applied = self.order_mgr.apply_deal_fill(
+            order.order_id,
+            deal_id=combo_identity,
+            fill_price=prices[0] - prices[1],
+            fill_qty=min(quantities),
+            exchange_fill_id=combo_identity,
+            broker_trade_id=combo_identity,
+            raw_payload={"combo_leg_receipts": [
+                receipts[symbol]["payload"] for symbol in expected]},
+            broker_order_id=(payload.get("trade_id")
+                             or getattr(order, "broker_order_id", None)),
+            seqno=payload.get("seqno"),
+            ordno=getattr(order, "ordno", None),
+            source="shioaji_callback",
+            reason=str(payload.get("errmsg") or payload.get("reason") or ""),
+            observation_type="FDEAL_CALLBACK",
+        )
+        return True, applied
 
     def _fills_bridge_mark_seen(self, order, deal_id, seqno,
                                exchange_seq=None) -> bool:
