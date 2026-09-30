@@ -11,7 +11,9 @@ Locks:
   dispatcher registered by main.py)
 - no direct module-var fills-log reads in monitor/tmf_spread
 """
+import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -300,3 +302,110 @@ def test_rejected_deal_records_the_offending_values():
     assert payload["raw_price"] is None
     assert payload["raw_quantity"] == 1
     assert payload["broker_order_id"] == "BRK-1"
+
+
+class _LiveFDealPayload(Mapping):
+    """Dict-like callback shape used by the live Shioaji dispatcher.
+
+    The object intentionally has neither ``dict`` inheritance nor
+    ``__dict__``.  This is the shape that exposed the production bridge bug:
+    ``msg.get(...)`` works, while the old serializer collapsed the receipt to
+    ``{"value": "..."}`` and therefore observed every canonical field as
+    null.
+    """
+
+    __slots__ = ("_payload",)
+
+    def __init__(self, **payload):
+        self._payload = payload
+
+    def __getitem__(self, key):
+        return self._payload[key]
+
+    def __iter__(self):
+        return iter(self._payload)
+
+    def __len__(self):
+        return len(self._payload)
+
+
+def test_live_combo_fdeal_replay_lands_two_leg_prices_once(tmp_path, monkeypatch):
+    """Replay the 2026-09-30 09:56:10 two-leg FDEAL sequence through the
+    production bridge.  The broker combo id is shared by both leg receipts;
+    leg identity comes from contract/exchange receipt content.
+    """
+    from strategies.plugins.futures.active import tmf_spread
+
+    fill_log = tmp_path / "mts_trade_fills.jsonl"
+    monkeypatch.setattr(tmf_spread, "_MTS_FILL_LOG", str(fill_log))
+
+    manager = OrderManager(mode="paper")
+    order = Order(
+        "TMFJ6-TMFK6", OrderSide.BUY, OrderType.MKP, 1,
+        order_id="ORD-20260930-000248", strategy="MTS_ENTRY",
+        truth_source="broker_combo",
+        combo_legs=[
+            {"symbol": "TMFJ6", "side": "buy", "quantity": 1},
+            {"symbol": "TMFK6", "side": "sell", "quantity": 1},
+        ],
+        combo_strategy="TIME_SPREAD",
+    )
+    manager.active_orders[order.order_id] = order
+    order.submit("2a97043a", broker_order_id="2a97043a", ordno="2a97043a")
+
+    mon = _monitor_with(manager)
+    mon._mts_pending_fills = {
+        "mts-auto-095609-997": {
+            "combo_order_id": order.order_id,
+            "combo": True,
+            "combo_legs": list(order.combo_legs),
+            "near_filled": False,
+            "far_filled": False,
+            "side": "LONG",
+            "spread_side": "BUY_NEAR_SELL_FAR",
+            "near_label": "NEAR",
+            "far_label": "FAR",
+        }
+    }
+
+    def _persist_confirmed_combo(event):
+        pending = mon._mts_pending_fills["mts-auto-095609-997"]
+        tmf_spread._append_fill(
+            "TMF", "TMFJ6", "NEAR", "LONG", 1,
+            pending["near_fill_price"], "ENTRY", "mts-auto-095609-997")
+        tmf_spread._append_fill(
+            "TMF", "TMFK6", "FAR", "SHORT", 1,
+            pending["far_fill_price"], "ENTRY", "mts-auto-095609-997")
+
+    manager.register_callback("on_fill", _persist_confirmed_combo)
+
+    callbacks = [
+        _LiveFDealPayload(
+            trade_id="2a97043a", seqno="787254", ordno=None,
+            exchange_seq=None, action="Buy",
+            code="TMFJ6", price=48605.0, quantity=1, combo=True,
+            ts=1790733370.414,
+        ),
+        _LiveFDealPayload(
+            trade_id="2a97043a", seqno="787254", ordno=None,
+            exchange_seq=None, action="Sell",
+            code="TMFK6", price=48754.0, quantity=1, combo=True,
+            ts=1790733370.450,
+        ),
+    ]
+    state = SimpleNamespace(name="FuturesDeal", value="FDEAL")
+
+    for callback in callbacks:
+        mon.on_order_event(state, callback)
+    for callback in callbacks:  # broker replay must be idempotent
+        mon.on_order_event(state, callback)
+
+    rows = [json.loads(line) for line in fill_log.read_text().splitlines()]
+    assert [(row["leg"], row["price"]) for row in rows] == [
+        ("NEAR", 48605.0),
+        ("FAR", 48754.0),
+    ]
+    assert order.status is OrderStatus.FILLED
+    assert order.filled_quantity == 1
+    assert len(order.fills) == 1
+    assert order.fills[0].deal_id.startswith("combo-callback:")
