@@ -11,11 +11,18 @@ TRANSITION_STALL. Baselines seeded at startup so a restored OPEN position
 with no first evaluation alerts after grace (first_eval=True).
 """
 import time
+import pytest
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from strategies.futures.monitor import FuturesMonitor
+
+@pytest.fixture(autouse=True)
+def _deterministic_trading_session(monkeypatch):
+    # Unit fixtures exercise the open-session SLO independent of wall clock.
+    # test_market_closed_suppressed still explicitly overrides this to False.
+    monkeypatch.setattr('strategies.futures.monitor.is_taifex_futures_market_open', lambda: True)
 
 
 def make_mon():

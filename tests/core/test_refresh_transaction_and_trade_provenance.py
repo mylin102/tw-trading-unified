@@ -132,15 +132,23 @@ def test_refresh_timeout_keeps_single_flight_lock_until_worker_finishes():
     class API:
         is_connected = True
         futopt_account = object()
-        def update_status(self, **kwargs): time.sleep(0.12)
+        def __init__(self): self.release = threading.Event()
+        def update_status(self, **kwargs): self.release.wait(5)
         def list_trades(self): return []
 
     api = API()
     mon = _monitor_for_refresh(api)
-    first = mon._refresh_futures_trade_view(api, api.futopt_account)
-    second = mon._refresh_futures_trade_view(api, api.futopt_account)
-    assert first["state"] == "REFRESH_TIMEOUT_UNCERTAIN"
-    assert second["state"] == "REFRESH_SKIPPED_INFLIGHT"
+    try:
+        first = mon._refresh_futures_trade_view(api, api.futopt_account)
+        second = mon._refresh_futures_trade_view(api, api.futopt_account)
+        assert first["state"] == "REFRESH_TIMEOUT_UNCERTAIN"
+        assert second["state"] == "REFRESH_SKIPPED_INFLIGHT"
+    finally:
+        api.release.set()
+        # Join the transaction via its actual single-flight lock: no daemon
+        # worker is left leaking into the next test or A/B run.
+        assert mon._broker_refresh_lock.acquire(timeout=2)
+        mon._broker_refresh_lock.release()
 
 
 def test_refresh_timeout_uncertain_orphan_worker_cannot_publish_or_send():
