@@ -1524,6 +1524,7 @@ class FuturesMonitor:
                                     "datetime": datetime.now()
                                 }
                             elif self.far_contract and _snap.code == self.far_contract.code:
+                                _old_far = self._far_current_bar.get('close')
                                 self._far_current_bar["close"] = float(_snap.close)
                                 self._far_current_bar["open"] = float(_snap.close)
                                 self._far_current_bar["high"] = float(_snap.close)
@@ -5813,6 +5814,7 @@ class FuturesMonitor:
                 reason="callback_gap_snapshot",
             )
         except ValueError as _fill_ve:
+            import re
             _oid = "unknown"
             _m = re.search(r"for\s+(\S+)", str(_fill_ve))
             if _m:
@@ -10030,6 +10032,7 @@ class FuturesMonitor:
             _sig_action = getattr(signal, "action", None)
             _action_value = getattr(_sig_action, "value", _sig_action)
             if _action_value in ("ENTRY", "BUY", "SELL"):
+                from core.mode_transition import EntryBlocked
                 try:
                     _exec_ctx.assert_entry_allowed()
                 except EntryBlocked as exc:
@@ -17544,6 +17547,7 @@ class FuturesMonitor:
             vol_filter_ok = True
             console.print(f"[dim][BYPASS][PAPER_ONLY] volume gate disabled[/dim]")
         if not vol_filter_ok:
+            session_note = 'night' if is_night else 'day'
             console.print(f"[ENTRY_GATE] BLOCKED by volume: vol={vol:.0f} avg={avg_vol:.0f} thresh={vol_threshold} night={is_night}")
             self._audit_signal("ENTRY_BLOCKED", "", score, "low_volume", f"vol={vol:.0f} avg={avg_vol:.0f} thresh={vol_threshold}")
             console.print(f"[dim]⏸️ Volume too low ({session_note}): {vol:.0f} vs avg {avg_vol:.0f} (>{vol_threshold*100:.0f}%) — skipping entry[/dim]")

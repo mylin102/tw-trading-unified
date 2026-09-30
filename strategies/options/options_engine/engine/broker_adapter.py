@@ -1,4 +1,5 @@
 import datetime
+from types import SimpleNamespace
 
 import shioaji as sj
 

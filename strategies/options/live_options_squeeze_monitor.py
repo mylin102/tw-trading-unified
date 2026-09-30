@@ -4855,6 +4855,7 @@ class ShioajiOptionsSmartMonitor:
 
                 # ── [Vertical Spread v1] Spread position management ──
                 if self._enable_vertical_spread and self._current_spread is not None:
+                    option_chain = getattr(self, '_all_month_contracts', None) or []
                     if self.live_trading:
                         exited = self.manage_spread_live_position(signal, option_chain=option_chain)
                     else:
