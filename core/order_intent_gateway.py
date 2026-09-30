@@ -326,7 +326,7 @@ class OrderIntentGateway:
 
     def reconcile_confirmed_fill(self, intent_id: str, *, broker_order_id: str,
                                  deal_id: str, symbol: str, side: str,
-                                 quantity: int) -> bool:
+                                 quantity: int, broker_id_source: str = 'BROKER_DEAL_ID') -> bool:
         """Terminalize an exit from its confirmed full broker receipt only.
 
         This never issues authorization, resubmits, or enables new entries.
@@ -346,12 +346,14 @@ class OrderIntentGateway:
             if rec.get(field) is not None and rec[field] != value:
                 return False
         if rec['state'] == FILLED:
-            return rec.get('broker_deal_id') == deal_id
+            return (rec.get('receipt_identity') or rec.get('broker_deal_id')) == deal_id
         if rec['state'] not in (SUBMITTED, PENDING_RECONCILE, PENDING_SUBMIT):
             return False
         previous = dict(rec)
         rec.update(state=FILLED, broker_order_id=broker_order_id,
-                   broker_deal_id=deal_id, symbol=symbol, side=side,
+                   broker_deal_id=(None if broker_id_source == 'DETERMINISTIC_RECEIPT' else deal_id),
+                   receipt_identity=deal_id, broker_id_source=broker_id_source,
+                   symbol=symbol, side=side,
                    quantity=quantity, reconciliation_id='broker-fill:' + deal_id)
         if not self._record(intent_id):
             self._intents[intent_id] = previous

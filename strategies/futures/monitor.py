@@ -6629,6 +6629,71 @@ class FuturesMonitor:
         temporary.replace(path)
         return trade_id
 
+    def _replay_historical_gateway_exits(self, snapshot, gateway) -> int:
+        """Match restored full local exits to explicit full broker deal rows.
+
+        Caller has verified current snapshot account/session/freshness/flat.
+        No receipt, ambiguity, partial fill or mismatch leaves the intent pending.
+        Replays metadata only: no order, position or fill-ledger mutation.
+        """
+        from core.order_management.order import OrderStatus
+        completed = getattr(getattr(self, 'order_mgr', None), 'completed', [])
+        changed = 0
+        for oid, rec in gateway.durable_view().items():
+            if (rec.get('strategy') not in ('MTS_EXIT', 'MTS_RELEASE')
+                    or rec.get('state') not in ('SUBMITTED', 'PENDING_RECONCILE', 'PENDING_SUBMIT')):
+                continue
+            matches = [o for o in completed if getattr(o, 'order_id', None) == oid]
+            if len(matches) != 1:
+                continue
+            order = matches[0]
+            bid = getattr(order, 'broker_order_id', None)
+            qty = getattr(order, 'quantity', None)
+            side = str(getattr(getattr(order, 'side', None), 'value', '')).lower()
+            if (order.status != OrderStatus.FILLED or not isinstance(bid, str) or not bid
+                    or type(qty) is not int or qty <= 0 or order.filled_quantity != qty):
+                continue
+            proofs = {}
+            for row in snapshot.get('broker_trades') or []:
+                if not isinstance(row, dict):
+                    proofs['invalid'] = None
+                    continue
+                if (row.get('broker_order_id') or row.get('id')) != bid:
+                    continue
+                if (row.get('code') != order.symbol or row.get('direction') != side
+                        or row.get('broker_status') != 'Filled'
+                        or type(row.get('requested_qty')) is not int or row['requested_qty'] != qty
+                        or type(row.get('filled_qty')) is not int or row['filled_qty'] != qty):
+                    proofs['invalid'] = None
+                    continue
+                deals = row.get('deals')
+                if (not isinstance(deals, list) or not deals
+                        or any(not isinstance(d, dict) or type(d.get('quantity')) is not int
+                               or d['quantity'] <= 0 or not isinstance(d.get('price'), (int, float))
+                               or isinstance(d['price'], bool) or not math.isfinite(d['price'])
+                               or d['price'] <= 0 for d in deals)
+                        or sum(d['quantity'] for d in deals) != qty):
+                    proofs['invalid'] = None
+                    continue
+                average = sum(d['price']*d['quantity'] for d in deals)/qty
+                if average != order.avg_fill_price:
+                    proofs['invalid'] = None
+                    continue
+                proof = {'broker_order_id':bid, 'symbol':order.symbol, 'side':side,
+                         'quantity':qty, 'ordno':row.get('ordno'), 'seqno':row.get('seqno'),
+                         'deals':sorted((d['price'], d['quantity']) for d in deals)}
+                identity = 'snapshot-receipt:' + hashlib.sha256(
+                    json.dumps(proof, sort_keys=True).encode()).hexdigest()
+                proofs[identity] = proof
+            if len(proofs) != 1 or 'invalid' in proofs:
+                continue
+            identity = next(iter(proofs))
+            if gateway.reconcile_confirmed_fill(oid, broker_order_id=bid,
+                    deal_id=identity, symbol=order.symbol, side=side, quantity=qty,
+                    broker_id_source='DETERMINISTIC_RECEIPT'):
+                changed += 1
+        return changed
+
     def _complete_broker_flat_reconciliation(self, snapshot, strategy) -> bool:
         """Reentrant flat reconciliation, never a mode/authorization promotion.
 
@@ -6641,7 +6706,7 @@ class FuturesMonitor:
         from core.channel_safety import get_safety_state
         ctx = getattr(self, '_execution_context', None)
         gateway = getattr(self, '_order_intent_gateway', None)
-        if (ctx is None or gateway is None
+        if (ctx is None
                 or getattr(ctx, 'requested_mode', '') != 'live'
                 or getattr(ctx, 'effective_mode', '') != 'live_ready'
                 or getattr(ctx, 'live_order_allowed', False) is not True
@@ -6659,12 +6724,16 @@ class FuturesMonitor:
                 or snapshot.get('account_identity_hash') != ctx.account_id_hash
                 or captured is None or not 0 <= time.time()*1000-captured <= 15000):
             return False
+        if gateway is None:
+            gateway = self._gateway()  # recover persisted intents on restart
+        self._replay_historical_gateway_exits(snapshot, gateway)
         intents = gateway.durable_view()
         for rec in intents.values():
             if rec.get('state') == 'REJECTED':
                 continue
             if (rec.get('state') != 'FILLED' or not rec.get('broker_order_id')
-                    or not rec.get('broker_deal_id') or not rec.get('reconciliation_id')):
+                    or not (rec.get('receipt_identity') or rec.get('broker_deal_id'))
+                    or not rec.get('reconciliation_id')):
                 return False
         durable = read_execution_context()
         if (durable.get('session_id') != ctx.session_id
