@@ -40,6 +40,7 @@ class EdgeModel:
         """
         if self._ml_model and self._scaler:
             try:
+                import numpy as np
                 # Use ONLY the most predictive features
                 vec = np.array([[
                     features.get("trend_strength", 0.5),

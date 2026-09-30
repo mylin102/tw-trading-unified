@@ -411,6 +411,7 @@ def _current_runtime_session_id() -> str:
     """The current runtime execution-context session id, or ''."""
     try:
         from core.runtime_paths import runtime_path
+        from pathlib import Path
         _f = Path(runtime_path("execution_context.json"))
         if _f.exists():
             _ctx = json.loads(_f.read_text(encoding="utf-8"))
