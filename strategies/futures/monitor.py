@@ -12584,6 +12584,11 @@ class FuturesMonitor:
             if not _has_pos_in_mem and existing.get("has_position") is True:
                 return
 
+            # Held state belongs to the lifecycle writer, not the flat heartbeat.
+            # Return before constructing flat-only fields or querying margin.
+            if _has_pos_in_mem:
+                return
+
             # ADR-009 Task 10: FLAT must not inherit position fields from disk or
             # strategy memory. A rejected/unconfirmed order may leave stale legs
             # in memory even when _has_position is False.
