@@ -19,7 +19,7 @@ def test_held_status_sync_preserves_lifecycle_without_flat_heartbeat(tmp_path, m
     mon._far_current_bar = {}
     mon._pending_lifecycle_orders = {}
     mon._manual_trade_status = 'FILLED'
-    mon.initial_balance = 0
+    mon.trader = SimpleNamespace(initial_balance=0, balance=0)
     mon.live_trading = True
     def forbidden_margin(*a, **kw):
         raise AssertionError('held heartbeat must not query broker margin')
