@@ -63,6 +63,8 @@ def test_confirmed_release_then_exit_preserves_actual_provenance(tmp_path, monke
         assert all(r['price_source'] == 'BROKER_FILL' for r in rows)
         assert [r['broker_order_id'] for r in rows] == ['brk-release', 'brk-exit']
         assert [r['broker_deal_id'] for r in rows] == ['receipt-release', 'receipt-exit']
+        assert all(r.get('broker_observed_at') for r in rows)
+        assert all('broker_execution_time' not in r for r in rows)
         assert all(not r.get('paper_fill_id') for r in rows)
         assert all(not str(r.get('parent_combo_order_id') or '').startswith('PAPER-') for r in rows)
         assert mon._order_intent_gateway.intent_state('release') == 'FILLED'
@@ -100,7 +102,8 @@ def test_broker_refresh_keeps_entry_identity_through_partial_close(tmp_path, mon
     assert restarted._refresh_live_broker_authority(_strategy()).trade_id != anchor
 
 
-def test_streamed_combo_uses_real_entry_sync_writer(tmp_path, monkeypatch):
+@pytest.mark.parametrize('metadata_hydrated', [True, False])
+def test_streamed_combo_uses_real_entry_sync_writer(tmp_path, monkeypatch, metadata_hydrated):
     from tests.core.test_fills_callback_bridge import _monitor_with, _LiveFDealPayload
     from tests.strategies.test_tmf_spread_atr import _setup_armed
     from core.order_management.order_manager import OrderManager
@@ -117,6 +120,8 @@ def test_streamed_combo_uses_real_entry_sync_writer(tmp_path, monkeypatch):
                             {'symbol':'TMFK6','side':'sell','quantity':1}])
     manager.active_orders['combo']=order
     order.submit('2a97043a',broker_order_id='2a97043a',ordno='2a97043a')
+    if not metadata_hydrated:
+        order.broker_order_id = None  # real FDEAL may precede order metadata
     mon=_monitor_with(manager)
     strategy,_=_setup_armed(tmp_path)
     mon._registry={'tmf_spread':strategy}
@@ -147,3 +152,17 @@ def test_streamed_combo_uses_real_entry_sync_writer(tmp_path, monkeypatch):
     assert all(r['execution_source']=='BROKER_FILL' for r in rows)
     assert all(r['broker_order_id']=='2a97043a' for r in rows)
     assert all(not r.get('paper_fill_id') for r in rows)
+
+def test_missing_account_refresh_does_not_mint_durable_broker_identity(tmp_path, monkeypatch):
+    from tests.core.test_broker_authority_hydration import _monitor, _two_leg_snap, _strategy
+    monkeypatch.setenv('TRADING_RUNTIME_DIR', str(tmp_path))
+    monkeypatch.setenv('MTS_STATE_PATH', str(tmp_path/'position.json'))
+    mon = _monitor(tmp_path)
+    snap = _two_leg_snap()
+    snap['account_identity_hash'] = None
+    mon._capture_post_startup_snapshot = lambda: snap
+    first = mon._refresh_live_broker_authority(_strategy())
+    mon._live_broker_authority_at = 0
+    second = mon._refresh_live_broker_authority(_strategy())
+    assert first.trade_id == second.trade_id
+    assert not (tmp_path/'mts_broker_lifecycle_identity.json').exists()
