@@ -302,12 +302,21 @@ class TestGenerationFencing:
 
 
 class TestQuarantineSemantics:
-    def test_premature_promote_gets_reblocked(self):
+    def test_premature_promote_gets_reblocked(self, monkeypatch):
         """If reconnect internally promoted the context, the window's
         quarantine_callable must push it BACK to blocked on every interval.
         We simulate: callable re-asserts live_order_allowed=False."""
         api = _FakeApi()
-        mon = _FakeMonitor()
+        mon = _FakeMonitor(tick_advances=False, bidask_advances=False)
+        clock = [time.monotonic()]
+        def advance(seconds):
+            clock[0] += seconds
+            for slot in mon.market_data.values():
+                slot['bidask_received_at'] = clock[0]
+        # Exercise the actual extracted verification window with controlled
+        # clock/BidAsk arrivals; its BBO, generation and quarantine checks stay.
+        monkeypatch.setitem(_verify_reconnect_window.__globals__, 'time',
+                            types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance))
         state = {"live_order_allowed": True, "effective_mode": "live_ready"}
         calls = []
 
