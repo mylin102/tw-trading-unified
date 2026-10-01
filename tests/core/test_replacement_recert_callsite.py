@@ -33,16 +33,17 @@ def _actual_callback(monkeypatch, outcomes, *, restore_ok=True, swap_ok=True,
         if not restore_ok:
             raise RuntimeError("restore failed")
 
-    def recert(mon, api):
+    def recert(mon, api, *, defer_promotion=False):
         calls.append("recert")
+        assert defer_promotion, "no live permission until every monitor is certified"
+        assert all(not m._execution_context.live_order_allowed for m in mons)
         assert api is new_api and mon.api is new_api and mon.client.api is new_api
         value = outcomes[mons.index(mon)]
         if value == "raise":
             raise RuntimeError("cert failed")
         if value:
-            mon._execution_context = replace(mon._execution_context,
-                                            effective_mode="live_ready",
-                                            live_order_allowed=True)
+            return replace(mon._execution_context, effective_mode="live_ready",
+                           live_order_allowed=True)
         return value
 
     env = dict(vars(main))

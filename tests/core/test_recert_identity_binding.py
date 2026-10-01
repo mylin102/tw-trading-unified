@@ -57,3 +57,28 @@ def test_real_recertify_identity_and_final_generation_guard(
         assert "gate" not in calls
     if expected:
         assert calls[-2:] == ["confirm", "transition"]
+
+
+def test_recertify_rejects_generation_rebound_after_runtime_capture(monkeypatch):
+    import main
+    import core.live_route_certificate as certificate
+    from core.mode_transition import live_preflight_context
+    mon = SimpleNamespace(
+        _execution_context=replace(live_preflight_context(), effective_mode="live_quarantined"),
+        config_path="fixture-live.yaml")
+    runtime = SimpleNamespace(account_hash="proved-account", session_generation="generation-A")
+    mon._bind_session_generation = lambda: setattr(
+        mon, "_execution_context", replace(mon._execution_context, session_id="generation-B"))
+    mon._confirm_session_generation = lambda: True
+    mon._run_post_startup_gate = lambda: (SimpleNamespace(ok=True), None)
+    transitions = []
+    monkeypatch.setattr(main, "_persist_ctx", lambda mon: None)
+    monkeypatch.setattr(certificate, "certify_route", lambda *a, **kw: (object(), []))
+    monkeypatch.setattr(certificate, "build_runtime_certification_context", lambda *a: runtime)
+    def transition(ctx, *a, **kw):
+        transitions.append(True)
+        return replace(ctx, effective_mode="live_ready", live_order_allowed=True)
+    monkeypatch.setattr(certificate, "transition_with_certificate", transition)
+    assert main._recertify_after_reconnect(mon, object()) is False
+    assert not transitions
+    assert mon._execution_context.live_order_allowed is False
