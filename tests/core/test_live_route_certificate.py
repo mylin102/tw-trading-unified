@@ -765,7 +765,8 @@ def test_certify_remaining_mts_leg_through_real_preflight(remaining_code, direct
     api._contracts = [_Contract('TMFJ6','2099-10-21'), _Contract('TMFK6','2099-11-18')]
     api.Contracts = _Contracts(api._contracts)
     position = SimpleNamespace(code=remaining_code, quantity=1,
-                               direction='Action.'+direction, price=48428., pnl=0.)
+                               direction=SimpleNamespace(name=direction, value=direction),
+                               price=48428., pnl=0.)
     def positions(account):
         api.calls.append('list_positions')
         return [position]
@@ -800,7 +801,7 @@ def test_certify_remaining_mts_leg_through_real_preflight(remaining_code, direct
 def test_remaining_leg_invalid_identity_still_refused(change):
     from types import SimpleNamespace
     api = _FakeApi()
-    row = dict(code='TMFI6', quantity=1, direction='Action.Buy', price=48428., pnl=0.)
+    row = dict(code='TMFI6', quantity=1, direction=SimpleNamespace(name='Buy',value='Buy'), price=48428., pnl=0.)
     row.update(change)
     api.list_positions = lambda account: [SimpleNamespace(**row)]
     register_session(api)
@@ -812,7 +813,7 @@ def test_remaining_leg_pending_order_still_refused():
     from types import SimpleNamespace
     api = _FakeApi(open_trade_statuses=('Submitted',))
     api.list_positions = lambda account: [SimpleNamespace(
-        code='TMFI6', quantity=1, direction='Action.Buy', price=48428., pnl=0.)]
+        code='TMFI6', quantity=1, direction=SimpleNamespace(name='Buy',value='Buy'), price=48428., pnl=0.)]
     register_session(api)
     cert, failures, _ = _certify(api)
     assert cert is None and 'OPEN_ORDERS_PRESENT' in failures
