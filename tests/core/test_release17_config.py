@@ -7,10 +7,10 @@ import subprocess
 
 import pytest
 
-ROOT = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release17'
+ROOT = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release18'
 
 
-@pytest.mark.parametrize('root,ok', [(ROOT, True), (ROOT.replace('release17', 'release16'), False)])
+@pytest.mark.parametrize('root,ok', [(ROOT, True), (ROOT.replace('release18', 'release17'), False)])
 def test_actual_ecosystem_release_identity(tmp_path, root, ok):
     node = shutil.which('node')
     if not node:
