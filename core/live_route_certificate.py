@@ -388,14 +388,16 @@ def certify_route(api: object, *, process_start_id: str,
     contracts = pre.get("contracts") or {}
     _positions = pre.get("positions") or []
     # A restart with an existing MTS spread is safe when broker truth is
-    # exact: two futures legs, complete direction/cost/qty, and no orders.
+    # 2026-10-01 codex: a released spread has one legitimate remaining leg.
+    # Exact one/two distinct futures legs, complete identity, and no orders.
     # Other positions remain fail-closed.  This does not create an exit-only
     # capability; it permits normal LIVE_READY Policy-J/release evaluation.
     _mts_codes = {str((contracts.get("near") or {}).get("code") or "TMFH6"),
                   str((contracts.get("far") or {}).get("code") or "TMFI6")}
     _valid_existing_mts = (
-        isinstance(_positions, list) and len(_positions) == 2
-        and {str(p.get("code")) for p in _positions if isinstance(p, dict)} == _mts_codes
+        isinstance(_positions, list) and len(_positions) in (1, 2)
+        and len({str(p.get("code")) for p in _positions if isinstance(p, dict)}) == len(_positions)
+        and {str(p.get("code")) for p in _positions if isinstance(p, dict)} <= _mts_codes
         and all(isinstance(p, dict)
                 and type(p.get("qty")) is int and p["qty"] > 0
                 and str(p.get("direction") or "").lower() in {"buy", "sell", "long", "short"}
