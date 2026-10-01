@@ -304,14 +304,12 @@ def test_rejected_deal_records_the_offending_values():
     assert payload["broker_order_id"] == "BRK-1"
 
 
-class _LiveFDealPayload(Mapping):
-    """Dict-like callback shape used by the live Shioaji dispatcher.
+class _LiveFDealPayload:
+    """SDK-protocol fixture, NOT a captured raw callback.
 
-    The object intentionally has neither ``dict`` inheritance nor
-    ``__dict__``.  This is the shape that exposed the production bridge bug:
-    ``msg.get(...)`` works, while the old serializer collapsed the receipt to
-    ``{"value": "..."}`` and therefore observed every canonical field as
-    null.
+    # 2026-10-01 codex: native OrderEventDict has get/items/keys but is not
+    # a Mapping and has no instance __dict__ (verified on installed SDK 1.5.5).
+    Values below are reconstructed historical evidence, not a raw SDK replay.
     """
 
     __slots__ = ("_payload",)
@@ -328,11 +326,26 @@ class _LiveFDealPayload(Mapping):
     def __len__(self):
         return len(self._payload)
 
+    def get(self, key, default=None):
+        return self._payload.get(key, default)
+
+    def keys(self):
+        return list(self._payload.keys())
+
+    def values(self):
+        return list(self._payload.values())
+
+    def items(self):
+        return list(self._payload.items())
+
+    def __contains__(self, key):
+        return key in self._payload
+
 
 def test_live_combo_fdeal_replay_lands_two_leg_prices_once(tmp_path, monkeypatch):
-    """Replay the 2026-09-30 09:56:10 two-leg FDEAL sequence through the
-    production bridge.  The broker combo id is shared by both leg receipts;
-    leg identity comes from contract/exchange receipt content.
+    """Exercise the production bridge with reconstructed two-leg evidence
+    wrapped in the native SDK protocol shape, NOT a captured raw callback.
+    The broker combo id is shared; leg identity comes from receipt content.
     """
     from strategies.plugins.futures.active import tmf_spread
 
@@ -393,6 +406,8 @@ def test_live_combo_fdeal_replay_lands_two_leg_prices_once(tmp_path, monkeypatch
             ts=1790733370.450,
         ),
     ]
+    assert all(not isinstance(callback, Mapping) for callback in callbacks)
+    assert all(not hasattr(callback, "__dict__") for callback in callbacks)
     state = SimpleNamespace(name="FuturesDeal", value="FDEAL")
 
     for callback in callbacks:
@@ -409,3 +424,56 @@ def test_live_combo_fdeal_replay_lands_two_leg_prices_once(tmp_path, monkeypatch
     assert order.filled_quantity == 1
     assert len(order.fills) == 1
     assert order.fills[0].deal_id.startswith("combo-callback:")
+
+
+# 2026-10-01 codex: all probes enter the real handler, never the serializer helper.
+@pytest.mark.parametrize("nested", [False, True])
+def test_native_dict_like_callback_preserves_fields_through_handler(nested):
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    mon = _monitor_with(manager)
+    fields = dict(id="BRK-1", trade_id="native-deal-1", seqno="SEQ-1",
+                  ordno="BRK-1", price=46329.0, quantity=1)
+    payload = _LiveFDealPayload(**fields)
+    if nested:
+        payload = _LiveFDealPayload(deal=payload)
+    state = SimpleNamespace(name="FuturesDeal", value="FDEAL")
+    mon.on_order_event(state, payload)
+    mon.on_order_event(state, payload)
+    assert order.status is OrderStatus.FILLED, mon.events
+    assert order.filled_quantity == 1
+    assert len(order.fills) == 1
+    assert order.fills[0].fill_price == 46329.0
+
+
+@pytest.mark.parametrize("invalid", [
+    {"price": None}, {"price": ""}, {"price": float("nan")},
+    {"price": 0}, {"quantity": None}, {"quantity": 0},
+])
+def test_native_dict_like_invalid_fill_still_fails_closed(invalid):
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    mon = _monitor_with(manager)
+    fields = dict(id="BRK-1", trade_id="native-invalid", seqno="SEQ-1",
+                  ordno="BRK-1", price=46329.0, quantity=1)
+    fields.update(invalid)
+    mon.on_order_event(SimpleNamespace(value="FDEAL"), _LiveFDealPayload(**fields))
+    assert order.status is OrderStatus.SUBMITTED
+    assert order.filled_quantity == 0
+    assert order.fills == []
+    rejects = [p for event, p in mon.events if event == "FDEAL_CALLBACK_REJECTED"]
+    assert len(rejects) == 1
+    assert rejects[0]["broker_order_id"] == "BRK-1"
+    assert rejects[0]["rejection_reason"] == "INVALID_PRICE_OR_QUANTITY"
+
+
+def test_native_dict_like_missing_identity_still_fails_closed():
+    manager = OrderManager(mode="paper")
+    order = _order(manager)
+    mon = _monitor_with(manager)
+    mon.on_order_event(SimpleNamespace(value="FDEAL"),
+                       _LiveFDealPayload(price=46329.0, quantity=1))
+    assert order.status is OrderStatus.SUBMITTED
+    assert order.fills == []
+    assert any(event == "FILL_REJECTED_MISSING_BROKER_IDENTITY"
+               for event, _ in mon.events)
