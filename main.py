@@ -840,6 +840,20 @@ def _recertify_after_reconnect(mon, api):
         runtime = build_runtime_certification_context(
             api, cfg_path,
             {"process_state": {"process_start_id": f"monitor-{os.getpid()}"}})
+        # Rebuild lost metadata only from the freshly certified API. Never
+        # silently switch an already-bound account or authorize from JSON.
+        _account = getattr(runtime, "account_hash", "")
+        _generation = getattr(runtime, "session_generation", "")
+        _ctx = getattr(mon, "_execution_context", None)
+        if not _account or not _generation or _ctx is None:
+            _quarantine_for_handoff([mon], reason="RECERTIFY_IDENTITY_UNAVAILABLE")
+            return False
+        if getattr(_ctx, "account_id_hash", None) not in (None, "", _account):
+            _quarantine_for_handoff([mon], reason="RECERTIFY_ACCOUNT_MISMATCH")
+            return False
+        from dataclasses import replace
+        mon._execution_context = replace(
+            _ctx, account_id_hash=_account, live_order_allowed=False)
         # [D1] after a relogin the registry holds a NEW generation — bind
         # it into the quarantined ctx + confirm before promoting
         bind = getattr(mon, "_bind_session_generation", None)
@@ -887,6 +901,11 @@ def _recertify_after_reconnect(mon, api):
                     audit_reasons=("POST_STARTUP_GATE_FAILED",))
                 _persist_ctx(mon)
                 return False
+        # The broker gate may take time. A generation change during it must
+        # invalidate this transition too, not just the earlier binding.
+        if callable(confirm) and not confirm():
+            _quarantine_for_handoff([mon], reason="SESSION_GENERATION_MISMATCH")
+            return False
         mon._execution_context = transition_with_certificate(
             mon._execution_context, cert, issuer, runtime=runtime)
         _persist_ctx(mon)
