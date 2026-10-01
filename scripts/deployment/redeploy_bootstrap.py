@@ -33,6 +33,7 @@ registry-bound session generation (this tool only prepares pre_deploy).
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -134,6 +135,46 @@ def _pid_alive(pid_file: str) -> bool:
         return False
 
 
+def _current_single_leg(snapshot_path: str, expected: list[str]) -> dict:
+    """2026-10-01 codex: explicit operator scope, broker bytes are sole truth."""
+    from core.deployment_safety_gate import guard_margin
+    data = json.loads(Path(snapshot_path).read_bytes())
+    if (data.get('source') != 'live_broker' or data.get('mode') != 'live'
+            or data.get('scope') != 'futopt'
+            or (data.get('fetch_status') or {}).get('capture') != 'OK'
+            or any(data.get(k) for k in ('errors', 'query_failures', 'capture_error'))):
+        raise ValueError('CURRENT_SINGLE_LEG_CAPTURE_INVALID')
+    stamp = data.get('captured_at')
+    if type(stamp) is not int or not 0 <= time.time() - stamp / 1000 <= 60:
+        raise ValueError('CURRENT_SINGLE_LEG_STALE')
+    digest = hashlib.sha256(json.dumps(dict(data, canonical_input_hash=None),
+        sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+    if data.get('canonical_input_hash') != digest:
+        raise ValueError('CURRENT_SINGLE_LEG_HASH_MISMATCH')
+    margin = guard_margin(data.get('available_margin'), margin_evidence=data)
+    if not margin.ok:
+        raise ValueError('CURRENT_SINGLE_LEG_MARGIN_INVALID')
+    if not isinstance(data.get('positions'), list) or data.get('open_orders') != []:
+        raise ValueError('CURRENT_SINGLE_LEG_PENDING_OR_UNKNOWN')
+    rows = [p for p in data['positions'] if isinstance(p, dict)
+            and p.get('account', 'futures') == 'futures']
+    if len(rows) != 1 or any(not isinstance(p, dict) for p in data['positions']):
+        raise ValueError('CURRENT_SINGLE_LEG_COUNT_INVALID')
+    row = rows[0]
+    side = str(row.get('direction') or '').lower().replace('action.', '')
+    side = {'long':'buy', 'short':'sell'}.get(side, side)
+    qty, avg = row.get('quantity'), row.get('avg_cost')
+    if (type(qty) is not int or qty <= 0 or side not in ('buy', 'sell')
+            or isinstance(avg, bool) or not isinstance(avg, (int, float))
+            or not math.isfinite(avg) or avg <= 0):
+        raise ValueError('CURRENT_SINGLE_LEG_IDENTITY_INVALID')
+    if (row.get('code'), side, qty, avg) != (expected[0], expected[1], int(expected[2]), float(expected[3])):
+        raise ValueError('CURRENT_SINGLE_LEG_SCOPE_MISMATCH')
+    return {'source':'live_broker', 'captured_at':stamp, 'canonical_input_hash':digest,
+            'canonical_legs':[{'code':row['code'], 'side':'LONG' if side == 'buy' else 'SHORT',
+                               'qty':qty, 'avg_cost':float(avg)}]}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--runtime-dir", required=True)
@@ -151,6 +192,9 @@ def main() -> int:
                     help="allow one explicitly reconciled broker-held MTS "
                          "position; requires complete identity and no "
                          "pending orders")
+    ap.add_argument('--reconcile-current-single-leg', nargs=4,
+                    metavar=('CODE', 'SIDE', 'QTY', 'AVG_COST'),
+                    help='explicit broker-only single-leg reconciliation; requires allow-existing flag')
     ap.add_argument("--apply", action="store_true",
                     help="perform the reset (default: dry-run, no writes)")
     args = ap.parse_args()
@@ -170,13 +214,27 @@ def main() -> int:
         failures.append(str(e))
         ctx, raw = None, b""
 
+    # 2026-10-01 codex: validate all proofs before changing any durable context.
+    holding = None
+    guard_ctx = ctx
+    if args.reconcile_current_single_leg:
+        try:
+            if not args.allow_existing_mts_position or ctx is None or ctx.get('requested_mode') != 'live':
+                raise ValueError('CURRENT_SINGLE_LEG_EXPLICIT_LIVE_SCOPE_REQUIRED')
+            if Path(args.position_state).resolve() != Path(args.margin_evidence).resolve():
+                raise ValueError('CURRENT_SINGLE_LEG_EVIDENCE_MISMATCH')
+            holding = _current_single_leg(args.margin_evidence, args.reconcile_current_single_leg)
+            guard_ctx = dict(ctx, canonical_holding=holding, exit_only_capability=None)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            failures.append(str(exc))
+
     # 2. fresh live_broker futures-flat / no-orders snapshot. Local strategy
     # state may be stale/ghosted after a stopped process; use the same
     # canonical broker evidence supplied for the margin proof.
     from core.deployment_safety_gate import guard_flat_no_pending
     flat = guard_flat_no_pending(
         args.margin_evidence,
-        ctx if ctx is not None else {"requested_mode": "live"},
+        guard_ctx if guard_ctx is not None else {"requested_mode": "live"},
         args.allow_existing_mts_position,
         reject_stale_two_leg=True)
     if not flat.ok:
@@ -249,9 +307,11 @@ def main() -> int:
     # must survive the reset: pre_deploy and the in-process startup gate accept
     # a non-flat account only against these legs.  It is evidence, not stale
     # process state.
-    _holding = (ctx or {}).get("canonical_holding")
+    _holding = holding or (ctx or {}).get("canonical_holding")
     if isinstance(_holding, dict) and _holding.get("canonical_legs"):
         new_ctx["canonical_holding"] = _holding
+    if holding is not None and isinstance(ctx.get('gateway_intents'), dict):
+        new_ctx['gateway_intents'] = ctx['gateway_intents']  # keep exact durable receipts
 
     p = _ctx_path(rt)
     tmp = p.with_suffix(".json.tmp")
