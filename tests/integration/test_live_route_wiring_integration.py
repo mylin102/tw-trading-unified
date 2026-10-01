@@ -366,7 +366,9 @@ def test_reconnect_quarantines_before_relogin_and_recertifies(monkeypatch):
                         lambda api, **kw: (cert_fake, []))
     monkeypatch.setattr("core.live_route_certificate."
                         "build_runtime_certification_context",
-                        lambda api, cfg, process_state=None: object())
+                        lambda api, cfg, process_state=None: SimpleNamespace(
+                            account_hash="certified-fixture-account",
+                            session_generation="certified-fixture-generation"))
 
     def _transition_spy(ctx, cert, issuer, *, runtime):
         from core.mode_transition import (ModeTransitionState,
@@ -456,7 +458,9 @@ def test_reconnect_auto_code12_path_quarantines(monkeypatch):
                         lambda api, **kw: (cert_fake, []))
     monkeypatch.setattr("core.live_route_certificate."
                         "build_runtime_certification_context",
-                        lambda api, cfg, process_state=None: object())
+                        lambda api, cfg, process_state=None: SimpleNamespace(
+                            account_hash="certified-fixture-account",
+                            session_generation="certified-fixture-generation"))
 
     def _transition_spy(ctx, cert, issuer, *, runtime):
         from core.mode_transition import (ModeTransitionState,

@@ -541,7 +541,9 @@ def test_recertify_after_relogin_recovers_live_ready(tmp_path, monkeypatch):
         return (object(), [])
 
     def fake_build(api, config, process_state=None):
-        return object()
+        return SimpleNamespace(
+            account_hash=lrc._account_hash(api.futopt_account),
+            session_generation=lrc.session_registry.generation(api))
 
     def spy_transition(ctx, cert, issuer, *, runtime):
         calls["transitions"] += 1
