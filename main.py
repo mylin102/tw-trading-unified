@@ -812,7 +812,7 @@ def _reconnect_monitors(fm):
     return fm if isinstance(fm, (list, tuple)) else [fm]
 
 
-def _recertify_after_reconnect(mon, api):
+def _recertify_after_reconnect(mon, api, *, defer_promotion=False):
     """After a successful resubscribe the certificate-required transition
     MAY proceed: fresh certify -> transition_with_certificate. Any
     failure leaves the context LIVE_QUARANTINED with an explicit reason —
@@ -862,6 +862,9 @@ def _recertify_after_reconnect(mon, api):
                 bind()
             except Exception:
                 pass
+        if str(getattr(mon._execution_context, "session_id", "")) != str(_generation):
+            _quarantine_for_handoff([mon], reason="SESSION_GENERATION_MISMATCH")
+            return False
         confirm = getattr(mon, "_confirm_session_generation", None)
         if callable(confirm):
             try:
@@ -906,8 +909,11 @@ def _recertify_after_reconnect(mon, api):
         if callable(confirm) and not confirm():
             _quarantine_for_handoff([mon], reason="SESSION_GENERATION_MISMATCH")
             return False
-        mon._execution_context = transition_with_certificate(
+        _certified_ctx = transition_with_certificate(
             mon._execution_context, cert, issuer, runtime=runtime)
+        if defer_promotion:
+            return _certified_ctx if _certified_ctx.is_live_ready() else False
+        mon._execution_context = _certified_ctx
         _persist_ctx(mon)
         return bool(mon._execution_context.is_live_ready())
     except Exception:
@@ -1824,10 +1830,12 @@ def run_system(dry_run=False, config_name="futures"):
                 om.monitor.api = _new_api
                 try:
                     _recert_results = [
-                        _recertify_after_reconnect(_mon, _new_api)
+                        _recertify_after_reconnect(_mon, _new_api, defer_promotion=True)
                         for _mon in _live_mons
                     ]
-                    _recert_ok = all(_result is True for _result in _recert_results)
+                    _recert_ok = all(
+                        _result is not False and _result.is_live_ready()
+                        for _result in _recert_results)
                 except Exception:
                     _recert_ok = False
                 if not _recert_ok:
@@ -1836,6 +1844,9 @@ def run_system(dry_run=False, config_name="futures"):
                     _session_event("SESSION_RECONNECT_FAILED",
                                    error_type="RECERTIFY_FAILED")
                     return False
+                for _mon, _certified_ctx in zip(_live_mons, _recert_results):
+                    _mon._execution_context = _certified_ctx
+                    _persist_ctx(_mon)
                 _session_event("SESSION_RECONNECT_READY", **evidence)
                 return True
 
