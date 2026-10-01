@@ -158,12 +158,21 @@ class OrderManager:
 
     @staticmethod
     def _payload_to_dict(payload) -> Optional[Dict[str, Any]]:
+        # 2026-10-01 codex: SDK OrderEventDict is dict-like, not a Mapping.
+        # Use the same protocol check for the callback and nested event structs.
+        def is_mapping(value):
+            return isinstance(value, Mapping) or (
+                callable(getattr(value, "items", None))
+                and callable(getattr(value, "keys", None))
+                and callable(getattr(value, "__getitem__", None))
+            )
+
         def serialize(value):
             if value is None or isinstance(value, (str, int, float, bool)):
                 return value
             if isinstance(value, datetime):
                 return value.isoformat()
-            if isinstance(value, Mapping):
+            if is_mapping(value):
                 return {key: serialize(item) for key, item in value.items()}
             if isinstance(value, (list, tuple, set)):
                 return [serialize(item) for item in value]
@@ -179,7 +188,7 @@ class OrderManager:
 
         if payload is None:
             return None
-        if isinstance(payload, Mapping):
+        if is_mapping(payload):
             return serialize(payload)
         if hasattr(payload, "__dict__"):
             return serialize(payload)
