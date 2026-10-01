@@ -1774,7 +1774,12 @@ def run_system(dry_run=False, config_name="futures"):
 
             def _request_session_reconnect(exc, **evidence):
                 nonlocal api
-                _quarantine_for_handoff(futures_mons,
+                _live_mons = [
+                    _mon for _mon in futures_mons
+                    if getattr(getattr(_mon, "_execution_context", None),
+                               "requested_mode", None) == "live"
+                ]
+                _quarantine_for_handoff(_live_mons,
                                         reason="SESSION_RECONNECT_PENDING")
                 _session_event("SESSION_RECONNECT_TRIGGERED", **evidence)
                 _old_api = api
@@ -1798,6 +1803,20 @@ def run_system(dry_run=False, config_name="futures"):
                         _mon.client.api = _new_api
                 om.api = _new_api
                 om.monitor.api = _new_api
+                try:
+                    _recert_results = [
+                        _recertify_after_reconnect(_mon, _new_api)
+                        for _mon in _live_mons
+                    ]
+                    _recert_ok = all(_result is True for _result in _recert_results)
+                except Exception:
+                    _recert_ok = False
+                if not _recert_ok:
+                    _quarantine_for_handoff(
+                        _live_mons, reason="SESSION_RECERTIFY_FAILED")
+                    _session_event("SESSION_RECONNECT_FAILED",
+                                   error_type="RECERTIFY_FAILED")
+                    return False
                 _session_event("SESSION_RECONNECT_READY", **evidence)
                 return True
 
