@@ -38,7 +38,7 @@ def _actual_callback(monkeypatch, outcomes, *, restore_ok=True, swap_ok=True,
         assert defer_promotion, "no live permission until every monitor is certified"
         assert all(not m._execution_context.live_order_allowed for m in mons)
         assert api is new_api and mon.api is new_api and mon.client.api is new_api
-        value = outcomes[mons.index(mon)]
+        value = outcomes[next(i for i, item in enumerate(mons) if item is mon)]
         if value == "raise":
             raise RuntimeError("cert failed")
         if value:

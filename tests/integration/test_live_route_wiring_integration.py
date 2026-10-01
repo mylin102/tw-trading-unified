@@ -17,6 +17,7 @@ Contracts:
 """
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -380,7 +381,9 @@ def test_reconnect_quarantines_before_relogin_and_recertifies(monkeypatch):
                         "transition_with_certificate", _transition_spy)
     m = _monitor_stub(_ready_ctx())
     m._run_post_startup_gate = lambda: (SimpleNamespace(ok=True, refusal_codes=()), {})
-    m._bind_session_generation = lambda: None
+    m._bind_session_generation = lambda: setattr(
+        m, "_execution_context", replace(m._execution_context,
+                                         session_id="certified-fixture-generation"))
     m._confirm_session_generation = lambda: True
     m.far_contract = SimpleNamespace(code="TMFI6")
     m.config_path = "/tmp/futures_test.yaml"
@@ -472,7 +475,9 @@ def test_reconnect_auto_code12_path_quarantines(monkeypatch):
                         "transition_with_certificate", _transition_spy)
     m = _monitor_stub(_ready_ctx())
     m._run_post_startup_gate = lambda: (SimpleNamespace(ok=True, refusal_codes=()), {})
-    m._bind_session_generation = lambda: None
+    m._bind_session_generation = lambda: setattr(
+        m, "_execution_context", replace(m._execution_context,
+                                         session_id="certified-fixture-generation"))
     m._confirm_session_generation = lambda: True
     m.far_contract = SimpleNamespace(code="TMFI6")
     m.config_path = "/tmp/futures_test.yaml"
