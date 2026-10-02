@@ -1,98 +1,64 @@
-# Phase 1 Release Candidate — FINAL FREEZE + Preflight Packet
+# Futures PAPER selector — final freeze
 
-**日期**: 2026-08-09（Codex bounded step — final freeze）
-**狀態**: FROZEN（freeze-first：所有 code/test commits 已完成後 freeze；
-**此後禁改檔** — gate 對任何 post-freeze 變更 refuse）
-**Frozen release tree HEAD**: `423e149eec41eaf8ea926667200d4fd5e5215e09`
-（= serializer int-like exact-type fix commit；其後僅此 re-freeze docs commit）
-（= gate closure fix commit；其後僅此 freeze-record docs commit）
-**frozen_tree_hash（exclude-self tree identity — manifest/rollback docs
-排除）**: `ed2f316240a6914dcbd6f5ab3cb0bd7805dd189397077a8dcbe4b14dfae19464`
-（= `git ls-tree -r <commit> | grep -v manifest docs | sha256`；manifest-only
-commits 不影響此 identity — 解除 freeze/manifest SHA cycle；任何 code
-變更 → hash 變 → gate GUARD_MANIFEST_STALE 拒絕）
-```
-frozen_tree_hash: 15e4c604096c64fe9931457ca52216752ba697d4df10a9d287d11aa5c50fd220
-```
-**LRC_RELEASE_SHA（部署時）**: = deploy-time `git -C <release_dir>
-rev-parse HEAD` 之 literal（= 此 freeze-record commit 的 SHA；deployed
-tree 的 HEAD — gate 以 GUARD_HEAD_MISMATCH 強制一致）
-**Closure**: Steps 1-9 + exit failure-side + orphan + release identity +
-margin + Phase-1b fix + Deployment Safety Gate（7db0e0a1/63ea9e68，
-AGY 驗收 44/44）
+2026-10-02 Codex. PAPER-only cutover, not LIVE promotion authorization.
+Base: 2fc306d38fefc25376fd944c33f6acd335fabead.
+Tested code HEAD: f4a858c2128cf25e0fdb16e1388a11a344efa054.
+Application scope: ecosystem.config.js only. This commit is doc-only.
+LRC_RELEASE_SHA must equal the literal final deployed release HEAD.
 
-## Clean-tree 證據（freeze 時刻）
-```
-git status --porcelain -- <closure 11 files>  = (empty)
-git diff --exit-code -- ecosystem.config.js   = clean（未修改）
+```text
+frozen_tree_hash: a461e8e0eb9b96f12a610e4339ea9f2b2125bf24ece9d3200d63bff259c152fd
 ```
 
-## Preflight Packet（read-only — NOT_READY，無補值）
+Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
+PHASE2_DEPLOYMENT_MANIFEST.md. No application edits after freeze.
+Prior manifest backed up with SHA256 under:
+/private/tmp/mts-paper-freeze-backup-codex-20261002/.
 
-| Item | 現況 | 狀態 |
-|---|---|---|
-| source=live_broker | **缺**（position state 無 source/mode） | NOT_READY |
-| positions=[] | **缺**（has_position=True, HOLDING_SPREAD；欄位全 None） | NOT_READY |
-| open_orders=[] | 缺 | NOT_READY |
-| captured_at ≤600s | 缺（_updated 2026-08-08T04:59 — stale） | NOT_READY |
-| snapshot hash | 缺 | NOT_READY |
-| session_id | 缺（ctx 檔不存在 — Release B 未寫） | NOT_READY |
-| margin ≥ 220000 | 無唯讀來源（禁 broker read） | NOT_READY |
-| execution_context | 缺檔 → gate 判定 quarantine-bootstrap（原子寫入能力已驗證） | PASS（bootstrap only, never LIVE） |
+## Actual offline evidence
 
-**Packet verdict: NOT_READY** — 部署前需由授權的 broker 唯讀快照提供
-source=live_broker 的 flat 證明 + margin + session（本 freeze 不補值）。
+Real Node require(ecosystem.config.js) callsite: RED then four-case GREEN.
+Default-live mutation failed; paper restored byte-identically to committed
+ecosystem blob 97e35acffde12663e65e087dd698d4005b320430.
+node --check and git diff --check passed.
 
-## Deployment Gate dry/read-only 結果（production env）
-```
-[PASS] release_head / clean_tree / runtime_paths / single_process /
-       quarantine_first_startup / ctx_atomic_health(bootstrap)
-[FAIL] flat_snapshot:      GUARD_SNAPSHOT_SOURCE_AMBIGUOUS
-[FAIL] session_generation: GUARD_SESSION_MISSING
-[FAIL] margin:             GUARD_MARGIN_UNAVAILABLE
-[FAIL] rollback_manifest:  GUARD_MANIFEST_STALE（此記錄修正後應 PASS）
-NOT_READY refusal_codes=['GUARD_MANIFEST_STALE','GUARD_MARGIN_UNAVAILABLE',
-'GUARD_SESSION_MISSING','GUARD_SNAPSHOT_SOURCE_AMBIGUOUS']
-```
+Full A/B: Python 3.12.5, pytest 9.1.1, anyio 4.14.2; background taskpolicy;
+isolated fake-broker runtime without live credentials. No concurrent pytest.
+A: 149 failed, 3983 passed, 15 skipped, 10 collection errors.
+B: 147 failed, 3985 passed, 15 skipped, 10 collection errors.
+Both: 4147 collected/completed; 12447 actual phase/collection records.
+New failed node/phase pairs and new collection errors: empty.
+Added/removed/unfinished nodes: empty; duplicate collection: false.
+Not an all-green suite. PM2 SSOT contract now passes. The other resolved
+baseline node (reconnect-window current-generation BBO) is not credited here.
 
-## PM2/ecosystem（未修改 — 僅列出待注入）
-- `LRC_RELEASE_SHA`: **0 處** — deploy 時必須注入 literal = deploy-time HEAD
-- `TRADING_RUNTIME_DIR`: 2 處（preserved，不需改）
-- ecosystem.config.js 本 freeze **未修改**
+Raw artifacts:
+/private/tmp/claude-501/-Users-mylin/e660ac12-1943-4be6-b6de-f2b0daef2a5f/scratchpad/
+final_A_baseline.log, final_A_phase.jsonl, final_A_collected.txt,
+paper_B1_codex_candidate.log, paper_B1_codex_phase.jsonl,
+paper_B1_codex_collected.txt, paper_B1_codex_run.json,
+paper_B1_codex_finished.json.
+Comparison: /private/tmp/mts_compare_phase_codex_20261002.py.
 
-## Runtime certification metadata
-## Runtime certification metadata
-<!-- BEGIN RUNTIME_CERTIFICATION_METADATA -->
-```json
-{
-  "broker": {
-    "active_orders": 0,
-    "capture": "OK",
-    "futures_positions": 0,
-    "mode": "live",
-    "source": "live_broker"
-  },
-  "callback_registration_generation": null,
-  "candidate_head": "6dd9a7de6e5e1c6b0a2162e9cfa46845c731e5ad",
-  "captured_at": 1789611061307,
-  "clean_worktree": true,
-  "config_hash": null,
-  "durable_locks": {
-    "active": 0,
-    "retired_unresolved": 2
-  },
-  "generated_at": "2026-09-17T05:03:43.433858+00:00",
-  "live_order_allowed": false,
-  "process": {
-    "pid": null,
-    "start_identity": null
-  },
-  "promotion_mode": "live_quarantined",
-  "refresh_generation": null,
-  "session_id": "b7f96eec510c24a87ce2ef659c34e5fb",
-  "source_tree_hash": "fea9ccc857767e39677fb4fc88c9020ed6d6c8dd8935d3f5b656723053221422",
-  "ttl_seconds": 600.0
-}
-```
-<!-- END RUNTIME_CERTIFICATION_METADATA -->
+## Mode and pending Mini acceptance
+
+TRADING_FUTURES_MODE: default/paper -> futures; live -> futures_live;
+invalid values reject. Preserve global/options PAPER_MODE=true.
+Mode is startup-bound; no hot YAML mode switch or release-directory rotation.
+No strategy/risk/YAML/Python/stock/options/gateway/deployment-identity changes.
+Four pre-existing Python undefined names unchanged. No LIVE gate bypass.
+Separate account-binding/gateway candidate is NOT included.
+
+Mini acceptance PENDING: fresh broker FLAT/open_orders=0/health/identity;
+single trading-only stop/start, old owner gone before Git source change;
+exact SHA and clean tracked source; new paper_active context/hash/namespace;
+paper OrderManager and near/far Tick+BidAsk acknowledgements;
+new-process startup broker reconciliation and safety writer; 120s stable;
+then existing maintenance-flag release and PM2 save/dump/launchd provenance.
+Dashboard and stock stay untouched. No manual orders, ledger/context/safety
+JSON edits, git stash, automatic second restart or LIVE authorization.
+
+LIVE account-binding/margin problems remain outside this PAPER cutover.
+Paper lacks LIVE certification session: preserve genuine pre-stop last-live
+broker snapshot; do not relabel it a current paper-session broker query.
 
