@@ -101,7 +101,8 @@ def test_real_startup_binds_paper_before_shared_ledger_bootstrap(isolated_runtim
     assert not mon._mts_has_open_position_from_fills()
     assert mon.order_mgr.get_pending() == []
     assert mon.order_mgr.get_completed() == []
-    assert mon._execution_context.requested_mode.value == "paper"
+    # 2026-10-02 Codex: ExecutionContext stores the production mode as a string.
+    assert mon._execution_context.requested_mode == "paper"
     assert mon.order_mgr.broker_adapter is None
     _unchanged(originals)
 
@@ -195,7 +196,7 @@ def _actual_ui_nodes(relative, names, namespace):
 @pytest.mark.parametrize("relative,names", [
     ("ui/pages/02_positions_orders.py", {"pos_file", "fills_file"}),
     ("ui/pages/03_trade_review.py", {"fills_path", "events_path"}),
-    ("ui/dashboard.py", {"_read_canonical_mts_state", "_fills_path", "_events_path", "FUTURES_TRADES"}),
+    ("ui/dashboard.py", {"_read_canonical_mts_state", "_fills_path", "_events_path", "MTS_TRADES", "FUTURES_TRADES"}),
 ])
 def test_actual_ui_read_sites_follow_runtime_not_stale_ui_env(isolated_runtime, monkeypatch, relative, names):
     rt = isolated_runtime
@@ -210,8 +211,11 @@ def test_actual_ui_read_sites_follow_runtime_not_stale_ui_env(isolated_runtime, 
     if hasattr(rp, "mts_runtime_path"):
         ns["mts_runtime_path"] = rp.mts_runtime_path
     _actual_ui_nodes(relative, names, ns)
-    for name in names - {"_read_canonical_mts_state"}:
+    # 2026-10-02 Codex: the legacy directory is also a STOCK consumer, so never redirect it.
+    for name in names - {"_read_canonical_mts_state", "FUTURES_TRADES"}:
         assert Path(ns[name]).is_relative_to(rt / "paper")
+    if "FUTURES_TRADES" in names:
+        assert Path(ns["FUTURES_TRADES"]) == rt / "exports/trades"
     if "_read_canonical_mts_state" in names:
         actual, status, path = ns["_read_canonical_mts_state"]()
         assert status == "OK" and actual["trade_id"] == "paper-ui"
