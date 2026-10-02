@@ -17360,7 +17360,8 @@ class FuturesMonitor:
             trade_state = {
                 "entry_price": float(self.trader.entry_price),
                 "side": "LONG" if self.trader.position > 0 else "SHORT",
-                "peak_price": float(self.trader.peak_price if self.trader.position > 0 else self.trader.floor_price),
+                # 2026-10-02 Codex: PaperTrader maintains the LONG peak / SHORT floor in one field.
+                "peak_price": float(self.trader._best_price),
                 "position_age_bars": 0 # TODO: Implement bar tracking
             }
             
