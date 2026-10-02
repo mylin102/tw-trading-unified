@@ -84,3 +84,67 @@ def test_actual_reload_persist_failure_keeps_prior_hash(isolated_runtime, monkey
     assert mon.order_mgr.execution_context is prior
     assert path.read_bytes() == original
     assert mon._config_mtime == 0  # failed publication must remain retryable
+
+
+@pytest.mark.parametrize("signal,prices,expected", [
+    ("BUY", (48150.0, 48090.0), 48150.0),
+    ("SELL", (47850.0, 47910.0), 47850.0),
+])
+def test_actual_strategy_tick_uses_paper_favorable_extreme(
+        isolated_runtime, monkeypatch, signal, prices, expected):
+    # 2026-10-02 Codex: full tick callsite and real PaperTrader, stop before order execution.
+    import time
+    from datetime import datetime
+    import pandas as pd
+    from strategies.futures import monitor as fm
+    from core import exit_engine
+    mon = _monitor(isolated_runtime, monkeypatch)
+    mon.cfg["mts"] = {"enabled": False}
+    mon.dry_run = False
+    mon.is_trading_ready = True
+    mon.last_tick_at = time.time()
+    mon.manual_trade_flag_path = str(isolated_runtime / "no-manual-flag")
+    mon.contract = SimpleNamespace(delivery_date="2099/01/01")
+    mon._is_settlement_day = lambda _: False
+    mon._tmf_feed_age_secs = lambda: 0
+    mon._trend_hold_active = lambda *args: False
+    mon._scout_entry_bar = -1
+    for name in ("_process_live_upl_refresh_command", "_reconcile_exit_only_authorization",
+                 "_run_mts_watchdog", "_sync_mts_status", "_check_futures_contract_staleness",
+                 "_refresh_runtime_status", "_check_tick_api_consistency", "_hourly_no_trade_audit",
+                 "_update_mtf_snapshot"):
+        setattr(mon, name, lambda *args, **kwargs: None)
+    mon._check_canonical_freshness = lambda _: []
+    mon._periodic_backfill_bars = lambda: None
+    monkeypatch.setattr("core.date_utils.is_day_session", lambda _: True)
+    monkeypatch.setattr("core.date_utils.is_night_session", lambda _: False)
+    monkeypatch.setattr(fm, "get_taifex_futures_hhmm", lambda: 1000)
+    monkeypatch.setattr(fm, "get_taifex_futures_session_type", lambda: "day")
+    monkeypatch.setattr(fm, "calculate_futures_squeeze", lambda frame, **kwargs: frame)
+    monkeypatch.setattr(fm, "attach_bar_metadata", lambda frame: frame)
+    now = datetime.now()
+    result = mon.trader.execute_signal(signal, 48000.0, now)
+    assert result and mon.trader.position == (1 if signal == "BUY" else -1)
+    assert not hasattr(mon.trader, "peak_price") and not hasattr(mon.trader, "floor_price")
+    observed = []
+    class ReachedExitBoundary(Exception):
+        pass
+    def observe_exit(trade_state, context, market):
+        observed.append(dict(trade_state))
+        assert trade_state["side"] == ("LONG" if signal == "BUY" else "SHORT")
+        assert trade_state["peak_price"] == expected
+        raise ReachedExitBoundary
+    monkeypatch.setattr(exit_engine, "should_exit", observe_exit)
+    for price in prices:
+        row = {"Open": price, "High": price, "Low": price, "Close": price,
+               "Volume": 1.0, "vwap": price, "atr": 50.0, "atr_raw": 50.0,
+               "momentum": 0.0, "sqz_on": False, "trading_day": now.strftime("%Y-%m-%d")}
+        frame = pd.DataFrame([row, row], index=pd.date_range(now, periods=2, freq="5min"))
+        mon._get_tick_bars_df = lambda: frame
+        monkeypatch.setattr(fm, "build_preferred_canonical_bar_frames",
+                            lambda *args, **kwargs: ({"5m": frame}, {"source": "tick-5m"}))
+        with pytest.raises(ReachedExitBoundary):
+            mon._strategy_tick()
+        assert mon.trader.position == (1 if signal == "BUY" else -1)
+        assert mon.trader._best_price == expected
+    assert len(observed) == 2
