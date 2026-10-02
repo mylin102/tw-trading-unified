@@ -193,6 +193,18 @@ def _actual_ui_nodes(relative, names, namespace):
     return namespace
 
 
+def test_real_state_writer_accepts_string_path(isolated_runtime, monkeypatch):
+    # 2026-10-02 Codex: preserve the real writer's existing str/Path injection contract.
+    path = isolated_runtime / "paper/data/state/string_path.json"
+    monkeypatch.setattr(tmf, "_get_state_file_path", lambda: str(path))
+    tmf._write_mts_state(has_position=True, action="TEST", reason="string path",
+                         trade_id="paper-string-path", peak_net_exit_pnl_twd=1850.0)
+    assert path.exists()
+    state = json.loads(path.read_text())
+    assert state["trade_id"] == "paper-string-path"
+    assert state["peak_net_exit_pnl_twd"] == 1850.0
+
+
 @pytest.mark.parametrize("relative,names", [
     ("ui/pages/02_positions_orders.py", {"pos_file", "fills_file"}),
     ("ui/pages/03_trade_review.py", {"fills_path", "events_path"}),
