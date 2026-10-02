@@ -42,7 +42,7 @@ from squeeze_futures.data.data_storage import save_trade
 
 # GSD: Pluggable Strategy Integration
 from core.strategy_registry import StrategyRegistry
-from core.runtime_paths import runtime_logs, runtime_path, mts_position_state_path
+from core.runtime_paths import runtime_logs, runtime_path, mts_position_state_path, mts_runtime_path, bind_mts_data_mode
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.futures_bar_regime import classify_futures_bar_regime
@@ -302,6 +302,9 @@ def _mts_position_state_path() -> Path:
     alternate deployments), falling back to the module-level constant.
     Tests can monkeypatch MTS_POSITION_STATE_PATH to redirect.
     """
+    # 2026-10-02 Codex: production never reuses a pre-bind module snapshot or LIVE override.
+    if os.environ.get("NODE_ENV") == "production":
+        return Path(mts_position_state_path())
     # 2026-07-21 Gemini CLI: Support thread-local path override for multi-instance concurrent processes
     if getattr(_thread_local, "state_path", None) is not None:
         return Path(_thread_local.state_path)
@@ -321,6 +324,9 @@ def _mts_intent_log_dir() -> str:
 
     Test isolation is explicit dependency injection through
     TRADING_RUNTIME_DIR; production never inspects pytest state."""
+    # 2026-10-02 Codex: paper exits must not replay LIVE durable intents.
+    if os.environ.get("NODE_ENV") == "production":
+        return mts_runtime_path("logs")
     _rt = os.environ.get("TRADING_RUNTIME_DIR")
     if _rt:
         return os.path.join(_rt, "logs")
@@ -398,6 +404,11 @@ class FuturesMonitor:
         self._config_mtime = 0
         self.dry_run = dry_run
         self.cfg = self._load_config(config_path)
+        # 2026-10-02 Codex: resolve every MTS restore/write path BEFORE state and ledger bootstrap.
+        if os.environ.get("NODE_ENV") == "production":
+            bind_mts_data_mode("live" if self.cfg.get("live_trading", False) else "paper")
+            from strategies.plugins.futures.active.tmf_spread import configure_mts_data_paths
+            configure_mts_data_paths()
         # 2026-05-27 Gemini CLI: Generalize ticker initialization (no hardcoded default)
         self.ticker = self.cfg.get("ticker", "UNKNOWN")
         # 2026-07-21 Gemini CLI: Determine state path based on ticker name for multi-instance isolation
@@ -536,8 +547,10 @@ class FuturesMonitor:
         # (three-state FLAT/OPEN/UNKNOWN). Bootstrap reads the ledger once;
         # afterwards only NEW bytes are tail-read (never a per-tick full scan).
         self._ledger_projection = MtsLedgerProjection(
-            path=os.environ.get("MTS_FILL_LOG_PATH")
-            or runtime_logs("mts_trade_fills.jsonl"),
+            # 2026-10-02 Codex: same namespace as the actual confirmed-fill writer.
+            path=(mts_runtime_path("logs", "mts_trade_fills.jsonl")
+                  if os.environ.get("NODE_ENV") == "production" else
+                  os.environ.get("MTS_FILL_LOG_PATH") or runtime_logs("mts_trade_fills.jsonl")),
             source="PAPER",
         )
         self._ledger_projection_sync_ts = 0.0
@@ -7699,7 +7712,8 @@ class FuturesMonitor:
 
             # Use the shared runtime export root; tests inject it through
             # TRADING_RUNTIME_DIR / runtime_paths.
-            orders_dir = runtime_path("exports", "trades")
+            # 2026-10-02 Codex: mode-scoped export must not merge legacy LIVE rows into PAPER.
+            orders_dir = mts_runtime_path("exports", "trades")
             orders_file = Path(orders_dir) / f"{self.ticker}_{_date}_orders.json"
             orders_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -7841,7 +7855,8 @@ class FuturesMonitor:
             # promote position-covered pending rows to FILLED.
             try:
                 from core.runtime_paths import runtime_path
-                orders_file = Path(runtime_path(
+                # 2026-10-02 Codex: recover only this mode's durable lifecycle.
+                orders_file = Path(mts_runtime_path(
                     "exports", "trades",
                     f"{self.ticker}_{datetime.now().strftime('%Y%m%d')}_orders.json"))
                 if orders_file.exists():
@@ -7858,7 +7873,10 @@ class FuturesMonitor:
             
             # Find today's trades CSV
             today = datetime.now().strftime("%Y%m%d")
-            trades_file = Path(f"exports/trades/TMF_{today}_trades.csv")
+            # 2026-10-02 Codex: retain LIVE legacy CSV compatibility; PAPER has no legacy fallback.
+            from core.runtime_paths import mts_data_mode
+            trades_file = (Path(mts_runtime_path("exports", "trades", f"{self.ticker}_{today}_trades.csv"))
+                           if mts_data_mode() == "paper" else Path(f"exports/trades/TMF_{today}_trades.csv"))
             
             if not trades_file.exists():
                 console.print("[dim]No trades file to recover orders from[/dim]")
@@ -9590,7 +9608,12 @@ class FuturesMonitor:
             if not os.path.exists(_dir):
                 os.makedirs(_dir, exist_ok=True)
             # 2026-06-25 Gemini CLI / Hermes Agent: environmental isolation for MTS spread events
-            path = os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl"))
+            # 2026-10-02 Codex: use the same bound event namespace as the strategy writer.
+            path = (mts_runtime_path("logs", "mts_spread_events.jsonl")
+                    if os.environ.get("NODE_ENV") == "production" else
+                    os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl")))
+            # 2026-10-02 Codex: create the selected namespace before the first event.
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
             event = {"event": event_type, "ts": datetime.now().isoformat()}
             event.update(kwargs)
             with open(path, "a") as f:
@@ -9609,7 +9632,12 @@ class FuturesMonitor:
             _dir = runtime_logs()
             if not os.path.exists(_dir):
                 os.makedirs(_dir, exist_ok=True)
-            path = os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl"))
+            # 2026-10-02 Codex: don't let PAPER events enter LIVE history through this second writer.
+            path = (mts_runtime_path("logs", "mts_spread_events.jsonl")
+                    if os.environ.get("NODE_ENV") == "production" else
+                    os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl")))
+            # 2026-10-02 Codex: same first-write behavior as the checked writer.
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
             event = {"event": event_type, "ts": datetime.now().isoformat()}
             event.update(kwargs)
             with open(path, "a") as f:
@@ -9733,9 +9761,10 @@ class FuturesMonitor:
         """
         if not trade_id:
             return None
-        _fills_path = os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(
-            runtime_logs(), "mts_trade_fills.jsonl",
-        )
+        # 2026-10-02 Codex: exit quantity authority and startup projection share one mode path.
+        _fills_path = (mts_runtime_path("logs", "mts_trade_fills.jsonl")
+                       if os.environ.get("NODE_ENV") == "production" else
+                       os.environ.get("MTS_FILL_LOG_PATH") or os.path.join(runtime_logs(), "mts_trade_fills.jsonl"))
         if not os.path.exists(_fills_path):
             return None
         _open_qty = {"NEAR": 0, "FAR": 0}
@@ -11259,7 +11288,8 @@ class FuturesMonitor:
             return _p
         try:
             from core.runtime_paths import runtime_path
-            return runtime_path("exports", "trades", "live", "diagnostics",
+            # 2026-10-02 Codex: PAPER leg locks must not modify LIVE recovery bookkeeping.
+            return mts_runtime_path("exports", "trades", "live", "diagnostics",
                                 "mts_leg_locks.json")
         except Exception:
             return "/tmp/mts_leg_locks.json"
@@ -11633,7 +11663,8 @@ class FuturesMonitor:
             return _p
         try:
             from core.runtime_paths import runtime_path
-            return runtime_path("exports", "trades", "live", "diagnostics",
+            # 2026-10-02 Codex: local reconciliation intents stay in the bound MTS namespace.
+            return mts_runtime_path("exports", "trades", "live", "diagnostics",
                                 "mts_reconcile_intents.json")
         except Exception:
             return "/tmp/mts_reconcile_intents.json"

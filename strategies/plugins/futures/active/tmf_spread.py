@@ -415,6 +415,9 @@ _MTS_STATE_FILE = os.getenv("MTS_STATE_PATH") or mts_position_state_path()
 
 # 💡 Gemini CLI: Dynamic state file path supporting thread-local overrides for multi-instance monitors
 def _get_state_file_path() -> Path:
+    # 2026-10-02 Codex: module import can precede the engine's startup mode binding.
+    if os.environ.get("NODE_ENV") == "production":
+        return Path(mts_position_state_path())
     return Path(_MTS_STATE_FILE)
 # One canonical append-only ledger for strategy and dashboard.  A relative
 # default follows PM2 cwd, which can be the release worktree while the
@@ -433,6 +436,10 @@ def _fills_ledger_path() -> str:
     paper, tests) the legacy cwd-relative default is preserved so fixtures and
     relative writes keep resolving to the same file.  Legacy schema untouched.
     """
+    # 2026-10-02 Codex: production overrides cannot alias PAPER back into the LIVE ledger.
+    if os.environ.get("NODE_ENV") == "production":
+        from core.runtime_paths import mts_runtime_path
+        return mts_runtime_path("logs", "mts_trade_fills.jsonl")
     _env = os.getenv("MTS_FILL_LOG_PATH")
     if _env:
         return _env
@@ -447,6 +454,19 @@ _MTS_RECOVERY_AUDIT_LOG = os.getenv(
     "MTS_RECOVERY_AUDIT_LOG_PATH",
     os.path.join(runtime_logs(), "mts_recovery_audit.jsonl"),
 )
+
+
+# 2026-10-02 Codex: rebind all related durable artifacts together before any restore.
+def configure_mts_data_paths() -> None:
+    global _MTS_STATE_FILE, _MTS_FILL_LOG, _MTS_EVENT_LOG, _MTS_RECOVERY_AUDIT_LOG
+    global _SETTLEMENT_FAILURE_LATCH, _CRITICAL_FAILURE_SENTINEL
+    from core.runtime_paths import mts_runtime_path
+    _MTS_STATE_FILE = mts_position_state_path()
+    _MTS_FILL_LOG = _fills_ledger_path()
+    _MTS_EVENT_LOG = mts_runtime_path("logs", "mts_spread_events.jsonl")
+    _MTS_RECOVERY_AUDIT_LOG = mts_runtime_path("logs", "mts_recovery_audit.jsonl")
+    _SETTLEMENT_FAILURE_LATCH = mts_runtime_path("logs", "runtime", "settlement_failure_latch.json")
+    _CRITICAL_FAILURE_SENTINEL = mts_runtime_path("logs", "runtime", "critical.sentinel")
 
 
 def _abandoned_trade_ids(log_path: str | None = None) -> set[str]:
@@ -698,6 +718,10 @@ def _exit_intent_log():
     The runtime directory is injected through TRADING_RUNTIME_DIR in tests
     and supplied by the process supervisor in production."""
     from core.exit_intent import IntentLog
+    # 2026-10-02 Codex: share the monitor's isolated PAPER intent directory.
+    if os.environ.get("NODE_ENV") == "production":
+        from core.runtime_paths import mts_runtime_path
+        return IntentLog(mts_runtime_path("logs"))
     _rt = os.environ.get("TRADING_RUNTIME_DIR")
     if _rt:
         return IntentLog(os.path.join(_rt, "logs"))
@@ -1369,6 +1393,8 @@ def _write_mts_state(
     try:
         # 💡 Gemini CLI: Dynamic state file resolution for multi-instance monitors (TMF vs MTX)
         _target_state_file = _get_state_file_path()
+        # 2026-10-02 Codex: first PAPER state write cannot rely on a legacy directory.
+        _target_state_file.parent.mkdir(parents=True, exist_ok=True)
         # 1. Load existing state to preserve immutable fields if they exist
         existing = {}
         if os.path.exists(_target_state_file):

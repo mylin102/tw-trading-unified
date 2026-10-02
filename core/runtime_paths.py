@@ -11,6 +11,7 @@ Resolution order:
 """
 from __future__ import annotations
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -136,6 +137,39 @@ def runtime_path(*parts) -> str:
     return os.path.join(runtime_root(), *parts)
 
 
+# 2026-10-02 Codex: bind the engine before restore; dashboard reads its published context.
+_MTS_DATA_MODE: Optional[str] = None
+
+
+def bind_mts_data_mode(mode: str) -> None:
+    """Bind production MTS data to the startup profile, not a hot-reloaded flag."""
+    global _MTS_DATA_MODE
+    if mode not in ("live", "paper"):
+        raise ValueError(f"Invalid MTS data mode: {mode}")
+    if os.environ.get("NODE_ENV") == "production":
+        _MTS_DATA_MODE = mode
+
+
+def mts_data_mode() -> Optional[str]:
+    """Preserve offline explicit path injection; production UI follows runtime truth."""
+    if os.environ.get("NODE_ENV") != "production":
+        return None
+    if _MTS_DATA_MODE is not None:
+        return _MTS_DATA_MODE
+    try:
+        with open(runtime_path("execution_context.json"), encoding="utf-8") as f:
+            mode = json.load(f).get("requested_mode")
+        return mode if mode in ("live", "paper") else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def mts_runtime_path(*parts) -> str:
+    """MTS-only namespace; LIVE history stays in place, PAPER never falls back to it."""
+    prefix = ("paper",) if mts_data_mode() == "paper" else ()
+    return runtime_path(*prefix, *parts)
+
+
 def mts_position_state_path() -> str:
     """Canonical MTS state path; production has no implicit override/fallback."""
     explicit = os.environ.get("MTS_STATE_PATH")
@@ -148,7 +182,8 @@ def mts_position_state_path() -> str:
                     f"RUNTIME_STATE_PATH_REJECTED: expected={expected} actual={actual}")
         if os.environ.get("NODE_ENV") != "production":
             return str(Path(explicit).expanduser().resolve())
-    return runtime_path("data", "state", "mts_position_state.json")
+    # 2026-10-02 Codex: PM2's canonical override identifies the file, not its mode.
+    return mts_runtime_path("data", "state", "mts_position_state.json")
 
 
 def runtime_id() -> str:

@@ -49,7 +49,9 @@ st.divider()
 
 # 2. Orders & Fills
 st.subheader("📤 歷史成交與委託明細 (Trades & Fills Ledger)")
-fills_file = ROOT / "logs" / "mts_trade_fills.jsonl"
+# 2026-10-02 Codex: select runtime MTS mode, never the release-tree ledger.
+from core.runtime_paths import mts_runtime_path
+fills_file = Path(mts_runtime_path("logs", "mts_trade_fills.jsonl"))
 
 if fills_file.exists():
     try:

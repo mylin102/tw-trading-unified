@@ -9,6 +9,7 @@ from pathlib import Path as _Path
 from core.runtime_paths import (
     runtime_logs,
     runtime_path,
+    mts_runtime_path,  # 2026-10-02 Codex: MTS-only data follows the running execution context.
     mts_position_state_path,
     runtime_id,
     validate_runtime_state,
@@ -667,7 +668,7 @@ def _hvwap_load_events(max_lines: int = 2000) -> list:
     """Read the MTS event ledger (newest LAST). Pure IO, never raises."""
     _events = []
     try:
-        _p = runtime_path("logs", "mts_spread_events.jsonl")
+        _p = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: mode-scoped entry evidence.
         if os.path.exists(_p):
             with open(_p) as _f:
                 for _line in _f:
@@ -1677,8 +1678,8 @@ def latest_entry_audit_line(events_path=None) -> str | None:
     """
     if events_path is None:
         try:
-            events_path = os.path.join(runtime_logs(),
-                                       "mts_spread_events.jsonl")
+            # 2026-10-02 Codex: entry audit belongs to the displayed runtime mode.
+            events_path = mts_runtime_path("logs", "mts_spread_events.jsonl")
         except Exception:
             return None
     try:
@@ -1996,6 +1997,8 @@ def render_volatility_regime_section():
 OPTIONS_REPO = BASE / "strategies" / "options"
 FUTURES_MKT = Path(runtime_path("logs", "market_data"))
 FUTURES_TRADES = Path(runtime_path("exports", "trades"))
+# 2026-10-02 Codex: keep STOCK consumers shared; only MTS follows runtime mode.
+MTS_TRADES = Path(mts_runtime_path("exports", "trades"))
 OPTIONS_DATA = OPTIONS_REPO / "logs" / ("live_trading" if o_live else "paper_trading")
 
 # ── Filter by latest Trading Day ──
@@ -3865,15 +3868,19 @@ def load_calendar_spread_data():
         return pd.DataFrame()
 
 @st.cache_data(ttl=30)
-def load_futures_trades():
+def load_futures_trades(trade_root=None):
     """Load today's futures trades CSV."""
     import glob
     # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded TMF)
     _active_ticker = futures_cfg.get("ticker", "TMF")
+    # 2026-10-02 Codex: namespace is a cache key; no LIVE market-data fallback in PAPER.
+    _trades_dir = Path(trade_root) if trade_root is not None else FUTURES_TRADES
+    _trade_market_dir = (_trades_dir.parents[1] / "logs" / "market_data"
+                         if trade_root is not None else FUTURES_MKT)
     
     # Try canonical exports location first
     for date_str in [TRADE_DATE_STR, DATE_STR]:
-        f_exact = FUTURES_TRADES / f"{_active_ticker}_{date_str}_trades.csv"
+        f_exact = _trades_dir / f"{_active_ticker}_{date_str}_trades.csv"
         if f_exact.exists():
             try:
                 return pd.read_csv(f_exact), date_str
@@ -3881,7 +3888,7 @@ def load_futures_trades():
                 pass
     # Fallback: search market_data for any matching pattern (prefer newest)
     for date_str in [TRADE_DATE_STR, DATE_STR]:
-        pattern = str(FUTURES_MKT / f"{_active_ticker}_{date_str}*trades.csv")
+        pattern = str(_trade_market_dir / f"{_active_ticker}_{date_str}*trades.csv")
         matches = glob.glob(pattern)
         if matches:
             # pick newest by mtime
@@ -3893,8 +3900,8 @@ def load_futures_trades():
                     continue
     # Final fallback: any trades.csv in exports/trades or market_data
     try:
-        ex_matches = list(FUTURES_TRADES.glob(f"{_active_ticker}_*_trades.csv"))
-        m_matches = list(FUTURES_MKT.glob(f"{_active_ticker}_*_trades.csv"))
+        ex_matches = list(_trades_dir.glob(f"{_active_ticker}_*_trades.csv"))
+        m_matches = list(_trade_market_dir.glob(f"{_active_ticker}_*_trades.csv"))
         all_matches = ex_matches + m_matches
         if all_matches:
             latest = max(all_matches, key=os.path.getmtime)
@@ -4475,7 +4482,7 @@ if page == "總覽":
                 st.caption("🟡 指標數據尚未產出，顯示訂閱即時價格")
             else:
                 st.info("無期貨指標數據")
-        ft, ft_date = load_futures_trades()
+        ft, ft_date = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
         # GSD Fix: Show which date's file was actually loaded to avoid confusion during night sessions
         trading_day_str = TRADE_DATE_STR
         trading_day_display = f"{trading_day_str[:4]}-{trading_day_str[4:6]}-{trading_day_str[6:8]}"
@@ -4575,7 +4582,7 @@ if page == "總覽":
     # ── 總覽 PnL ──
     st.header("今日累計 PnL")
     pc1, pc2, pc3 = st.columns(3)
-    ft, _ = load_futures_trades()
+    ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
     fpnl = calc_futures_pnl(ft)
     ol = load_options_ledger()
     opnl = calc_options_pnl(ol)
@@ -4892,10 +4899,12 @@ elif _selected_product == "TMF":
                     _archived = 0
                     # Archive fill/event logs instead of deleting
                     for _log_name in ["mts_trade_fills.jsonl", "mts_spread_events.jsonl"]:
-                        _log_path = runtime_path("logs", _log_name)
+                        _log_path = mts_runtime_path("logs", _log_name)  # 2026-10-02 Codex: never clear the other mode.
                         if os.path.exists(_log_path) and os.path.getsize(_log_path) > 0:
                             _ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                            _archive_dir = os.path.join(_base, "logs", "archive")
+                            # 2026-10-02 Codex: PAPER archive remains inside its own namespace.
+                            _archive_dir = (mts_runtime_path("logs", "archive") if MTS_TRADES != FUTURES_TRADES
+                                            else os.path.join(_base, "logs", "archive"))
                             os.makedirs(_archive_dir, exist_ok=True)
                             _archive_path = os.path.join(_archive_dir, _log_name.replace(".jsonl", f"_{_ts_str}.jsonl"))
                             try:
@@ -5298,7 +5307,7 @@ elif _selected_product == "TMF":
         st.error(_quick_presentation["message"])
 
     # ── Calendar Spread 顯示 ──
-    ft, _ = load_futures_trades()
+    ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
     st.caption("📊 日曆價差分析暫停載入（診斷中）")
     
     if False:  # Rendered at the bottom after MTS/performance sections.
@@ -5422,7 +5431,7 @@ elif _selected_product == "TMF":
         classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl, live_upl_presented_reason,
         select_mts_reporting_day)
     _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
-    _events_path_scope = runtime_path("logs", "mts_spread_events.jsonl")
+    _events_path_scope = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode scope.
     if _exit_only_dashboard:
         # This presentation is intentionally isolated from the ordinary MTS
         # state/ledger path.  A restricted-exit position has one authority:
@@ -5519,7 +5528,7 @@ elif _selected_product == "TMF":
         _mts_perf_scope = {"ok": False, "mode": "exit_only",
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:
-        _fills_path_scope = runtime_path("logs", "mts_trade_fills.jsonl")
+        _fills_path_scope = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode scope.
         _scope_current_day = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
         _scope_trading_day = select_mts_reporting_day(
             _fills_path_scope, _events_path_scope, _scope_current_day)
@@ -5623,7 +5632,7 @@ elif _selected_product == "TMF":
             # Only a confirmed fill/settlement may clear stale paper state.
             _trade_id_for_state = _mts_state.get("trade_id")
             _terminal_fill = latest_mts_terminal_fill(
-                runtime_path("logs", "mts_trade_fills.jsonl"),
+                mts_runtime_path("logs", "mts_trade_fills.jsonl"),  # 2026-10-02 Codex: paper position evidence.
                 _trade_id_for_state)
             _terminal_event = latest_mts_terminal_event(
                 _events_path_scope, _trade_id_for_state)
@@ -5891,7 +5900,7 @@ elif _selected_product == "TMF":
 
                 # ── MTS 個別委託 (from mts_trade_fills.jsonl) ──
                 try:
-                    _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
+                    _fills_path = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode fills.
                     _trade_id = _mts_state.get("trade_id", "")
                     if _trade_id and os.path.exists(_fills_path):
                         _order_rows = []
@@ -6061,8 +6070,9 @@ elif _selected_product == "TMF":
         print(f"[PERF] mts_state_section: {time.time()-_pt_data:.3f}s")
 
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
-    _fills_path = runtime_path("logs", "mts_trade_fills.jsonl")
-    _events_path = runtime_path("logs", "mts_spread_events.jsonl")
+    # 2026-10-02 Codex: paper metrics read only paper events/fills, not broker history.
+    _fills_path = mts_runtime_path("logs", "mts_trade_fills.jsonl")
+    _events_path = mts_runtime_path("logs", "mts_spread_events.jsonl")
     # Historical restricted-exit contract marker: if not _exit_only_dashboard and os.path.exists(_fills_path):
     # Live/quarantined runtime must never show legacy paper fills/performance.
     if not _live_runtime and not _exit_only_dashboard and os.path.exists(_fills_path):
@@ -6288,7 +6298,7 @@ elif _selected_product == "TMF":
             st.markdown("---")
     
     # ── PnL & Position Summary (MTS mode: skip — uses tmf_spread state file instead of PaperTrader) ──
-    ft, _ = load_futures_trades()
+    ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
     _realized_futures_pnl = 0.0
     if ft is not None and not ft.empty:
         fpnl = calc_futures_pnl(ft)
@@ -6358,7 +6368,8 @@ elif _selected_product == "TMF":
 
     # ── Order Status Panel ──
     with st.expander("📤 委託單狀態 (Order Lifecycle)", expanded=False):
-        orders_path = Path(runtime_path("exports", "trades"))
+        # 2026-10-02 Codex: MTS order panel shares the engine's restore/export namespace.
+        orders_path = Path(mts_runtime_path("exports", "trades"))
         # 2026-05-27 Gemini CLI: Generalize file patterns (no hardcoded TMF)
         _ui_ticker = futures_cfg.get("ticker", "TMF")
         order_files = list(orders_path.glob(f"{_ui_ticker}_{DATE_STR}_orders.json")) + list(orders_path.glob(f"{_ui_ticker}_*_orders.json"))
@@ -6629,7 +6640,7 @@ elif _selected_product == "TMF":
                             _near_event = ""
                             _far_event = ""
                             try:
-                                _el_path = os.path.join(runtime_logs(), "mts_spread_events.jsonl")
+                                _el_path = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode events.
                                 if os.path.exists(_el_path):
                                     _recent = []
                                     with open(_el_path) as _ef:
@@ -6721,7 +6732,7 @@ elif _selected_product == "TMF":
                 st.caption(f"Flag: {_flag_path}")
 
                 # ── MTS Spread Event Ledger ──
-                _event_log_path = os.path.join(runtime_logs(), "mts_spread_events.jsonl")
+                _event_log_path = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode events.
                 if os.path.exists(_event_log_path):
                     try:
                         _events = []
@@ -6754,7 +6765,7 @@ elif _selected_product == "TMF":
                 if not _mts_fallback_shown:
                     st.info("MTS 為 FLAT / IDLE 狀態：tick loop 正常，尚未達到進場條件，因此沒有委託或持倉。")
 
-                _fill_log_path = runtime_path("logs", "mts_trade_fills.jsonl")
+                _fill_log_path = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode fills.
                 if os.path.exists(_fill_log_path):
                     try:
                         _fills = []
@@ -6839,7 +6850,7 @@ elif _selected_product == "TMF":
         _chart_key = f"tmf_dual_chart_{_today}"
         if st.button("載入／重新整理圖表", key=f"{_chart_key}_refresh"):
             t_chart_start = time.monotonic()
-            ft, _ = load_futures_trades()
+            ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
             print(f"[PERF_CHART] load_futures_trades took {time.monotonic()-t_chart_start:.3f}s")
             t_far_start = time.monotonic()
             df_far = load_far_month_data(_ov_ticker)

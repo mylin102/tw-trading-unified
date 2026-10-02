@@ -15,8 +15,10 @@ st.set_page_config(page_title="Trade Review | Trading Unified", page_icon="🔍"
 st.title("🔍 交易檢討 (Trade Review)")
 st.caption("單筆交易入場/離場生命週期檢討")
 
-fills_path = ROOT / "logs" / "mts_trade_fills.jsonl"
-events_path = ROOT / "logs" / "mts_spread_events.jsonl"
+# 2026-10-02 Codex: trade review and position panel use the same runtime-selected MTS mode.
+from core.runtime_paths import mts_runtime_path
+fills_path = Path(mts_runtime_path("logs", "mts_trade_fills.jsonl"))
+events_path = Path(mts_runtime_path("logs", "mts_spread_events.jsonl"))
 
 try:
     from scripts.generate_daily_report import parse_logs, _format_exit_reason_label
