@@ -995,6 +995,20 @@ class FuturesMonitor:
             try:
                 self.cfg = self._load_config(self.config_path)
                 self._apply_config_params()
+                # 2026-10-02 Codex: publish applied PAPER identity, never rebind LIVE certification.
+                _prior_ctx = getattr(self, "_execution_context", None)
+                if (not self.live_trading and _prior_ctx is not None
+                        and _prior_ctx.requested_mode == "paper"
+                        and _prior_ctx.effective_mode == "paper_active"
+                        and _prior_ctx.live_order_allowed is False):
+                    import hashlib
+                    from dataclasses import replace
+                    _applied_hash = hashlib.sha256(Path(self.config_path).read_bytes()).hexdigest()
+                    if _applied_hash != _prior_ctx.config_hash:
+                        self._execution_context = replace(_prior_ctx, config_hash=_applied_hash)
+                        if not self._persist_execution_context():
+                            self._execution_context = _prior_ctx
+                            raise OSError("PAPER config identity publication failed")
                 self._config_mtime = mtime
                 console.print(f"[cyan]🔄 Config hot-reloaded from {self.config_path}[/cyan]")
             except Exception as e:
