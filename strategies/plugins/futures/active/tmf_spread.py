@@ -1394,7 +1394,7 @@ def _write_mts_state(
         # 💡 Gemini CLI: Dynamic state file resolution for multi-instance monitors (TMF vs MTX)
         _target_state_file = _get_state_file_path()
         # 2026-10-02 Codex: first PAPER state write cannot rely on a legacy directory.
-        _target_state_file.parent.mkdir(parents=True, exist_ok=True)
+        Path(_target_state_file).parent.mkdir(parents=True, exist_ok=True)
         # 1. Load existing state to preserve immutable fields if they exist
         existing = {}
         if os.path.exists(_target_state_file):
