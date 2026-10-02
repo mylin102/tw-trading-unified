@@ -28,6 +28,14 @@ const CANONICAL_RELEASE_ROOT = '/Users/myllin_mini/Documents/mylin102/tw-trading
 const isProduction = process.env.NODE_ENV === 'production'
   || process.env.DEPLOY_MODE === 'production';
 
+// 2026-10-02 Codex: one startup selector for futures; default is paper.
+// This selects an existing profile, never authorizes/bypasses live promotion.
+const futuresMode = process.env.TRADING_FUTURES_MODE === undefined
+  ? 'paper' : process.env.TRADING_FUTURES_MODE;
+if (!['paper', 'live'].includes(futuresMode)) {
+  throw new Error('TRADING_FUTURES_MODE must be paper or live');
+}
+
 if (isProduction && path.resolve(PROJECT_ROOT) !== path.resolve(CANONICAL_RELEASE_ROOT)) {
   throw new Error(
     'RUNTIME_IDENTITY_REJECTED: production PM2 config must be loaded from '
@@ -94,9 +102,8 @@ const baseEnv = {
   MTS_STATE_PATH: path.join(runtimeDir, 'data', 'state', 'mts_position_state.json'),
   TRADING_LOG_DIR: logDir,
   NODE_ENV: 'production',
-  // Explicit paper override for the currently approved non-live deployment.
-  // The profile and this flag must agree; PAPER_MODE alone never authorizes
-  // a live profile.
+  // Preserve the global/options paper override. Futures routing is bound
+  // to its selected startup profile, not this legacy environment flag.
   PAPER_MODE: 'true',
 };
 if (pythonBin) baseEnv.TRADING_PYTHON_BIN = pythonBin;
@@ -139,7 +146,9 @@ module.exports = {
       // production PM2 deployment mode.
       // Current deployment is paper-only.  Live requires a separately
       // approved futures_live profile and controlled promotion.
-      args: `-c background ${pythonPath} main.py --config futures_live`,
+      args: futuresMode === 'live'
+        ? `-c background ${pythonPath} main.py --config futures_live`
+        : `-c background ${pythonPath} main.py --config futures`,
       interpreter: 'none',
       cwd: PROJECT_ROOT,
       restart_delay: 15000,
@@ -156,7 +165,7 @@ module.exports = {
       out_file: L('trading', 'out.log'),
       log_file: L('trading', 'combined.log'),
       pid_file: L('trading', 'trading.pid'),
-      env: { ...baseEnv },
+      env: { ...baseEnv, TRADING_FUTURES_MODE: futuresMode },
     },
     {
       name: 'dashboard',
