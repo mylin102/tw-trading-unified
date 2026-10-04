@@ -722,7 +722,7 @@ def api_is_healthy(api):
 
 
 
-def verify_startup_reconciliation(api) -> bool:
+def verify_startup_reconciliation(api, *, paper_only=False) -> bool:
     """Fail closed after reboot until broker position and order state are known.
 
     This function performs read-only broker reconciliation only.  It never
@@ -734,6 +734,12 @@ def verify_startup_reconciliation(api) -> bool:
     )
 
     safety = get_safety_state()
+    # 2026-10-04 Codex: PAPER's account is local simulation, never broker-flat evidence.
+    if paper_only is True:
+        safety.set_account_healthy()
+        safety.set_reconciled()
+        console.print("[green]PAPER_STARTUP_READY: local simulation; broker positions/orders not queried[/green]")
+        return True
     try:
         account = api.futopt_account
         api.update_status(account)
@@ -1422,6 +1428,9 @@ def run_system(dry_run=False, config_name="futures"):
     # [sealed live profile] validate the config name BEFORE any broker
     # login — unknown/missing config => fast-fail (fail-closed; live
     # deployments must use the sealed --config futures_live profile)
+    # 2026-10-04 Codex: explicit all-PAPER profiles only; mixed/unknown stays fail-closed.
+    import yaml
+    _paper_only = bool(config_name.strip()) and os.environ.get("TRADING_FUTURES_MODE", "paper") == "paper"
     for _ci in (c.strip() for c in config_name.split(",") if c.strip()):
         _cf = f"{_ci.replace('.yaml', '')}.yaml"
         if not os.path.exists(os.path.join(BASE, "config", _cf)):
@@ -1429,6 +1438,12 @@ def run_system(dry_run=False, config_name="futures"):
                 f"Unknown futures config: {_cf} — refusing to start "
                 f"(fail-closed; live deployments must use "
                 f"--config futures_live)")
+        with open(os.path.join(BASE, "config", _cf), encoding="utf-8") as _fh:
+            _startup_cfg = yaml.safe_load(_fh)
+        _paper_only = _paper_only and isinstance(_startup_cfg, dict) and _startup_cfg.get("live_trading") is False
+    with open(os.path.join(BASE, "config", "options_strategy.yaml"), encoding="utf-8") as _fh:
+        _options_cfg = yaml.safe_load(_fh)
+    _paper_only = _paper_only and isinstance(_options_cfg, dict) and _options_cfg.get("live_trading") is False
     update_startup_progress("SHIOAJI_CONNECTING", 30, "📡 正在與 永豐期貨 建立安全連線與 Session...", status="STARTING")
 
     # ── Lifecycle provenance recorder ──
@@ -1480,7 +1495,7 @@ def run_system(dry_run=False, config_name="futures"):
             console.print("[green]✅ Single Shioaji session established[/green]")
 
             # 2026-08-05 Codex: login alone never unlocks post-reboot entries.
-            verify_startup_reconciliation(api)
+            verify_startup_reconciliation(api, paper_only=_paper_only)
 
             # ── Shioaji quote event callback (provenance only) ──
             try:
