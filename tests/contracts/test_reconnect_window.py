@@ -293,6 +293,13 @@ class TestGenerationFencing:
         assert _verify_reconnect_window(
             [mon], api, duration_s=0.2, interval_s=0.05) is True
 
+    def test_current_generation_fixture_without_thread_scheduling(self, monkeypatch):
+        # 2026-10-04 Codex: a generation contract must not race OS callback scheduling.
+        started = []
+        monkeypatch.setattr(threading.Thread, "start", lambda worker: started.append(worker))
+        self.test_current_generation_bbo_passes()
+        assert started == [], "The positive fixture must own deterministic callback arrivals"
+
     def test_no_generation_fails_closed(self):
         """No current generation -> cannot fence -> fail-closed."""
         api = _FakeApi(generation=None)
