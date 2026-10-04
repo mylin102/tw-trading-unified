@@ -2065,7 +2065,8 @@ def run_system(dry_run=False, config_name="futures"):
                 # 1) API session health — classified; exit ONLY on
                 #    PROCESS_RESTART_REQUIRED (auth exhaustion). Generic
                 #    500/timeout degrade state + block entry, never exit.
-                _bh_state = api_is_healthy(api)
+                # 2026-10-04 Codex: PAPER account readiness is local; quote freshness is checked below.
+                _bh_state = "PAPER_LOCAL" if _paper_only else api_is_healthy(api)
                 if _bh_state == "PROCESS_RESTART_REQUIRED":
                     console.print("[red]💀 Broker session unrecoverable (relogin exhausted) — exiting for external supervisor[/red]")
                     _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
