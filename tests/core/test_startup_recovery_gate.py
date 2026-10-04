@@ -13,7 +13,7 @@ import pytest
 import main as startup
 
 
-def run_startup_callsite(monkeypatch, tmp_path, broker, flags, *, options=False, mode="paper"):
+def run_startup_callsite(monkeypatch, tmp_path, broker, flags, *, options=False, mode="paper", include_health=False):
     """Keep production statements through reconciliation, omit quote/thread startup."""
     config = tmp_path / "config"
     config.mkdir()
@@ -36,6 +36,12 @@ def run_startup_callsite(monkeypatch, tmp_path, broker, flags, *, options=False,
         isinstance(x, ast.Name) and x.id == "verify_startup_reconciliation" for x in ast.walk(n)))
     entry.body[0].body = entry.body[0].body[:call_index + 1]
     fn.body = fn.body[:fn.body.index(entry)] + entry.body[:1]
+    # 2026-10-04 Codex: include the exact periodic-health assignment, not a surrogate.
+    if include_health:
+        real_fn = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "run_system")
+        health = next(n for n in ast.walk(real_fn) if isinstance(n, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "_bh_state" for t in n.targets))
+        fn.body.append(copy.deepcopy(health))
     module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
     namespace = dict(vars(startup))
     exec(compile(module, startup.__file__, "exec"), namespace)
@@ -74,6 +80,19 @@ def test_real_live_startup_still_requires_successful_broker_read(monkeypatch, tm
     assert broker.update_calls == 1
 
 
+@pytest.mark.parametrize("failure", [RuntimeError("SystemMaintenance 503"), None])
+def test_real_paper_periodic_health_never_queries_positions(monkeypatch, tmp_path, failure):
+    broker = FakeBroker(failure=failure)
+    assert run_startup_callsite(monkeypatch, tmp_path, broker, {"futures": False}, include_health=True) is True
+    assert broker.update_calls == 0 and broker.position_calls == 0
+
+
+def test_real_live_periodic_health_still_queries_positions(monkeypatch, tmp_path):
+    broker = FakeBroker()
+    assert run_startup_callsite(monkeypatch, tmp_path, broker, {"futures_live": True}, mode="live", include_health=True) is True
+    assert broker.position_calls == 2
+
+
 class FakeBroker:
     def __init__(self, positions=(), trades=(), failure=None):
         self.futopt_account = object()
@@ -81,6 +100,7 @@ class FakeBroker:
         self.trades = list(trades)
         self.failure = failure
         self.update_calls = 0
+        self.position_calls = 0
 
     def update_status(self, account):
         self.update_calls += 1
@@ -88,6 +108,7 @@ class FakeBroker:
             raise self.failure
 
     def list_positions(self, account):
+        self.position_calls += 1
         if self.failure:
             raise self.failure
         return self.positions
