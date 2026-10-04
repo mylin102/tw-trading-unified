@@ -289,9 +289,21 @@ class TestGenerationFencing:
     def test_current_generation_bbo_passes(self):
         """Slot tagged with the CURRENT generation -> accepted."""
         api = _FakeApi(generation="GEN-1")
-        mon = _FakeMonitor(generation="GEN-1")
-        assert _verify_reconnect_window(
-            [mon], api, duration_s=0.2, interval_s=0.05) is True
+        # 2026-10-04 Codex: drive actual BidAsk checks without a .2s OS scheduling race.
+        mon = _FakeMonitor(generation="GEN-1", tick_advances=False, bidask_advances=False)
+        clock = [time.monotonic()]
+
+        def advance(seconds):
+            clock[0] += seconds
+            for slot in mon.market_data.values():
+                slot["bidask_received_at"] = clock[0]
+
+        with pytest.MonkeyPatch.context() as patcher:
+            patcher.setitem(_verify_reconnect_window.__globals__, "time",
+                            types.SimpleNamespace(monotonic=lambda: clock[0], sleep=advance))
+            assert _verify_reconnect_window(
+                [mon], api, duration_s=0.2, interval_s=0.05) is True
+        assert mon.generation_checks >= 2
 
     def test_current_generation_fixture_without_thread_scheduling(self, monkeypatch):
         # 2026-10-04 Codex: a generation contract must not race OS callback scheduling.
