@@ -488,7 +488,8 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             # 2026-08-03: near/far leg realized gross — complete per-leg fill
             _near_gross = 0.0
             _far_gross = 0.0
-            for _lf in ([release_fill] if release_fill else []) + ([exit_fill] if exit_fill else []):
+            # 2026-10-05 Codex: exit is only the final fill; keep both legs and partial closes.
+            for _lf in ([release_fill] if release_fill else []) + data["exit_fills"]:
                 _lr = float(_lf.get("realized_pnl") or 0.0)
                 if str(_lf.get("leg", "")).upper() == "NEAR":
                     _near_gross += _lr
