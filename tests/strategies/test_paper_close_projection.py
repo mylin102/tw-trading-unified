@@ -109,3 +109,21 @@ def test_completed_marker_without_leg_closes_is_not_flat(tmp_path, monkeypatch):
     mon, _ = monitor_for(tmp_path, monkeypatch, rows)
     assert mon._mts_has_open_position_from_fills() is True
     assert mon._ledger_projection.snapshot().near_qty == 1
+
+
+def test_live_records_are_not_reinterpreted_by_shared_paper_projection(tmp_path, monkeypatch):
+    # 2026-10-06 Codex: monitor's actual constructor labels its projection PAPER
+    # even in LIVE. Guard on per-record mode, not the shared projection label.
+    # These are negative-control broker-shaped records, not raw captured receipts.
+    rows = [r for r in incident_rows() if r["fill_type"] in ("ENTRY", "COMBINED_EXIT")]
+    for index, row in enumerate(rows):
+        row.update(mode="live", execution_source="BROKER_FILL", price_source="BROKER_FILL",
+                   paper_fill_id=None, broker_order_id=f"BROKER-O-{index}",
+                   broker_deal_id=f"BROKER-D-{index}")
+    mon, path = monitor_for(tmp_path, monkeypatch, rows)
+    before = path.read_bytes()
+    assert mon._mts_has_open_position_from_fills() is True
+    auth = mon._ledger_projection.snapshot()
+    assert (auth.near_qty, auth.far_qty) == (-1, 1)  # unchanged legacy LIVE projection
+    assert auth.anomalies == ()
+    assert path.read_bytes() == before
