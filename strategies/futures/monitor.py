@@ -13676,6 +13676,27 @@ class FuturesMonitor:
                         "exit_only_capability", None), dict)
         )
 
+        # 2026-10-06 Codex: PAPER closes are local authority, never broker proof.
+        # Require readable, same-trade, dual-entry evidence before clearing state;
+        # LIVE/unknown/missing history retain the original broker-only reset.
+        _paper_ctx = getattr(self, "_execution_context", None)
+        _paper_projection = getattr(self, "_ledger_projection", None)
+        _paper_auth = _paper_projection.snapshot() if _paper_projection else None
+        _paper_trade = getattr(_paper_projection, "_trades", {}).get(_state_trade_id, {})
+        _paper_flat_proven = (
+            getattr(_paper_ctx, "requested_mode", "") == "paper"
+            and getattr(_paper_ctx, "effective_mode", "") == "paper_active"
+            and getattr(_paper_ctx, "live_order_allowed", None) is False
+            and not getattr(self, "live_trading", False)
+            and getattr(_paper_projection, "source", "") == "PAPER"
+            and not getattr(_paper_projection, "_unreadable", True)
+            and getattr(getattr(_paper_auth, "status", None), "value", None) == "FLAT"
+            and bool(_state_trade_id)
+            and getattr(_paper_auth, "current_trade_id", None) == _state_trade_id
+            and _paper_trade.get("near_entry", 0.0) > 0
+            and _paper_trade.get("far_entry", 0.0) > 0
+        )
+
         # LIVE broker truth is authoritative.  Never resurrect a local
         # position from historical fills in live mode — the recovery path is
         # PAPER-only.  Gate on the execution context's requested_mode (the
@@ -13711,7 +13732,7 @@ class FuturesMonitor:
                     )
         elif (_state_has_pos and not _fills_open
                 and not _exit_only_authority_active
-                and self._broker_truth_is_flat(_early_broker_auth)):
+                and (_paper_flat_proven or self._broker_truth_is_flat(_early_broker_auth))):
             console.print(
                 f"[bold yellow]⚠️ [MTS_SPLIT_BRAIN] State says POSITION but fills says closed. "
                 f"Resetting to FLAT.[/bold yellow]"
