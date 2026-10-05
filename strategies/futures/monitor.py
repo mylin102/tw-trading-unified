@@ -16123,6 +16123,13 @@ class FuturesMonitor:
         )
 
     def _apply_combined_exit_fill(self, event, pending: dict, signal: str, price: float) -> None:
+        # 2026-10-06 Codex: serialize leg updates and durable settlement together;
+        # distinct quote/callback threads must not both commit the same trade.
+        lock = self.__dict__.setdefault("_combined_exit_fill_lock", threading.RLock())
+        with lock:
+            self._apply_combined_exit_fill_serial(event, pending, signal, price)
+
+    def _apply_combined_exit_fill_serial(self, event, pending: dict, signal: str, price: float) -> None:
         console.print(f"[dim]DBG [COMBINED_EXIT_FILL_ENTERED] signal={signal} order_id={event.order_id}[/dim]")
         """Process a COMBINED_EXIT leg fill. Tracks both legs; only resets strategy to FLAT when both fully filled."""
         from core.order_management.order import OrderStatus
