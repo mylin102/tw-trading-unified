@@ -97,6 +97,10 @@ def _paper_close_delta(fill, trade, leg) -> int:
     # 2026-10-06 Codex: a PAPER close reduces existing inventory only. Distinct
     # duplicate append identities are retained as anomalies, never reverse ENTRYs.
     delta = _side_delta(fill)
+    # 2026-10-06 Codex: monitor shares the PAPER projection label; only explicit
+    # PAPER records may use local close bounding. LIVE/unknown rows stay unchanged.
+    if fill.get("mode") != "paper":
+        return delta
     if str(fill.get("fill_type") or "") not in _EXIT_FILL_TYPES or not delta:
         return delta
     current = trade[leg]
