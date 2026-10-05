@@ -159,7 +159,7 @@ def test_real_paper_submit_gateway_to_simulated_combo_fill(real_paper_monitor, m
     order = _submit_real_combo(monitor, action)
     assert order.status is OrderStatus.FILLED
     assert order.filled_quantity == 1
-    assert order.fills[0].price == net
+    assert order.fills[0].fill_price == net
     assert order.fills[0].deal_id.startswith("PAPER-")
     assert order.truth_source == "paper_strategy"
     metadata = monitor._mts_pending_fills["REGRESSION-PAPER"]
