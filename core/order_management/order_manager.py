@@ -967,12 +967,24 @@ class OrderManager:
         if fill_qty <= 0:
             raise ValueError("Fill quantity must be positive")
 
+        # 2026-10-05 Codex: simulator callbacks have local PAPER identities,
+        # never broker-issued receipts. Persisted fill ordinals distinguish
+        # partial fills while retaining the existing lifecycle/dedupe path.
+        _paper_identity = {}
+        if self.mode == "paper":
+            _paper_identity = {
+                "deal_id": f"PAPER-{order.order_id}-{len(order.fills) + 1}",
+                "source": "paper_simulator",
+                "reason": "simulated_fill",
+                "observation_type": "PAPER_FILL",
+            }
         self.apply_deal_fill(
             order_id,
             fill_price=fill_price,
             fill_qty=fill_qty,
             commission=commission,
             tax=tax,
+            **_paper_identity,
         )
 
     # ── Release OCO Bracket (ADR-010) ──

@@ -11191,7 +11191,10 @@ class FuturesMonitor:
             _order = self.order_mgr.create_order(
                 symbol=f"{near_code}-{far_code}", side=near_side,
                 order_type=OrderType.MKP, quantity=1, price=_combo_price,
-                strategy="MTS_ENTRY", truth_source="broker_combo",
+                # 2026-10-05 Codex: local simulation is not broker provenance.
+                strategy="MTS_ENTRY", truth_source=(
+                    "broker_combo" if self.live_trading and not self.dry_run
+                    else "paper_strategy"),
                 combo_legs=_combo_legs, combo_strategy="TIME_SPREAD")
             # create_order() takes no wire_price_type argument: the wire price type
             # is an Order attribute read by the adapter
@@ -11260,9 +11263,12 @@ class FuturesMonitor:
         # identity before publishing COMBO_ORDER_SUBMITTED/ENTRY_SUBMITTED;
         # absent/terminal broker evidence converges the local order and clears
         # the pending leg state instead of creating a phantom position.
-        _broker_result = self._reconcile_pending_mts_combos(trade_id=trade_id)
-        if _broker_result.get("status") != "BROKER_CONFIRMED":
-            return
+        # 2026-10-05 Codex: PAPER must reach the local simulator without a
+        # broker query. LIVE still requires the exact broker receipt proof.
+        if self.live_trading and not self.dry_run:
+            _broker_result = self._reconcile_pending_mts_combos(trade_id=trade_id)
+            if _broker_result.get("status") != "BROKER_CONFIRMED":
+                return
         self._append_mts_event(
             "COMBO_ORDER_SUBMITTED", order_id=_order.order_id,
             trade_id=trade_id, strategy="MTS_ENTRY", combo_legs=_combo_legs,
