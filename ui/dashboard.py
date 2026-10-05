@@ -6004,6 +6004,13 @@ elif _selected_product == "TMF":
                     _u1.metric("近月 UPL", "0 TWD")
                     _u2.metric("遠月 UPL", "0 TWD")
                     _u3.metric("總計 UPL", "0 TWD")
+                elif active_runtime_truth.get("is_paper_runtime"):
+                    # 2026-10-05 Codex: keep PAPER evidence failures local;
+                    # never replace them with an old LIVE snapshot/session.
+                    _u1.metric("近月 UPL", "N/A")
+                    _u2.metric("遠月 UPL", "N/A")
+                    _u3.metric("總計 UPL", "N/A")
+                    st.warning(f"⚠️ MTS PAPER UPL N/A — {_upl_pres['reason']}")
                 else:
                     # [live truth] live UPL comes ONLY from the CURRENT
                     # broker-reconciled preflight snapshot; missing/stale
