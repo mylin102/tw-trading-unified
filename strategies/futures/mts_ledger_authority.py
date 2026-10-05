@@ -93,6 +93,22 @@ def _fill_key(fill):
     )
 
 
+def _paper_close_delta(fill, trade, leg) -> int:
+    # 2026-10-06 Codex: a PAPER close reduces existing inventory only. Distinct
+    # duplicate append identities are retained as anomalies, never reverse ENTRYs.
+    delta = _side_delta(fill)
+    if str(fill.get("fill_type") or "") not in _EXIT_FILL_TYPES or not delta:
+        return delta
+    current = trade[leg]
+    if current * delta >= 0 or abs(delta) > abs(current):
+        trade.setdefault("close_anomalies", []).append(
+            f"PAPER_CLOSE_EXCEEDS_OR_MISMATCHES_OPEN:{fill.get('trade_id')}:{leg}"
+        )
+    if current * delta >= 0:
+        return 0
+    return delta if abs(delta) <= abs(current) else -current
+
+
 def _reduce_trades(trades: dict, order: list) -> MtsAuthorityState:
     """Shared reduction over a per-trade per-leg accumulator.
 
@@ -106,7 +122,7 @@ def _reduce_trades(trades: dict, order: list) -> MtsAuthorityState:
     anomalies = tuple(
         tid for tid in order
         if tid != current and (trades[tid]["NEAR"] != 0 or trades[tid]["FAR"] != 0)
-    )
+    ) + tuple(trades[current].get("close_anomalies", ()))
     if trades[current]["NEAR"] == 0 and trades[current]["FAR"] == 0:
         return MtsAuthorityState(
             MtsAuthority.FLAT,
@@ -128,7 +144,7 @@ def _reduce_trades(trades: dict, order: list) -> MtsAuthorityState:
     )
 
 
-def project_fills(fills: Iterable[dict]) -> MtsAuthorityState:
+def project_fills(fills: Iterable[dict], *, source: str = "PAPER") -> MtsAuthorityState:
     """Pure: reduce an iterable of fill dicts to the three-state authority."""
     trades: dict = {}
     order: list = []
@@ -148,7 +164,10 @@ def project_fills(fills: Iterable[dict]) -> MtsAuthorityState:
         if leg is None:
             continue
         ft = str(fill.get("fill_type") or "")
-        d = _side_delta(fill)
+        # 2026-10-06 Codex: match incremental PAPER close-only accounting;
+        # LIVE projection behavior and its broker-truth authority stay unchanged.
+        d = (_paper_close_delta(fill, trades[tid], leg)
+             if source == "PAPER" else _side_delta(fill))
         trades[tid][leg] += d
         if ft == "ENTRY" and d != 0 and trades[tid].get(f"{leg.lower()}_entry", 0.0) == 0.0:
             try:
@@ -237,7 +256,9 @@ class MtsLedgerProjection:
         if leg is None:
             return
         ft = str(fill.get("fill_type") or "")
-        d = _side_delta(fill)
+        # 2026-10-06 Codex: closing a PAPER leg can never open the opposite side.
+        d = (_paper_close_delta(fill, self._trades[tid], leg)
+             if self.source == "PAPER" else _side_delta(fill))
         self._trades[tid][leg] += d
         if ft == "ENTRY" and d != 0 and self._trades[tid].get(f"{leg.lower()}_entry", 0.0) == 0.0:
             try:
