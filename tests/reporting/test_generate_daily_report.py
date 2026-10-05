@@ -74,3 +74,120 @@ def test_parse_logs_active_trade_without_exit_is_renderable(tmp_path):
     assert len(report["active"]) == 1
     assert report["active"][0]["near_pnl_gross"] == 0.0
     assert report["active"][0]["far_pnl_gross"] == 0.0
+
+
+# 2026-10-05 Codex: real parser -> actual dashboard closed-loop row regression.
+def _render_closed_loop_callsite(fills, events):
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "ui" / "dashboard.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name == "calculate_mts_daily_performance"]
+    loops = [node for node in ast.walk(tree) if isinstance(node, ast.For)
+             and ast.unparse(node.target) == "t"
+             and ast.unparse(node.iter) == "_completed_filtered"]
+    assert len(functions) == len(loops) == 1, "Execute exact production callsites"
+    namespace = {"_loop_rows": [], "_fmt_policy_j_reason": lambda reason: reason}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
+    report = namespace["calculate_mts_daily_performance"](str(fills), str(events), "2026-10-05")
+    namespace["_completed_filtered"] = report["completed"]
+    exec(compile(ast.Module(body=loops, type_ignores=[]), str(path), "exec"), namespace)
+    return report["completed"][0], namespace["_loop_rows"][0]
+
+
+def _write_closed_loop_fixture(tmp_path, near_pnl, far_pnl, reverse=False,
+                               partial=False, single_release=False):
+    import json
+
+    trade_id = "mts-paper-real-shape"
+    entries = [{"timestamp": "2026-10-05T10:40:00.299327", "trade_id": trade_id,
+                "session": "day", "mode": "paper", "leg": leg, "qty": 1,
+                "side": side, "price": price, "fill_type": "ENTRY",
+                "realized_pnl": None, "execution_source": "PAPER_COMBO_FILL"}
+               for leg, side, price in (("NEAR", "LONG", 50045.0),
+                                        ("FAR", "SHORT", 50224.0))]
+    closes = []
+    for leg, side, entry_price, pnl in (("NEAR", "SELL", 50045.0, near_pnl),
+                                       ("FAR", "BUY", 50224.0, far_pnl)):
+        for part in range(2 if partial else 1):
+            qty = 1
+            amount = pnl / 2 if partial else pnl
+            # Actual Oct 5 shape: two explicit per-leg COMBINED_EXIT records,
+            # followed by a zero-quantity lifecycle marker, not a RELEASE.
+            closes.append({"timestamp": "2026-10-05T11:14:42.697648",
+                           "trade_id": trade_id, "session": "day", "mode": "paper",
+                           "leg": leg, "side": side, "qty": qty,
+                           "price": entry_price + amount / 10 if leg == "NEAR" else entry_price - amount / 10,
+                           "realized_pnl": amount, "fill_type": "COMBINED_EXIT",
+                           "position_effect": "CLOSE",
+                           "position_side_before_exit": "LONG" if leg == "NEAR" else "SHORT",
+                           "paper_fill_id": f"PF-{leg}-{part}", "execution_source": "PAPER_EXIT_FILL"})
+    if partial:
+        for entry in entries:
+            entry["qty"] = 2
+    if reverse:
+        closes.reverse()
+    if single_release:
+        closes[0]["fill_type"] = "RELEASE"
+        closes[1]["fill_type"] = "EXIT"
+    settled = {"timestamp": "2026-10-05T11:14:42.670245", "trade_id": trade_id,
+               "session": "day", "mode": "paper", "leg": "SETTLED", "qty": 0,
+               "price": 0.0, "realized_pnl": None, "fill_type": "COMBINED_EXIT_SETTLED",
+               "event_type": "COMBINED_EXIT_SETTLED", "near_realized_pnl_gross": near_pnl,
+               "far_realized_pnl_gross": far_pnl, "combined_realized_pnl_gross": near_pnl + far_pnl,
+               "combined_realized_pnl_net": None, "pnl_status": "GROSS_ONLY"}
+    marker = {"timestamp": "2026-10-05T11:14:42.704246", "trade_id": trade_id,
+              "session": "day", "mode": "paper", "leg": "NEAR", "qty": 0,
+              "price": 0.0, "realized_pnl": None, "fill_type": "COMBINED_EXIT_COMPLETED"}
+    rows = entries + ([] if single_release else [settled]) + closes + [marker]
+    fills = tmp_path / "mts_trade_fills.jsonl"
+    events = tmp_path / "mts_spread_events.jsonl"
+    fills.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    events.write_text(json.dumps({"event": "COMBINED_EXIT_SUBMITTED", "trade_id": trade_id,
+                                  "ts": "2026-10-05T11:14:42", "reason": "POLICY_J"}) + "\n")
+    return fills, events
+
+
+import pytest
+
+
+@pytest.mark.parametrize("near_pnl,far_pnl", [(0.0, 80.0), (-1370.0, 1000.0), (-350.0, 120.0)])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_combined_exit_all_legs_reach_real_dashboard_rows(tmp_path, near_pnl, far_pnl, reverse):
+    fills, events = _write_closed_loop_fixture(tmp_path, near_pnl, far_pnl, reverse=reverse)
+    original = fills.read_bytes(), events.read_bytes()
+    trade, row = _render_closed_loop_callsite(fills, events)
+    # Total remains canonical; the omitted losing NEAR leg must not become +0.
+    assert trade["gross_pnl"] == trade["net_pnl"] == near_pnl + far_pnl
+    assert trade["pnl_status"] == "GROSS_ONLY"
+    assert trade["near_pnl_gross"] == near_pnl
+    assert trade["far_pnl_gross"] == far_pnl
+    assert row["近月 PnL"] == f"{near_pnl:+,.0f}"
+    assert row["遠月 PnL"] == f"{far_pnl:+,.0f}"
+    assert (fills.read_bytes(), events.read_bytes()) == original
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_partial_combined_exits_keep_every_leg_fill(tmp_path, reverse):
+    fills, events = _write_closed_loop_fixture(tmp_path, -1370.0, 1000.0,
+                                              reverse=reverse, partial=True)
+    trade, row = _render_closed_loop_callsite(fills, events)
+    assert trade["gross_pnl"] == -370.0
+    assert trade["near_pnl_gross"] == -1370.0
+    assert trade["far_pnl_gross"] == 1000.0
+    assert row["近月 PnL"] == "-1,370"
+    assert row["遠月 PnL"] == "+1,000"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_single_release_leg_mapping_remains_unchanged(tmp_path, reverse):
+    fills, events = _write_closed_loop_fixture(tmp_path, -1370.0, 1000.0,
+                                              reverse=reverse, single_release=True)
+    trade, row = _render_closed_loop_callsite(fills, events)
+    assert trade["gross_pnl"] == -370.0
+    assert trade["near_pnl_gross"] == -1370.0
+    assert trade["far_pnl_gross"] == 1000.0
+    assert row["近月 PnL"] == "-1,370"
+    assert row["遠月 PnL"] == "+1,000"
