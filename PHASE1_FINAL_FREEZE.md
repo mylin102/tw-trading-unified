@@ -1,4 +1,41 @@
-# MTS PAPER restoration — final freeze 2026-10-04
+# MTS PAPER combo landing and UI mode separation — final freeze 2026-10-05
+
+2026-10-05 Codex: user authorized controlled PAPER deployment of tested
+code 04320bade9ab612b6f5589681c24b9084ac6292f. This freeze-only commit
+changes no application code. LIVE stays disabled, no broker-flat query
+required for PAPER, no manual order/fill/ledger/context repair.
+
+Fill slice: 6e04fd8a/3d2b51b5 tests → 7f124ef7 fix. Actual production
+submit/gateway/manager/simulator regression RED 5 failures, GREEN 12 passed;
+mutations broker gate 4 failures and local identity 5 failures, restored.
+Complete A/B 013f4b9f → 7f124ef7: 147 → 111 failed, 4016 → 4061 passed,
+15 skipped and 10 collection errors unchanged; 4178 → 4187 collected AND
+completed; no new failure phases/errors, removed/unfinished/duplicate nodes.
+
+UI slice: 5936091c tests → 04320bad fix. Actual dashboard FLAT UPL AST
+branch RED 1 failure, final UI+fill focused 15 passed; mutation 1 failure,
+restored. Complete A/B 7f124ef7 → 04320bad: 111 failures unchanged,
+4061 → 4064 passed, 15 skipped/10 collection errors unchanged; 4187 → 4190
+collected AND completed; no new failure phases/errors or removed/unfinished/
+duplicate nodes. The suite is NOT all green. Exact complete comparison
+artifacts paper_combo_candidate_20261005_comparison.json and
+paper_upl_candidate_20261005_comparison.json are under Air4
+/private/tmp/mts-modeisolation-evidence-codex-20261002/.
+
+PAPER simulator fills have explicit PAPER-local ordinal IDs; LIVE receipt
+identity and broker confirmation requirements remain. PAPER UPL no longer
+falls back to stale LIVE snapshots; insufficient paper evidence remains N/A.
+No strategy/risk/config changes, no retroactive fill for today's missed order.
+
+Acceptance: same release18 and exact Git SHA; preserve untracked data and
+all history; single-instance stop/start via ecosystem.config.js, near/far
+Tick+BidAsk acknowledgements and fresh local PAPER heartbeat; 120 seconds
+stable ENTRY-locked observation, then unlock ENTRY and PM2 save. Only
+trading-system/dashboard targeted; stock-runner must remain unchanged.
+
+The October 4/2 sections below are archived evidence, not current sign-off.
+
+## Archived October 4 freeze
 
 2026-10-04 Codex. PAPER-only MTS restoration, not LIVE promotion authorization.
 Test base: bd095cde085ab661b361384f24f0d391c92c841d.
@@ -39,7 +76,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: 463443da6170c37b74e9cd2eaf21b9b48404e071c7665689cc3496681add4523
+frozen_tree_hash: b34dba7fcb59e33be349b85b9bedc1fa637ee402370d5ce75e82cbd57dd7d9fd
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
