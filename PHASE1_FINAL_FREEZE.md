@@ -1,4 +1,32 @@
-# MTS PAPER combo landing and UI mode separation — final freeze 2026-10-05
+# Dashboard near-leg PnL — final freeze 2026-10-05
+
+2026-10-05 Codex: user authorized dashboard-only deployment to Mini.
+Test-only commit c309653c689cfbde085e65fc2514635099306a34;
+tested fix 2fc842cace1a6f1618e6ab9f00b0e525b3edddd7.
+This freeze-only commit changes no application code. Deploy to an isolated
+dashboard release; trading-system stays on df4fcf5c and stock-runner stays
+on its current release. Do not restart either trading owner, change mode,
+write ledgers/context/positions, query broker, or create ENTRY locks.
+
+Actual dashboard callsite RED: 7 failed/6 passed; focused GREEN: 30 passed.
+Last-fill-only mutation: 7 failed/6 passed, exact committed bytes restored.
+Complete actual-node A/B df4fcf5c -> 2fc842ca:
+4063 -> 4073 passed; 112 failures, 15 skipped, 10 collection errors unchanged;
+4190 -> 4200 collected AND completed. Zero new failed node/phases or
+collection errors; all 10 added nodes pass, no removed/unfinished/duplicate
+nodes. This is NOT an all-green suite. Evidence:
+/private/tmp/mts-modeisolation-evidence-codex-20261002/
+leg_pnl_candidate_20261005_comparison.json.
+
+Acceptance: SHA-pinned dashboard-only PM2 owner, frozen clean tracked tree,
+HTTP health and rendered October 5 rows near 0/-1370/-350, far 80/1000/120,
+total 80/-370/-230 unchanged; 120 seconds stable with protected trading and
+stock owners unchanged, then PM2 save/dump and launchd-home verification.
+PAPER remains paper_active with live_order_allowed=false. Runtime account
+values are not synthesized, and no broker-flat proof is required for a UI
+restart. Existing gross-vs-net labels are deferred outside this slice.
+
+## Archived morning October 5 freeze
 
 2026-10-05 Codex: user authorized controlled PAPER deployment of tested
 code 04320bade9ab612b6f5589681c24b9084ac6292f. This freeze-only commit
@@ -76,7 +104,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: b34dba7fcb59e33be349b85b9bedc1fa637ee402370d5ce75e82cbd57dd7d9fd
+frozen_tree_hash: b71cd3d093b435164a269d2886451fa83734c0e8ef0ce6e73100fb9c24d91341
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
