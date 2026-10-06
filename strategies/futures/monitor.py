@@ -10977,6 +10977,8 @@ class FuturesMonitor:
                 "near_ref": _near_close,
                 "far_ref": _far_close,
                 "ts": _ts,
+                # 2026-10-06 Codex: freeze observed Z before synchronous fills.
+                "entry_spread_z": bar_dict.get("spread_z"),
                 "near_price_source": "LIVE_TICK" if "near_close_rt" in bar_dict else "BAR_CLOSE",
                 "near_tick_age_ms": 0,
                 "far_price_source": "LIVE_TICK" if "far_close_rt" in bar_dict else "BAR_CLOSE",
@@ -11242,6 +11244,8 @@ class FuturesMonitor:
             "side": "SHORT" if action == "SELL_NEAR_BUY_FAR" else "LONG",
             "spread_side": action, "near_label": "NEAR", "far_label": "FAR",
             "near_ref": near_price, "far_ref": far_price, "ts": ts,
+            # 2026-10-06 Codex: retain the submitted observation, not threshold/RAM.
+            "entry_spread_z": bar_dict.get("spread_z"),
             "combo": True,
             "combo_legs": _combo_legs,
         }
@@ -16624,6 +16628,14 @@ class FuturesMonitor:
         """Synchronize MTS strategy state after both legs are confirmed filled."""
         data = self._mts_pending_fills.get(trade_id)
         if not data: return
+
+        # 2026-10-06 Codex: missing/manual observations are unknown, never +3.
+        try:
+            _fill_entry_z = float(data.get("entry_spread_z"))
+            if not math.isfinite(_fill_entry_z):
+                _fill_entry_z = None
+        except (TypeError, ValueError):
+            _fill_entry_z = None
         
         try:
             _mts_strat = self._registry.get("tmf_spread")
@@ -16656,6 +16668,7 @@ class FuturesMonitor:
                     side=data["side"],
                     near_entry=data["near_fill_price"], 
                     far_entry=data["far_fill_price"],
+                    entry_spread_z=_fill_entry_z,
                     # 2026-05-27 Gemini CLI: Pass entry snapshot metadata for contract compliance
                     near_tick_age_ms=data.get("near_tick_age_ms", -1),
                     far_tick_age_ms=data.get("far_tick_age_ms", -1),
@@ -16672,7 +16685,7 @@ class FuturesMonitor:
                     far_last=data["far_fill_price"],
                     near_side=data["near_label"], 
                     far_side=data["far_label"],
-                    spread_z=3.0, released_leg=None, trade_id=trade_id
+                    spread_z=_fill_entry_z, released_leg=None, trade_id=trade_id
                 )
 
                 # ADR-010 Sprint 3: submit release OCO bracket after entry confirmed
@@ -16748,7 +16761,8 @@ class FuturesMonitor:
                                 timestamp=datetime.now().isoformat(),
                             )
 
-                            _entry_spread_z = getattr(_mts_strat, "_entry_z", 3.0)
+                            # 2026-10-06 Codex: release setup must not replace Z with its gate.
+                            _entry_spread_z = _fill_entry_z
                             _write_mts_state(
                                 has_position=True, action="RELEASE_ARMED",
                                 reason="release_threshold_armed",
