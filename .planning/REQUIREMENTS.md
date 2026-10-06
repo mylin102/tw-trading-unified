@@ -31,7 +31,7 @@
 
 ## MTS Operational Repair — Phase 1001 (2026-10-06)
 
-- [ ] **MTSZ-AB**: Existing monitor complete A/B evidence is reconciled without mistaking unchanged failure totals for zero new failures.
+- [x] **MTSZ-AB**: Existing monitor complete A/B evidence is reconciled without mistaking unchanged failure totals for zero new failures.
 - [ ] **MTSZ-ENTRY**: Submitted entry Z survives delayed/partial/duplicate callback paths and real persistence; zero and missing remain distinct.
 - [ ] **MTSZ-STATE**: Frozen entry/current Z semantics survive actual state round-trip, including zero, unknown and legacy state.
 - [ ] **MTSZ-LOADER**: One resolved root, validated ticker/date discovery, same-path/new-date reload and honest last-valid-cache provenance.
@@ -77,8 +77,15 @@ Traceability: all six MTSZ requirements map only to Phase 1001; historical requi
 | VIEW-04 | Phase 3 | Complete |
 | VMDL-01 | Phase 4 | Complete |
 | VMDL-02 | Phase 4 | Complete |
+| MTSZ-AB | Phase 1001 | Complete |
+| MTSZ-ENTRY | Phase 1001 | Pending |
+| MTSZ-STATE | Phase 1001 | Pending |
+| MTSZ-LOADER | Phase 1001 | Pending |
+| MTSZ-PUBLISH | Phase 1001 | Pending |
+| MTSZ-HANDOFF | Phase 1001 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 12 total
 - Mapped to phases: 12
 - Unmapped: 0 ✓

@@ -161,15 +161,17 @@ Plans:
 **Requirements**: MTSZ-AB, MTSZ-ENTRY, MTSZ-STATE, MTSZ-LOADER, MTSZ-PUBLISH, MTSZ-HANDOFF
 **Depends on:** Nothing (independent operational repair; no change to historical phase dependencies)
 **Success Criteria**:
+
   1. Submitted entry Z survives delayed fills and persisted state; current zero/missing semantics are correct.
   2. Loader/producer resolve the same isolated/shared data root, hot reload safely and publish atomically without rejecting normal warmup NaN.
   3. Every slice has callsite RED/FIX, mutation restoration and full actual node/phase A/B evidence.
   4. Dashboard source proof and verified maintenance/rollback instructions are separate from production publication; no production operations executed.
+
 **Plans:** 6 sequential plans
 
 Plans:
 
-- [ ] 1001-01-PLAN.md — Close existing monitor A/B evidence
+- [x] 1001-01-PLAN.md — Close existing monitor A/B evidence
 - [ ] 1001-02-PLAN.md — Verify submitted entry Z through delayed fills
 - [ ] 1001-03-PLAN.md — Freeze entry Z and persist current Z accurately
 - [ ] 1001-04-PLAN.md — Unify loader root and implement safe hot reload
