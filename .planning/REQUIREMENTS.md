@@ -29,6 +29,17 @@
 - [x] **VMDL-01**: Regression tests cover partial fill, cancel/reject, restart recovery, and trading-day mapping across futures/options lifecycle flows
 - [x] **VMDL-02**: Milestone verification proves lifecycle refactor does not break current `main.py` orchestration or the 8500 dashboard's core runtime path
 
+## MTS Operational Repair — Phase 1001 (2026-10-06)
+
+- [ ] **MTSZ-AB**: Existing monitor complete A/B evidence is reconciled without mistaking unchanged failure totals for zero new failures.
+- [ ] **MTSZ-ENTRY**: Submitted entry Z survives delayed/partial/duplicate callback paths and real persistence; zero and missing remain distinct.
+- [ ] **MTSZ-STATE**: Frozen entry/current Z semantics survive actual state round-trip, including zero, unknown and legacy state.
+- [ ] **MTSZ-LOADER**: One resolved root, validated ticker/date discovery, same-path/new-date reload and honest last-valid-cache provenance.
+- [ ] **MTSZ-PUBLISH**: Atomic successful publication, failure hash preservation, normal warmup NaN and real producer-to-loader readback.
+- [ ] **MTSZ-HANDOFF**: Dashboard source status and exact pending production maintenance/rollback checklist delivered without executing it.
+
+Traceability: all six MTSZ requirements map only to Phase 1001; historical requirements remain unchanged.
+
 ## v2 Requirements
 
 ### Platform Evolution

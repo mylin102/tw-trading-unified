@@ -1,19 +1,21 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.2
-milestone_name: Adaptive Strategy Optimization
-current_phase: 12-1
-current_plan: 01
-status: complete
+current_phase: 1001
+current_phase_name: MTS Data Root and Z State Repair
+current_plan: 1
+status: executing
 stopped_at: Completed Phase 12-1 ATR Verification
-last_updated: "2026-07-01T08:11:00.000Z"
-last_activity: 2026-07-01
+last_updated: "2026-10-06T07:57:29.486Z"
+last_activity: 2026-10-06
+last_activity_desc: Phase 1001 execution started
+state_head: e2f196bd3442189ad6b9f21c61651981e7b72cf9
 progress:
   total_phases: 7
-  completed_phases: 4
+  completed_phases: 1
   total_plans: 17
-  completed_plans: 12
-  percent: 70
+  completed_plans: 0
+milestone_name: Adaptive Strategy Optimization
 ---
 
 # Session State
@@ -23,23 +25,24 @@ progress:
 See: .planning/PROJECT.md (updated 2026-05-13)
 
 **Core value:** Transform fixed-parameter spread strategies into volatility-adaptive systems to reduce friction and improve capture quality.
-**Current focus:** Phase 12-1 — ATR Adaptive Verification
+**Current focus:** Phase 1001 — MTS Data Root and Z State Repair
 
 ## Current Position
 
-Phase: 12-1 (ATR Adaptive Verification) — COMPLETE
-Plan: 1 of 1
+Phase: 1001 (MTS Data Root and Z State Repair) — EXECUTING
+Plan: 1 of 6
 **Milestone:** v1.2 Adaptive Strategy Optimization
-**Current phase:** 12-1
-**Current plan:** 01
-**Status:** Complete
-**Last activity:** 2026-07-01
+**Current phase:** 1001
+**Current plan:** 1
+**Status:** Executing Phase 1001
+**Last activity:** 2026-10-06 — Phase 1001 execution started
 
 Progress: [███████░░░] 70% (includes v1.1 completed phases)
 
 ## Performance Metrics
 
 **Velocity:**
+
 - Total plans completed: 12
 - Current Milestone: 1/1 plans completed
 
@@ -53,19 +56,27 @@ Progress: [███████░░░] 70% (includes v1.1 completed phases)
 
 ## Accumulated Context
 
+### Roadmap Evolution
+
+- Phase 1001 added: User approved independent offline MTS data-root and Z-state repair; no production operations.
+
 ## Decisions
+
 - [ADAPT]: Use ATR-scaled dynamic thresholds for `tmf_spread`.
 - [ADAPT]: Implement `min_atr` gate to filter entry in low-volatility sessions.
 - [ADAPT]: Hard floors for stops (5pt) and trails (10pt) are mandatory for capital safety.
 
 ## Roadmap Evolution
+
 - Milestone v1.2 added for Adaptive Strategy Optimization.
 - Phase 12-1 defined for ATR Adaptive Verification.
 
 ### Pending Todos
+
 - [x] Build the adaptive trade dataset pipeline (adaptive-trade-dataset-pipeline.md).
 
 ### Blockers/Concerns
+
 - None.
 
 ## Session Continuity
