@@ -1,4 +1,45 @@
-# Dashboard near-leg PnL — final freeze 2026-10-05
+# PAPER close/startup consistency — final freeze 2026-10-06
+
+2026-10-06 Codex; AGENT_NAME=codex. User authorized verified repair then direct
+PAPER deployment, and closed-session heartbeat bypass. Tested code:
+b992e5d52b029354259b5e39b78870188669b350. Freeze-only manifest commit; no
+application edits after the full run. Canonical engine stays release18.
+
+Separate test -> fix commits:
+callback race 32ceefaf -> 580c4c76;
+close projection 6b98858e -> b16f2caa;
+explicit PAPER row scope 40438e4e -> 9c1b50a4;
+actual tick/reset/writer 2d1cafd0 -> f634dfc6;
+actual monitor.run local startup 42fe4daf -> b992e5d5.
+Every slice <=2 source/test files; real callsites, RED and separate commits.
+Mutations respectively 1,2,1,2,6/4 failures, all committed bytes restored.
+Final focused startup GREEN 30 PASS; tick/LIVE-adjacent GREEN 53 PASS.
+
+Complete actual-node A/B c9e848dc -> b992e5d5: 4200 -> 4224 collected AND
+finished, 4074 -> 4098 PASS, unchanged 111 failed-node/phases, 15 SKIP and
+10 collection errors. All 24 added nodes PASS; no new failures/errors,
+removed/unfinished/duplicate nodes. This is NOT an all-green suite.
+Each intermediate full A/B also has zero new failures/errors. Raw logs,
+actual node/phase lists, mutations and exact-SHA comparisons:
+/private/tmp/mts-modeisolation-evidence-codex-20261002/
+paper_consistency_final_comparison_20261006.json.
+
+Acceptance: exact frozen SHA; stop old engine before ff-only source update;
+one canonical PAPER engine, PAPER_ACTIVE/live_order_allowed=false, unchanged
+config hash and PAPER namespace. No broker-flat/holdings/reconciliation query
+needed for PAPER. Startup empty bar invokes normal local reset/writer, never
+an entry signal; LIVE/unknown accounting/recovery protections unchanged.
+Local same-trade readable dual-entry/close proof; no manual fill/state/context
+edits, no history rewrite, no stash, no manual orders/cancels, no LIVE enablement.
+Protect current dashboard and stock owner snapshots; no restart/source edits
+to either. Near/far Tick+BidAsk acknowledgements, genuine cleared local state
+and zero UPL, 120s stable ENTRY-locked observation, then unlock and PM2 save/
+dump/launchd consistency. Heartbeat checks bypass ONLY during canonical
+market-closed hours; process/SHA/mode/state/HTTP checks remain mandatory.
+
+The October 5 sections below are archived evidence, NOT current deployment scope.
+
+## Archived dashboard near-leg PnL freeze 2026-10-05
 
 2026-10-05 Codex: user authorized dashboard-only deployment to Mini.
 Test-only commit c309653c689cfbde085e65fc2514635099306a34;
@@ -104,7 +145,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: b71cd3d093b435164a269d2886451fa83734c0e8ef0ce6e73100fb9c24d91341
+frozen_tree_hash: e2b81243b2aab8e64d98a99032e67af05303393c9856f5759f3a1d5d483a3fba
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
