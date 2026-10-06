@@ -12605,8 +12605,19 @@ class FuturesMonitor:
 
         # [Phase A] Immediate Position Recovery & Heartbeat Start
         self._refresh_runtime_status()
-        
-        if not self.dry_run and self.api:
+
+        # 2026-10-06 Codex: PAPER startup restores local fills, not broker holdings.
+        # Empty bar runs only recovery, including closed hours, never a signal.
+        _paper_ctx = getattr(self, "_execution_context", None)
+        _paper_runtime = (getattr(_paper_ctx, "requested_mode", "") == "paper"
+                          and not self.live_trading)
+        if (_paper_runtime and not self.dry_run
+                and getattr(_paper_ctx, "effective_mode", "") == "paper_active"
+                and getattr(_paper_ctx, "live_order_allowed", None) is False
+                and self.cfg.get("mts", {}).get("enabled", False)):
+            self._mts_tick(enriched_bar={})
+
+        if not self.dry_run and self.api and not _paper_runtime:
             try:
                 positions = self.api.list_positions(self.api.futopt_account)
                 for p in positions:
