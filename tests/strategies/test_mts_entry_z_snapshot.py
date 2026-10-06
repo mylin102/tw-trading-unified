@@ -47,7 +47,8 @@ def test_real_combo_fill_preserves_decision_z(real_paper_monitor, tmp_path, monk
              if json.loads(x).get('event')=='ENTRY']
     assert len(fills)==2 and len(entries)==1
     assert [r['spread_z'] for r in fills] == [expected, expected]
-    assert entries[0]['spread_z'] == expected
+    # 2026-10-06 Codex: events keep full precision; fills/state round to 2dp.
+    assert entries[0]['spread_z'] == (None if expected is None else pytest.approx(float(decision_z)))
     state=json.loads((tmp_path/'state.json').read_text())
     assert state['spread_z'] == expected
     assert strategy._entry_spread_z == (None if expected is None else pytest.approx(float(decision_z)))
