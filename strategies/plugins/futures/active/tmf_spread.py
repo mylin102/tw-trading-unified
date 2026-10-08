@@ -1356,6 +1356,15 @@ def _renko_status_payload(self_or_none=None):
         return None
 
 
+# 2026-10-08 Codex: zero is a value; non-finite/blank Z is unknown everywhere.
+def _finite_spread_z_or_none(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _write_mts_state(
     has_position: bool,
     action: str,
@@ -1366,7 +1375,7 @@ def _write_mts_state(
     far_last: float = 0,
     near_side: str | None | object = _UNSET_SENTINEL,
     far_side: str | None | object = _UNSET_SENTINEL,
-    spread_z: float = 0,
+    spread_z: float | None = None,
     released_leg: str | None = None,
     release_price: float = 0,
     trail_pts: int = 0,
@@ -1434,6 +1443,22 @@ def _write_mts_state(
                       if entry_ts is _UNSET_SENTINEL else entry_ts)
         if not _f_entry_ts and has_position:
             _f_entry_ts = datetime.now().isoformat()
+
+        # 2026-10-08 Codex: freeze the confirmed entry for this trade only.
+        _current_z = _finite_spread_z_or_none(kwargs.pop("current_spread_z", spread_z))
+        _entry_z_arg = kwargs.pop("entry_spread_z", _UNSET_SENTINEL)
+        _same_trade = (has_position and existing.get("has_position")
+                       and bool(_f_trade_id) and existing.get("trade_id") == _f_trade_id)
+        if not has_position:
+            _entry_z = None
+        elif _same_trade:
+            _entry_z = _finite_spread_z_or_none(existing.get("entry_spread_z"))
+        elif _entry_z_arg is not _UNSET_SENTINEL:
+            _entry_z = _finite_spread_z_or_none(_entry_z_arg)
+        elif reason == "MANUAL_ENTRY_CONFIRMED":
+            _entry_z = _finite_spread_z_or_none(spread_z)
+        else:
+            _entry_z = None
 
         # ── UPL Calculation ──
         # 2026-05-27 Gemini CLI: Use dynamic point value from engine constants
@@ -1537,8 +1562,8 @@ def _write_mts_state(
             "ticker": ticker,
             "monitor_id": f"futures_{ticker.lower()}",
             "manual_trade_status": existing.get("manual_trade_status"),
-            "entry_spread_z": round(spread_z, 2) if (spread_z is not None and spread_z != 0) else existing.get("entry_spread_z"),
-            "current_spread_z": existing.get("current_spread_z"),
+            "entry_spread_z": round(_entry_z, 2) if _entry_z is not None else None,
+            "current_spread_z": round(_current_z, 2) if _current_z is not None else None,
             "release_state": release_state,
             "legs": legs,
             "released_leg": released_leg,
@@ -1562,7 +1587,7 @@ def _write_mts_state(
             "cumulative_realized_pnl": round(_cumulative, 1),
             # Preserve initial_balance from existing (set via dashboard)
             "initial_balance": existing.get("initial_balance", 100000),
-            "spread_z": round(spread_z, 2) if spread_z is not None else None,
+            "spread_z": round(_current_z, 2) if _current_z is not None else None,
             "trail_side": _trail_side,
             "trail_mode": _trail_mode,
             "trail_peak": round(trail_peak, 1),
@@ -1662,7 +1687,7 @@ def _write_mts_telemetry(
     total_upl: float = 0.0,
     atr: float = 0.0,
     quote_age_ms: float = 0.0,
-    spread_z: float = 0.0,
+    spread_z: float | None = None,
     **kwargs,
 ) -> None:
     """P0: Heartbeat-only telemetry update — NEVER writes lifecycle fields.
@@ -1739,6 +1764,8 @@ def _write_mts_telemetry(
             far_upl = 0.0
             total_upl = 0.0
         _mult = float(get_point_value(ticker))
+        # 2026-10-08 Codex: normalize the current mark before serialization.
+        _current_z = _finite_spread_z_or_none(spread_z)
         telemetry = {
             "has_position": existing.get("has_position", False),
             "state": existing.get("state", "HEARTBEAT"),
@@ -1749,8 +1776,9 @@ def _write_mts_telemetry(
             "far_upl": round(far_upl, 1),
             "total_upl": round(total_upl, 1),
             "atr": round(atr, 2) if atr else existing.get("atr"),
-            "spread_z": round(float(spread_z), 2) if spread_z
-                        else existing.get("spread_z", 0.0),
+            # 2026-10-08 Codex: this mark may be zero or explicitly unknown.
+            "spread_z": round(_current_z, 2) if _current_z is not None else None,
+            "current_spread_z": round(_current_z, 2) if _current_z is not None else None,
             "quote_age_ms": round(float(quote_age_ms), 1),
             "heartbeat_at": datetime.now().isoformat(),
             "heartbeat_pid": os.getpid(),
@@ -1770,7 +1798,7 @@ def _write_mts_telemetry(
                       "trail_side", "trail_mode", "trail_peak", "trail_nadir",
                       "trail_stop_price", "distance_to_stop", "release_stop_points",
                       "trail_distance_points", "lifecycle", "manual_trade_status",
-                      "entry_spread_z", "current_spread_z", "release_state",
+                      "entry_spread_z", "release_state",
                       "release_price", "risk_mode", "session", "stop_mult", "trail_mult",
                       "final_release_stop", "final_trail_dist", "release_stop",
                       "release_stop_floor", "trail_dist", "trail_dist_floor",
@@ -1867,7 +1895,7 @@ class TMFSpread(StrategyBase):
         self._far_entry: float = 0.0
         self._near_side: str | None = None  # "LONG" or "SHORT" at entry
         self._far_side: str | None = None   # "LONG" or "SHORT" at entry
-        self._entry_spread_z: float = 0.0   # snapshot at entry, not hot-reloaded
+        self._entry_spread_z: float | None = None  # 2026-10-08 Codex: unknown until confirmed.
         self._released_leg: str | None = None  # "near" or "far"
         self._release_ts: datetime | None = None
         self._release_mono: float = 0.0
@@ -2653,7 +2681,7 @@ class TMFSpread(StrategyBase):
                     near_entry=self._near_entry, far_entry=self._far_entry,
                     near_last=near_close, far_last=far_close,
                     near_side=self._near_side, far_side=self._far_side,
-                    spread_z=bar.get("spread_z") or 0.0,
+                    spread_z=bar.get("spread_z"),  # 2026-10-08 Codex: retain unknown.
                     release_price=_exit_price,
                     trade_id=self._trade_id, ticker=self._ticker,
                     lifecycle=lifecycle_to_dict(self._lifecycle_oca),
@@ -2775,7 +2803,7 @@ class TMFSpread(StrategyBase):
 
     def sync_position(self, trade_id: str, side: str,
                       near_entry: float, far_entry: float,
-                      entry_spread_z: float = 3.0, **kwargs) -> None:
+                      entry_spread_z: float | None = None, **kwargs) -> None:
         """
         Synchronize in-memory position state after a manual/spread entry.
 
@@ -2791,6 +2819,8 @@ class TMFSpread(StrategyBase):
         self._far_entry = far_entry
         self._near_side = "LONG" if side == "LONG" else "SHORT"
         self._far_side = "SHORT" if side == "LONG" else "LONG"
+        # 2026-10-08 Codex: confirmed snapshots never fabricate the entry gate.
+        entry_spread_z = _finite_spread_z_or_none(entry_spread_z)
         self._entry_spread_z = entry_spread_z
         self._released_leg = None
         self._release_ts = None
@@ -3202,7 +3232,9 @@ class TMFSpread(StrategyBase):
 
         _near_last = float(_near_last_val) if _near_last_val is not None else 0.0
         _far_last = float(_far_last_val) if _far_last_val is not None else 0.0
-        _spread_z = float(_spread_z_val) if _spread_z_val is not None else 0.0
+        _spread_z = _finite_spread_z_or_none(_spread_z_val)
+        # 2026-10-08 Codex: pass entry and current separately to the disk writer.
+        kw["entry_spread_z"] = getattr(self, "_entry_spread_z", None)
         _trail_pts = float(_trail_pts_val) if _trail_pts_val is not None else 0.0
         _release_stop = float(_release_stop_val) if _release_stop_val is not None else 0.0
         _trail_dist = float(_trail_dist_val) if _trail_dist_val is not None else 0.0
@@ -4048,7 +4080,8 @@ class TMFSpread(StrategyBase):
                                 # 2026-07-22 Gemini CLI: Restore state_revision from disk during recovery
                                 self._state_revision = int(state.get("state_revision", 0))
                                 # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
-                                self._entry_spread_z = float(state.get("entry_spread_z") or 0.0)
+                                # 2026-10-08 Codex: legacy unknown stays unknown after restart.
+                                self._entry_spread_z = _finite_spread_z_or_none(state.get("entry_spread_z"))
                                 self._near_entry = float(state.get("near_entry") or 0.0)
                                 self._far_entry = float(state.get("far_entry") or 0.0)
                                 self._near_side = state.get("near_side")
@@ -5438,6 +5471,7 @@ class TMFSpread(StrategyBase):
                 total_upl=_total_upl,
                 atr=float(bar.get("atr", 0.0) or 0.0),
                 quote_age_ms=quote_age_ms,
+                spread_z=spread_z,  # 2026-10-08 Codex: propagate the actual current mark.
             )
 
         # 2026-07-09 Hermes Agent: release diagnostic eval — fires whenever a leg is at threshold
@@ -6264,7 +6298,7 @@ class TMFSpread(StrategyBase):
         self._far_entry = 0.0
         self._near_side = None
         self._far_side = None
-        self._entry_spread_z = 0.0
+        self._entry_spread_z = None  # 2026-10-08 Codex: no active entry while flat.
         self._released_leg = None
         # 2026-08-23 Hermes Agent: per-trade HVWAP release sentinel — cleared
         # on flat so the NEXT trade may release again (one intent per trade).
