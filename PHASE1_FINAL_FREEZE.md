@@ -145,7 +145,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: e2b81243b2aab8e64d98a99032e67af05303393c9856f5759f3a1d5d483a3fba
+frozen_tree_hash: b26d2ca725bbc669904f6ffbe111df2ac0743be0064f31d91fa1640181d0855a
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
