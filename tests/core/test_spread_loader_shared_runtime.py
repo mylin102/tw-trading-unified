@@ -57,6 +57,16 @@ def test_actual_enrich_loads_warmup_nans_without_dropping_columns_or_rows(tmp_pa
     assert loader.status()["csv"].endswith("tmf_calendar_spread_20260930.csv")
 
 
+def test_actual_enrich_accepts_nanosecond_timestamp_contract(tmp_path):
+    data = frame()
+    data["ts"] = data["ts"].astype("int64")
+    publish(tmp_path, "20260930", data)
+    loader = module.SpreadLoader(str(tmp_path))
+    assert loader.load_latest_csv("TMF") is True
+    assert len(loader._far_df) == 40
+    assert enrich(loader)["spread_z"] == pytest.approx(float(loader._far_df["spread_z"].iloc[-1]))
+
+
 def test_actual_enrich_discovers_new_date_and_ignores_decoys(tmp_path):
     publish(tmp_path, "20260930")
     loader = module.SpreadLoader(str(tmp_path))
@@ -98,6 +108,7 @@ def test_failed_refresh_keeps_last_valid_source_and_values(tmp_path, damage):
     elif damage == "timestamp":
         broken["ts"] = "not-a-timestamp"
     else:
+        broken["Close_near"] = broken["Close_near"].astype(object)
         broken.loc[25, "Close_near"] = "not-a-price"
     replacement = tmp_path / "replacement.csv"
     broken.to_csv(replacement, index=False)
@@ -108,4 +119,3 @@ def test_failed_refresh_keeps_last_valid_source_and_values(tmp_path, damage):
     assert loader.status()["last_refresh_error"]
     pd.testing.assert_frame_equal(loader._far_df, before_data)
     assert bar["spread_z"] == pytest.approx(float(before_data["spread_z"].iloc[-1]))
-
