@@ -19,10 +19,10 @@ import os
 import sys
 import argparse
 import tempfile
-import shutil
 import yaml
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,11 +30,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.shioaji_session import get_api
 from core.broker.shioaji_compat import kbars_to_dataframe
 from core.date_utils import is_night_session
+from core.runtime_paths import runtime_path
 
 
 # ── Config ─────────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 SPREAD_WINDOW = 20  # rolling window for spread_z
 
 # ── Config Loading (GSD: Zero Hardcoding) ──
@@ -189,6 +189,66 @@ def calculate_spread_metrics(df_near, df_far):
     return merged
 
 
+def validate_spread_output(df):
+    """Fail closed unless the complete rolling-metric frame is publishable."""
+    required = {
+        "ts", "Close_near", "Close_far", "spread", "spread_ma", "spread_std",
+        "spread_z", "spread_ema_20", "spread_ema_60", "vwap", "vwap_std", "vwap_z",
+    }
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Missing spread output columns: {sorted(missing)}")
+    if df.empty:
+        raise ValueError("Spread output is empty")
+
+    timestamps = pd.to_datetime(df["ts"], errors="coerce")
+    if timestamps.isna().any() or timestamps.duplicated().any() or not timestamps.is_monotonic_increasing:
+        raise ValueError("Spread timestamps must be valid, unique, and increasing")
+
+    for column in ("Close_near", "Close_far", "spread"):
+        values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"Non-finite values in {column}")
+    if not np.allclose(df["spread"].to_numpy(dtype=float),
+                       df["Close_near"].to_numpy(dtype=float) - df["Close_far"].to_numpy(dtype=float)):
+        raise ValueError("Spread does not equal near minus far")
+
+    warmup = min(SPREAD_WINDOW - 1, len(df))
+    rolling_columns = ("spread_ma", "spread_std", "spread_z", "vwap", "vwap_std", "vwap_z")
+    if df.loc[:warmup - 1, list(rolling_columns)].notna().any().any():
+        raise ValueError("Rolling metrics must remain undefined during the full warmup window")
+    ready = df.iloc[warmup:]
+    for column in ("spread_ma", "spread_std", "vwap", "vwap_std"):
+        values = pd.to_numeric(ready[column], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"Non-finite rolling values in {column}")
+    for std_column, z_column in (("spread_std", "spread_z"), ("vwap_std", "vwap_z")):
+        std = ready[std_column].to_numpy(dtype=float)
+        z = pd.to_numeric(ready[z_column], errors="coerce").to_numpy(dtype=float)
+        if (std < 0).any() or not np.isfinite(z[std > 0]).all() or not np.isnan(z[std == 0]).all():
+            raise ValueError(f"Invalid zero/nonzero standard deviation semantics for {z_column}")
+    return df
+
+
+def _atomic_publish_csv(df, final_path, data_dir):
+    """Publish one complete CSV by same-directory atomic replacement."""
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".tmp",
+        prefix=f".{os.path.basename(final_path)}.",
+        dir=data_dir,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            df.to_csv(handle, index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, final_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -228,33 +288,24 @@ def main():
     print(f"Near bars: {len(df_near)}, Far bars: {len(df_far)}")
 
     # 4. Compute spread
-    df_spread = calculate_spread_metrics(df_near, df_far)
-    if df_spread is None or df_spread.empty:
-        print("ERROR: Spread calculation failed")
-        return 1
-    print(f"Spread bars: {len(df_spread)}, latest spread_z={df_spread['spread_z'].iloc[-1]:.2f}")
-
-    # 5. Atomic write: temp → rename
-    today_str = datetime.now().strftime("%Y%m%d")
-    ticker_lower = TICKER.lower()
-    final_path = os.path.join(DATA_DIR, f"{ticker_lower}_calendar_spread_{today_str}.csv")
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".csv",
-        prefix=f"{ticker_lower}_calendar_spread_{today_str}_",
-        dir=DATA_DIR,
-    )
     try:
-        df_spread.to_csv(tmp_path, index=False)
-        os.close(fd)
-        shutil.move(tmp_path, final_path)
+        df_spread = calculate_spread_metrics(df_near, df_far)
+        if df_spread is None:
+            raise ValueError("Spread calculation failed")
+        validate_spread_output(df_spread)
+        latest_z = df_spread["spread_z"].iloc[-1]
+        latest_z_display = f"{latest_z:.2f}" if pd.notna(latest_z) else "NA"
+        print(f"Spread bars: {len(df_spread)}, latest spread_z={latest_z_display}")
+
+        data_dir = runtime_path("data")
+        os.makedirs(data_dir, exist_ok=True)
+        today_str = datetime.now().strftime("%Y%m%d")
+        ticker_lower = TICKER.lower()
+        final_path = os.path.join(data_dir, f"{ticker_lower}_calendar_spread_{today_str}.csv")
+        _atomic_publish_csv(df_spread, final_path, data_dir)
         print(f"OK: Written {final_path} ({len(df_spread)} rows)")
     except Exception as e:
-        os.close(fd)
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        print(f"ERROR: Write failed: {e}")
+        print(f"ERROR: Spread publish failed: {e}")
         return 1
 
     return 0
