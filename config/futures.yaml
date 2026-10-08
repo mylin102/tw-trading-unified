@@ -172,7 +172,7 @@ mts:
     vwap_exit:
       enabled: true
       tighten_ratio: 0.3
-    max_spread_width: 3
+    max_spread_width: 4
     entry_marketable_offset_ticks: 10
     entry_price_type_day: MKT
     entry_price_type_night: LMT
