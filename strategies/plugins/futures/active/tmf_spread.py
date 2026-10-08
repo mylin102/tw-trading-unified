@@ -4009,6 +4009,37 @@ class TMFSpread(StrategyBase):
                 self._mts_state_write_enabled = True
                 return False
 
+        # 2026-10-08 Codex: same-trade PAPER fills repair directionless JSON
+        # before it can become an apparently recovered, unmanageable position.
+        from core.runtime_paths import mts_data_mode
+        _paper_direction_recovered = False
+        if (mts_data_mode() == "paper" and state and state.get("has_position")
+                and state.get("released_leg") is None
+                and any(state.get(k) not in ("LONG", "SHORT")
+                        for k in ("near_side", "far_side"))):
+            try:
+                from strategies.futures.mts_ledger_authority import project_fills, MtsAuthority
+                with open(_MTS_FILL_LOG, encoding="utf-8") as handle:
+                    fills = [json.loads(line) for line in handle if line.strip()]
+                auth = project_fills(
+                    (row for row in fills if row.get("mode") == "paper"
+                     and row.get("trade_id") == state.get("trade_id")), source="PAPER")
+                if not (state.get("trade_id") and auth.status is MtsAuthority.OPEN
+                        and auth.trade_id == state["trade_id"]
+                        and auth.near_qty * auth.far_qty < 0
+                        and auth.near_side in ("LONG", "SHORT")
+                        and auth.far_side in ("LONG", "SHORT")
+                        and math.isclose(auth.near_entry, float(state["near_entry"]))
+                        and math.isclose(auth.far_entry, float(state["far_entry"]))):
+                    raise ValueError("missing same-trade PAPER direction evidence")
+                state = dict(state, near_side=auth.near_side, far_side=auth.far_side)
+                _paper_direction_recovered = True
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                self._mts_recovery_state = RecoveryState.RECOVERY_REQUIRED
+                self._mts_state_write_enabled = False
+                logger.warning("[MTS_RESTORE_REJECTED] reason=PAPER_DIRECTION_UNPROVEN error=%s", exc)
+                return False
+
         # 1. Primary Source: JSON State File
         if state and state.get("has_position") is True:
             action = state.get("state", "")
@@ -4226,6 +4257,13 @@ class TMFSpread(StrategyBase):
                                 self._single_leg_entered_mono = time.monotonic()
                                 self._single_leg_post_fill_ticks = 0
                                 self._single_leg_last_tick_ts = 0.0
+                                if _paper_direction_recovered:
+                                    self.write_state(
+                                        action, "PAPER_DIRECTION_RECOVERED",
+                                        near_last=state.get("near_last", 0.0),
+                                        far_last=state.get("far_last", 0.0),
+                                        spread_z=state.get("current_spread_z", state.get("spread_z")),
+                                    )
                                 logger.info("[MTS_RESTORE_OK] source=JSON action=%s trade_id=%s", action, self._trade_id)
                                 return True
                             else:
