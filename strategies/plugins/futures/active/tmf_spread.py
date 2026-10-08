@@ -1776,9 +1776,6 @@ def _write_mts_telemetry(
             "far_upl": round(far_upl, 1),
             "total_upl": round(total_upl, 1),
             "atr": round(atr, 2) if atr else existing.get("atr"),
-            # 2026-10-08 Codex: this mark may be zero or explicitly unknown.
-            "spread_z": round(_current_z, 2) if _current_z is not None else None,
-            "current_spread_z": round(_current_z, 2) if _current_z is not None else None,
             "quote_age_ms": round(float(quote_age_ms), 1),
             "heartbeat_at": datetime.now().isoformat(),
             "heartbeat_pid": os.getpid(),
@@ -1788,6 +1785,17 @@ def _write_mts_telemetry(
             "schema_version": existing.get("schema_version", 3),
             "position_epoch": existing.get("position_epoch"),
         }
+        # Keep the legacy heartbeat shape when no spread-Z was ever supplied,
+        # while clearing previously persisted marks when a later update is unknown.
+        if (
+            _current_z is not None
+            or "spread_z" in existing
+            or "current_spread_z" in existing
+        ):
+            telemetry["spread_z"] = round(_current_z, 2) if _current_z is not None else None
+            telemetry["current_spread_z"] = (
+                round(_current_z, 2) if _current_z is not None else None
+            )
         # Preserve all lifecycle fields from existing state
         for _key in ["state", "reason", "has_position", "near_entry", "far_entry",
                       "near_side", "far_side", "near_status", "far_status",
