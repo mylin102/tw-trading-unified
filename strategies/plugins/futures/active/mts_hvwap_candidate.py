@@ -375,10 +375,16 @@ def aggregate_completed_bars(
     if dts is None:
         return []
     buckets: dict[int, dict[str, Any]] = {}
+    # 2026-10-12 Codex: prewarm and live histories overlap. One real 5m
+    # close contributes once, never twice toward completeness or volume.
+    seen_closes: set[float] = set()
     for b in bars_5m:
         ts = to_epoch_secs(b.get("ts"))
         if ts is None or ts > dts:
             continue  # incomplete bar ignored
+        if ts in seen_closes:
+            continue
+        seen_closes.add(ts)
         sub = 300.0
         open_ts = ts - sub
         bucket_start = math.floor(open_ts / target_secs) * target_secs
