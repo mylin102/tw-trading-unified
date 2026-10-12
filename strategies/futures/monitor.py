@@ -1152,7 +1152,7 @@ class FuturesMonitor:
         }, index=[r["ts"] for r in records])
 
     def _get_hvwap_regime_prewarm_bars(self, decision_ts):
-        """Load only the immediately prior session's completed 5m bars.
+        """Load prior-session CSV and completed in-memory 5m regime history.
 
         This buffer is exclusively for the 60m regime builder.  It is never
         merged into the current-session deque used by VWAP/15m/5m logic.
@@ -1168,7 +1168,9 @@ class FuturesMonitor:
             _prior_label, _prior_start = vwap_session_bounds(_current_start - 1.0)
             if _prior_label == _current_label:
                 _prior_label, _prior_start = vwap_session_bounds(_current_start - 86400.0)
-            _cache_key = (_current_start, _prior_label, bool(self.live_trading))
+            # 2026-10-12 Codex: current-session real bars warm the 60m regime
+            # even without indicator CSV. Refresh once per decision bucket.
+            _cache_key = (_current_start, _prior_label, bool(self.live_trading), int(_dts // 300))
             if getattr(self, "_hvwap_regime_prewarm_key", None) == _cache_key:
                 return list(getattr(self, "_hvwap_regime_prewarm_bars", []))
 
@@ -1176,10 +1178,6 @@ class FuturesMonitor:
             _tag = "_LIVE" if self.live_trading else "_PAPER"
             _base = Path(runtime_logs("market_data"))
             _paths = sorted(_base.glob(f"{self.ticker}_*{_tag}_indicators.csv"))
-            if not _paths:
-                self._hvwap_regime_prewarm_key = _cache_key
-                self._hvwap_regime_prewarm_bars = []
-                return []
             _rows = {}
             for _path in _paths:
                 try:
@@ -1202,12 +1200,22 @@ class FuturesMonitor:
                         _rows[int(_ts)] = (_row, _close, _volume)
                 except Exception:
                     continue
+            # 2026-10-12 Codex: use existing monitor history only; no broker
+            # query, no fabricated sub-bars and no unfinished/future bucket.
+            for _record in list(getattr(self, "_tick_bars_deque", ())):
+                _ts = to_epoch_secs(_record.get("ts"))
+                if (_ts is None or int(_ts) % 300 != 0
+                        or not (_prior_start <= _ts < _dts)
+                        or _ts + 300 > _dts):
+                    continue
+                _row = dict(_record, timestamp=_ts)
+                _rows[int(_ts)] = (_row, "close", "volume")
             _out = []
             for _ts_int in sorted(_rows):
                 _row, _close, _volume = _rows[_ts_int]
                 try:
                     _out.append({
-                        "ts": _row["timestamp"],
+                        "ts": float(_ts_int + 300),
                         "open": float(_row.get("open", _row.get("Open", _row[_close]))),
                         "high": float(_row.get("high", _row.get("High", _row[_close]))),
                         "low": float(_row.get("low", _row.get("Low", _row[_close]))),
