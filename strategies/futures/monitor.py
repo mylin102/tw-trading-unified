@@ -10182,6 +10182,36 @@ class FuturesMonitor:
                         "ORDER_INTENT_BLOCKED", action=_action,
                         reason="PAPER_EXIT_BBO_INVALID_OR_STALE", leg=_leg.upper(),
                         trade_id=getattr(strategy, "_trade_id", ""))
+                    # 2026-10-12 Codex: undo only an UNSENT PAPER emission.
+                    # Pending or durably attempted orders must never rearm.
+                    _tid = getattr(strategy, "_trade_id", "")
+                    _unsent = bool(_tid) and not any(p.get("trade_id") == _tid for p in
+                                      getattr(self, "_pending_lifecycle_orders", {}).values())
+                    try:
+                        from core.exit_intent import IntentLog
+                        _retry_log = IntentLog(_mts_intent_log_dir())
+                        for _iid in _retry_log.list_active():
+                            _row = _retry_log.get(_iid)
+                            if _row.get("trade_id") == _tid:
+                                _unsent = _unsent and bool(_row.get("legs")) and all(
+                                    leg.get("status") == "NOT_SUBMITTED"
+                                    for leg in _row.get("legs", {}).values())
+                    except Exception:
+                        _unsent = False
+                    if _unsent:
+                        from strategies.plugins.futures.active.tmf_spread import (
+                            PositionPhase, ReleaseGroupStatus)
+                        _lc = getattr(strategy, "_lifecycle_oca", None)
+                        if _lc is not None and _lc.phase == PositionPhase.SPREAD:
+                            strategy._lifecycle = "OPEN"
+                            strategy._release_ts = None
+                            strategy._release_mono = 0.0
+                            strategy._combined_exit_in_flight = False
+                            if _lc.release_group.status == ReleaseGroupStatus.TRIGGERED:
+                                _lc.release_group.status = ReleaseGroupStatus.ARMED
+                                _lc.exit_owner = None
+                        elif _lc is not None and _lc.phase == PositionPhase.SINGLE_LEG:
+                            strategy._lifecycle = f"TRAILING_{strategy._side}"
                     return
                 _exit_marks[_leg] = _bid if _side == "LONG" else _ask
             _near_close = _exit_marks.get("near", _near_close)
