@@ -302,3 +302,82 @@ def test_wrong_host_refused_before_any_pm2_call(mini):
     target.write_text(json.dumps(value))
     assert mini.deploy.main(["--site", str(mini.site), "params", "--max-spread-width", "4"]) == 1
     assert mini.calls == []
+
+
+# 2026-10-12 Codex: engine-only must preserve a running dirty-data dashboard.
+def engine_only_candidate(mini):
+    import hashlib
+    root = mini.roots['trading-system']
+    (root / 'version.txt').write_text('engine candidate')
+    mini.git(root, 'add', 'version.txt')
+    mini.git(root, 'commit', '-qm', 'candidate')
+    tree = mini.git(root, 'ls-tree', '-r', 'HEAD')
+    (root / 'PHASE1_FINAL_FREEZE.md').write_text('frozen_tree_hash: ' + hashlib.sha256(tree.encode()).hexdigest() + '\n')
+    mini.git(root, 'add', 'PHASE1_FINAL_FREEZE.md')
+    mini.git(root, 'commit', '-qm', 'freeze')
+    sha = mini.git(root, 'rev-parse', 'HEAD')
+    mini.git(root, 'switch', '--detach', mini.heads['trading-system'])
+    dash = mini.roots['dashboard']
+    csv = dash / 'data/taifex_raw/STOCK_2330_5m.csv'
+    csv.parent.mkdir(parents=True)
+    csv.write_text('old data\n')
+    mini.git(dash, 'add', '-f', str(csv))
+    mini.git(dash, 'commit', '-qm', 'existing generated data')
+    mini.heads['dashboard'] = mini.git(dash, 'rev-parse', 'HEAD')
+    mini.deploy.one(mini.rows, 'dashboard')['pm2_env']['LRC_RELEASE_SHA'] = mini.heads['dashboard']
+    csv.write_text('updated data\n')
+    return ['--site', str(mini.site), '--apply', 'release', '--maintenance-approved',
+            '--engine-only', '--mts-sha', sha, '--dashboard-sha', mini.heads['dashboard']], csv
+
+
+def test_actual_engine_only_preserves_dashboard_pid_head_and_dirty_csv(mini):
+    import copy
+    args, csv = engine_only_candidate(mini)
+    before = copy.deepcopy(mini.deploy.one(mini.rows, 'dashboard'))
+    assert mini.deploy.main(args) == 0
+    assert mini.deploy.one(mini.rows, 'dashboard') == before
+    assert mini.git(mini.roots['dashboard'], 'rev-parse', 'HEAD') == mini.heads['dashboard']
+    assert csv.read_text() == 'updated data\n'
+    mutations = [c for c in mini.calls if c[0] == '/pm2fake' and c[1] != 'jlist']
+    assert not any('dashboard' in c for c in mutations)
+    assert any(c[1] == 'save' for c in mutations)
+    assert not (mini.roots['trading-system'] / 'data/maintenance_entry_lock.flag').exists()
+
+
+@pytest.mark.parametrize('case', ['both', 'dashboard_sha', 'dashboard_code', 'engine_dirty', 'same_root'])
+def test_actual_engine_only_refuses_unsafe_scope_before_mutation(mini, case):
+    import json
+    args, _ = engine_only_candidate(mini)
+    if case == 'both':
+        args.remove('--engine-only')
+    elif case == 'dashboard_sha':
+        args[-1] = mini.heads['trading-system']
+    elif case == 'dashboard_code':
+        with (mini.roots['dashboard'] / 'ui/dashboard.py').open('a') as h:
+            h.write('\n# foreign source edit\n')
+    elif case == 'engine_dirty':
+        with (mini.roots['trading-system'] / 'config/futures.yaml').open('a') as h:
+            h.write('\n# foreign config edit\n')
+    else:
+        site = json.loads(mini.site.read_text())
+        site['dashboard_root'] = site['mts_root']
+        mini.site.write_text(json.dumps(site))
+    assert mini.deploy.main(args) == 1
+    assert all(c[1] == 'jlist' for c in mini.calls if c[0] == '/pm2fake')
+    assert not (mini.runtime / 'logs/deployments').exists()
+
+
+@pytest.mark.parametrize('change', ['csv', 'pid'])
+def test_actual_engine_only_detects_preserved_dashboard_drift(mini, monkeypatch, change):
+    args, csv = engine_only_candidate(mini)
+    original = mini.deploy.MiniDeployment.start
+    def start(self):
+        original(self)
+        if change == 'csv':
+            csv.write_text('concurrent writer\n')
+        else:
+            mini.deploy.one(mini.rows, 'dashboard')['pid'] += 1
+    monkeypatch.setattr(mini.deploy.MiniDeployment, 'start', start)
+    assert mini.deploy.main(args) == 1
+    assert (mini.roots['trading-system'] / 'data/maintenance_entry_lock.flag').exists()
+    assert not any(c[1] == 'save' for c in mini.calls if c[0] == '/pm2fake')
