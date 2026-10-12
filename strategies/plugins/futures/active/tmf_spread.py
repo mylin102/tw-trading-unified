@@ -3365,9 +3365,9 @@ class TMFSpread(StrategyBase):
             _entry_reason = "NOW_TS_MISSING"
         else:
             _elapsed_ms = max(0.0, now_ms - entry_ts_ms)
-            _max_age_ms = 48.0 * 3600.0 * 1000.0  # 48h plausibility cap
-            if _elapsed_ms > _max_age_ms:
-                _entry_reason = _ENTRY_GUARD_REASON_IMPLAUSIBLE
+            # 2026-10-12 Codex: elapsed holding time is not invalid entry
+            # evidence. Cross-day inventory keeps the original guard anchor;
+            # never reset its clock or suppress Policy J solely for age.
         if _entry_reason is not None:
             # Fail-safe: untrusted entry time blocks Policy J peak activation;
             # other risk controllers (ATR/hard/release/emergency) keep running.
