@@ -1156,6 +1156,12 @@ def load_yaml(path):
 
 def save_yaml(path, data):
     """Save YAML data preserving comments and formatting when possible via ruamel.yaml round-trip."""
+    # 2026-10-12 Codex: runtime PAPER edits are atomic and cannot enable LIVE.
+    if Path(path).name == "futures.paper.yaml":
+        from core.futures_profiles import write_paper_profile
+        write_paper_profile(Path(path), yaml.safe_dump(data, allow_unicode=True).encode(),
+                            ticker=load_yaml(Path(path)).get("ticker"))
+        return
     from ruamel.yaml import YAML
     _ryaml = YAML()
     _ryaml.preserve_quotes = True
@@ -1347,6 +1353,12 @@ def save_futures_settings(base_dir: Path, futures_cfg: dict, active_runtime_trut
     cfg_name = resolve_active_futures_cfg_name(active_runtime_truth, is_night_session)
     primary_path = base_dir / "config" / cfg_name
     is_live_target = (cfg_name == "futures_live.yaml")
+    # 2026-10-12 Codex: the settings helper must obey the same shared PAPER source.
+    if not is_live_target:
+        from core.futures_profiles import resolve_futures_profile
+        shared = resolve_futures_profile(base_dir / "config/futures.yaml")
+        if shared.name == "futures.paper.yaml":
+            primary_path = shared
 
     saved_paths = []
     diff_lines = []
@@ -1367,7 +1379,7 @@ def save_futures_settings(base_dir: Path, futures_cfg: dict, active_runtime_trut
     # If in paper mode, synchronize shared parameters across day and night configs
     if not is_live_target:
         _counterpart_cfg_name = "futures.yaml" if is_night_session else "futures_night.yaml"
-        _counterpart_cfg_path = base_dir / "config" / _counterpart_cfg_name
+        _counterpart_cfg_path = primary_path.parent / _counterpart_cfg_name
         SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
 
         if _counterpart_cfg_path.exists():
@@ -1831,13 +1843,15 @@ def summarize_execution_context(context, known_profile_hashes):
 def load_active_runtime_truth(base):
     import hashlib
     from core.execution_context_state import read_execution_context
+    # 2026-10-12 Codex: never classify MTS against another release's baseline.
+    from core.futures_profiles import resolve_futures_profile
 
     known_profile_hashes = {}
     for filename, identity in (
         ("futures.yaml", "futures.yaml (Paper baseline)"),
         ("futures_live.yaml", "futures_live.yaml"),
     ):
-        profile_path = base / "config" / filename
+        profile_path = resolve_futures_profile(base / "config" / filename)
         try:
             known_profile_hashes[identity] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
         except OSError:
@@ -1859,7 +1873,9 @@ def get_counterfactual_service():
     return CounterfactualService()
 
 # ── Configs ──
-FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
+# 2026-10-12 Codex: editable PAPER source and identity classifier share one path.
+from core.futures_profiles import resolve_futures_profile
+FUTURES_CFG_PATH = resolve_futures_profile(BASE / "config" / FUTURES_CFG_NAME)
 OPTIONS_CFG_PATH = BASE / "config" / "options_strategy.yaml"
 RISK_CFG_PATH = BASE / "config" / "risk_global.yaml"
 STOCK_CFG_PATH = BASE / "config" / "stocks.yaml"
@@ -8390,7 +8406,7 @@ elif page == "設定":
 
         # ── Session indicator: show active vs inactive params ──
         _night_cfg = load_yaml(BASE / "config" / "futures_night.yaml")
-        _day_cfg = load_yaml(BASE / "config" / "futures.yaml")
+        _day_cfg = load_yaml(FUTURES_CFG_PATH)
         _day_risk = _day_cfg.get("risk_mgmt", {})
         _night_risk = _night_cfg.get("risk_mgmt", {})
         _active_risk = _night_risk if _CURRENT_SESSION_NIGHT else _day_risk
@@ -8556,7 +8572,8 @@ elif page == "設定":
 
                 # 2026-07-27 Gemini CLI: Dual-config sync with explicit SESSION_SPECIFIC_MTS_PARAMS taxonomy
                 _counterpart_cfg_name = "futures.yaml" if _CURRENT_SESSION_NIGHT else "futures_night.yaml"
-                _counterpart_cfg_path = BASE / "config" / _counterpart_cfg_name
+                # 2026-10-12 Codex: shared runtime profile has no source-tree twin.
+                _counterpart_cfg_path = FUTURES_CFG_PATH.parent / _counterpart_cfg_name
                 SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
 
                 if _counterpart_cfg_path.exists():

@@ -1430,6 +1430,8 @@ def run_system(dry_run=False, config_name="futures"):
     # deployments must use the sealed --config futures_live profile)
     # 2026-10-04 Codex: explicit all-PAPER profiles only; mixed/unknown stays fail-closed.
     import yaml
+    # 2026-10-12 Codex: validate the actual PAPER profile before broker login.
+    from core.futures_profiles import resolve_futures_profile
     _paper_only = bool(config_name.strip()) and os.environ.get("TRADING_FUTURES_MODE", "paper") == "paper"
     for _ci in (c.strip() for c in config_name.split(",") if c.strip()):
         _cf = f"{_ci.replace('.yaml', '')}.yaml"
@@ -1438,7 +1440,7 @@ def run_system(dry_run=False, config_name="futures"):
                 f"Unknown futures config: {_cf} — refusing to start "
                 f"(fail-closed; live deployments must use "
                 f"--config futures_live)")
-        with open(os.path.join(BASE, "config", _cf), encoding="utf-8") as _fh:
+        with open(resolve_futures_profile(Path(BASE) / "config" / _cf), encoding="utf-8") as _fh:
             _startup_cfg = yaml.safe_load(_fh)
         _paper_only = _paper_only and isinstance(_startup_cfg, dict) and _startup_cfg.get("live_trading") is False
     with open(os.path.join(BASE, "config", "options_strategy.yaml"), encoding="utf-8") as _fh:

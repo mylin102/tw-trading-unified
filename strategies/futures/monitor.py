@@ -400,6 +400,9 @@ class FuturesMonitor:
 
     def __init__(self, api, config_path: str, dry_run: bool = False):
         self.api = api
+        # 2026-10-12 Codex: both consumers resolve the same mutable PAPER profile.
+        from core.futures_profiles import resolve_futures_profile
+        config_path = str(resolve_futures_profile(config_path))
         self.config_path = config_path
         self._config_mtime = 0
         self.dry_run = dry_run
@@ -993,6 +996,10 @@ class FuturesMonitor:
         mtime = os.path.getmtime(self.config_path)
         if mtime > self._config_mtime:
             try:
+                # 2026-10-12 Codex: a runtime PAPER revision cannot promote LIVE.
+                if Path(self.config_path).name == "futures.paper.yaml":
+                    from core.futures_profiles import validate_paper_profile
+                    validate_paper_profile(Path(self.config_path).read_bytes(), ticker=self.ticker)
                 self.cfg = self._load_config(self.config_path)
                 self._apply_config_params()
                 # 2026-10-02 Codex: publish applied PAPER identity, never rebind LIVE certification.
