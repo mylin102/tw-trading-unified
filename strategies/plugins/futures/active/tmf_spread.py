@@ -4013,27 +4013,46 @@ class TMFSpread(StrategyBase):
         # before it can become an apparently recovered, unmanageable position.
         from core.runtime_paths import mts_data_mode
         _paper_direction_recovered = False
+        # 2026-10-12 Codex: elapsed time cannot close a PAPER position. Only
+        # matching, unambiguous local inventory may attest an aged snapshot.
+        _paper_aged_recovered = False
+        _paper_snapshot_expired = False
+        if mts_data_mode() == "paper" and state and state.get("_updated"):
+            try:
+                _saved_at = datetime.fromisoformat(state["_updated"])
+                _paper_snapshot_expired = (
+                    datetime.now(_saved_at.tzinfo) - _saved_at).total_seconds() >= 3600
+            except (TypeError, ValueError):
+                pass
         if (mts_data_mode() == "paper" and state and state.get("has_position")
                 and state.get("released_leg") is None
-                and any(state.get(k) not in ("LONG", "SHORT")
-                        for k in ("near_side", "far_side"))):
+                and (_paper_snapshot_expired or any(state.get(k) not in ("LONG", "SHORT")
+                        for k in ("near_side", "far_side")))):
             try:
                 from strategies.futures.mts_ledger_authority import project_fills, MtsAuthority
                 with open(_MTS_FILL_LOG, encoding="utf-8") as handle:
                     fills = [json.loads(line) for line in handle if line.strip()]
                 auth = project_fills(
                     (row for row in fills if row.get("mode") == "paper"
-                     and row.get("trade_id") == state.get("trade_id")), source="PAPER")
+                     and (_paper_snapshot_expired or row.get("trade_id") == state.get("trade_id"))), source="PAPER")
                 if not (state.get("trade_id") and auth.status is MtsAuthority.OPEN
+                        and not auth.anomalies
                         and auth.trade_id == state["trade_id"]
                         and auth.near_qty * auth.far_qty < 0
+                        and (not _paper_snapshot_expired or
+                             (abs(auth.near_qty) == abs(auth.far_qty) == 1
+                              and all(row.get("mode") == "paper" for row in fills)
+                              and state.get("near_side") == auth.near_side
+                              and state.get("far_side") == auth.far_side))
                         and auth.near_side in ("LONG", "SHORT")
                         and auth.far_side in ("LONG", "SHORT")
                         and math.isclose(auth.near_entry, float(state["near_entry"]))
                         and math.isclose(auth.far_entry, float(state["far_entry"]))):
                     raise ValueError("missing same-trade PAPER direction evidence")
+                _paper_direction_recovered = any(state.get(k) not in ("LONG", "SHORT")
+                                                for k in ("near_side", "far_side"))
                 state = dict(state, near_side=auth.near_side, far_side=auth.far_side)
-                _paper_direction_recovered = True
+                _paper_aged_recovered = _paper_snapshot_expired
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 self._mts_recovery_state = RecoveryState.RECOVERY_REQUIRED
                 self._mts_state_write_enabled = False
@@ -4053,7 +4072,7 @@ class TMFSpread(StrategyBase):
                         _now = datetime.now(_ts.tzinfo) if _ts.tzinfo else datetime.now()
                         _age_min = (_now - _ts).total_seconds() / 60.0
                         # 60 min expiration for production stability
-                        if _age_min < 60:
+                        if _age_min < 60 or _paper_aged_recovered:
                             # 2026-05-27 Gemini CLI: Only accept JSON if it has valid peak/nadir memory
                             _rem_side = state.get("remaining_side")
                             # 2026-06-23 Gemini CLI: Remove numeric defaults in .get() to comply with no_get_numeric_fallback contract
@@ -4257,9 +4276,10 @@ class TMFSpread(StrategyBase):
                                 self._single_leg_entered_mono = time.monotonic()
                                 self._single_leg_post_fill_ticks = 0
                                 self._single_leg_last_tick_ts = 0.0
-                                if _paper_direction_recovered:
+                                if _paper_direction_recovered or _paper_aged_recovered:
                                     self.write_state(
-                                        action, "PAPER_DIRECTION_RECOVERED",
+                                        action, ("PAPER_LEDGER_RECOVERED" if _paper_aged_recovered
+                                                 else "PAPER_DIRECTION_RECOVERED"),
                                         near_last=state.get("near_last", 0.0),
                                         far_last=state.get("far_last", 0.0),
                                         spread_z=state.get("current_spread_z", state.get("spread_z")),
