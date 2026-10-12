@@ -10155,6 +10155,38 @@ class FuturesMonitor:
         _far_close = float(bar_dict.get("far_close", 0))
         _ts = ts or datetime.now()
 
+        # 2026-10-12 Codex: PAPER exits cross fresh executable BBO, not last.
+        # Validate before intents/claims so bad quotes preserve retryability.
+        if (not self.live_trading and getattr(self, "paper_fill_sim", None)
+                and _action in ("EXIT", "PARTIAL_EXIT")):
+            if _action == "PARTIAL_EXIT":
+                _exit_legs = ["near"] if "RELEASE_NEAR" in str(_reason).upper() else ["far"]
+            elif "COMBINED_EXIT" in str(_reason).upper():
+                _exit_legs = ["near", "far"]
+            else:
+                _exit_legs = ["far"] if getattr(strategy, "_released_leg", None) == "near" else ["near"]
+            _exit_marks = {}
+            _age_limit = float(getattr(self, "cfg", {}).get("mts", {}).get(
+                "params", {}).get("max_quote_age_ms", 30000.0))
+            for _leg in _exit_legs:
+                _bid = bar_dict.get(f"bbo_{_leg}_bid")
+                _ask = bar_dict.get(f"bbo_{_leg}_ask")
+                _age = bar_dict.get(f"bbo_{_leg}_age_ms")
+                _side = getattr(strategy, f"_{_leg}_side", None)
+                _valid = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                             and math.isfinite(v) for v in (_bid, _ask, _age))
+                if (not _valid or not (0 < _bid <= _ask)
+                        or not (0 <= _age <= _age_limit)
+                        or _side not in ("LONG", "SHORT")):
+                    self._append_mts_event(
+                        "ORDER_INTENT_BLOCKED", action=_action,
+                        reason="PAPER_EXIT_BBO_INVALID_OR_STALE", leg=_leg.upper(),
+                        trade_id=getattr(strategy, "_trade_id", ""))
+                    return
+                _exit_marks[_leg] = _bid if _side == "LONG" else _ask
+            _near_close = _exit_marks.get("near", _near_close)
+            _far_close = _exit_marks.get("far", _far_close)
+
         # 💡 [Fixed 2026-05-27] Prioritize existing strategy trade_id for releases/exits
         _trade_id = getattr(strategy, "_trade_id", None)
         if not _trade_id or _action in ("BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"):
