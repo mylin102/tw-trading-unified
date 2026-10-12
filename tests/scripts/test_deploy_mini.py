@@ -92,3 +92,213 @@ def test_params_allow_only_width_change():
     for bad in (0, float("nan"), float("inf"), True):
         with pytest.raises((DeployError, ValueError)):
             updated_width(old, bad)
+
+
+# 2026-10-12 Codex: run real filesystem/Git/CLI/backend stages, mocking PM2 only.
+@pytest.fixture
+def mini(tmp_path, monkeypatch):
+    import ast
+    import copy
+    import hashlib
+    import json
+    import plistlib
+    import subprocess
+    import sys
+    from pathlib import Path
+    from scripts.deployment import deploy_mini as deploy
+
+    code = Path(__file__).resolve().parents[2]
+    baseline = b"ticker: TMF\nlive_trading: false\nmts:\n  params:\n    max_spread_width: 3\n"
+    roots = {n: tmp_path / n for n in ("trading-system", "dashboard")}
+    runtime = tmp_path / "runtime"
+    (runtime / "paper/logs").mkdir(parents=True)
+    (runtime / "paper/data/state").mkdir(parents=True)
+    (runtime / "data/state").mkdir(parents=True)
+    (runtime / "paper/logs/mts_trade_fills.jsonl").write_text("")
+    log = runtime / "out.log"
+    log.write_text("")
+    def git(root, *args):
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+    classifier = [n for n in ast.parse((code / "ui/dashboard.py").read_text()).body
+                  if isinstance(n, ast.FunctionDef) and n.name in
+                  {"load_active_runtime_truth", "summarize_execution_context"}]
+    for name, root in roots.items():
+        root.mkdir()
+        (root / "config").mkdir()
+        (root / "core").mkdir()
+        (root / "ui").mkdir()
+        (root / ".gitignore").write_text(".deployment-target\ndata/\n")
+        (root / "config/futures.yaml").write_bytes(baseline)
+        (root / "core/futures_profiles.py").write_text((code / "core/futures_profiles.py").read_text())
+        (root / "ui/dashboard.py").write_text("\n\n".join(ast.unparse(n) for n in classifier))
+        (root / "ecosystem.config.js").write_text("module.exports={apps:[{name:'trading-system',cwd:__dirname}]};")
+        git(root, "init", "-q")
+        git(root, "config", "user.email", "test@example.invalid")
+        git(root, "config", "user.name", "offline test")
+        git(root, "add", ".")
+        git(root, "commit", "-qm", "base")
+        identity = {"deployment_id": "mini", "host_role": "runtime-primary", "instance_id": name,
+                    "repo_path": str(root), "execution_modes": ["paper"], "allowed_operations": ["live_runtime"]}
+        (root / ".deployment-target").write_text(json.dumps(identity))
+    heads = {n: git(r, "rev-parse", "HEAD") for n, r in roots.items()}
+    pm2_home = tmp_path / "pm2"
+    pm2_home.mkdir()
+    plist = tmp_path / "launchd.plist"
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"PM2_HOME": str(pm2_home)}}))
+    site = {"mts_root": str(roots["trading-system"]), "dashboard_root": str(roots["dashboard"]),
+            "runtime_dir": str(runtime), "python_bin": sys.executable, "pm2_bin": "/pm2fake",
+            "pm2_home": str(pm2_home), "launchd_plist": str(plist)}
+    site_path = tmp_path / "site.json"
+    site_path.write_text(json.dumps(site))
+    rows = []
+    for i, (name, root) in enumerate(roots.items()):
+        env = {"pm_cwd": str(root), "status": "online", "LRC_RELEASE_SHA": heads[name],
+               "TRADING_CANONICAL_ROOT": str(root), "TRADING_RUNTIME_DIR": str(runtime),
+               "TRADING_FUTURES_MODE": "paper", "restart_time": 0, "pm_out_log_path": str(log),
+               "args": (["-c", "background", sys.executable, "main.py", "--config", "futures"]
+                        if name == "trading-system" else ["--server.port", "8500"])}
+        env.update({key: "offline-only" for key in ("SHIOAJI_API_KEY", "SHIOAJI_SECRET_KEY", "SHIOAJI_CA_PATH",
+                                                    "SHIOAJI_CA_PASSWD", "TRADING_RUNTIME_ID")})
+        rows.append({"name": name, "pid": 1100 + i, "pm2_env": env})
+    rows.append({"name": "stock-runner", "pid": 99, "pm2_env": {
+        "pm_cwd": str(tmp_path / "stock"), "status": "online", "restart_time": 0}})
+    context = {"requested_mode": "paper", "effective_mode": "paper_active", "live_order_allowed": False,
+               "state_namespace": "paper", "audit_reasons": [], "revision": 1,
+               "config_hash": hashlib.sha256(baseline).hexdigest()}
+
+    def engine_tick():
+        pid = deploy.one(rows, "trading-system")["pid"]
+        shared = runtime / "config/futures.paper.yaml"
+        if shared.exists():
+            context["config_hash"] = hashlib.sha256(shared.read_bytes()).hexdigest()
+        (runtime / "execution_context.json").write_text(json.dumps(context))
+        (runtime / "paper/data/state/mts_position_state.json").write_text(json.dumps({
+            "has_position": False, "writer_identity": "mts_spread:" + str(pid)}))
+        (runtime / "data/state/trading_safety_state.json").write_text(json.dumps({
+            "pid": pid, "entry_allowed": True, "account_health": "HEALTHY"}))
+    engine_tick()
+    calls = []
+    original = deploy.MiniDeployment.command
+    def command(self, argv, *, root=None, env=None, body=None):
+        if argv[0] == "git":
+            return original(self, argv, root=root, env=env, body=body)
+        calls.append(argv[:])
+        if argv[0] == "node":
+            return b""
+        if argv[0] == "/bin/ps":
+            return (str(deploy.one(rows, "trading-system")["pid"]) + " python3 main.py --config futures\n").encode()
+        assert argv[0] == "/pm2fake"
+        action = argv[1]
+        if action == "jlist":
+            engine_tick()
+            return json.dumps(rows).encode()
+        if action == "save":
+            (pm2_home / "dump.pm2").write_text(json.dumps([dict(r["pm2_env"], name=r["name"]) for r in rows]))
+            return b""
+        name = "trading-system" if action == "start" else argv[2]
+        row = deploy.one(rows, name)
+        if action in ("stop", "delete"):
+            row["pid"] = 0
+            row["pm2_env"]["status"] = "stopped"
+        else:
+            row["pid"] = 2200 if name == "trading-system" else 2201
+            row["pm2_env"].update({k: env[k] for k in
+                                    ("LRC_RELEASE_SHA", "TRADING_CANONICAL_ROOT", "TRADING_RUNTIME_DIR")})
+            row["pm2_env"]["status"] = "online"
+            log.write_text("PAPER_STARTUP_READY: local simulation\n" + "\n".join(
+                "Subscribed " + far + "TMF " + kind + ": CODE"
+                for far in ("", "far-month ") for kind in ("tick", "bidask")))
+            engine_tick()
+        return b""
+    monkeypatch.setattr(deploy.MiniDeployment, "command", command)
+    def killed(pid, signal):
+        raise ProcessLookupError
+    monkeypatch.setattr(deploy.os, "kill", killed)
+    clock = iter(range(0, 10000, 5))
+    monkeypatch.setattr(deploy.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(deploy.time, "sleep", lambda _: None)
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", lambda *a, **kw: Response())
+    from core import date_utils
+    monkeypatch.setattr(date_utils, "is_taifex_futures_market_open", lambda: False)
+    return SimpleNamespace(deploy=deploy, roots=roots, runtime=runtime, heads=heads, site=site_path,
+                           git=git, calls=calls, rows=rows, baseline=baseline, tick=engine_tick,
+                           protected=copy.deepcopy(rows[-1]))
+
+
+def test_actual_params_cli_no_pm2_mutations_no_source_edits(mini):
+    shared = mini.runtime / "config/futures.paper.yaml"
+    shared.parent.mkdir()
+    shared.write_bytes(mini.baseline)
+    mini.tick()
+    assert mini.deploy.main(["--site", str(mini.site), "--apply", "params", "--max-spread-width", "4"]) == 0
+    assert all(c[1] == "jlist" for c in mini.calls if c[0] == "/pm2fake")
+    assert all(mini.git(root, "rev-parse", "HEAD") == mini.heads[name] for name, root in mini.roots.items())
+    assert all((root / "config/futures.yaml").read_bytes() == mini.baseline for root in mini.roots.values())
+    assert mini.rows[-1] == mini.protected
+    assert not (mini.roots["trading-system"] / "data/maintenance_entry_lock.flag").exists()
+    assert list((mini.runtime / "logs/deployments").glob("*/complete.json"))
+
+
+def test_actual_release_cli_pins_both_roots_before_save(mini):
+    import hashlib
+    candidates = {}
+    for name, root in mini.roots.items():
+        (root / "version.txt").write_text("new release")
+        mini.git(root, "add", "version.txt")
+        mini.git(root, "commit", "-qm", "candidate")
+        tree = mini.git(root, "ls-tree", "-r", "HEAD")
+        (root / "PHASE1_FINAL_FREEZE.md").write_text("frozen_tree_hash: " + hashlib.sha256(tree.encode()).hexdigest() + "\n")
+        mini.git(root, "add", "PHASE1_FINAL_FREEZE.md")
+        mini.git(root, "commit", "-qm", "freeze")
+        candidates[name] = mini.git(root, "rev-parse", "HEAD")
+        # A stopped-source fixture: return current worktree to the baseline.
+        mini.git(root, "switch", "--detach", mini.heads[name])
+    assert mini.deploy.main(["--site", str(mini.site), "--apply", "release", "--maintenance-approved",
+                             "--mts-sha", candidates["trading-system"], "--dashboard-sha", candidates["dashboard"]]) == 0
+    for name, root in mini.roots.items():
+        assert mini.git(root, "rev-parse", "HEAD") == candidates[name]
+        assert mini.deploy.one(mini.rows, name)["pm2_env"]["LRC_RELEASE_SHA"] == candidates[name]
+    assert mini.rows[-1] == mini.protected
+    assert any(c[1] == "save" for c in mini.calls if c[0] == "/pm2fake")
+    assert list((mini.runtime / "logs/deployments").glob("*/complete.json"))
+
+
+def test_actual_params_failure_keeps_lock_and_never_saves(mini, monkeypatch):
+    shared = mini.runtime / "config/futures.paper.yaml"
+    shared.parent.mkdir()
+    shared.write_bytes(mini.baseline)
+    mini.tick()
+    def unavailable(*args, **kwargs):
+        raise OSError("offline health failure")
+    monkeypatch.setattr(mini.deploy.urllib.request, "urlopen", unavailable)
+    assert mini.deploy.main(["--site", str(mini.site), "--apply", "params", "--max-spread-width", "4"]) == 1
+    assert (mini.roots["trading-system"] / "data/maintenance_entry_lock.flag").exists()
+    assert not list((mini.runtime / "logs/deployments").glob("*/complete.json"))
+    assert list((mini.runtime / "logs/deployments").glob("*/failed.json"))
+    assert all(c[1] == "jlist" for c in mini.calls if c[0] == "/pm2fake")
+
+
+def test_actual_plan_creates_no_profile_or_entry_lock(mini):
+    shared = mini.runtime / "config/futures.paper.yaml"
+    shared.parent.mkdir()
+    shared.write_bytes(mini.baseline)
+    mini.tick()
+    assert mini.deploy.main(["--site", str(mini.site), "params", "--max-spread-width", "4"]) == 0
+    assert shared.read_bytes() == mini.baseline
+    assert not (mini.runtime / "logs/deployments").exists()
+    assert not (mini.roots["trading-system"] / "data/maintenance_entry_lock.flag").exists()
+
+
+def test_wrong_host_refused_before_any_pm2_call(mini):
+    import json
+    target = mini.roots["trading-system"] / ".deployment-target"
+    value = json.loads(target.read_text())
+    value["deployment_id"] = "air4"
+    target.write_text(json.dumps(value))
+    assert mini.deploy.main(["--site", str(mini.site), "params", "--max-spread-width", "4"]) == 1
+    assert mini.calls == []
