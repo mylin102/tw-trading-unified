@@ -2536,6 +2536,15 @@ class TMFSpread(StrategyBase):
         _max = float(getattr(self, "_max_quote_age_ms", 10000.0))
         return _age_f <= _max, _age_f
 
+    def _exit_spread_width_limit(self) -> float:
+        # 2026-10-12 Codex: PAPER exits pay executable BBO friction rather
+        # than inheriting an entry liquidity cap. LIVE/unknown stay unchanged.
+        if (getattr(self, "_hvwap_execution_mode", None) == "paper_active"
+                and not getattr(self, "_hvwap_live_order_allowed", False)):
+            cap = getattr(self, "_paper_exit_max_spread_width", None)
+            return float("inf") if cap is None else float(cap)
+        return float(getattr(self, "_max_spread_width", 50.0))
+
     def _hvwap_release_width_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
         """Defensive parity with the baseline quote-validity + spread-width
         gates for the released leg (missing quote keys are NOT a failure —
@@ -2543,7 +2552,7 @@ class TMFSpread(StrategyBase):
         _bid_k, _ask_k = (("near_bid", "near_ask") if rel_leg == "NEAR"
                           else ("far_bid", "far_ask"))
         _b, _a = bar.get(_bid_k), bar.get(_ask_k)
-        _max = float(getattr(self, "_max_spread_width", 50.0))
+        _max = self._exit_spread_width_limit()
         if _b is None and _a is None:
             return True, 0.0
         _numeric = (isinstance(_b, (int, float)) and not isinstance(_b, bool)
@@ -4446,6 +4455,8 @@ class TMFSpread(StrategyBase):
             self._confirm_ms = float(_params.get("confirm_ms", getattr(self, "_confirm_ms", 200.0)))
             self._max_quote_age_ms = float(_params.get("max_quote_age_ms", getattr(self, "_max_quote_age_ms", 10000.0)))
             self._max_spread_width = float(_params.get("max_spread_width", getattr(self, "_max_spread_width", 50.0)))
+            # 2026-10-12 Codex: optional PAPER-only exit cap; entry unchanged.
+            self._paper_exit_max_spread_width = _params.get("paper_exit_max_spread_width")
 
             # 2026-07-16 Hermes Agent: ADR-011 Phase 4 hot-reload warmup params
             self._single_leg_warmup_ms = float(_params.get("single_leg_warmup_ms", getattr(self, "_single_leg_warmup_ms", 500.0)))
@@ -5319,7 +5330,10 @@ class TMFSpread(StrategyBase):
                 logger.warning("[MTS_QUOTE_GUARD_BYPASS] reason=%s action=%s age=%.0f ms", 
                                _reason_str, _decision.action.name, quote_age_ms)
 
-        if quote_age_ms > self._max_quote_age_ms and not _bypass_quote_guard:
+        # 2026-10-12 Codex: PAPER cannot manufacture a stale emergency fill.
+        _paper_exit_policy = (getattr(self, "_hvwap_execution_mode", None) == "paper_active"
+                              and not getattr(self, "_hvwap_live_order_allowed", False))
+        if quote_age_ms > self._max_quote_age_ms and (_paper_exit_policy or not _bypass_quote_guard):
             self._set_eval(skip_reason="STALE_QUOTE_AGE", age=quote_age_ms)
             logger.warning("[MTS_RELEASE_BLOCKED] reason=STALE_QUOTE_AGE age=%.0f/%s", quote_age_ms, self._max_quote_age_ms)
             return None
@@ -5391,10 +5405,10 @@ class TMFSpread(StrategyBase):
             if _key_present and not _strict_numeric:
                 _quote_ok = False
                 break
-            if _rel_leg is not None:
+            if _rel_leg is not None or _paper_exit_policy:
                 _rel = (_label == "NEAR" and _rel_leg == Leg.NEAR) or (
                     _label == "FAR" and _rel_leg == Leg.FAR)
-                if not _rel:
+                if _rel_leg is not None and not _rel:
                     continue
                 if (not _key_present
                         or not _strict_numeric
@@ -5416,10 +5430,11 @@ class TMFSpread(StrategyBase):
         near_width = near_ask - near_bid
         far_width = far_ask - far_bid
 
-        if ((_check_near and near_width > self._max_spread_width)
-                or (_check_far and far_width > self._max_spread_width)):
+        _exit_width_limit = self._exit_spread_width_limit()
+        if ((_check_near and near_width > _exit_width_limit)
+                or (_check_far and far_width > _exit_width_limit)):
             self._set_eval(skip_reason="WIDE_SPREAD_WIDTH", near_width=near_width, far_width=far_width)
-            logger.warning("[MTS_RELEASE_BLOCKED] reason=WIDE_SPREAD_WIDTH near=%.1f far=%.1f max=%.1f", near_width, far_width, self._max_spread_width)
+            logger.warning("[MTS_RELEASE_BLOCKED] reason=WIDE_SPREAD_WIDTH near=%.1f far=%.1f max=%.1f", near_width, far_width, _exit_width_limit)
             return None
 
         # Dynamic thresholds
