@@ -42,7 +42,10 @@ def test_aged_restore_never_accepts_unproven_inventory(state_case, monkeypatch, 
     if evidence == "wrong_side":
         rows[0]["side"] = "SHORT"
     if evidence == "anomaly":
-        rows.append(dict(rows[0], qty=5, fill_type="EXIT"))
+        # 2026-10-12 Codex: a distinct real closing direction, not an ENTRY
+        # duplicate (the reducer deliberately deduplicates identical receipts).
+        rows.append(dict(rows[0], qty=5, side="SELL", fill_type="EXIT",
+                         timestamp="2026-10-07T09:00:00", price=49000.))
     if evidence == "missing":
         ledger.unlink()
     else:
