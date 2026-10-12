@@ -11,6 +11,10 @@ from tests.strategies.test_mts_paper_exit_bbo import paper_exit
 
 
 def restart_case(held_paper, monkeypatch, tmp_path, records=None):
+    # 2026-10-13 Codex: mirror the production PAPER namespace injection;
+    # offline runtime_paths deliberately returns None without this boundary.
+    from core import runtime_paths
+    monkeypatch.setattr(runtime_paths, 'mts_data_mode', lambda: 'paper')
     s, bar, cfg, events = held_paper
     s._entry_ts = datetime.now() - timedelta(days=6)
     s._entry_guard_start_ms = s._entry_ts.timestamp() * 1000
