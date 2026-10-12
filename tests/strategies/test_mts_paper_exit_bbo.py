@@ -48,3 +48,44 @@ def test_bad_paper_exit_bbo_preserves_position_without_submission(paper_exit, ke
     assert mon.order_mgr.submit.call_count == 0
     assert mon.paper_fill_sim.process_tick.call_count == 0
     assert strat._has_position is True
+
+
+def test_real_manager_simulator_callback_settles_executable_exit(paper_exit, monkeypatch, tmp_path):
+    # 2026-10-12 Codex: full local order/fill/settlement seam, no broker calls.
+    import json
+    from core.order_management.order_manager import OrderManager
+    from core.order_management.paper_fill import PaperFillSimulator
+    from core.order_intent_gateway import OrderIntentGateway
+    from strategies.plugins.futures.active import tmf_spread as mod
+    mon, strat, bar = paper_exit
+    monkeypatch.setenv("TRADING_FUTURES_MODE", "paper")
+    mon.ticker = "TMF"
+    mon.order_mgr = OrderManager(mode="paper")
+    mon.paper_fill_sim = PaperFillSimulator(mon.order_mgr)
+    mon.order_mgr.set_simulator(mon.paper_fill_sim)
+    mon._order_intent_gateway = OrderIntentGateway()
+    mon._applied_lifecycle_deals = set()
+    mon._combined_exit_trackers = {}
+    mon._mts_pending_fills = {}
+    mon._registry = {"tmf_spread": strat}
+    mon.trader = MagicMock(position=0)
+    for name in ("_check_mts_multi_leg_fill", "_maybe_complete_emergency_command",
+                 "_enter_post_exit_reconciliation", "_maybe_finalize_exit_only_reconciliation"):
+        monkeypatch.setattr(mon, name, MagicMock())
+    state = tmp_path / "source_state.json"
+    state.write_text(json.dumps({"trade_id": strat._trade_id,
+                                "near_side": "SHORT", "far_side": "LONG",
+                                "near_entry": 44005.0, "far_entry": 44090.0}))
+    fills = tmp_path / "fills.jsonl"
+    monkeypatch.setattr(mod, "_get_state_file_path", lambda: str(state))
+    monkeypatch.setattr(mod, "_MTS_FILL_LOG", str(fills))
+    mon._wire_order_callbacks()
+    mon._submit_mts_order_signal(Signal("EXIT", "TMF_COMBINED_EXIT"), strat, bar, ts=None)
+    rows = [json.loads(line) for line in fills.read_text().splitlines()]
+    exits = [row for row in rows if row["fill_type"] == "COMBINED_EXIT"]
+    assert [(row["leg"], row["side"], row["price"]) for row in exits] == [
+        ("NEAR", "BUY", 44003.0), ("FAR", "SELL", 44096.0)]
+    assert sum(row["fill_type"] == "COMBINED_EXIT_COMPLETED" for row in rows) == 1
+    assert strat._has_position is False
+    assert mon.paper_fill_sim.get_pending_count() == 0
+    mon._enter_post_exit_reconciliation.assert_called_once()
