@@ -1,4 +1,31 @@
-# PAPER close/startup consistency — final freeze 2026-10-06
+# MTS PAPER exit recovery + engine-only deployment — 2026-10-12
+
+2026-10-12 Codex; AGENT_NAME=codex. Current approval is PAPER maintenance
+deployment to Mini release18 only. Tested application candidate 59806d6d;
+engine-only deployment RED 65bc6522, fix 6327d933. This manifest-only commit
+does not change application code. The exact final commit must bind PM2 SHA.
+
+Exit recovery A/B: base 112 PASS/1 existing SKIP, candidate 132 PASS/1 SKIP;
+all 113 baseline outcomes identical, 20 added PASS. Deployment A/B: base
+19 PASS, candidate 27 PASS; all baseline outcomes identical, 8 added PASS.
+Mutation of engine-only stop isolation fails its real CLI regression; restored.
+Raw evidence: /private/tmp/mts_engine_only_{red,green,mutation,restored}_20261012.log
+and /Users/mylin/Documents/MTS-plans/2026-10-06/MTS_EXIT_RECOVERY_EVIDENCE_CODEX_20261012.md.
+Only affected tests run per user instruction; not a full-suite assertion.
+
+Deploy with --engine-only; dashboard SHA stays 45f0ced7c7ea5317c610677c323262f15df7a7a2.
+Preserve dashboard PID/root/HEAD and existing generated CSV differences;
+reject source edits, staged/deleted data, unknown drift. No stash or cleanup.
+Preserve PAPER ledger and existing spread via normal local restore, no forced
+flatten/manual orders/state/context edits, no broker account query, no LIVE.
+Exact commit/identity/config hash, single engine, four subscriptions, dashboard
+classifier and HTTP, fresh market-open state, ledger agreement and 120s stable
+ENTRY-locked observation are required before save/unlock. Other PM2 owners
+must remain unchanged. No cron or credential changes authorized.
+
+All sections below are archival; the current October 12 scope takes precedence.
+
+## Archived PAPER close/startup consistency — final freeze 2026-10-06
 
 2026-10-06 Codex; AGENT_NAME=codex. User authorized verified repair then direct
 PAPER deployment, and closed-session heartbeat bypass. Tested code:
@@ -145,7 +172,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: 57de600d399d372d7dae9243149f16921a4496456506ac89c2fbb1be8655873e
+frozen_tree_hash: ec91ea156e04a924965387298033dbae3a9effcb694f961a77f8c1ab560c96b7
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
