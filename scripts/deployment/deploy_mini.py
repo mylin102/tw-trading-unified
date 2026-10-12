@@ -117,6 +117,12 @@ class MiniDeployment:
             require(Path(self.site[key]).is_absolute(), "SITE_PATH_MUST_BE_ABSOLUTE:" + key)
         self.roots = {"trading-system": Path(self.site["mts_root"]).resolve(),
                       "dashboard": Path(self.site["dashboard_root"]).resolve()}
+        # 2026-10-12 Codex: explicit deployment scope, not a dirty-source bypass.
+        self.engine_only = bool(getattr(args, "engine_only", False))
+        require(not self.engine_only or (args.operation == "release"
+                and self.roots["trading-system"] != self.roots["dashboard"]),
+                "ENGINE_ONLY_REQUIRES_SEPARATE_ROOTS")
+        self.managed = ("trading-system",) if self.engine_only else tuple(self.roots)
         self.runtime = Path(self.site["runtime_dir"]).resolve()
         require(all(self.runtime != r and r not in self.runtime.parents for r in self.roots.values()),
                 "RUNTIME_MUST_BE_OUTSIDE_SOURCE")
@@ -159,6 +165,18 @@ class MiniDeployment:
             handle.flush()
             os.fsync(handle.fileno())
 
+    def preserved_dashboard_data(self):
+        # 2026-10-12 Codex: only existing generated CSV differences are allowed;
+        # source, staged edits, deletions and concurrent data changes fail closed.
+        root = self.roots["dashboard"]
+        require(not self.git(root, "diff", "--cached", "--name-only"), "STAGED_DASHBOARD_SOURCE")
+        paths = self.git(root, "diff", "HEAD", "--name-only").splitlines()
+        require(not self.git(root, "diff", "HEAD", "--name-only", "--diff-filter=D"),
+                "DELETED_DASHBOARD_DATA")
+        require(all(p.startswith("data/taifex_raw/") and p.endswith(".csv") for p in paths),
+                "DIRTY_DASHBOARD_SOURCE")
+        return {p: digest((root / p).read_bytes()) for p in paths}
+
     def preflight(self):
         self.stage = "preflight"
         require(self.runtime.is_dir(), "RUNTIME_MISSING")
@@ -175,8 +193,11 @@ class MiniDeployment:
             self.targets[name] = target
         self.before = self.apps()
         for name, root in self.roots.items():
-            require(not self.git(root, "status", "--porcelain", "--untracked-files=no"),
-                    "DIRTY_TRACKED_SOURCE:" + name)
+            if self.engine_only and name == "dashboard":
+                self.dashboard_data = self.preserved_dashboard_data()
+            else:
+                require(not self.git(root, "status", "--porcelain", "--untracked-files=no"),
+                        "DIRTY_TRACKED_SOURCE:" + name)
             untracked = self.git(root, "ls-files", "--others", "--exclude-standard").splitlines()
             require(all(p.startswith(("data/", "logs/")) for p in untracked), "UNTRACKED_SOURCE:" + name)
             self.heads[name] = self.git(root, "rev-parse", "HEAD")
@@ -200,6 +221,8 @@ class MiniDeployment:
         else:
             for name, sha in (("trading-system", self.args.mts_sha), ("dashboard", self.args.dashboard_sha)):
                 require(isinstance(sha, str) and re.fullmatch("[0-9a-f]{40}", sha), "FULL_CANDIDATE_SHA_REQUIRED")
+                require(not self.engine_only or name != "dashboard" or sha == self.heads[name],
+                        "ENGINE_ONLY_DASHBOARD_SHA_MUST_STAY")
                 root = self.roots[name]
                 require(self.git(root, "rev-parse", sha + "^{commit}") == sha, "CANDIDATE_NOT_AVAILABLE")
                 self.git(root, "merge-base", "--is-ancestor", self.heads[name], sha)
@@ -243,7 +266,7 @@ class MiniDeployment:
                   "const a=m.exports.apps.filter(a=>a.name==='trading-system');"
                   "if(a.length!==1||a[0].cwd!==process.cwd())process.exit(2);")
             self.command(["node", "-e", js], root=root, env=self.app_env("trading-system"), body=ecosystem)
-        self.before_protected = {r["name"]: brief(r) for r in self.before if r["name"] not in self.roots}
+        self.before_protected = {r["name"]: brief(r) for r in self.before if r["name"] not in self.managed}
         self.initial_ledger = self.ledger_snapshot()
         self.initial_state = read_json(self.runtime / "paper/data/state/mts_position_state.json")
         self.check_position(self.initial_state, self.initial_ledger)
@@ -261,7 +284,8 @@ class MiniDeployment:
     def plan(self):
         print(json.dumps({"status": "PLAN_ONLY_NOT_DEPLOYED", "operation": self.args.operation,
                           "mode": "paper", "roots": self.roots, "before": self.heads,
-                          "after": self.shas, "config_hash": digest(self.body)}, default=str))
+                          "after": self.shas, "managed_apps": self.managed,
+                          "config_hash": digest(self.body)}, default=str))
 
     def app_env(self, name):
         old = one(self.before, name)["pm2_env"]
@@ -297,23 +321,26 @@ class MiniDeployment:
                                     "position": self.initial_state, "ledger": self.initial_ledger,
                                     "config_hash": digest(self.old_body), "operation": self.args.operation,
                                     "hostname": socket.gethostname(), "deployment_targets": self.targets,
+                                    "managed_apps": self.managed,
+                                    "preserved_dashboard_data": getattr(self, "dashboard_data", {}),
                                     "ticker": self.ticker, "mode": "paper"})
         (self.out / "paper-profile.before.yaml").write_bytes(self.old_body)
 
     def protected(self, rows):
-        require({r["name"]: brief(r) for r in rows if r["name"] not in self.roots}
+        require({r["name"]: brief(r) for r in rows if r["name"] not in self.managed}
                 == self.before_protected, "UNRELATED_PM2_APP_CHANGED")
 
     def stop(self):
         self.stage = "stop"
         for name in ("dashboard", "trading-system"):
-            self.pm2("stop", name)
+            if name in self.managed:
+                self.pm2("stop", name)
         deadline = time.monotonic() + 40
         while True:
             rows = self.apps()
-            gone = all(one(rows, n)["pm2_env"]["status"] == "stopped" and not one(rows, n)["pid"] for n in self.roots)
+            gone = all(one(rows, n)["pm2_env"]["status"] == "stopped" and not one(rows, n)["pid"] for n in self.managed)
             old_alive = []
-            for name in self.roots:
+            for name in self.managed:
                 try:
                     os.kill(one(self.before, name)["pid"], 0)
                     old_alive.append(name)
@@ -328,7 +355,7 @@ class MiniDeployment:
 
     def install(self):
         self.stage = "install"
-        for root in set(self.roots.values()):
+        for root in {self.roots[n] for n in self.managed}:
             name = next(n for n, r in self.roots.items() if r == root)
             require(self.git(root, "rev-parse", "HEAD") == self.heads[name], "HEAD_DRIFT")
             require(not self.git(root, "status", "--porcelain", "--untracked-files=no"), "SOURCE_DRIFT")
@@ -342,7 +369,8 @@ class MiniDeployment:
         self.pm2("delete", "trading-system")
         self.pm2("start", "ecosystem.config.js", "--only", "trading-system",
                  root=self.roots["trading-system"], env=self.app_env("trading-system"))
-        self.pm2("restart", "dashboard", "--update-env", env=self.app_env("dashboard"))
+        if "dashboard" in self.managed:
+            self.pm2("restart", "dashboard", "--update-env", env=self.app_env("dashboard"))
 
     def publish_params(self):
         self.stage = "publish_params"
@@ -397,7 +425,10 @@ class MiniDeployment:
         for name, root in self.roots.items():
             verify_app(one(rows, name), root, self.shas[name], self.runtime)
             require(self.git(root, "rev-parse", "HEAD") == self.shas[name], "SOURCE_SHA_DRIFT")
-            require(not self.git(root, "status", "--porcelain", "--untracked-files=no"), "DIRTY_DEPLOYED_SOURCE")
+            if self.engine_only and name == "dashboard":
+                require(self.preserved_dashboard_data() == self.dashboard_data, "PRESERVED_DASHBOARD_DATA_CHANGED")
+            else:
+                require(not self.git(root, "status", "--porcelain", "--untracked-files=no"), "DIRTY_DEPLOYED_SOURCE")
         pid = one(rows, "trading-system")["pid"]
         self.check_single_engine(pid)
         args = one(rows, "trading-system")["pm2_env"].get("args", [])
@@ -503,6 +534,7 @@ class MiniDeployment:
     def complete(self):
         self.stage = "complete"
         value = {"status": "VERIFIED", "operation": self.args.operation, "heads": self.shas,
+                 "managed_apps": self.managed,
                  "config_hash": digest(self.body), "paper_only": True, "broker_queries": 0,
                  "manual_orders": 0, "manual_state_or_ledger_edits": False,
                  "completed_at": datetime.now(timezone.utc).isoformat()}
@@ -527,6 +559,8 @@ def main(argv=None):
     release.add_argument("--mts-sha", required=True)
     release.add_argument("--dashboard-sha", required=True)
     release.add_argument("--maintenance-approved", action="store_true")
+    release.add_argument("--engine-only", action="store_true",
+                         help="preserve dashboard process/source; dashboard SHA must equal current HEAD")
     args = parser.parse_args(argv)
     ops = None
     try:
