@@ -16,12 +16,16 @@ full-suite claim.
 
 The previous deployment attempt `codex-ec7ef959b63d4ba5ab1a2a7c590106b4`
 failed at observe and intentionally retained its PAPER entry lock. Deployment
-controller test `17cab394` was RED before implementation; `286a508d` adds
-strict adoption of only that exact matching failed-observe lock, validates
-the transaction receipt and target identities, keeps the lock continuously
-through restart/120-second observation/save, and removes it only after the
-success receipt. Controller suite: 29 passed. This does not modify trading
-state/ledger or query the broker. Deploy engine-only to release18; keep
+controller test `17cab394` was RED before implementation; `286a508d` added
+strict adoption of only that exact matching failed-observe lock. The Mini
+receipt exposed an additional format fact: its `pm2` map contains all apps,
+while `heads` contains only deployment roots. Regression `1f0839cd` reproduced
+that mismatch RED; fix `b5cb261f` validates exactly the two deployment roots
+and their prior PID/cwd/SHA/status while allowing unrelated app snapshots.
+The first live preflight rejected the mismatched validator before lock
+adoption, PM2 mutation, checkout or unlock; the original token remains. Final
+controller suite: 29 passed. This does not modify trading state/ledger or
+query the broker. Deploy engine-only to release18; keep
 dashboard SHA `45f0ced7c7ea5317c610677c323262f15df7a7a2` and stock-runner
 untouched. A failed resumed attempt must retain its lock; never manually
 remove it or rewrite state. PAPER only; no LIVE promotion.
