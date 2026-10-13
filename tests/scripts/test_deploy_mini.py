@@ -453,3 +453,62 @@ def test_resume_rejects_lock_without_matching_failed_receipt_before_pm2(mini):
     assert mini.calls == []
     assert lock.read_text() == transaction_id
     assert not list((mini.runtime / "logs/deployments").glob("*/complete.json"))
+
+
+def test_resume_started_engine_after_start_failure_only_verifies_saves_and_unlocks(mini, monkeypatch):
+    import json
+
+    args, _ = engine_only_candidate(mini)
+    original_id = "codex-" + "c" * 32
+    _write_failed_observe_receipt(mini, original_id)
+    start_id = "codex-" + "d" * 32
+    old_heads = dict(mini.heads)
+    old_apps = {row["name"]: mini.deploy.brief(row) for row in mini.rows}
+    targets = {name: json.loads((root / ".deployment-target").read_text())
+               for name, root in mini.roots.items()}
+    failed_start = mini.runtime / "logs/deployments" / start_id
+    failed_start.mkdir(parents=True)
+    (failed_start / "before.json").write_text(json.dumps({
+        "heads": old_heads, "pm2": old_apps, "operation": "release", "mode": "paper",
+        "managed_apps": ["trading-system"], "deployment_targets": targets,
+    }))
+    (failed_start / "failed.json").write_text(json.dumps({
+        "stage": "start", "entry_lock_retained": True, "resumed_from": original_id,
+    }))
+
+    candidate_sha = args[args.index("--mts-sha") + 1]
+    engine = mini.roots["trading-system"]
+    mini.git(engine, "switch", "--detach", candidate_sha)
+    mini.heads["trading-system"] = candidate_sha
+    process = mini.deploy.one(mini.rows, "trading-system")
+    process["pid"] = 3300
+    process["pm2_env"].update({"LRC_RELEASE_SHA": candidate_sha, "status": "online"})
+    mini.deploy.write_paper_profile(
+        mini.runtime / "config/futures.paper.yaml", mini.baseline,
+        ticker="TMF", runtime_dir=mini.runtime,
+    )
+    mini.tick()
+    log = mini.runtime / "out.log"
+    log.write_text("PAPER_STARTUP_READY: local simulation\n" + "\n".join(
+        "Subscribed " + far + "TMF " + kind + ": CODE"
+        for far in ("", "far-month ") for kind in ("tick", "bidask")))
+
+    lock = mini.roots["trading-system"] / "data/maintenance_entry_lock.flag"
+    args.extend(["--resume-start-failed-transaction", start_id])
+    observed = []
+    original_command = mini.deploy.MiniDeployment.command
+
+    def track_pm2(self, argv, **kwargs):
+        if argv[0] == "/pm2fake" and argv[1] in {"stop", "delete", "start", "save"}:
+            observed.append((argv[1], lock.read_text() if lock.exists() else None))
+        return original_command(self, argv, **kwargs)
+
+    monkeypatch.setattr(mini.deploy.MiniDeployment, "command", track_pm2)
+    assert mini.deploy.main(args) == 0
+    assert [action for action, _ in observed] == ["save"]
+    assert observed == [("save", original_id)]
+    assert not lock.exists()
+    complete = next((mini.runtime / "logs/deployments").glob("*/complete.json"))
+    value = json.loads(complete.read_text())
+    assert value["resumed_from"] == original_id
+    assert value["continued_from"] == start_id
