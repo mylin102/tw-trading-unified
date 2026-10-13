@@ -1,5 +1,35 @@
 # MTS PAPER confirmed peak restart recovery — 2026-10-13
 
+## Current follow-up: protective ATR risk release + retained PAPER deploy lock — 2026-10-13
+
+2026-10-13 Codex; AGENT_NAME=codex. User authorized fixing the missing
+protective release path and deploying. Candidate includes test `40e92d51`
+and fix `7add2c0f`: an ATR-triggered protective release no longer requires
+the PAPER trend snapshot's `pass_release`; quote validity/width, lifecycle,
+price and order/idempotency guards remain. Discrete TREND_RELEASE continues
+to require its trend snapshot. The field remains for compatibility/telemetry.
+The real-callsite regression was RED against the prior implementation and
+GREEN after the fix. The nearby focused strategy run is 39 PASS / 3 existing
+failures: one unrelated counter-trend side-mapping expectation and two
+integration tests lacking TMF calendar-spread CSV fixtures. It is not a
+full-suite claim.
+
+The previous deployment attempt `codex-ec7ef959b63d4ba5ab1a2a7c590106b4`
+failed at observe and intentionally retained its PAPER entry lock. Deployment
+controller test `17cab394` was RED before implementation; `286a508d` adds
+strict adoption of only that exact matching failed-observe lock, validates
+the transaction receipt and target identities, keeps the lock continuously
+through restart/120-second observation/save, and removes it only after the
+success receipt. Controller suite: 29 passed. This does not modify trading
+state/ledger or query the broker. Deploy engine-only to release18; keep
+dashboard SHA `45f0ced7c7ea5317c610677c323262f15df7a7a2` and stock-runner
+untouched. A failed resumed attempt must retain its lock; never manually
+remove it or rewrite state. PAPER only; no LIVE promotion.
+
+No broker, order, runtime state, ledger, PM2 process, stash, dashboard, or
+stock-runner was changed during offline implementation/testing. The formal
+Mini deployment remains pending below.
+
 ## Follow-up: HVWAP unsent PAPER release retry — 2026-10-13
 
 2026-10-13 Codex; AGENT_NAME=codex. User said go after reviewing today's
