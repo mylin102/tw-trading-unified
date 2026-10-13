@@ -188,12 +188,9 @@ class LifecycleContext:
     trend_release_enabled: bool = False
     trend_confirmed: dict | None = None  # Immutable TrendDecision snapshot dict (see mts_trend_signal_adapter.TrendDecision.to_dict)
     trend_reversal_confirmed: dict | None = None
-    # 2026-08-26 Hermes Agent: paper-only ATR-release trend gate. When ON
-    # (monitor-injected paper_active + live_order_allowed False + env
-    # MTS_ATR_RELEASE_TREND_GATE != "0"), the protective single-leg RELEASE
-    # fallback requires a valid trend snapshot with pass_release=True AND
-    # release_leg matching the ATR-selected leg. The ATR threshold itself is
-    # unchanged (still the trigger); live/unknown modes never set this flag.
+    # Compatibility/telemetry field for the retired paper ATR-release trend
+    # gate. Protective ATR-stop RELEASE candidates are no longer gated by a
+    # trend snapshot; quote/order safety checks remain downstream.
     release_trend_gate_enabled: bool = False
     # 2026-09-29 Hermes Agent: mark freshness at decision time.  The Policy J
     # release-stop intercept is an optimisation and must not be chosen on marks
@@ -418,25 +415,10 @@ def _check_release_candidates(
             near_hit, far_hit, leg.value,
             ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
         )
-        # 2026-08-26 Hermes Agent: paper-only ATR-release trend gate. When the
-        # gate is ON, the protective single-leg RELEASE fallback is not an
-        # unconditional risk exit: it requires a valid trend snapshot with
-        # pass_release=True AND release_leg matching the ATR-selected leg.
-        # The ATR threshold itself is unchanged (still the trigger / hard
-        # risk cap); only the fallback action is gated in paper mode.
-        # Live/unknown modes never set the flag -> existing behavior unchanged.
-        if getattr(ctx, "release_trend_gate_enabled", False):
-            _tc = getattr(ctx, "trend_confirmed", None)
-            _tc_pass = isinstance(_tc, dict) and bool(_tc.get("pass_release"))
-            _tc_leg = _tc.get("release_leg") if isinstance(_tc, dict) and _tc_pass else None
-            if not _tc_pass or _tc_leg != leg.value:
-                logger.info(
-                    "[CHECK_RELEASE_GATE_BLOCKED] paper-only trend gate: "
-                    "leg=%s pass_release=%s trend_leg=%s near_pnl=%.1f far_pnl=%.1f threshold=%.1f",
-                    leg.value, _tc_pass, _tc_leg,
-                    ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
-                )
-                return []
+        # The ATR release threshold is a protective risk stop. Do not require
+        # the separate trend snapshot seam here: it has no production producer
+        # and could otherwise veto risk reduction indefinitely. Fresh-quote,
+        # price, lifecycle and order-idempotency guards still run downstream.
         return [LifecycleDecision(action=LifecycleAction.RELEASE, release_leg=leg)]
     logger.info(
         "[CHECK_RELEASE_SKIP] near_hit=%s far_hit=%s "
