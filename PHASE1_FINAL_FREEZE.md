@@ -80,7 +80,7 @@ PAPER trade: repair the stranded single-leg release after bad BBO. Test-only
 commits faf4e344 and 136a819a; fix fcb11e69982c91058977451a54e1c498dfdbf599.
 This freeze manifest binds that source for an engine-only PAPER release18
 candidate; dashboard SHA remains 45f0ced7c7ea5317c610677c323262f15df7a7a2.
-frozen_tree_hash: 93e41d4af5b3e0d989563cc0a3a4f3f902dc5fdeb70e57a95dd2cf670e405365
+frozen_tree_hash: c8d0a4b157b6db34fb48bfaaf5b8ef20dcdc4387c01125814a9bc99fcd2a677d
 
 Confirmed incident: trade mts-auto-091504-132 emitted HVWAP_RELEASE_INTENT
 for NEAR at 09:28:33.722368, then actual dispatcher emitted
@@ -323,7 +323,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: 93e41d4af5b3e0d989563cc0a3a4f3f902dc5fdeb70e57a95dd2cf670e405365
+frozen_tree_hash: c8d0a4b157b6db34fb48bfaaf5b8ef20dcdc4387c01125814a9bc99fcd2a677d
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
