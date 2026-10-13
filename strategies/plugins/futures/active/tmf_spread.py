@@ -3300,6 +3300,55 @@ class TMFSpread(StrategyBase):
             f_pnl = self._pnl_far(far_close)
         return n_pnl + f_pnl
 
+    def _recover_paper_policy_j_peak(self, entry_ts_ms, now_ms):
+        """2026-10-13 Codex: recover confirmed risk memory, never a position/fill.
+
+        The legacy snapshot peak is not proof of confirmation. Replay only the
+        same open PAPER spread's durable confirmation events after its entry
+        quarantine, once on the first synchronized post-restart baseline.
+        """
+        if (getattr(self, "_hvwap_execution_mode", None) != "paper_active"
+                or getattr(self, "_hvwap_live_order_allowed", False)
+                or not getattr(self, "_has_position", False)
+                or getattr(self, "_released_leg", None) is not None
+                or not getattr(self, "_trade_id", None)):
+            return None
+        from core.runtime_paths import mts_data_mode
+        if mts_data_mode() != "paper":
+            return None
+        peak = None
+        guard_ms = float(getattr(self, "_entry_peak_guard_ms", 15000.0))
+        try:
+            with open(_MTS_EVENT_LOG) as source:
+                for line in source:
+                    if '"POLICY_J_PEAK_CONFIRMED"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                        if (not isinstance(row, dict)
+                                or row.get("event") != "POLICY_J_PEAK_CONFIRMED"
+                                or row.get("trade_id") != self._trade_id
+                                or row.get("mode", "paper") != "paper"
+                                or row.get("phase", "SPREAD") != "SPREAD"):
+                            continue
+                        value = row.get("durable_peak")
+                        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                                or not math.isfinite(value)):
+                            continue
+                        stamp = iso_to_epoch_ms(row.get("ts"))
+                        if not (entry_ts_ms + guard_ms <= stamp <= now_ms):
+                            continue
+                        peak = value if peak is None else max(peak, value)
+                    except (ValueError, TypeError):
+                        continue
+        except OSError:
+            logger.warning("[POLICY_J_PEAK_RECOVERY_UNAVAILABLE] trade_id=%s", self._trade_id)
+            return None
+        if peak is not None:
+            _append_event("POLICY_J_PEAK_RESTORED", trade_id=self._trade_id,
+                          durable_peak=peak, source="PAPER_CONFIRMED_EVENTS")
+        return peak
+
     def _update_policy_j_peak(self, current_pnl_pts, near_mark, far_mark, now_ms,
                               mark_age_ms=0.0, pair_skew_ms=0.0, entry_ts_ms=0.0,
                               phase="SPREAD") -> bool:
@@ -3413,7 +3462,14 @@ class TMFSpread(StrategyBase):
             self._pj_guard_state = "COMPLETE"
             self._pj_guard_initialized = True
             self._pj_guard_just_completed = True
-            self._pj_durable_peak = _upl
+            # 2026-10-13 Codex: restart must not erase a confirmed same-trade
+            # PAPER high-water mark after an UNSENT quote rejection. Keep the
+            # first-tick guard, freshness checks and unconfirmed-spike isolation.
+            _recovered_peak = (self._recover_paper_policy_j_peak(entry_ts_ms, now_ms)
+                               if getattr(self, "_hvwap_execution_mode", None) == "paper_active"
+                               else None)
+            self._pj_durable_peak = (_upl if _recovered_peak is None
+                                     else max(_upl, _recovered_peak))
             _append_event("POLICY_J_GUARD_BASELINE", trade_id=_tid,
                           baseline=_upl,
                           provisional_peak=self._pj_guard_provisional_peak,
