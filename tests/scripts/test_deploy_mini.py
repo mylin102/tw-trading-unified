@@ -482,7 +482,8 @@ def test_resume_started_engine_after_start_failure_only_verifies_saves_and_unloc
     mini.heads["trading-system"] = candidate_sha
     process = mini.deploy.one(mini.rows, "trading-system")
     process["pid"] = 3300
-    process["pm2_env"].update({"LRC_RELEASE_SHA": candidate_sha, "status": "online"})
+    process["pm2_env"].update({"LRC_RELEASE_SHA": candidate_sha, "status": "online",
+                               "pm_uptime": __import__("time").time() * 1000})
     mini.deploy.write_paper_profile(
         mini.runtime / "config/futures.paper.yaml", mini.baseline,
         ticker="TMF", runtime_dir=mini.runtime,
