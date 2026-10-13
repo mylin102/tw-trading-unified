@@ -317,13 +317,23 @@ class MiniDeployment:
         require(before.get("operation") == "release" and before.get("mode") == "paper"
                 and before.get("managed_apps") == ["trading-system"],
                 "RESUME_PRIOR_SCOPE_MISMATCH")
-        require(set(before.get("heads", {})) == set(self.roots)
-                and set(before.get("pm2", {})) == set(self.roots),
+        prior_heads = before.get("heads")
+        prior_pm2 = before.get("pm2")
+        require(isinstance(prior_heads, dict) and set(prior_heads) == set(self.roots)
+                and isinstance(prior_pm2, dict) and set(self.roots).issubset(prior_pm2),
                 "RESUME_PRIOR_RECEIPT_ROOTS_MISMATCH")
         old_targets = before.get("deployment_targets")
         require(isinstance(old_targets, dict) and set(old_targets) == set(self.targets),
                 "RESUME_PRIOR_TARGETS_MISMATCH")
         for name, root in self.roots.items():
+            prior_app = prior_pm2[name]
+            require(isinstance(prior_app, dict)
+                    and Path(prior_app.get("cwd", "")).resolve() == root
+                    and prior_app.get("sha") == prior_heads[name]
+                    and prior_app.get("status") == "online"
+                    and isinstance(prior_app.get("pid"), int)
+                    and prior_app["pid"] > 0,
+                    "RESUME_PRIOR_PROCESS_IDENTITY_MISMATCH:" + name)
             prior = old_targets[name]
             current = self.targets[name]
             require(prior.get("deployment_id") == "mini"
