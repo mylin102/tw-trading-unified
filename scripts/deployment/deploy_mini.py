@@ -129,6 +129,8 @@ class MiniDeployment:
         self.profile = self.runtime / "config/futures.paper.yaml"
         self.entry_lock = self.roots["trading-system"] / "data/maintenance_entry_lock.flag"
         self.token = "codex-" + uuid.uuid4().hex
+        self.lock_token = self.token
+        self.resumed_from = None
         self.out = self.runtime / "logs/deployments" / self.token
         self.stage = "init"
         self.owns_lock = False
@@ -180,7 +182,12 @@ class MiniDeployment:
     def preflight(self):
         self.stage = "preflight"
         require(self.runtime.is_dir(), "RUNTIME_MISSING")
-        require(not self.entry_lock.exists(), "EXISTING_ENTRY_LOCK_PRESERVED")
+        resume_id = getattr(self.args, "resume_failed_transaction", None)
+        if resume_id is None:
+            require(not self.entry_lock.exists(), "EXISTING_ENTRY_LOCK_PRESERVED")
+        else:
+            require(self.args.apply and self.args.operation == "release" and self.engine_only,
+                    "RESUME_REQUIRES_APPLIED_ENGINE_ONLY_RELEASE")
         self.heads = {}
         self.targets = {}
         # Identity is checked BEFORE contacting any PM2 daemon.
@@ -191,6 +198,8 @@ class MiniDeployment:
                     and Path(target.get("repo_path", "")).resolve() == root,
                     "DEPLOYMENT_TARGET_MISMATCH:" + name)
             self.targets[name] = target
+        if resume_id is not None:
+            self.validate_resume_lock(resume_id)
         self.before = self.apps()
         for name, root in self.roots.items():
             if self.engine_only and name == "dashboard":
@@ -281,6 +290,50 @@ class MiniDeployment:
         self.log = Path(one(self.before, "trading-system")["pm2_env"]["pm_out_log_path"])
         self.log_inode, self.log_offset = self.log.stat().st_ino, self.log.stat().st_size
 
+    def validate_resume_lock(self, transaction_id):
+        """Adopt only our exact retained observe-failure lock; never unlock it here."""
+        require(isinstance(transaction_id, str)
+                and re.fullmatch(r"codex-[0-9a-f]{32}", transaction_id),
+                "RESUME_TRANSACTION_ID_INVALID")
+        require(self.entry_lock.is_file() and not self.entry_lock.is_symlink()
+                and self.entry_lock.read_text(encoding="utf-8") == transaction_id,
+                "RESUME_ENTRY_LOCK_OWNER_MISMATCH")
+        deployment_root = (self.runtime / "logs/deployments").resolve()
+        receipt = deployment_root / transaction_id
+        require(not receipt.is_symlink() and receipt.resolve().parent == deployment_root,
+                "RESUME_RECEIPT_PATH_INVALID")
+        failed_path = receipt / "failed.json"
+        before_path = receipt / "before.json"
+        require(failed_path.is_file() and not failed_path.is_symlink()
+                and before_path.is_file() and not before_path.is_symlink(),
+                "RESUME_RECEIPT_INCOMPLETE")
+        require(not (receipt / "complete.json").exists()
+                and not (receipt / "observed.json").exists(),
+                "RESUME_RECEIPT_ALREADY_COMPLETED")
+        failed = read_json(failed_path)
+        before = read_json(before_path)
+        require(failed.get("stage") == "observe" and failed.get("entry_lock_retained") is True,
+                "RESUME_FAILURE_STAGE_NOT_ADOPTABLE")
+        require(before.get("operation") == "release" and before.get("mode") == "paper"
+                and before.get("managed_apps") == ["trading-system"],
+                "RESUME_PRIOR_SCOPE_MISMATCH")
+        require(set(before.get("heads", {})) == set(self.roots)
+                and set(before.get("pm2", {})) == set(self.roots),
+                "RESUME_PRIOR_RECEIPT_ROOTS_MISMATCH")
+        old_targets = before.get("deployment_targets")
+        require(isinstance(old_targets, dict) and set(old_targets) == set(self.targets),
+                "RESUME_PRIOR_TARGETS_MISMATCH")
+        for name, root in self.roots.items():
+            prior = old_targets[name]
+            current = self.targets[name]
+            require(prior.get("deployment_id") == "mini"
+                    and prior.get("host_role") == "runtime-primary"
+                    and prior.get("instance_id") == current.get("instance_id")
+                    and Path(prior.get("repo_path", "")).resolve() == root,
+                    "RESUME_TARGET_IDENTITY_MISMATCH:" + name)
+        self.resumed_from = transaction_id
+        self.lock_token = transaction_id
+
     def plan(self):
         print(json.dumps({"status": "PLAN_ONLY_NOT_DEPLOYED", "operation": self.args.operation,
                           "mode": "paper", "roots": self.roots, "before": self.heads,
@@ -302,10 +355,15 @@ class MiniDeployment:
     def lock(self):
         self.stage = "lock"
         self.entry_lock.parent.mkdir(parents=True, exist_ok=True)
-        with self.entry_lock.open("x") as handle:
-            handle.write(self.token)
-            handle.flush()
-            os.fsync(handle.fileno())
+        if self.resumed_from is not None:
+            require(self.entry_lock.is_file() and not self.entry_lock.is_symlink()
+                    and self.entry_lock.read_text(encoding="utf-8") == self.lock_token,
+                    "RESUME_ENTRY_LOCK_OWNER_CHANGED")
+        else:
+            with self.entry_lock.open("x") as handle:
+                handle.write(self.lock_token)
+                handle.flush()
+                os.fsync(handle.fileno())
         self.owns_lock = True
         self.out.mkdir(parents=True, mode=0o700)
 
@@ -322,6 +380,7 @@ class MiniDeployment:
                                     "config_hash": digest(self.old_body), "operation": self.args.operation,
                                     "hostname": socket.gethostname(), "deployment_targets": self.targets,
                                     "managed_apps": self.managed,
+                                    "resumed_from": self.resumed_from,
                                     "preserved_dashboard_data": getattr(self, "dashboard_data", {}),
                                     "ticker": self.ticker, "mode": "paper"})
         (self.out / "paper-profile.before.yaml").write_bytes(self.old_body)
@@ -527,7 +586,7 @@ class MiniDeployment:
 
     def unlock(self):
         self.stage = "unlock"
-        require(self.owns_lock and self.entry_lock.read_text() == self.token, "ENTRY_LOCK_OWNER_CHANGED")
+        require(self.owns_lock and self.entry_lock.read_text() == self.lock_token, "ENTRY_LOCK_OWNER_CHANGED")
         self.entry_lock.unlink()
         self.owns_lock = False
 
@@ -535,6 +594,7 @@ class MiniDeployment:
         self.stage = "complete"
         value = {"status": "VERIFIED", "operation": self.args.operation, "heads": self.shas,
                  "managed_apps": self.managed,
+                 "resumed_from": self.resumed_from,
                  "config_hash": digest(self.body), "paper_only": True, "broker_queries": 0,
                  "manual_orders": 0, "manual_state_or_ledger_edits": False,
                  "completed_at": datetime.now(timezone.utc).isoformat()}
@@ -544,6 +604,7 @@ class MiniDeployment:
     def failed(self):
         if self.out.exists():
             self.record("failed.json", {"stage": self.stage, "entry_lock_retained": self.owns_lock,
+                                        "resumed_from": self.resumed_from,
                                         "recovery": "Review before.json; no automatic state rewrite or restart."})
 
 
@@ -561,6 +622,8 @@ def main(argv=None):
     release.add_argument("--maintenance-approved", action="store_true")
     release.add_argument("--engine-only", action="store_true",
                          help="preserve dashboard process/source; dashboard SHA must equal current HEAD")
+    release.add_argument("--resume-failed-transaction", metavar="CODEX_TXID",
+                         help="adopt only the matching retained lock from a failed observe-stage PAPER release")
     args = parser.parse_args(argv)
     ops = None
     try:
