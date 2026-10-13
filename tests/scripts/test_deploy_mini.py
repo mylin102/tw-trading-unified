@@ -504,9 +504,17 @@ def test_resume_started_engine_after_start_failure_only_verifies_saves_and_unloc
     lock = mini.roots["trading-system"] / "data/maintenance_entry_lock.flag"
     args.extend(["--resume-start-failed-transaction", start_id])
     observed = []
+    jlist_calls = 0
     original_command = mini.deploy.MiniDeployment.command
 
     def track_pm2(self, argv, **kwargs):
+        nonlocal jlist_calls
+        if argv[0] == "/pm2fake" and argv[1] == "jlist":
+            jlist_calls += 1
+            if jlist_calls == 3:
+                # Simulate PM2 logrotate after the first successful startup
+                # acknowledgement but during the stable observation window.
+                log.write_text("rotated active log; startup is in archived file\n")
         if argv[0] == "/pm2fake" and argv[1] in {"stop", "delete", "start", "save"}:
             observed.append((argv[1], lock.read_text() if lock.exists() else None))
         return original_command(self, argv, **kwargs)
