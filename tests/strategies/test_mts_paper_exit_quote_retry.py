@@ -80,3 +80,10 @@ def test_hvwap_unsent_quote_rejection_retries_same_trade(held_paper, paper_exit)
     assert retry is not None
     assert retry.action == "PARTIAL_EXIT"
     assert strategy._trade_id == "mts-auto-151001-499"
+
+    mon._pending_lifecycle_orders["inflight"] = {"trade_id": strategy._trade_id}
+    mon._submit_mts_order_signal(retry, strategy, dispatch_bar, ts=None)
+    assert strategy._hvwap_release_sent_trade_id == strategy._trade_id
+    assert strategy._release_pending_mono > 0
+    assert strategy._hvwap_maybe_paper_release(
+        quote_bar, datetime.now(), quote_bar["near_close"], quote_bar["far_close"]) is None
