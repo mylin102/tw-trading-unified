@@ -490,9 +490,12 @@ def test_resume_started_engine_after_start_failure_only_verifies_saves_and_unloc
     )
     mini.tick()
     log = mini.runtime / "out.log"
-    log.write_text("PAPER_STARTUP_READY: local simulation\n" + "\n".join(
+    startup = "PAPER_STARTUP_READY: local simulation\n" + "\n".join(
         "Subscribed " + far + "TMF " + kind + ": CODE"
-        for far in ("", "far-month ") for kind in ("tick", "bidask")))
+        for far in ("", "far-month ") for kind in ("tick", "bidask"))
+    # A long-lived process can emit enough logs that startup acknowledgements
+    # are no longer in an arbitrary small tail window.
+    log.write_text(startup + "\n" + "diagnostic-noise\n" * 90_000)
 
     lock = mini.roots["trading-system"] / "data/maintenance_entry_lock.flag"
     args.extend(["--resume-start-failed-transaction", start_id])
