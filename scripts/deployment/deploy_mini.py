@@ -96,9 +96,10 @@ def execute(args, ops):
     ops.lock()
     ops.backup()
     if args.operation == "release":
-        ops.stop()
-        ops.install()
-        ops.start()
+        if getattr(ops, "resume_verify_only", False) is not True:
+            ops.stop()
+            ops.install()
+            ops.start()
     else:
         ops.publish_params()
     ops.observe()
@@ -131,6 +132,9 @@ class MiniDeployment:
         self.token = "codex-" + uuid.uuid4().hex
         self.lock_token = self.token
         self.resumed_from = None
+        self.continued_from = None
+        self.resume_verify_only = False
+        self.resume_failed_at = None
         self.out = self.runtime / "logs/deployments" / self.token
         self.stage = "init"
         self.owns_lock = False
@@ -183,7 +187,9 @@ class MiniDeployment:
         self.stage = "preflight"
         require(self.runtime.is_dir(), "RUNTIME_MISSING")
         resume_id = getattr(self.args, "resume_failed_transaction", None)
-        if resume_id is None:
+        resume_started_id = getattr(self.args, "resume_start_failed_transaction", None)
+        require(not (resume_id and resume_started_id), "RESUME_OPTIONS_MUTUALLY_EXCLUSIVE")
+        if resume_id is None and resume_started_id is None:
             require(not self.entry_lock.exists(), "EXISTING_ENTRY_LOCK_PRESERVED")
         else:
             require(self.args.apply and self.args.operation == "release" and self.engine_only,
@@ -200,6 +206,8 @@ class MiniDeployment:
             self.targets[name] = target
         if resume_id is not None:
             self.validate_resume_lock(resume_id)
+        elif resume_started_id is not None:
+            self.validate_started_failure(resume_started_id)
         self.before = self.apps()
         for name, root in self.roots.items():
             if self.engine_only and name == "dashboard":
@@ -237,6 +245,12 @@ class MiniDeployment:
                 self.git(root, "merge-base", "--is-ancestor", self.heads[name], sha)
                 self.git(root, "cat-file", "-e", sha + ":core/futures_profiles.py")
                 self.shas[name] = sha
+            if self.resume_verify_only:
+                require(self.heads["trading-system"] == self.shas["trading-system"],
+                        "RESUME_STARTED_SOURCE_NOT_AT_CANDIDATE")
+                row = one(self.before, "trading-system")
+                require(row["pm2_env"].get("LRC_RELEASE_SHA") == self.shas["trading-system"],
+                        "RESUME_STARTED_PROCESS_NOT_AT_CANDIDATE")
             dash_root = self.roots["dashboard"]
             dash_cfg = self.command(["git", "-C", str(dash_root), "show",
                                      self.shas["dashboard"] + ":config/futures.yaml"])
@@ -343,6 +357,56 @@ class MiniDeployment:
                     "RESUME_TARGET_IDENTITY_MISMATCH:" + name)
         self.resumed_from = transaction_id
         self.lock_token = transaction_id
+
+    def validate_started_failure(self, transaction_id):
+        """Continue verification only for an exact retained-lock start failure."""
+        require(isinstance(transaction_id, str)
+                and re.fullmatch(r"codex-[0-9a-f]{32}", transaction_id),
+                "RESUME_START_TRANSACTION_ID_INVALID")
+        deployment_root = (self.runtime / "logs/deployments").resolve()
+        receipt = deployment_root / transaction_id
+        require(not receipt.is_symlink() and receipt.resolve().parent == deployment_root,
+                "RESUME_START_RECEIPT_PATH_INVALID")
+        failed_path, before_path = receipt / "failed.json", receipt / "before.json"
+        require(failed_path.is_file() and not failed_path.is_symlink()
+                and before_path.is_file() and not before_path.is_symlink(),
+                "RESUME_START_RECEIPT_INCOMPLETE")
+        require(not (receipt / "complete.json").exists()
+                and not (receipt / "observed.json").exists(),
+                "RESUME_START_RECEIPT_ALREADY_COMPLETED")
+        failed, before = read_json(failed_path), read_json(before_path)
+        parent_id = failed.get("resumed_from")
+        require(failed.get("stage") == "start" and failed.get("entry_lock_retained") is True
+                and isinstance(parent_id, str), "RESUME_FAILURE_STAGE_NOT_START")
+        self.validate_resume_lock(parent_id)
+        require(before.get("operation") == "release" and before.get("mode") == "paper"
+                and before.get("managed_apps") == ["trading-system"],
+                "RESUME_START_SCOPE_MISMATCH")
+        before_heads = before.get("heads")
+        before_pm2 = before.get("pm2")
+        before_targets = before.get("deployment_targets")
+        require(isinstance(before_heads, dict) and set(before_heads) == set(self.roots)
+                and isinstance(before_pm2, dict) and set(self.roots).issubset(before_pm2)
+                and isinstance(before_targets, dict) and set(before_targets) == set(self.targets),
+                "RESUME_START_RECEIPT_ROOTS_MISMATCH")
+        for name, root in self.roots.items():
+            prior_app = before_pm2[name]
+            require(isinstance(prior_app, dict)
+                    and Path(prior_app.get("cwd", "")).resolve() == root
+                    and prior_app.get("sha") == before_heads[name]
+                    and prior_app.get("status") == "online"
+                    and isinstance(prior_app.get("pid"), int) and prior_app["pid"] > 0,
+                    "RESUME_START_PRIOR_PROCESS_IDENTITY_MISMATCH:" + name)
+            prior = before_targets[name]
+            current = self.targets[name]
+            require(prior.get("deployment_id") == "mini"
+                    and prior.get("host_role") == "runtime-primary"
+                    and prior.get("instance_id") == current.get("instance_id")
+                    and Path(prior.get("repo_path", "")).resolve() == root,
+                    "RESUME_START_TARGET_IDENTITY_MISMATCH:" + name)
+        self.resume_verify_only = True
+        self.continued_from = transaction_id
+        self.resume_failed_at = failed_path.stat().st_mtime
 
     def plan(self):
         print(json.dumps({"status": "PLAN_ONLY_NOT_DEPLOYED", "operation": self.args.operation,
@@ -541,8 +605,17 @@ class MiniDeployment:
             require(all(brief(one(rows, name)) == brief(one(self.before, name)) for name in self.roots),
                     "PARAMETERS_RESTARTED_PROCESS")
         else:
+            engine = one(rows, "trading-system")
+            if self.resume_verify_only:
+                started_at = engine["pm2_env"].get("pm_uptime")
+                require(isinstance(started_at, (int, float))
+                        and started_at / 1000 >= self.resume_failed_at - 2
+                        and self.log.stat().st_mtime >= self.resume_failed_at - 2,
+                        "RESUME_ENGINE_NOT_STARTED_AFTER_FAILURE")
             with self.log.open("rb") as handle:
-                if self.log.stat().st_ino == self.log_inode:
+                if self.resume_verify_only:
+                    handle.seek(max(0, self.log.stat().st_size - 512_000))
+                elif self.log.stat().st_ino == self.log_inode:
                     handle.seek(self.log_offset)
                 body = handle.read().decode(errors="replace")
             require("PAPER_STARTUP_READY: local simulation" in body, "PAPER_STARTUP_ACK_MISSING")
@@ -605,6 +678,7 @@ class MiniDeployment:
         value = {"status": "VERIFIED", "operation": self.args.operation, "heads": self.shas,
                  "managed_apps": self.managed,
                  "resumed_from": self.resumed_from,
+                 "continued_from": self.continued_from,
                  "config_hash": digest(self.body), "paper_only": True, "broker_queries": 0,
                  "manual_orders": 0, "manual_state_or_ledger_edits": False,
                  "completed_at": datetime.now(timezone.utc).isoformat()}
@@ -615,6 +689,7 @@ class MiniDeployment:
         if self.out.exists():
             self.record("failed.json", {"stage": self.stage, "entry_lock_retained": self.owns_lock,
                                         "resumed_from": self.resumed_from,
+                                        "continued_from": self.continued_from,
                                         "recovery": "Review before.json; no automatic state rewrite or restart."})
 
 
@@ -634,6 +709,8 @@ def main(argv=None):
                          help="preserve dashboard process/source; dashboard SHA must equal current HEAD")
     release.add_argument("--resume-failed-transaction", metavar="CODEX_TXID",
                          help="adopt only the matching retained lock from a failed observe-stage PAPER release")
+    release.add_argument("--resume-start-failed-transaction", metavar="CODEX_TXID",
+                         help="verify/save/unlock an online exact-candidate engine after a retained start-stage failure; never restarts it")
     args = parser.parse_args(argv)
     ops = None
     try:
