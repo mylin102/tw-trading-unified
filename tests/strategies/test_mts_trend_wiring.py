@@ -178,6 +178,29 @@ def test_hard_stop_precedes_trend_release():
     assert result.decision.action == LifecycleAction.STOPLOSS  # hard stop wins
 
 
+def test_atr_risk_release_does_not_require_trend_snapshot():
+    """A protective ATR leg-stop must still release when trend data is absent."""
+    adapter = MtsLifecycleAdapter()
+    lc = _spread_lifecycle()
+    state = {
+        "near_pnl_pts": 229.0,
+        "far_pnl_pts": -234.0,
+        "floating_pnl_pts": -5.0,
+        "entry_age_secs": 3600.0,
+        "release_stop_threshold": 130.2,
+        "trail_dist": 20.0,
+        "release_trend_gate_enabled": True,
+        "trend_release_enabled": False,
+        "trend_confirmed": None,
+    }
+
+    result = adapter.evaluate(_input(state, lc, mode="PAPER"))
+
+    assert result.decision is not None
+    assert result.decision.action == LifecycleAction.RELEASE
+    assert result.decision.release_leg == Leg.FAR
+
+
 # ── 5. strategy seam fail-closed (env off / missing snapshot) ──
 def test_strategy_seam_fail_closed_when_env_off(monkeypatch):
     monkeypatch.delenv("MTS_TREND_RELEASE_ENABLED", raising=False)
