@@ -10210,6 +10210,17 @@ class FuturesMonitor:
                             if _lc.release_group.status == ReleaseGroupStatus.TRIGGERED:
                                 _lc.release_group.status = ReleaseGroupStatus.ARMED
                                 _lc.exit_owner = None
+                            if (_action == "PARTIAL_EXIT"
+                                    and ("RELEASE_NEAR" in str(_reason).upper()
+                                         or "RELEASE_FAR" in str(_reason).upper())
+                                    and getattr(strategy, "_hvwap_release_sent_trade_id", None) == _tid):
+                                # 2026-10-13 Codex: an HVWAP candidate emitted
+                                # before this proven-unsent BBO refusal; release
+                                # only its dedupe latch and timer so the same
+                                # trade can retry. Durable/pending attempts keep
+                                # both protections because they never reach here.
+                                strategy._hvwap_release_sent_trade_id = None
+                                strategy._release_pending_mono = 0.0
                         elif _lc is not None and _lc.phase == PositionPhase.SINGLE_LEG:
                             strategy._lifecycle = f"TRAILING_{strategy._side}"
                     return
