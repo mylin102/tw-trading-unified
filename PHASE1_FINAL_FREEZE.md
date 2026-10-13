@@ -1,5 +1,41 @@
 # MTS PAPER confirmed peak restart recovery — 2026-10-13
 
+## Current deployment completion — 2026-10-13
+
+2026-10-13 Codex; AGENT_NAME=codex. The PAPER-only, engine-only Mini release
+was completed and recorded as VERIFIED in
+`/Users/myllin_mini/Documents/mylin102/tw-trading-unified-runtime/logs/deployments/codex-4a9591f64ccf4dbca9b814e19558be40/complete.json`.
+Running `trading-system` is pinned to release18 SHA
+`ec47a54df528632257b0ea7c5edd06f90a339855`; dashboard remains at
+`45f0ced7c7ea5317c610677c323262f15df7a7a2`; stock-runner was not restarted.
+The PAPER profile hash is `4e3c871137587205aab9a7685f31bcd4156bb9a1e2ca39bb94201e70b1044c4a`.
+PM2 save completed; all 24 samples passed across 124.95 seconds while the
+futures session was open. This transaction's ENTRY lock is absent. Final PM2
+status: trading-system PID 86087 online, dashboard PID 49778 online, and
+stock-runner PID 41421 online.
+
+The start-stage PM2 command initially failed after the prior engine stopped.
+The canonical PAPER engine was restored under the retained entry lock, then
+the controller continuation did verify/save/unlock only; it did not stop or
+restart that recovered process. Two subsequent attempts correctly failed
+closed and retained the lock: first the startup marker fell outside a 512 KB
+log tail, then PM2 rotated its startup segment out of the active log. Test-first
+regressions cover long logs and startup logs rotated before/during observation.
+Mutations restoring tail-only/no-archive reading or re-reading after rotation
+fail the regression; the restored controller suite is 30 PASS. Controller
+commits: `68ea2c2c` test → `c0eb7b02` implementation; long-log tests
+`8d8c1e3a` / `ffc2f01e` → `6cba1153`; rotation tests `bf42df9b` /
+`b4db8ea1` / `cd54ac8c` → fixes `ad148fa3` / `272cc182`. The managed-root
+receipt correction is `1f0839cd` test → `b5cb261f` fix.
+
+No broker query, order, manual state/ledger change, LIVE enablement, dashboard
+restart, or stock-runner restart. Normal PAPER runtime writes and market-data
+activity occurred. The completion receipt records zero broker queries, zero
+manual orders, and no manual state/ledger edits. Six temporary controller
+worktrees created for this operation were removed after completion; unrelated
+worktrees and user telemetry/data were left untouched. This supersedes the
+earlier pending-deployment notes in the 2026-10-13 sections below.
+
 ## Current follow-up: protective ATR risk release + retained PAPER deploy lock — 2026-10-13
 
 2026-10-13 Codex; AGENT_NAME=codex. User authorized fixing the missing
@@ -24,15 +60,18 @@ that mismatch RED; fix `b5cb261f` validates exactly the two deployment roots
 and their prior PID/cwd/SHA/status while allowing unrelated app snapshots.
 The first live preflight rejected the mismatched validator before lock
 adoption, PM2 mutation, checkout or unlock; the original token remains. Final
-controller suite: 29 passed. This does not modify trading state/ledger or
-query the broker. Deploy engine-only to release18; keep
+controller suite at this milestone: 29 passed. This does not modify trading
+state/ledger or query the broker. The later completion and additional
+controller verification fixes are documented at the top. Deploy engine-only
+to release18; keep
 dashboard SHA `45f0ced7c7ea5317c610677c323262f15df7a7a2` and stock-runner
 untouched. A failed resumed attempt must retain its lock; never manually
 remove it or rewrite state. PAPER only; no LIVE promotion.
 
 No broker, order, runtime state, ledger, PM2 process, stash, dashboard, or
-stock-runner was changed during offline implementation/testing. The formal
-Mini deployment remains pending below.
+stock-runner was changed during offline implementation/testing. At this point
+the formal Mini deployment was pending; it was later completed as recorded at
+the top of this file.
 
 ## Follow-up: HVWAP unsent PAPER release retry — 2026-10-13
 
