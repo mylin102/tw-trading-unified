@@ -614,15 +614,51 @@ class MiniDeployment:
                         "RESUME_ENGINE_NOT_STARTED_AFTER_FAILURE")
             with self.log.open("rb") as handle:
                 if self.resume_verify_only:
-                    handle.seek(max(0, self.log.stat().st_size - 512_000))
+                    # A healthy long-running PAPER process can produce enough
+                    # output to push its startup acknowledgements out of a
+                    # fixed tail window. Scan the log for an acknowledgement
+                    # block whose nearby ISO timestamp matches this exact
+                    # post-failure PM2 process start instead of accepting an
+                    # arbitrary historical startup marker.
+                    handle.seek(0)
                 elif self.log.stat().st_ino == self.log_inode:
                     handle.seek(self.log_offset)
                 body = handle.read().decode(errors="replace")
-            require("PAPER_STARTUP_READY: local simulation" in body, "PAPER_STARTUP_ACK_MISSING")
-            acks = {(bool(far), kind) for far, kind in re.findall(
-                r"Subscribed (far-month )?" + re.escape(self.ticker) + r" (tick|bidask):", body)}
-            require(len(acks) == 4, "FOUR_MARKET_DATA_SUBSCRIPTIONS_MISSING")
-            require("Traceback (most recent call last)" not in body, "STARTUP_TRACEBACK")
+            if self.resume_verify_only:
+                lines = body.splitlines()
+                started_epoch = started_at / 1000
+                current_startup = None
+                for index, line in enumerate(lines):
+                    if "PAPER_STARTUP_READY: local simulation" not in line:
+                        continue
+                    window = lines[index:index + 256]
+                    acks = {(bool(far), kind) for far, kind in re.findall(
+                        r"Subscribed (far-month )?" + re.escape(self.ticker)
+                        + r" (tick|bidask):", "\n".join(window))}
+                    if len(acks) != 4:
+                        continue
+                    timestamps = re.findall(
+                        r"20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+                        r"(?:Z|[+-]\d{2}:\d{2})?", "\n".join(window))
+                    for value in timestamps:
+                        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        event_epoch = parsed.timestamp()
+                        if started_epoch - 10 <= event_epoch <= started_epoch + 180:
+                            current_startup = window
+                            break
+                    if current_startup is not None:
+                        break
+                require(current_startup is not None, "PAPER_STARTUP_ACK_MISSING")
+                require("Traceback (most recent call last)" not in "\n".join(current_startup),
+                        "STARTUP_TRACEBACK")
+            else:
+                require("PAPER_STARTUP_READY: local simulation" in body, "PAPER_STARTUP_ACK_MISSING")
+                acks = {(bool(far), kind) for far, kind in re.findall(
+                    r"Subscribed (far-month )?" + re.escape(self.ticker) + r" (tick|bidask):", body)}
+                require(len(acks) == 4, "FOUR_MARKET_DATA_SUBSCRIPTIONS_MISSING")
+                require("Traceback (most recent call last)" not in body, "STARTUP_TRACEBACK")
         return {"apps": {n: brief(one(rows, n)) for n in self.roots}, "ledger": ledger,
                 "config_hash": ctx["config_hash"], "mode": "paper_active", "market_open": market_open,
                 "time": time.time()}
