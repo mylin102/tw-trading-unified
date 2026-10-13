@@ -615,17 +615,20 @@ class MiniDeployment:
                         "RESUME_ENGINE_NOT_STARTED_AFTER_FAILURE")
             if self.resume_verify_only and self.resume_startup_verified:
                 body = ""
+            elif self.resume_verify_only:
+                # PM2 may already have rotated this process's startup output;
+                # include only this process's current log and post-start archives.
+                log_paths = [self.log]
+                archive_pattern = self.log.stem + "*.log"
+                for candidate in self.log.parent.glob(archive_pattern):
+                    if (candidate != self.log and candidate.is_file() and not candidate.is_symlink()
+                            and candidate.stat().st_mtime >= started_at / 1000 - 2):
+                        log_paths.append(candidate)
+                body = "\n".join(path.read_text(errors="replace") for path in log_paths
+                                   if path.is_file() and not path.is_symlink())
             else:
                 with self.log.open("rb") as handle:
-                    if self.resume_verify_only:
-                        # A healthy long-running PAPER process can produce enough
-                        # output to push its startup acknowledgements out of a
-                        # fixed tail window. Scan the log for an acknowledgement
-                        # block whose nearby ISO timestamp matches this exact
-                        # post-failure PM2 process start instead of accepting an
-                        # arbitrary historical startup marker.
-                        handle.seek(0)
-                    elif self.log.stat().st_ino == self.log_inode:
+                    if self.log.stat().st_ino == self.log_inode:
                         handle.seek(self.log_offset)
                     body = handle.read().decode(errors="replace")
             if self.resume_verify_only:
