@@ -511,9 +511,10 @@ def test_resume_started_engine_after_start_failure_only_verifies_saves_and_unloc
         nonlocal jlist_calls
         if argv[0] == "/pm2fake" and argv[1] == "jlist":
             jlist_calls += 1
-            if jlist_calls == 4:
-                # Simulate PM2 logrotate after the first successful startup
-                # acknowledgement but during the stable observation window.
+            if jlist_calls in (3, 4):
+                # Simulate rotation immediately before first verification and
+                # again during observation. Startup moves to the archived log.
+                log.rename(log.with_name("out__rotation_" + str(jlist_calls) + ".log"))
                 log.write_text("rotated active log; startup is in archived file\n")
         if argv[0] == "/pm2fake" and argv[1] in {"stop", "delete", "start", "save"}:
             observed.append((argv[1], lock.read_text() if lock.exists() else None))
