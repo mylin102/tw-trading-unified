@@ -381,3 +381,69 @@ def test_actual_engine_only_detects_preserved_dashboard_drift(mini, monkeypatch,
     assert mini.deploy.main(args) == 1
     assert (mini.roots['trading-system'] / 'data/maintenance_entry_lock.flag').exists()
     assert not any(c[1] == 'save' for c in mini.calls if c[0] == '/pm2fake')
+
+
+def _write_failed_observe_receipt(mini, transaction_id):
+    import json
+
+    targets = {
+        name: json.loads((root / ".deployment-target").read_text())
+        for name, root in mini.roots.items()
+    }
+    receipt = mini.runtime / "logs/deployments" / transaction_id
+    receipt.mkdir(parents=True)
+    (receipt / "before.json").write_text(json.dumps({
+        "heads": mini.heads,
+        "pm2": {"trading-system": {}, "dashboard": {}},
+        "operation": "release",
+        "mode": "paper",
+        "managed_apps": ["trading-system"],
+        "deployment_targets": targets,
+        "ticker": "TMF",
+    }))
+    (receipt / "failed.json").write_text(json.dumps({
+        "stage": "observe",
+        "entry_lock_retained": True,
+        "recovery": "Review before.json; no automatic state rewrite or restart.",
+    }))
+    lock = mini.roots["trading-system"] / "data/maintenance_entry_lock.flag"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(transaction_id)
+    return receipt, lock
+
+
+def test_resume_adopts_only_matching_failed_observe_lock_and_keeps_it_until_complete(mini, monkeypatch):
+    import json
+
+    transaction_id = "codex-" + "a" * 32
+    old_receipt, lock = _write_failed_observe_receipt(mini, transaction_id)
+    args, _ = engine_only_candidate(mini)
+    args.extend(["--resume-failed-transaction", transaction_id])
+    observed_lock_tokens = []
+    original = mini.deploy.MiniDeployment.command
+
+    def command_with_lock_assertion(self, argv, **kwargs):
+        if argv[0] == "/pm2fake" and argv[1] in {"stop", "delete", "start", "save"}:
+            observed_lock_tokens.append(lock.read_text() if lock.exists() else None)
+        return original(self, argv, **kwargs)
+
+    monkeypatch.setattr(mini.deploy.MiniDeployment, "command", command_with_lock_assertion)
+    assert mini.deploy.main(args) == 0
+    assert observed_lock_tokens and set(observed_lock_tokens) == {transaction_id}
+    assert not lock.exists()
+    assert (old_receipt / "failed.json").exists()
+    completed = next((mini.runtime / "logs/deployments").glob("*/complete.json"))
+    assert json.loads(completed.read_text())["resumed_from"] == transaction_id
+
+
+def test_resume_rejects_lock_without_matching_failed_receipt_before_pm2(mini):
+    transaction_id = "codex-" + "b" * 32
+    lock = mini.roots["trading-system"] / "data/maintenance_entry_lock.flag"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(transaction_id)
+    args, _ = engine_only_candidate(mini)
+    args.extend(["--resume-failed-transaction", transaction_id])
+    assert mini.deploy.main(args) == 1
+    assert mini.calls == []
+    assert lock.read_text() == transaction_id
+    assert not list((mini.runtime / "logs/deployments").glob("*/complete.json"))
