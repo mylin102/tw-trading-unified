@@ -1,4 +1,40 @@
-# MTS PAPER exit recovery + engine-only deployment — 2026-10-12
+# MTS PAPER confirmed peak restart recovery — 2026-10-13
+
+2026-10-13 Codex; AGENT_NAME=codex. User explicitly requested Mini to run
+the new version. PAPER maintenance deployment, trading-system only in
+release18; dashboard stays 45f0ced7c7ea5317c610677c323262f15df7a7a2.
+Test-only commits 418152ae, e711d23a, 13a79eb7 precede tested fix
+5efab57dd38a630a39c81b9404033d63956ef3f1. This commit changes only this
+excluded freeze manifest, not application code.
+
+Recover only same-trade confirmed PAPER Policy J durable peaks from existing
+PAPER events after entry quarantine. LIVE, unknown mode, new-entry quarantine,
+foreign trades, candidates, nonfinite peaks and released-leg records are not
+recovery evidence. First synchronized baseline still skips giveback evaluation;
+invalid/stale BBO remains blocked. No manual close or fabricated fill.
+
+Focused A/B: baseline 110 PASS/1 existing SKIP, candidate 125 PASS/1 SKIP.
+All 111 baseline node outcomes identical, 15 added nodes PASS; zero new
+failures, missing nodes or changed outcomes. Not a full-suite claim, per user
+instruction. Recovery-disabled mutation fails all 3 positive real-callsite
+tests, including actual JSON/fill-ledger restore followed by on_bar and
+invalid-quote dispatch/retry. Mutations restored before final candidate run.
+Raw /private/tmp/mts_pj_restart_{base,candidate,mutation}_20261013.log;
+base/candidate JUnit XML at the same prefix. Candidate completed in 5.15s.
+
+Only engine maintenance deployment is authorized. Preserve local PAPER
+position/ledger/history and all unrelated PM2 owners; no stash, manual
+orders, broker account queries, LIVE enablement or state/context rewriting.
+Normal engine writes and market-data connection after restart are expected.
+Verify exact SHA, canonical cwd/interpreter, local position/ledger agreement,
+PAPER mode/hash, four quote subscriptions, dashboard classifier/HTTP and
+120s stable observation before save/unlock. Closed-session freshness is
+exempt only during canonical closed hours. Opening alone is not proof of
+an exit fill; observe fresh-quote strategy execution after opening separately.
+
+The October 12 and older sections below are archival evidence.
+
+## Archived MTS PAPER exit recovery + engine-only deployment — 2026-10-12
 
 2026-10-12 Codex; AGENT_NAME=codex. Current approval is PAPER maintenance
 deployment to Mini release18 only. Tested application candidate 59806d6d;
@@ -172,7 +208,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: ec91ea156e04a924965387298033dbae3a9effcb694f961a77f8c1ab560c96b7
+frozen_tree_hash: 12b6086c68688131c39945c4b334357430d9a0ca95bc4d2afb38509792c8cef4
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
