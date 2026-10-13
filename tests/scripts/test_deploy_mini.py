@@ -394,7 +394,12 @@ def _write_failed_observe_receipt(mini, transaction_id):
     receipt.mkdir(parents=True)
     (receipt / "before.json").write_text(json.dumps({
         "heads": mini.heads,
-        "pm2": {"trading-system": {}, "dashboard": {}},
+        # Historical before.json records every PM2 app, not only the apps
+        # managed by this engine-only deployment.
+        "pm2": {
+            "trading-system": {}, "dashboard": {}, "pm2-logrotate": {},
+            "stock-runner": {}, "taishin-stock": {},
+        },
         "operation": "release",
         "mode": "paper",
         "managed_apps": ["trading-system"],
