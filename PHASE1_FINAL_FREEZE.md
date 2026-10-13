@@ -1,5 +1,46 @@
 # MTS PAPER confirmed peak restart recovery — 2026-10-13
 
+## Follow-up: HVWAP unsent PAPER release retry — 2026-10-13
+
+2026-10-13 Codex; AGENT_NAME=codex. User said go after reviewing today's
+PAPER trade: repair the stranded single-leg release after bad BBO. Test-only
+commits faf4e344 and 136a819a; fix fcb11e69982c91058977451a54e1c498dfdbf599.
+This freeze manifest binds that source for an engine-only PAPER release18
+candidate; dashboard SHA remains 45f0ced7c7ea5317c610677c323262f15df7a7a2.
+
+Confirmed incident: trade mts-auto-091504-132 emitted HVWAP_RELEASE_INTENT
+for NEAR at 09:28:33.722368, then actual dispatcher emitted
+ORDER_INTENT_BLOCKED/PAPER_EXIT_BBO_INVALID_OR_STALE at .734466 before any
+order submission. Later 120 ALIGNED_PASS records followed, all with
+release_action_emitted=false. The strategy set its per-trade sent latch and
+release timer at emission. The monitor's proven-unsent recovery reset the
+generic lifecycle but omitted these two HVWAP fields.
+
+Fix only releases the matching trade's HVWAP latch/timer after the existing
+pending-order and durable-intent checks establish the PAPER exit was not
+submitted. Pending lifecycle orders and durable SUBMIT_ATTEMPTED intents do
+not enter the reset branch. No quote gate, strategy criterion, LIVE path or
+fill semantics changed.
+
+Focused A/B across quote-retry, executable-BBO and exit-width tests: mutated
+pre-fix base 14 PASS/1 FAIL; candidate 15 PASS. The only changed node is the
+new same-trade HVWAP retry regression; no removed or added-unmatched nodes.
+Mutation retaining both old latch and timer: 14 PASS/1 FAIL, same regression;
+restored code then 15 PASS. Initial RED before fix: new regression failed at
+retry emission. Raw evidence:
+/private/tmp/mts_hvwap_retry_mutated_20261013.xml and
+/private/tmp/mts_hvwap_retry_candidate_20261013.xml. Not a full-suite claim,
+per scoped-test preference.
+
+Implementation is offline on Air4, branch fix/mts-mode-data-isolation-20261002.
+Only monitor.py changed for fix; the regression extends the existing quote
+retry test module. Mini restart is a separate maintenance operation; no
+deployment has yet been performed for fcb11e69. PAPER only, no broker account
+query, no manual order, no state/ledger/context edits, no LIVE activation,
+no stash, no dashboard or stock-runner edits.
+
+The October 12 and older sections below are archival evidence.
+
 2026-10-13 Codex; AGENT_NAME=codex. User explicitly requested Mini to run
 the new version. PAPER maintenance deployment, trading-system only in
 release18; dashboard stays 45f0ced7c7ea5317c610677c323262f15df7a7a2.
