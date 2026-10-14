@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any
+# 2026-10-14 Hermes Agent: opening-window decisions use Taiwan market time.
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -788,6 +790,21 @@ class MtsLifecycleAdapter:
             )
             
         decision = evaluate_lifecycle_actions(ctx, evaluation_input.lifecycle)
+        # 2026-10-14 Hermes Agent: preserve the hedge during the 08:45-09:00
+        # day open. Restrict splits only; whole-pair and remaining-leg exits
+        # retain their existing priority. Naive event times are Taipei-local.
+        if decision is not None and decision.action in (
+            LifecycleAction.TREND_RELEASE, LifecycleAction.RELEASE,
+        ):
+            event_time = diag.event_time
+            if event_time.tzinfo is not None:
+                event_time = event_time.astimezone(ZoneInfo("Asia/Taipei"))
+            if (8, 45) <= (event_time.hour, event_time.minute) < (9, 0):
+                logger.info(
+                    "[MTS_RELEASE_OPENING_WINDOW_BLOCKED] action=%s event_time=%s",
+                    decision.action.value, event_time.isoformat(),
+                )
+                decision = None
         return LifecycleEvaluationResult(
             context=ctx,
             decision=decision,
