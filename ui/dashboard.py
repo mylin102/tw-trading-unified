@@ -1858,6 +1858,75 @@ def load_active_runtime_truth(base):
             known_profile_hashes[identity] = None
     return summarize_execution_context(read_execution_context(), known_profile_hashes)
 
+
+# 2026-10-15 Hermes Agent: display actual running versions without PM2 commands.
+def _running_program_version(pid, expected_root, runtime_root, entry_name):
+    import datetime
+    from pathlib import Path
+    import re
+    import subprocess
+    from zoneinfo import ZoneInfo
+    import psutil
+
+    unknown = {"sha": "無法確認", "commit_date": "—", "started_at": "—"}
+    try:
+        if int(pid) <= 0:
+            return unknown
+        process = psutil.Process(int(pid))
+        root = Path(process.cwd()).resolve()
+        environment = process.environ()
+        sha = environment.get("LRC_RELEASE_SHA", "")
+        if (root != Path(expected_root).resolve()
+                or not environment.get("TRADING_RUNTIME_DIR")
+                or Path(environment["TRADING_RUNTIME_DIR"]).resolve() != Path(runtime_root).resolve()
+                or not re.fullmatch(r"[0-9a-f]{40}", sha)
+                or not any(Path(arg).name == entry_name for arg in process.cmdline())):
+            return unknown
+        taipei = ZoneInfo("Asia/Taipei")
+        started = datetime.datetime.fromtimestamp(process.create_time(), taipei).strftime("%Y-%m-%d %H:%M:%S")
+        commit_date = "無法確認"
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "show", "-s", "--format=%cI", sha],
+                capture_output=True, text=True, check=True, timeout=2,
+            )
+            commit_date = datetime.datetime.fromisoformat(result.stdout.strip()).astimezone(taipei).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        if not process.is_running():
+            return unknown
+        return {"sha": sha[:8], "commit_date": commit_date, "started_at": started}
+    except (OSError, ValueError, TypeError, OverflowError, psutil.Error):
+        return unknown
+
+
+# 2026-10-15 Hermes Agent: saved PM2 metadata locates a PID; process inspection
+# supplies its live SHA/start time. Never execute PM2 or trust a saved SHA.
+@st.cache_data(ttl=10)
+def get_running_program_versions(dashboard_root, runtime_root):
+    import json
+    import os
+    from pathlib import Path
+
+    unknown = {"sha": "無法確認", "commit_date": "—", "started_at": "—"}
+    versions = {"MTS": dict(unknown)}
+    try:
+        home = Path(os.environ.get("PM2_HOME") or Path.home() / ".pm2")
+        rows = json.loads((home / "dump.pm2").read_text())
+        engines = ([row for row in rows if isinstance(row, dict)
+                    and row.get("name") == "trading-system"]
+                   if isinstance(rows, list) else [])
+        if len(engines) == 1:
+            engine = engines[0]
+            pid = int(Path(engine["pm_pid_path"]).read_text().strip())
+            versions["MTS"] = _running_program_version(
+                pid, engine["pm_cwd"], runtime_root, "main.py")
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    versions["Dashboard"] = _running_program_version(
+        os.getpid(), dashboard_root, runtime_root, "dashboard.py")
+    return versions
+
 # 2026-06-23 Gemini CLI: 快取策略註冊表探索流程，避免在每次頁面重整（每 10 秒）都重新掃描並載入 21 個策略 plugin，藉此降低 CPU 使用率
 @st.cache_resource(ttl=300)
 def get_cached_strategy_registry():
@@ -4242,6 +4311,15 @@ st.caption(
     f"context version={active_runtime_truth['context_version']} | "
     f"updated={active_runtime_truth['context_freshness']}"
 )
+# 2026-10-15 Hermes Agent: version dates/start times are explicitly Taipei-local.
+for _program_name, _program_version in get_running_program_versions(
+    str(BASE), str(_Path(runtime_path("execution_context.json")).parent)
+).items():
+    st.caption(
+        f"{_program_name} 程式版本：{_program_version['sha']} | "
+        f"版本日期={_program_version['commit_date']} | "
+        f"啟動時間={_program_version['started_at']}（台北時間）"
+    )
 if active_runtime_truth["audit_reasons"]:
     st.caption("期貨執行稽核原因：" + ", ".join(active_runtime_truth["audit_reasons"]))
 if active_runtime_truth["warning"]:
