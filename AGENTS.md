@@ -1,7 +1,16 @@
 You are working on a Taiwan futures + options trading system (Shioaji broker). Bugs cause real financial loss.
 
 Read RULES.md in project root before any code change.
-Run `python3 -m pytest tests/ -v` before and after every change.
+<!-- 2026-10-14 Hermes Agent: use impact-based verification for small changes. -->
+Choose tests by change impact, following RULES.md's "Test Scope Policy":
+- For one focused behavior changing at most 2 production code/config files,
+  run relevant tests before and after the change; a full suite is not required.
+  Cover affected callers, integration paths, and existing regression contracts.
+- Tests and documentation files do not count toward the 2-file threshold.
+  Documentation-only changes need diff/content checks, not runtime tests.
+- Use the full suite for broader changes or unclear impact, or when relevant
+  failures indicate wider regression risk. Record baseline failures separately.
+- Deployment uses the same test scope; it does not automatically require a full suite.
 
 # Project Context
 

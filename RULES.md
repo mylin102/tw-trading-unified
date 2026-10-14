@@ -81,7 +81,31 @@ Enforce runtime capability gates (`assert_research_allowed()`, `assert_broker_ac
 ## CRITICAL: Read Before Any Code Change
 
 This is a live trading system (currently PAPER mode). Bugs cause real financial loss.
-Run `python3 -m pytest tests/ -v` before AND after every change.
+
+### Test Scope Policy
+
+<!-- 2026-10-14 Hermes Agent: replace mandatory full-suite runs with impact-based verification. -->
+Choose verification by the affected behavior, not by a blanket full-suite rule:
+
+- For one focused behavior changing at most 2 production code/config files,
+  run relevant tests before and after the change. A full-suite run is not required.
+  Include changed behavior, affected callers/integration paths, risk-exit precedence
+  where relevant, and any explicitly required regression contracts.
+- Count production code and configuration files toward the threshold; supporting
+  test and documentation files do not count. A small file count does not justify
+  narrow testing when the change has broad effects across modules.
+- Run the full suite for changes exceeding that threshold, broad cross-module
+  effects, unclear impact, or relevant failures indicating wider regression risk.
+  Do not rerun the full suite solely because unrelated baseline failures exist.
+- For documentation-only changes, check the diff and content consistency;
+  runtime tests are not required.
+- Record the selected scope, commands, results, skips, and baseline failures.
+  Relevant failures must be resolved or shown with evidence to predate the change
+  and be unrelated to it; never hide them or claim an unrun full suite passed.
+
+This policy applies both during development and before deployment. Existing
+host identity, release freeze, position/order reconciliation, mode isolation,
+restart authorization, and post-deployment runtime checks remain mandatory.
 
 ---
 
@@ -200,9 +224,15 @@ Every strategy function MUST:
 
 ## Rule 10: Test Before Deploy
 
+<!-- 2026-10-14 Hermes Agent: deployment follows the same impact-based test scope. -->
+Before deployment, apply the Test Scope Policy above. Small focused changes need
+the relevant tests, not an automatic full-suite run. Report all selected test
+results and separately classify evidenced unrelated baseline failures; do not
+deploy with new or unexplained failures in the affected behavior.
+
 ```bash
-# Mandatory before any deployment:
-python3 -m pytest tests/ -v          # All tests pass
+# Select relevant test paths per Test Scope Policy; for a required full run, use tests/.
+taskpolicy -c background python3 -m pytest <relevant-test-paths> -v
 python3 -c "import py_compile; ..."  # No syntax errors
 python3 main.py --dry-run            # Starts without crash
 ```
