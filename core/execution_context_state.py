@@ -204,13 +204,19 @@ def persist_execution_context(ctx_dict: dict, *, runtime_dir: str | None = None,
     for key in SCHEMA_KEYS:
         if key not in payload:
             payload[key] = None
-    # Broker-truth evidence is durable: a writer that does not mention it must
-    # not erase it (2026-09-24: the app's own publish nulled canonical_holding,
-    # so the startup gate refused GUARD_POSITION_NOT_FLAT on a broker position
-    # that had been recorded minutes earlier).
+    # Broker-truth evidence is durable within LIVE intent: a writer that does
+    # not mention it must not erase it (2026-09-24: the app's own publish nulled
+    # canonical_holding, so the startup gate refused GUARD_POSITION_NOT_FLAT on
+    # a broker position that had been recorded minutes earlier). Do not carry
+    # that evidence across a mode boundary: PAPER must not advertise an old
+    # live_broker holding as current, and a later LIVE transition must provide
+    # fresh/reconciled evidence rather than inheriting it from PAPER.
     for key in DURABLE_EVIDENCE_KEYS:
         if payload.get(key) is None and isinstance(_prev.get(key), dict):
-            payload[key] = _prev[key]
+            if key != "canonical_holding" or (
+                    payload.get("requested_mode") == "live"
+                    and _prev.get("requested_mode") == "live"):
+                payload[key] = _prev[key]
     errs = _validate(payload)
     if errs:
         raise ValueError("; ".join(errs))
