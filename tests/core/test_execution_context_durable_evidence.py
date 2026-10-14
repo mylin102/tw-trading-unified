@@ -42,6 +42,22 @@ def test_a_writer_that_omits_the_holding_does_not_erase_it(tmp_path):
     assert _read(rt)["canonical_holding"] == LEGS
 
 
+def test_switching_to_paper_does_not_retain_live_broker_holding(tmp_path):
+    rt = str(tmp_path)
+    persist_execution_context(_base(canonical_holding=LEGS), runtime_dir=rt)
+    paper = {
+        "requested_mode": "paper",
+        "effective_mode": "paper_active",
+        "live_order_allowed": False,
+        "state_namespace": "paper",
+        "audit_reasons": [],
+    }
+
+    persist_execution_context(paper, runtime_dir=rt)
+
+    assert _read(rt)["canonical_holding"] is None
+
+
 def test_an_explicit_holding_in_the_payload_wins(tmp_path):
     rt = str(tmp_path)
     persist_execution_context(_base(canonical_holding=LEGS), runtime_dir=rt)
