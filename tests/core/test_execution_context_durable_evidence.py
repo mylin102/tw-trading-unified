@@ -58,6 +58,22 @@ def test_switching_to_paper_does_not_retain_live_broker_holding(tmp_path):
     assert _read(rt)["canonical_holding"] is None
 
 
+def test_switching_from_paper_to_live_requires_fresh_holding_evidence(tmp_path):
+    rt = str(tmp_path)
+    paper_with_legacy_holding = {
+        **_base(canonical_holding=LEGS),
+        "requested_mode": "paper",
+        "effective_mode": "paper_active",
+        "state_namespace": "paper",
+        "audit_reasons": [],
+    }
+    persist_execution_context(paper_with_legacy_holding, runtime_dir=rt)
+
+    persist_execution_context(_base(), runtime_dir=rt)
+
+    assert _read(rt)["canonical_holding"] is None
+
+
 def test_an_explicit_holding_in_the_payload_wins(tmp_path):
     rt = str(tmp_path)
     persist_execution_context(_base(canonical_holding=LEGS), runtime_dir=rt)
