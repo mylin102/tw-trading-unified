@@ -178,8 +178,16 @@ def test_hard_stop_precedes_trend_release():
     assert result.decision.action == LifecycleAction.STOPLOSS  # hard stop wins
 
 
-def test_atr_risk_release_does_not_require_trend_snapshot():
-    """A protective ATR leg-stop must still release when trend data is absent."""
+# 2026-10-14 Hermes Agent: ATR loss must not bypass trend-confirmed paper release.
+@pytest.mark.parametrize("snapshot", [
+    None,
+    "invalid",
+    _valid_snapshot(release_leg="FAR", pass_release=False),
+    _valid_snapshot(release_leg="NEAR"),
+    {"pass_release": True, "release_leg": "FAR"},
+])
+def test_atr_release_blocks_without_matching_confirmed_trend(snapshot):
+    """Do not turn a hedged pair into an unconfirmed directional position."""
     adapter = MtsLifecycleAdapter()
     lc = _spread_lifecycle()
     state = {
@@ -191,14 +199,63 @@ def test_atr_risk_release_does_not_require_trend_snapshot():
         "trail_dist": 20.0,
         "release_trend_gate_enabled": True,
         "trend_release_enabled": False,
-        "trend_confirmed": None,
+        "trend_confirmed": snapshot,
     }
 
     result = adapter.evaluate(_input(state, lc, mode="PAPER"))
 
+    assert result.decision is None
+
+
+# 2026-10-14 Hermes Agent: confirm both release directions through the adapter.
+@pytest.mark.parametrize("release_leg,near_pnl,far_pnl", [
+    ("FAR", 156.0, -148.0),
+    ("NEAR", -148.0, 156.0),
+])
+def test_atr_release_allows_matching_confirmed_trend(release_leg, near_pnl, far_pnl):
+    adapter = MtsLifecycleAdapter()
+    state = {
+        "near_pnl_pts": near_pnl, "far_pnl_pts": far_pnl,
+        "floating_pnl_pts": near_pnl + far_pnl, "entry_age_secs": 3600.0,
+        "release_stop_threshold": 141.93, "trail_dist": 66.0,
+        "release_trend_gate_enabled": True, "trend_release_enabled": False,
+        "trend_confirmed": _valid_snapshot(release_leg=release_leg),
+    }
+    result = adapter.evaluate(_input(state, _spread_lifecycle(), mode="PAPER"))
+    assert result.decision is not None
+    assert result.decision.action == LifecycleAction.RELEASE
+    assert result.decision.release_leg == Leg(release_leg)
+
+
+# 2026-10-14 Hermes Agent: restore only the original opt-in gate behavior.
+def test_atr_release_gate_off_preserves_legacy_release():
+    adapter = MtsLifecycleAdapter()
+    state = {
+        "near_pnl_pts": 156.0, "far_pnl_pts": -148.0,
+        "floating_pnl_pts": 8.0, "entry_age_secs": 3600.0,
+        "release_stop_threshold": 141.93, "trail_dist": 66.0,
+        "release_trend_gate_enabled": False, "trend_release_enabled": False,
+        "trend_confirmed": None,
+    }
+    result = adapter.evaluate(_input(state, _spread_lifecycle(), mode="LIVE"))
     assert result.decision is not None
     assert result.decision.action == LifecycleAction.RELEASE
     assert result.decision.release_leg == Leg.FAR
+
+
+# 2026-10-14 Hermes Agent: blocking a split must not suppress whole-pair risk exits.
+def test_atr_trend_gate_does_not_block_whole_pair_hard_stop():
+    adapter = MtsLifecycleAdapter()
+    state = {
+        "near_pnl_pts": -156.0, "far_pnl_pts": -148.0,
+        "floating_pnl_pts": -304.0, "entry_age_secs": 3600.0,
+        "release_stop_threshold": 141.93, "trail_dist": 66.0,
+        "release_trend_gate_enabled": True, "trend_release_enabled": False,
+        "trend_confirmed": None, "max_loss_pts": 300.0,
+    }
+    result = adapter.evaluate(_input(state, _spread_lifecycle(), mode="PAPER"))
+    assert result.decision is not None
+    assert result.decision.action == LifecycleAction.STOPLOSS
 
 
 # ── 5. strategy seam fail-closed (env off / missing snapshot) ──
