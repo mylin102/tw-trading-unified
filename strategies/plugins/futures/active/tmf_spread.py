@@ -2034,6 +2034,8 @@ class TMFSpread(StrategyBase):
         self._oi_estimator = OIEstimator(_MTS_EVENT_LOG)
         self._oi_snapshot_key = None
         self._oi_snapshot = None
+        # 2026-10-15 Hermes Agent: cache the exact OI window for VolQuality.
+        self._oi_event_sequence = None
         self._hvwap_5m_bars: deque = deque(maxlen=320)
         self._hvwap_last_bucket: int | None = None
         self._hvwap_pending_snapshot: dict | None = None
@@ -2325,6 +2327,8 @@ class TMFSpread(StrategyBase):
                 _oi_key = (_oi_path, _oi_ts)
                 if getattr(self, "_oi_snapshot_key", None) != _oi_key:
                     self._oi_snapshot = None
+                    # 2026-10-15 Hermes Agent: unavailable is distinct from an empty window.
+                    self._oi_event_sequence = None
                     try:
                         from strategies.plugins.futures.active.mts_oi_estimator import OIEstimator
                         if (getattr(self, "_oi_estimator", None) is None
@@ -2332,11 +2336,21 @@ class TMFSpread(StrategyBase):
                             self._oi_estimator = OIEstimator(_oi_path)
                         if _oi_ts is not None:
                             self._oi_snapshot = self._oi_estimator.estimate_oi(_oi_ts)
+                            # 2026-10-15 Hermes Agent: reuse the estimator's already
+                            # loaded events, preserving (close - 300, close] semantics.
+                            _events = self._oi_estimator._event_cache
+                            if _events is not None:
+                                self._oi_event_sequence = []
+                                for _event in _events:
+                                    _event_ts = self._oi_estimator._parse_ts(_event.get("ts", ""))
+                                    if _event_ts is not None and _oi_ts - 300 < _event_ts <= _oi_ts:
+                                        self._oi_event_sequence.append(_event)
                     except Exception:
                         logger.warning("[HVWAP_CANDIDATE] OI estimate unavailable", exc_info=True)
                     self._oi_snapshot_key = _oi_key
                 verdict = evaluate_hvwap_candidate(
                     oi_snapshot=self._oi_snapshot,
+                    event_sequence=getattr(self, "_oi_event_sequence", None),
                     decision_ts=_close,
                     near_bars=near_bars,
                     far_bars=far_bars,

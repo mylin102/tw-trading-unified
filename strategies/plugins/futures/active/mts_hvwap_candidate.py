@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import math
+import logging
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Optional, Sequence
@@ -44,6 +45,8 @@ from typing import Any, Optional, Sequence
 # 2026-10-15 Hermes Agent: observational OI/volume signals supplied by dispatch.
 from strategies.plugins.futures.active.mts_oi_estimator import OISnapshot
 from strategies.plugins.futures.active.mts_vol_adjuster import VolAdjuster
+# 2026-10-15 Hermes Agent: Task 1.3.2 optional event-based quality observation.
+from strategies.plugins.futures.active.mts_vol_quality import VolQuality
 
 from strategies.plugins.futures.active.mts_lifecycle_adapter import (
     counter_trend_leg_from_sides,
@@ -552,6 +555,9 @@ class HvwapCandidateVerdict:
     vol_zscore: Optional[float] = None
     vol_anomaly_level: Optional[str] = None
     vol_quality: Optional[float] = None
+    # 2026-10-15 Hermes Agent: optional event quality, separate from Z-score quality.
+    vol_quality_score: Optional[float] = None
+    vol_quality_level: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -649,6 +655,8 @@ def evaluate_hvwap_candidate(
     position_phase: str = "SPREAD",
     # 2026-10-15 Hermes Agent: caller owns event-log IO; evaluator remains pure.
     oi_snapshot: Optional[OISnapshot] = None,
+    # 2026-10-15 Hermes Agent: same completed-bar window as oi_snapshot; None = unavailable.
+    event_sequence: Optional[Sequence[dict[str, Any]]] = None,
 ) -> HvwapCandidateVerdict:
     """Top-level Hierarchical VWAP candidate arbitration (PURE, telemetry-only).
 
@@ -892,6 +900,21 @@ def evaluate_hvwap_candidate(
         except (KeyError, TypeError, ValueError, OverflowError, OSError):
             pass
 
+    # 2026-10-15 Hermes Agent: all five indicators are computed by the supplied
+    # module. Reuse OI's deduplicated counts/as-of timestamp; never read log IO here.
+    quality = None
+    if oi_snapshot is not None and event_sequence is not None and oi_snapshot.ts <= dts:
+        try:
+            quality = VolQuality.compute(
+                ts=oi_snapshot.ts,
+                order_count=oi_snapshot.new_orders + oi_snapshot.close_orders,
+                fill_count=oi_snapshot.total_fills,
+                event_sequence=list(event_sequence),
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[HVWAP_CANDIDATE] volume quality unavailable", exc_info=True)
+
     return HvwapCandidateVerdict(
         decision_ts=str(decision_ts),
         session_label=label,
@@ -923,6 +946,8 @@ def evaluate_hvwap_candidate(
         vol_zscore=vol_adj.z_score if vol_adj is not None else None,
         vol_anomaly_level=vol_adj.anomaly_level if vol_adj is not None else None,
         vol_quality=vol_adj.quality_rating if vol_adj is not None else None,
+        vol_quality_score=quality.quality_score if quality is not None else None,
+        vol_quality_level=quality.quality_level if quality is not None else None,
     )
 
 
