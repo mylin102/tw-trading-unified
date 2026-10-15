@@ -39,7 +39,7 @@ Interpreter: `/Users/mylin/Documents/mylin102/tw-trading-unified-deploy-cli-2026
 | Five fraud indicators | Spy coverage confirms stacking, density, time_cluster, imbalance, follow_through all execute via the candidate call |
 | Optional fields | Both have Optional types and None defaults; serialization verified |
 | Syntax compilation | Three affected production modules passed |
-| `git diff --check` | Passed |
+| Whitespace check | Integration edits pass; full staged diff reports 13 trailing-whitespace lines inherited byte for byte from supplied `mts_vol_quality.py`; preserved per dispatch |
 | Bounded full-suite attempt (`tests/ --maxfail=1`) | 4538 collected; 30 passed, 1 failed; stopped on `test_unified_config_session_override_merging` (89.47s); full suite not completed |
 
 Focused test paths:
