@@ -41,6 +41,10 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Optional, Sequence
 
+# 2026-10-15 Hermes Agent: observational OI/volume signals supplied by dispatch.
+from strategies.plugins.futures.active.mts_oi_estimator import OISnapshot
+from strategies.plugins.futures.active.mts_vol_adjuster import VolAdjuster
+
 from strategies.plugins.futures.active.mts_lifecycle_adapter import (
     counter_trend_leg_from_sides,
 )
@@ -541,6 +545,14 @@ class HvwapCandidateVerdict:
     # "CURRENT_SESSION" or "PREWARMED_FROM_PRIOR_SESSION:<session_label>".
     regime_60m_provenance: Optional[str] = None
 
+    # 2026-10-15 Hermes Agent: optional telemetry, independent of release arbitration.
+    oi_intensity: Optional[float] = None
+    oi_direction: Optional[float] = None
+    oi_quality: Optional[float] = None
+    vol_zscore: Optional[float] = None
+    vol_anomaly_level: Optional[str] = None
+    vol_quality: Optional[float] = None
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["status"] = self.status.value
@@ -635,6 +647,8 @@ def evaluate_hvwap_candidate(
     slope_delta_secs: float = DEFAULT_SLOPE_DELTA_SECS,
     regime_roc_threshold: float = DEFAULT_REGIME_ROC_THRESHOLD,
     position_phase: str = "SPREAD",
+    # 2026-10-15 Hermes Agent: caller owns event-log IO; evaluator remains pure.
+    oi_snapshot: Optional[OISnapshot] = None,
 ) -> HvwapCandidateVerdict:
     """Top-level Hierarchical VWAP candidate arbitration (PURE, telemetry-only).
 
@@ -866,6 +880,18 @@ def evaluate_hvwap_candidate(
         elif retained_state.is_overextended:
             status, reason = HvwapStatus.HOLD, "OVEREXTENDED_HOLD"
 
+    # 2026-10-15 Hermes Agent: score only the latest completed current-session
+    # NEAR bar's own volume; missing/invalid volume is not a zero-volume sample.
+    vol_adj = None
+    if session_5m:
+        volume_bar = max(session_5m, key=lambda b: to_epoch_secs(b.get("ts")))
+        try:
+            volume = float(volume_bar["volume"])
+            if math.isfinite(volume) and volume >= 0:
+                vol_adj = VolAdjuster.adjust(to_epoch_secs(volume_bar["ts"]), volume)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            pass
+
     return HvwapCandidateVerdict(
         decision_ts=str(decision_ts),
         session_label=label,
@@ -891,6 +917,12 @@ def evaluate_hvwap_candidate(
         conflict_count=conflict_count,
         neutral_count=neutral_count,
         regime_60m_provenance=regime_60m_provenance,
+        oi_intensity=oi_snapshot.oi_intensity if oi_snapshot is not None else None,
+        oi_direction=oi_snapshot.oi_direction if oi_snapshot is not None else None,
+        oi_quality=oi_snapshot.quality_score if oi_snapshot is not None else None,
+        vol_zscore=vol_adj.z_score if vol_adj is not None else None,
+        vol_anomaly_level=vol_adj.anomaly_level if vol_adj is not None else None,
+        vol_quality=vol_adj.quality_rating if vol_adj is not None else None,
     )
 
 

@@ -2029,6 +2029,11 @@ class TMFSpread(StrategyBase):
         # TELEMETRY-ONLY bookkeeping: completed 5m bar ring (close-time ts)
         # fed from the bar stream. Consumed solely by _hvwap_candidate_tick;
         # never read by any baseline/lifecycle/order path.
+        # 2026-10-15 Hermes Agent: use the same mode-scoped event ledger as writer.
+        from strategies.plugins.futures.active.mts_oi_estimator import OIEstimator
+        self._oi_estimator = OIEstimator(_MTS_EVENT_LOG)
+        self._oi_snapshot_key = None
+        self._oi_snapshot = None
         self._hvwap_5m_bars: deque = deque(maxlen=320)
         self._hvwap_last_bucket: int | None = None
         self._hvwap_pending_snapshot: dict | None = None
@@ -2313,7 +2318,25 @@ class TMFSpread(StrategyBase):
                      "volume": _b.get("far_volume", 0.0)}
                     for _b in near_bars if _b.get("far_close", 0.0) > 0
                 ]
+                # 2026-10-15 Hermes Agent: estimate once per candidate boundary,
+                # isolating optional OI failures from existing HVWAP arbitration.
+                _oi_path = _MTS_EVENT_LOG
+                _oi_ts = max((_b["ts"] for _b in near_bars), default=None)
+                _oi_key = (_oi_path, _oi_ts)
+                if getattr(self, "_oi_snapshot_key", None) != _oi_key:
+                    self._oi_snapshot = None
+                    try:
+                        from strategies.plugins.futures.active.mts_oi_estimator import OIEstimator
+                        if (getattr(self, "_oi_estimator", None) is None
+                                or self._oi_estimator.log_path != _oi_path):
+                            self._oi_estimator = OIEstimator(_oi_path)
+                        if _oi_ts is not None:
+                            self._oi_snapshot = self._oi_estimator.estimate_oi(_oi_ts)
+                    except Exception:
+                        logger.warning("[HVWAP_CANDIDATE] OI estimate unavailable", exc_info=True)
+                    self._oi_snapshot_key = _oi_key
                 verdict = evaluate_hvwap_candidate(
+                    oi_snapshot=self._oi_snapshot,
                     decision_ts=_close,
                     near_bars=near_bars,
                     far_bars=far_bars,
