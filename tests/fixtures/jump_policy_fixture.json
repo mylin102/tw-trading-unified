@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "description": "Tick jump distribution + policy thresholds for MTS Renko single-leg (Step 3 analysis, 2026-08-02)",
+  "dataset": {
+    "near_raw_ticks": 393422,
+    "far_stream_ticks": 251602,
+    "date": "2026-07-31",
+    "timezone": "Asia/Taipei",
+    "source_near": "logs/raw_ticks/TMFH6_20260731_ticks.csv",
+    "source_far": "pm2-trading-error.log PAPER_FILL_DEBUG"
+  },
+  "jump_thresholds": {
+    "accept_lt_pts": 30,
+    "quarantine_ge_pts": 30,
+    "quarantine_lt_pts": 50,
+    "reject_ge_pts": 50,
+    "note": "50 is the REJECT threshold, not a warning. 80 remains a reported outlier marker only."
+  },
+  "stats": {
+    "near_night_max_pts": 35,
+    "near_day_p999_pts": 58,
+    "far_p999_pts": 17,
+    "near_all_p9999_pts": 24,
+    "near_gt50_count": 205,
+    "near_gt50_pct": 0.00052,
+    "far_gt50_count": 3
+  },
+  "session_gate": {
+    "session_calendar_required": true,
+    "note": "14:50 post-close ticks are rejected by Session Calendar Gate, NOT by jump cap or gap threshold",
+    "taifex_sessions": [
+      {
+        "name": "day",
+        "open": "08:45",
+        "close": "13:45"
+      },
+      {
+        "name": "night",
+        "open": "15:00",
+        "close": "05:00"
+      }
+    ]
+  },
+  "gap_reentry": {
+    "gap_reentry_seconds": 900,
+    "quarantine_first_ticks": 2,
+    "note": ">900s data gap → first N ticks enter QUARANTINE/warmup; separate from Session Calendar Gate"
+  },
+  "named_cases": [
+    {
+      "name": "normal_night_jump_35",
+      "contract": "TMFH6",
+      "jump_pts": 35,
+      "expected": "ACCEPT",
+      "note": "night session observed max"
+    },
+    {
+      "name": "day_outlier_jump_58",
+      "contract": "TMFH6",
+      "jump_pts": 58,
+      "expected": "REJECT",
+      "note": "day p99.9 — above 50 → reject under unified semantics"
+    },
+    {
+      "name": "post_close_tick_14_50",
+      "contract": "TMFH6",
+      "timestamp": "2026-07-31T14:50:15",
+      "jump_pts": 750,
+      "expected": "REJECT",
+      "expected_handler": "SESSION_CALENDAR",
+      "not_jump_filter": true,
+      "note": "14:50 is outside TAIFEX sessions (day closes 13:45, night opens 15:00) — reject by session calendar, not jump cap"
+    },
+    {
+      "name": "cross_leg_route_pollution_43822",
+      "contract": "TMFI6",
+      "timestamp": "2026-07-31T19:11:30",
+      "pollution_price": 43822,
+      "expected_handler": "QUOTE_INTEGRITY",
+      "not_jump_filter": true,
+      "note": "far-month tick routed into near cache — handled by QuoteIntegrity, NOT jump filter"
+    }
+  ],
+  "timezone": "Asia/Taipei"
+}

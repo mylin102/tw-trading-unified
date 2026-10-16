@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any
+# 2026-10-14 Hermes Agent: opening-window decisions use Taiwan market time.
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -57,8 +59,17 @@ class LifecycleAction(Enum):
     STOPLOSS = "STOPLOSS"
     TIMEOUT = "TIMEOUT"
     COMBINED_EXIT = "COMBINED_EXIT"  # 2026-07-26 Gemini CLI: Policy J Primary Exit (Both Legs Simultaneous)
+    TREND_RELEASE = "TREND_RELEASE"  # 2026-08-22 MTS 2.0: Trend-Confirmed Release (counter-trend leg)
+    TREND_REVERSAL_EXIT = "TREND_REVERSAL_EXIT"  # confirmed reversal exits the retained leg
     RELEASE = "RELEASE"
     TRAIL = "TRAIL"
+
+
+class PolicyJTriggerPath(Enum):
+    """Authoritative source of a Policy J-owned exit decision."""
+    SPREAD_GIVEBACK = "POLICY_J_SPREAD_GIVEBACK"
+    RELEASE_INTERCEPT = "POLICY_J_RELEASE_INTERCEPT"
+    SINGLE_LEG = "POLICY_J_SINGLE_LEG"
 
 class CancelStatus(Enum):
     """Status of a sibling cancel order (ADR-010)."""
@@ -121,12 +132,16 @@ class PositionLifecycle:
     phase: PositionPhase = PositionPhase.FLAT
     release_group: ReleaseGroup = field(default_factory=ReleaseGroup)
     trail_group: TrailGroup = field(default_factory=TrailGroup)
+    exit_owner: str | None = None
 
 @dataclass
 class LifecycleDecision:
     """Result of evaluate_lifecycle_actions()."""
     action: LifecycleAction
     release_leg: Leg | None = None  # which leg to release (only for RELEASE)
+    # B48 (codex): provenance of the decision — "POLICY_J_SINGLE_LEG" when the
+    # single-leg Policy J giveback block produced the TRAIL exit
+    winner: str | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +184,20 @@ class LifecycleContext:
     combined_upl_activation_net_pnl_twd: float = 300.0
     combined_upl_giveback_twd: float = 100.0
     peak_net_exit_pnl_twd: float = 0.0
+    combined_exit_execution_enabled: bool = True
+    policy_j_guard_just_completed: bool = False  # 2026-08-04: baseline tick, skip giveback eval
+    # MTS 2.0 trend-release support (2026-08-22): disabled by default (MTS_TREND_RELEASE_ENABLED=0).
+    trend_release_enabled: bool = False
+    trend_confirmed: dict | None = None  # Immutable TrendDecision snapshot dict (see mts_trend_signal_adapter.TrendDecision.to_dict)
+    trend_reversal_confirmed: dict | None = None
+    # 2026-10-14 Hermes Agent: restore the paper ATR-release trend gate.
+    # When enabled, require confirmed trend support for the selected release leg.
+    release_trend_gate_enabled: bool = False
+    # 2026-09-29 Hermes Agent: mark freshness at decision time.  The Policy J
+    # release-stop intercept is an optimisation and must not be chosen on marks
+    # known to be the last closed bar.  Unset (paper/backtest/replay) stays
+    # permissive so no existing caller changes behaviour.
+    marks_live: bool = True
 
 @dataclass(frozen=True)
 class LifecycleEvaluationInput:
@@ -226,6 +255,26 @@ def calculate_peak_giveback_ratio(peak_rem_net_pnl: float, exit_rem_net_pnl: flo
         return None
     return (peak_rem_net_pnl - exit_rem_net_pnl) / peak_rem_net_pnl
 
+def counter_trend_leg_from_sides(near_side: str | None, far_side: str | None) -> tuple[Side | None, str | None]:
+    """MTS 2.0: map ENTRY sides to (retained_direction, counter_trend_leg).
+
+    Pure mapping, never reads PNL/price. The returned side is the side of the
+    retained leg, and the second value is the counter-trend leg. near LONG +
+    far SHORT -> BULLISH retains near, releases FAR. near SHORT + far LONG ->
+    BULLISH retains far, releases NEAR. Any other combination -> (None, None)
+    fail-closed. The retained side must match the leg that is actually kept;
+    returning the near side for the second orientation would invert the trend
+    arbitration and veto valid releases.
+    """
+    ns = str(near_side or "").upper()
+    fs = str(far_side or "").upper()
+    if ns == "LONG" and fs == "SHORT":
+        return Side.LONG, "FAR"
+    if ns == "SHORT" and fs == "LONG":
+        return Side.LONG, "NEAR"
+    return None, None
+
+
 def _check_manual_candidate(ctx: LifecycleContext) -> list[LifecycleDecision]:
     if ctx.manual_requested:
         return [LifecycleDecision(action=LifecycleAction.MANUAL)]
@@ -247,22 +296,73 @@ def _check_combined_upl_trail_candidate(
     """2026-07-27 Gemini CLI: Policy J Primary Exit - Net Exit PnL TWD Combined Trailing Exit."""
     if not ctx.enable_combined_upl_trail:
         return []
+    if not getattr(ctx, "combined_exit_execution_enabled", True):
+        return []
+    # 2026-08-04: guard-completion tick establishes the baseline — never
+    # trigger giveback on the same tick (would exit on a spike-derived peak).
+    if getattr(ctx, "policy_j_guard_just_completed", False):
+        return []
     _phase_val = enum_value(lifecycle.phase)
-    if _phase_val != "SPREAD":
+    # 2026-08-03 Gemini CLI: Support Policy J combined total PnL exit in SINGLE_LEG phase (whichever hits first between Policy J & trailing exit)
+    if _phase_val not in ("SPREAD", "SINGLE_LEG"):
         return []
     _rg_status = enum_value(lifecycle.release_group.status)
-    if _rg_status not in ("ARMED", "INACTIVE"):
+    _owner = getattr(lifecycle, "exit_owner", None)
+
+    # 1. Exit Ownership & In-Flight Guard:
+    if _owner == "POLICY_J" or _rg_status in (
+        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED"
+    ):
+        return []
+
+    if _phase_val == "SPREAD" and _rg_status not in ("ARMED", "INACTIVE"):
         return []
 
     # Calculate net exit PnL TWD (1pt = 10 TWD for TMF, minus friction 92 TWD)
+    # In SINGLE_LEG phase, (near_pnl_pts + far_pnl_pts) equals realized PnL of released leg + floating UPL of remaining leg
     total_net_pnl_twd = (ctx.near_pnl_pts + ctx.far_pnl_pts) * 10.0 - 92.0
     if ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd:
         if total_net_pnl_twd <= (ctx.peak_net_exit_pnl_twd - ctx.combined_upl_giveback_twd):
             logger.info(
-                "[POLICY_J_TRIGGERED] Net Exit PnL TWD peak=%.1f current=%.1f giveback=%.1f -> COMBINED_EXIT",
-                ctx.peak_net_exit_pnl_twd, total_net_pnl_twd, ctx.combined_upl_giveback_twd,
+                "[POLICY_J_TRIGGERED] Net Exit PnL TWD phase=%s peak=%.1f current=%.1f giveback=%.1f -> EXIT",
+                _phase_val, ctx.peak_net_exit_pnl_twd, total_net_pnl_twd, ctx.combined_upl_giveback_twd,
             )
-            return [LifecycleDecision(action=LifecycleAction.COMBINED_EXIT)]
+            if _phase_val == "SINGLE_LEG":
+                return [LifecycleDecision(action=LifecycleAction.TRAIL,
+                                          winner=PolicyJTriggerPath.SINGLE_LEG.value)]
+            return [LifecycleDecision(
+                action=LifecycleAction.COMBINED_EXIT,
+                winner=PolicyJTriggerPath.SPREAD_GIVEBACK.value,
+            )]
+
+    if _phase_val == "SPREAD":
+        # 2. Release-Stop Intercept Rule (Combined-First Protection in SPREAD phase)
+        near_hit = ctx.near_pnl_pts <= -ctx.release_stop_threshold
+        far_hit = ctx.far_pnl_pts <= -ctx.release_stop_threshold
+        if (near_hit or far_hit) and (ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd or total_net_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd):
+            # 2026-09-29 Hermes Agent: this intercept is an OPTIMISATION - never
+            # pick it on marks known to be the last closed bar.  Declining here
+            # leaves the ordinary release candidate to win by priority, so the
+            # protective single-leg stop still fires (fail-closed for the
+            # optimisation only, never for risk control).
+            if not getattr(ctx, "marks_live", True):
+                logger.warning(
+                    "[POLICY_J_INTERCEPT_BLOCKED_STALE_MARK] near_hit=%s far_hit=%s "
+                    "Total Net PnL (%.1f TWD) >= Activation (%.1f TWD) but the "
+                    "decision marks are a closed bar - fall back to the release",
+                    near_hit, far_hit, total_net_pnl_twd,
+                    ctx.combined_upl_activation_net_pnl_twd,
+                )
+                return []
+            logger.info(
+                "[POLICY_J_RELEASE_INTERCEPT] Single leg hit release stop (near_hit=%s far_hit=%s) "
+                "but Total Net PnL (%.1f TWD) >= Activation (%.1f TWD) -> Intercept with COMBINED_EXIT",
+                near_hit, far_hit, total_net_pnl_twd, ctx.combined_upl_activation_net_pnl_twd,
+            )
+            return [LifecycleDecision(
+                action=LifecycleAction.COMBINED_EXIT,
+                winner=PolicyJTriggerPath.RELEASE_INTERCEPT.value,
+            )]
     return []
 
 def _check_release_candidates(
@@ -278,9 +378,23 @@ def _check_release_candidates(
         )
         return []
     _rg_status = enum_value(lifecycle.release_group.status)
-    if _rg_status not in ("ARMED", "TRIGGERED"):
+    _owner = getattr(lifecycle, "exit_owner", None)
+
+    # 2. Exit Ownership Preemption & In-Flight Suppression Guard:
+    # If Policy J (or any primary exit) holds exit ownership, or if release_group is in-flight/triggered,
+    # STRICTLY BLOCK single-leg release candidates!
+    if _owner == "POLICY_J" or _rg_status in (
+        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "COMPLETED"
+    ):
         logger.info(
-            "[CHECK_RELEASE_SKIP] phase=%s rg_status=%s expected in (ARMED,TRIGGERED) near_pnl=%.1f far_pnl=%.1f",
+            "[CHECK_RELEASE_SUPPRESSED] Single-leg release suppressed by Exit Ownership/In-Flight status: owner=%s rg_status=%s",
+            _owner, _rg_status,
+        )
+        return []
+
+    if _rg_status != "ARMED":
+        logger.info(
+            "[CHECK_RELEASE_SKIP] phase=%s rg_status=%s expected=ARMED near_pnl=%.1f far_pnl=%.1f",
             _phase_val,
             _rg_status,
             ctx.near_pnl_pts, ctx.far_pnl_pts,
@@ -302,6 +416,20 @@ def _check_release_candidates(
             near_hit, far_hit, leg.value,
             ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
         )
+        # 2026-10-14 Hermes Agent: a leg loss alone must not create an
+        # unconfirmed directional position when the paper trend gate is on.
+        if getattr(ctx, "release_trend_gate_enabled", False):
+            _tc = getattr(ctx, "trend_confirmed", None)
+            _tc_pass = isinstance(_tc, dict) and bool(_tc.get("pass_release"))
+            _tc_leg = _tc.get("release_leg") if _tc_pass else None
+            if not _tc_pass or _tc_leg != leg.value:
+                logger.info(
+                    "[CHECK_RELEASE_GATE_BLOCKED] paper-only trend gate: "
+                    "leg=%s pass_release=%s trend_leg=%s near_pnl=%.1f far_pnl=%.1f threshold=%.1f",
+                    leg.value, _tc_pass, _tc_leg,
+                    ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
+                )
+                return []
         return [LifecycleDecision(action=LifecycleAction.RELEASE, release_leg=leg)]
     logger.info(
         "[CHECK_RELEASE_SKIP] near_hit=%s far_hit=%s "
@@ -310,6 +438,40 @@ def _check_release_candidates(
         ctx.near_pnl_pts, ctx.far_pnl_pts, ctx.release_stop_threshold,
     )
     return []
+
+
+def _check_trend_release_candidates(
+    ctx: LifecycleContext, lifecycle: PositionLifecycle,
+) -> list[LifecycleDecision]:
+    """MTS 2.0: Trend-confirmed release (spec 5.5 priority chain).
+
+    Consumes an immutable TrendDecision snapshot (dict) computed upstream at
+    decision_ts. BLOCK unless: trend release enabled, phase==SPREAD,
+    release_group ARMED/INACTIVE, no exit owner, pass_release True, and a
+    valid release_leg (NEAR/FAR). The released leg is the counter-trend leg.
+    """
+    if not getattr(ctx, "trend_release_enabled", False):
+        return []
+    tc = getattr(ctx, "trend_confirmed", None)
+    if not isinstance(tc, dict) or not tc.get("pass_release"):
+        return []
+    _phase_val = enum_value(lifecycle.phase)
+    if _phase_val != "SPREAD":
+        return []
+    _rg_status = enum_value(lifecycle.release_group.status)
+    _owner = getattr(lifecycle, "exit_owner", None)
+    if _owner == "POLICY_J" or _rg_status in (
+        "TRIGGERED", "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED", "FILLED", "COMPLETED"
+    ):
+        return []
+    if _rg_status not in ("ARMED", "INACTIVE"):
+        return []
+    release_leg = tc.get("release_leg")
+    if release_leg not in ("NEAR", "FAR"):
+        return []
+    return [LifecycleDecision(action=LifecycleAction.TREND_RELEASE,
+                              release_leg=Leg(release_leg),
+                              winner="TREND_CONFIRMED_RELEASE")]
 
 def _check_trail_candidate(
     ctx: LifecycleContext, lifecycle: PositionLifecycle,
@@ -330,12 +492,31 @@ def _check_trail_candidate(
             return [LifecycleDecision(action=LifecycleAction.TRAIL)]
     return []
 
+def _check_trend_reversal_candidate(
+    ctx: LifecycleContext, lifecycle: PositionLifecycle,
+) -> list[LifecycleDecision]:
+    """Exit the remaining leg on a fresh, completed-bar trend reversal."""
+    if enum_value(lifecycle.phase) != "SINGLE_LEG":
+        return []
+    reversal = getattr(ctx, "trend_reversal_confirmed", None)
+    if not isinstance(reversal, dict) or not reversal.get("reversal_confirmed"):
+        return []
+    trail_status = enum_value(lifecycle.trail_group.status)
+    if trail_status not in ("ARMED", "ACTIVE"):
+        return []
+    return [LifecycleDecision(
+        action=LifecycleAction.TREND_REVERSAL_EXIT,
+        winner="TREND_REVERSAL_CONFIRMED",
+    )]
+
 _LIFECYCLE_ACTION_PRIORITY = [
     LifecycleAction.MANUAL,
     LifecycleAction.STOPLOSS,
     LifecycleAction.TIMEOUT,
     LifecycleAction.COMBINED_EXIT, # 2026-07-26 Gemini CLI: Policy J Primary Exit priority over Release
+    LifecycleAction.TREND_RELEASE, # 2026-08-22 MTS 2.0: trend release below Policy J & hard stop, above protective RELEASE
     LifecycleAction.RELEASE,
+    LifecycleAction.TREND_REVERSAL_EXIT,
     LifecycleAction.TRAIL,
 ]
 
@@ -356,11 +537,20 @@ def evaluate_lifecycle_actions(
     candidates.extend(_check_stoploss_candidate(ctx))
     candidates.extend(_check_timeout_candidate(ctx))
     candidates.extend(_check_combined_upl_trail_candidate(ctx, lifecycle)) # Policy J Primary Exit
+    candidates.extend(_check_trend_release_candidates(ctx, lifecycle))     # MTS 2.0 Trend-Confirmed Release
     candidates.extend(_check_release_candidates(ctx, lifecycle))           # ADR-011 Secondary Fallback
+    candidates.extend(_check_trend_reversal_candidate(ctx, lifecycle))
     candidates.extend(_check_trail_candidate(ctx, lifecycle))
 
     if not candidates:
         return None
+
+    # Policy J is represented as TRAIL in SINGLE_LEG for compatibility.  It
+    # must remain ahead of the newly introduced trend-reversal action.
+    for decision in candidates:
+        if (decision.action == LifecycleAction.TRAIL
+                and decision.winner == "POLICY_J_SINGLE_LEG"):
+            return decision
 
     for priority_action in _LIFECYCLE_ACTION_PRIORITY:
         for decision in candidates:
@@ -511,8 +701,45 @@ class MtsLifecycleAdapter:
         activation_twd = float(state.get("combined_upl_activation_net_pnl_twd", 300.0))
         giveback_twd = float(state.get("combined_upl_giveback_twd", 100.0))
         peak_net_exit_pnl = float(state.get("peak_net_exit_pnl_twd", 0.0))
-        
+        guard_just_completed = bool(state.get("policy_j_guard_just_completed", False))
+        # MTS 2.0 trend-release seam (2026-08-22): surfaced from strategy_state.
+        # Fail-closed defaults: disabled/None unless the caller supplied a valid
+        # immutable TrendDecision snapshot with decision/freshness metadata.
+        trend_enabled = bool(state.get("trend_release_enabled", False))
+        trend_confirmed = state.get("trend_confirmed") or None
+        trend_reversal_confirmed = state.get("trend_reversal_confirmed") or None
+        if trend_confirmed is not None:
+            if not isinstance(trend_confirmed, dict):
+                trend_confirmed = None  # never trust a non-dict snapshot
+            else:
+                # Immutable TrendDecision snapshot requires decision/asof/freshness
+                # metadata; any missing field -> fail closed (never release from
+                # an incomplete-bar snapshot).
+                _required = ("decision_ts", "pass_release", "direction", "confidence",
+                             "asof_ts", "decision_max_quote_age_ms", "window_max_quote_age_ms")
+                if not all(_k in trend_confirmed for _k in _required):
+                    trend_confirmed = None  # incomplete snapshot -> fail closed
+        if trend_reversal_confirmed is not None:
+            if not isinstance(trend_reversal_confirmed, dict):
+                trend_reversal_confirmed = None
+            else:
+                _required_reversal = (
+                    "decision_ts", "asof_ts", "reversal_confirmed",
+                    "decision_max_quote_age_ms", "window_max_quote_age_ms",
+                )
+                if not all(_k in trend_reversal_confirmed for _k in _required_reversal):
+                    trend_reversal_confirmed = None
+                else:
+                    try:
+                        _r_dec_age = float(trend_reversal_confirmed["decision_max_quote_age_ms"])
+                        _r_win_age = float(trend_reversal_confirmed["window_max_quote_age_ms"])
+                    except (TypeError, ValueError):
+                        trend_reversal_confirmed = None
+                    else:
+                        if not (0.0 <= _r_dec_age <= 10000.0 and 0.0 <= _r_win_age <= 10000.0):
+                            trend_reversal_confirmed = None
         ctx = LifecycleContext(
+            marks_live=bool(state.get("marks_live", True)),
             near_pnl_pts=near_pnl,
             far_pnl_pts=far_pnl,
             floating_pnl_pts=floating_pnl,
@@ -532,6 +759,11 @@ class MtsLifecycleAdapter:
             combined_upl_activation_net_pnl_twd=activation_twd,
             combined_upl_giveback_twd=giveback_twd,
             peak_net_exit_pnl_twd=peak_net_exit_pnl,
+            policy_j_guard_just_completed=guard_just_completed,
+            trend_release_enabled=trend_enabled,
+            trend_confirmed=trend_confirmed,
+            trend_reversal_confirmed=trend_reversal_confirmed,
+            release_trend_gate_enabled=bool(state.get("release_trend_gate_enabled", False)),
         )
         
         # Calculate time above breakeven
@@ -558,6 +790,21 @@ class MtsLifecycleAdapter:
             )
             
         decision = evaluate_lifecycle_actions(ctx, evaluation_input.lifecycle)
+        # 2026-10-14 Hermes Agent: preserve the hedge during the 08:45-09:00
+        # day open. Restrict splits only; whole-pair and remaining-leg exits
+        # retain their existing priority. Naive event times are Taipei-local.
+        if decision is not None and decision.action in (
+            LifecycleAction.TREND_RELEASE, LifecycleAction.RELEASE,
+        ):
+            event_time = diag.event_time
+            if event_time.tzinfo is not None:
+                event_time = event_time.astimezone(ZoneInfo("Asia/Taipei"))
+            if (8, 45) <= (event_time.hour, event_time.minute) < (9, 0):
+                logger.info(
+                    "[MTS_RELEASE_OPENING_WINDOW_BLOCKED] action=%s event_time=%s",
+                    decision.action.value, event_time.isoformat(),
+                )
+                decision = None
         return LifecycleEvaluationResult(
             context=ctx,
             decision=decision,

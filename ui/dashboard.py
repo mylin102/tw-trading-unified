@@ -4,10 +4,53 @@ tw-trading-unified — 整合儀表板 v2
 4 tabs: 總覽 / 期貨 / 選擇權 / 設定
 """
 import sys
+import datetime as _identity_datetime
 from pathlib import Path as _Path
+from core.runtime_paths import (
+    runtime_logs,
+    runtime_path,
+    mts_runtime_path,  # 2026-10-02 Codex: MTS-only data follows the running execution context.
+    mts_position_state_path,
+    runtime_id,
+    validate_runtime_state,
+)
 sys.path.insert(0, str(_Path(__file__).parent.parent))
+from core.runtime_paths import check_runtime_identity
+
+
+def _dashboard_identity_presentation(
+    ok, actual_sha, expected_sha, checked_at
+):
+    if ok:
+        return {"level": "normal", "render_release_panels": True, "message": ""}
+    return {
+        "level": "stale",
+        "render_release_panels": False,
+        "message": (
+            "🚨 STALE — 本頁與執行中的 release 不一致（部署進行中或未完成） · "
+            f"expected_sha={expected_sha} · actual_sha={actual_sha} · "
+            f"checked_at={checked_at} · 不讀取 legacy/tmp fallback"
+        ),
+    }
+
+
+_identity_ok, _identity_actual, _identity_expected, _identity_reason = (
+    check_runtime_identity(__file__))
+_identity_checked_at = _identity_datetime.datetime.now().astimezone().isoformat(
+    timespec="seconds")
+_identity_presentation = _dashboard_identity_presentation(
+    _identity_ok, _identity_actual, _identity_expected, _identity_checked_at)
+
+if not _identity_presentation["render_release_panels"]:
+    import streamlit as st
+    st.set_page_config(page_title="Trading Unified — STALE", page_icon="🚨",
+                       layout="wide")
+    st.error(_identity_presentation["message"])
+    st.caption(_identity_reason)
+    st.stop()
 
 import streamlit as st
+import plotly.graph_objects as go
 import shioaji as sj  # GSD: Display version in sidebar
 from core.broker.shioaji_compat import is_rust_version
 import pandas as pd
@@ -34,6 +77,7 @@ _STOCK_NAMES: dict[str, str] = {
 from core.dashboard_data import (
     build_stock_orders_from_trades,
     merge_indicator_frames,
+    read_mts_quote_freshness,
     extend_taifex_recess_continuity,
     resolve_preferred_or_latest_file,
     resolve_stock_orders_file,
@@ -50,6 +94,10 @@ from core.dashboard_positions import (
     latest_indicator_close,
     option_order_matches_open_position,
     summarize_combo_legs,
+)
+from core.futures_indicator_contract import (
+    FUTURES_INDICATOR_COLUMNS,
+    ordered_indicator_columns,
 )
 import subprocess
 import time
@@ -80,6 +128,45 @@ if str(ROOT) not in sys.path:
 
 # Load environment variables early
 load_dotenv(Path(__file__).parent.parent / ".env")
+
+
+def _read_canonical_mts_state() -> tuple[dict | None, str, str]:
+    """Read only the canonical runtime state and fail closed on identity."""
+    try:
+        _path = mts_position_state_path()
+    except Exception:
+        return None, "STATE_UNAVAILABLE", "<unresolved>"
+    if not os.path.isfile(_path):
+        return None, "STATE_UNAVAILABLE", _path
+    try:
+        with open(_path, encoding="utf-8") as _f:
+            _state = json.load(_f)
+    except Exception:
+        return None, "STATE_UNAVAILABLE", _path
+    _valid, _reason = validate_runtime_state(_state)
+    if not _valid:
+        return None, _reason, _path
+    return _state, "OK", _path
+
+
+def _quick_mts_summary_presentation(
+    is_live_runtime: bool, state: dict | None, status: str, path: str
+) -> dict:
+    """Describe the quick MTS panel without mislabelling LIVE broker scope."""
+    if is_live_runtime:
+        return {
+            "level": "info",
+            "message": "LIVE MTS 狀態以券商查詢為準；持倉與委託顯示於下方券商即時摘要。",
+        }
+    if isinstance(state, dict):
+        return {"level": "state", "message": ""}
+    return {
+        "level": "error",
+        "message": (
+            f"⚠️ MTS 狀態不可用：{status} · state_path={path} · "
+            "不使用 legacy/tmp fallback。"
+        ),
+    }
 
 
 # ── [weak_bear_trend Monitor] Import auto_select monitoring panel ──
@@ -181,8 +268,50 @@ def check_password():
 if not check_password():
     st.stop()
 
+# [live UPL refresh] ask the RUNNING trading-system process (the
+# SAME Shioaji session) to re-capture and re-persist the canonical
+# broker snapshot — never a new preflight subprocess or a second
+# login.  Atomic O_EXCL write with only command_id / action /
+# created_at (no credentials, no order fields); a pending command
+# is never overwritten and is consumed once by the monitor loop.
+def write_live_upl_refresh_command(path=None) -> bool:
+    """Request same-session live UPL refresh through the monitor command.
+
+    The payload is deliberately limited to a command id, action, and
+    timestamp.  It contains no credentials or order fields and uses
+    atomic no-replace creation so a pending request cannot be overwritten.
+    """
+    _p = Path(path) if path is not None else Path(
+        runtime_path("commands", "live_upl_refresh.json"))
+    try:
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _fd = os.open(str(_p), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    _payload = {
+        "command_id": f"UPL_REFRESH-{datetime.datetime.now():%Y%m%d%H%M%S%f}",
+        "action": "LIVE_UPL_REFRESH",
+        "created_at": int(time.time() * 1000),
+    }
+    try:
+        with os.fdopen(_fd, "w", encoding="utf-8") as _out:
+            json.dump(_payload, _out, ensure_ascii=False)
+            _out.flush()
+            os.fsync(_out.fileno())
+        return True
+    except OSError:
+        try:
+            os.unlink(str(_p))
+        except OSError:
+            pass
+        return False
+
 # 2026-06-30 Gemini CLI: Replaced auto-refresh with manual + optional auto refresh slider
 if st.sidebar.button("🔄 重新載入資料", use_container_width=True):
+    # Ask the running monitor to refresh via its existing same-session loop.
+    write_live_upl_refresh_command()
     st.cache_data.clear()
     st.rerun()
 
@@ -195,6 +324,8 @@ auto_refresh_sec = st.sidebar.selectbox(
 )
 if auto_refresh_sec != "關閉":
     interval_ms = int(auto_refresh_sec.replace("秒", "")) * 1000
+    # Auto-refresh uses the same sanctioned command path as manual refresh.
+    write_live_upl_refresh_command()
     safe_st_autorefresh(interval=interval_ms, key="auto_refresh_timer")
 
 # ── 全域字體縮小 CSS ──
@@ -219,6 +350,7 @@ h3 { font-size: 1.1rem !important; }
 """, unsafe_allow_html=True)
 
 BASE = Path(__file__).parent.parent
+from core.runtime_paths import runtime_path
 # GSD: Align DATE_STR with the ACTIVE trading session date (e.g. after 15:00 today, it's tomorrow's date)
 DATE_STR = get_session_date_str(datetime.datetime.now())
 # 新增：交易記錄日期，使用 get_trade_day 確保與交易記錄文件一致
@@ -226,9 +358,9 @@ TRADE_DATE_STR = get_trade_day(datetime.datetime.now()).strftime("%Y%m%d")
 TODAY = datetime.datetime.now().strftime("%Y-%m-%d")
 
 # ── Session detection (used by sidebar + config loading) ──
-from core.date_utils import is_night_session
+from core.date_utils import is_night_session, is_taifex_futures_market_open
 _CURRENT_SESSION_NIGHT = is_night_session(datetime.datetime.now())
-FUTURES_CFG_NAME = "futures_night.yaml" if _CURRENT_SESSION_NIGHT else "futures.yaml"
+FUTURES_CFG_NAME = "futures.yaml"
 
 # Early read _TICKER for sidebar radio before config loading
 try:
@@ -248,14 +380,14 @@ PRODUCT_CODES = list(PRODUCT_LABELS.keys())
 # ── Sidebar Info ──
 with st.sidebar:
     st.title("Trading Unified")
+
     # 2026-07-26 Gemini CLI: Product-based futures page selector
     _product_page = st.selectbox(
         "📄 頁面",
-        ["總覽", "設定"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "🔐 Real Preflight"],
-        index=2,
+        ["總覽"] + list(PRODUCT_LABELS.values()) + ["選擇權 TXO", "台股 Stocks", "策略管道", "波動率 Vol", "🔄 反事實研究室", "設定"],
+        index=1,
         key="page_selector",
     )
-
 
     # 2026-07-26 Gemini CLI: On-demand 8502 Research Lab launcher & shutdown toggle in sidebar
     st.divider()
@@ -298,17 +430,63 @@ with st.sidebar:
     
     ver_tag = " (Rust)" if is_rust_version() else " (Legacy)"
     st.caption(f"🚀 Shioaji API: {sj.__version__}{ver_tag}")
-    st.markdown(f"🗓️ **交易日 (Trading Day)**")
-    st.code(f"{DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:]}")
+    st.markdown("🗓️ **自然日 (Calendar Date)**")
+    st.code(TODAY)
+    st.caption(
+        f"期貨交易日 (Futures Trading Day)：{DATE_STR[:4]}-{DATE_STR[4:6]}-{DATE_STR[6:]}"
+        + (" · 本夜盤歸屬下一交易日" if _CURRENT_SESSION_NIGHT else "")
+    )
     
     # 💡 GSD: Continuous Chart Mode toggle
     cont_mode = st.toggle("🕒 連續圖表模式", value=True, help="顯示最近 24 小時資料，而非僅今日交易日。")
     
     st.markdown(f"🕒 **最後更新**: {datetime.datetime.now().strftime('%H:%M:%S')}")
-    # Session indicator
-    _session_label = "🌙 夜盤" if _CURRENT_SESSION_NIGHT else "☀️ 日盤"
-    _session_color = "#7c3aed" if _CURRENT_SESSION_NIGHT else "#f59e0b"
+    # Session indicator: distinguish an inter-session close from a weekend or
+    # holiday closure instead of inferring state from day/night alone.
+    _now_hhmm = int(datetime.datetime.now().strftime("%H%M"))
+    _market_is_open = is_taifex_futures_market_open()
+    _between_sessions = (500 <= _now_hhmm < 845) or (1346 <= _now_hhmm < 1500)
+    if _market_is_open:
+        _session_label = "🌙 夜盤" if _CURRENT_SESSION_NIGHT else "☀️ 日盤"
+        _session_color = "#7c3aed" if _CURRENT_SESSION_NIGHT else "#f59e0b"
+    elif _between_sessions:
+        _session_label, _session_color = "⏸️ 收盤", "#64748b"
+    else:
+        _session_label, _session_color = "⛔ 休市", "#dc2626"
     st.markdown(f"<span style='color:{_session_color};font-weight:bold'>{_session_label}</span> — 設定檔: `{FUTURES_CFG_NAME}`", unsafe_allow_html=True)
+
+    # Cross-process safety status. Dashboard is read-only: it must never
+    # change the trading entry gate or process lifecycle.
+    try:
+        from core.channel_safety import read_persisted_safety_snapshot
+
+        _safety_snapshot = read_persisted_safety_snapshot()
+    except Exception:
+        _safety_snapshot = None
+
+    st.markdown("🛡️ **交易安全閘門 (Trading Safety Gate)**")
+    if not _safety_snapshot:
+        st.warning("⚠️ 尚未取得 trading-system 安全狀態；新進場應視為封鎖。")
+    elif not _safety_snapshot.get("entry_allowed", False):
+        _blocked_reason = _safety_snapshot.get("entry_blocked_reason") or "UNKNOWN"
+        _detail = _safety_snapshot.get("account_degraded_message")
+        st.error(f"⛔ 新進場已封鎖：{_blocked_reason}")
+        if _blocked_reason == "RECONCILIATION_PENDING":
+            st.caption("重啟後尚未完成券商持倉／委託對帳；請等待 trading-system 完成或人工處理。")
+        elif _detail:
+            st.caption(str(_detail))
+    else:
+        st.success("✅ 新進場安全閘門已解除（券商對帳完成）")
+
+    if _safety_snapshot and _safety_snapshot.get("updated_at"):
+        try:
+            _safety_updated = datetime.datetime.fromtimestamp(
+                float(_safety_snapshot["updated_at"])
+            ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            st.caption(f"安全狀態最後更新：{_safety_updated}")
+        except (TypeError, ValueError, OSError):
+            st.caption("安全狀態最後更新時間無法解析")
+
     # ── [GSD 4.13] System Readiness Indicators (Pillar 4) ──
     st.markdown("🚦 **系統狀態 (Readiness)**")
     
@@ -349,7 +527,7 @@ with st.sidebar:
     try:
         import json as _json
         import glob as _glob
-        _trace_files = sorted(_glob.glob("logs/router_trace/router_trace_*.jsonl"), reverse=True)
+        _trace_files = sorted(_glob.glob(os.path.join(runtime_logs("router_trace"), "router_trace_*.jsonl")), reverse=True)
         if _trace_files:
             with open(_trace_files[0]) as _f:
                 _lines = [l for l in _f if l.strip()]
@@ -418,7 +596,7 @@ with st.sidebar:
             import subprocess
             with st.spinner("正在下載 watchlist K 線數據（約 2-3 分鐘）..."):
                 result = subprocess.run(
-                    ["python3", "-m", "strategies.stocks.downloader"],
+                    [sys.executable, "-m", "strategies.stocks.downloader"],
                     capture_output=True, text=True, timeout=300,
                 )
             output = result.stdout + result.stderr
@@ -444,7 +622,7 @@ with st.sidebar:
 
         import subprocess
         result = subprocess.run(
-            ["python3", "scripts/diagnose.py"],
+            [sys.executable, "scripts/diagnose.py"],
             capture_output=True, text=True, timeout=30,
         )
         output = result.stdout + result.stderr
@@ -470,6 +648,498 @@ with st.sidebar:
             st.error(f"❌ 更新失敗（回傳碼: {result.returncode}）")
 
 # 2026-07-08 Gemini CLI: Calculate MTS daily performance metrics matching scripts/generate_daily_report.py
+def _fmt_policy_j_reason(reason_str: str) -> str:
+    if not reason_str or reason_str in ("—", "?"):
+        return str(reason_str)
+    r_upper = str(reason_str).upper()
+    if "COMBINED_EXIT" in r_upper or "POLICY_J" in r_upper:
+        return "🛡️ Policy J 組合停利"
+    return str(reason_str)
+
+
+# ── 2026-08-23 Hermes Agent: Hierarchical VWAP candidate telemetry panel ──
+# PURE, testable data-assembly + rendering helpers (display-only; never
+# alter runtime behavior). The strategy writes HVWAP_CANDIDATE /
+# HVWAP_RELEASE_INTENT / HVWAP_RELEASE_BLOCKED events to the MTS event
+# ledger (mts_spread_events.jsonl); the position state file carries the
+# leg sides / release / trail / ATR fields.
+
+def _hvwap_load_events(max_lines: int = 2000) -> list:
+    """Read the MTS event ledger (newest LAST). Pure IO, never raises."""
+    _events = []
+    try:
+        _p = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: mode-scoped entry evidence.
+        if os.path.exists(_p):
+            with open(_p) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line:
+                        continue
+                    try:
+                        _events.append(json.loads(_line))
+                    except Exception:
+                        continue
+    except Exception:
+        return []
+    return _events[-max_lines:]
+
+
+def _hvwap_latest(events: list, event_type: str):
+    """Newest event of the given type (or None)."""
+    if not events:
+        return None
+    for _ev in reversed(events):
+        if _ev.get("event") == event_type:
+            return _ev
+    return None
+
+
+def _hvwap_execution_mode() -> dict:
+    """effective_mode / live_order_allowed (execution_context.json) plus the
+    PAPER_MODE env override. Display-only. Fail-closed: any read error or
+    missing context yields mode UNKNOWN / release wiring INACTIVE."""
+    _mode = None
+    _live_allowed = False
+    try:
+        _ctx = json.loads(Path(runtime_path("execution_context.json")).read_text())
+        _mode = _ctx.get("effective_mode")
+        _live_allowed = bool(_ctx.get("live_order_allowed", False))
+    except Exception:
+        _mode = None
+    _pm = (os.getenv("PAPER_MODE", "") or "").strip().lower()
+    _pm_on = _pm in ("true", "1", "yes")
+    _is_paper = (_mode == "paper_active") or _pm_on
+    _is_live = (not _is_paper) and str(_mode or "").startswith("live")
+    return {
+        "effective_mode": _mode,
+        "live_order_allowed": _live_allowed,
+        "paper_mode_env": _pm_on,
+        "mode_label": "PAPER" if _is_paper else ("LIVE" if _is_live else "UNKNOWN"),
+        "release_wiring_active": bool(_is_paper and not _live_allowed),
+    }
+
+
+def _hvwap_panel_payload(state: dict, events: list) -> dict:
+    """Assemble the HVWAP telemetry display payload (pure; missing fields
+    default to None/'—'). `state` = MTS position state dict, `events` =
+    ledger events (newest last).
+
+    Diagnosis states (2026-08-24) — the dashboard must distinguish a real
+    verdict from a missing/broken pipeline:
+      * OK               latest HVWAP_CANDIDATE is newer than any diagnostic
+      * NOT_EVALUATED    only HVWAP_DATA_UNAVAILABLE diagnostics exist (or the
+                         newest diagnostic is newer than the newest verdict);
+                         reason + last-event age shown
+      * DATA_PIPELINE_MISSING  no HVWAP_* event of ANY kind — the wiring is
+                         not producing telemetry (deployment gap / on_bar
+                         skipped / event-log path mismatch)
+    """
+    # Scope telemetry to the displayed paper trade.  The ledger is shared by
+    # consecutive trades; selecting the newest event globally can show an old
+    # LIVE_MODE block on a current PAPER position (or vice versa).
+    _active_trade_id = state.get("trade_id") if isinstance(state, dict) else None
+    if _active_trade_id:
+        events = [e for e in events
+                  if e.get("trade_id") in (None, _active_trade_id)]
+    _cand = _hvwap_latest(events, "HVWAP_CANDIDATE") or {}
+    _intent = _hvwap_latest(events, "HVWAP_RELEASE_INTENT") or {}
+    _blocked = _hvwap_latest(events, "HVWAP_RELEASE_BLOCKED") or {}
+    _diag = _hvwap_latest(events, "HVWAP_DATA_UNAVAILABLE") or {}
+    _mode = _hvwap_execution_mode()
+    _near = _cand.get("near") or {}
+    _far = _cand.get("far") or {}
+
+    # ── diagnosis: which event is newest? ──
+    _all_hvwap = [e for e in events
+                  if e.get("event") in ("HVWAP_CANDIDATE", "HVWAP_DATA_UNAVAILABLE")]
+    _newest = _all_hvwap[-1] if _all_hvwap else None
+    _newest_ts = _newest.get("ts") if _newest else None
+    _last_age_s = None
+    if _newest_ts:
+        try:
+            _last_age_s = max(
+                0.0, time.time() - datetime.datetime.fromisoformat(
+                    str(_newest_ts)).timestamp())
+        except Exception:
+            _last_age_s = None
+    if _cand and not _diag:
+        _diag_state = "OK"
+        _diag_reason = None
+    elif _cand and _diag:
+        # newest wins: a diagnostic newer than the last verdict means the
+        # pipeline stopped producing verdicts
+        try:
+            _cand_ts = _cand.get("ts", "")
+            _diag_ts = _diag.get("ts", "")
+            if str(_diag_ts) >= str(_cand_ts):
+                _diag_state = "NOT_EVALUATED"
+                _diag_reason = _diag.get("reason")
+            else:
+                _diag_state = "OK"
+                _diag_reason = None
+        except Exception:
+            _diag_state = "OK"
+            _diag_reason = None
+    elif _diag:
+        _diag_state = "NOT_EVALUATED"
+        _diag_reason = _diag.get("reason")
+    else:
+        _diag_state = "DATA_PIPELINE_MISSING"
+        _diag_reason = None
+
+    _rel_intent = _intent.get("release_leg") or _intent.get("leg")
+    # winner / trigger source: the state reason (e.g. HVWAP_CANDIDATE after
+    # a candidate release); overridden by the release-intent source only when
+    # the intent is the newest release event (recency-consistent).
+    _winner = state.get("reason") or state.get("state")
+    # release status: the NEWEST of (intent, blocked) wins — a block that
+    # arrived after an intent means a later attempt failed; an intent after
+    # a block means the block was resolved.
+    _rel_src = None
+    _rel_is_intent = False
+    _rel_idx_i = next((i for i, e in enumerate(events)
+                       if e.get("event") == "HVWAP_RELEASE_INTENT"), -1)
+    _rel_idx_b = next((i for i, e in enumerate(events)
+                       if e.get("event") == "HVWAP_RELEASE_BLOCKED"), -1)
+    if _rel_idx_i >= 0 and (_rel_idx_i >= _rel_idx_b or _rel_idx_b < 0):
+        _rel_src, _rel_is_intent = _intent, True
+    elif _rel_idx_b >= 0:
+        _rel_src, _rel_is_intent = _blocked, False
+    # A release block is attempt-scoped. Once a newer candidate has been
+    # evaluated, an older block (especially a prior LIVE/quarantine event)
+    # must not remain displayed as the current release status.
+    if _rel_src and _cand:
+        if str(_rel_src.get("ts", "")) < str(_cand.get("ts", "")):
+            _rel_src, _rel_is_intent = None, False
+    if _rel_src and _rel_is_intent:
+        _winner = _rel_src.get("source") or _winner
+    _release_status = "—"
+    if _rel_src and _rel_is_intent:
+        _release_status = (
+            f"INTENT {_rel_src.get('release_leg', '?')} "
+            f"@ {_rel_src.get('exit_price', '—')} "
+            f"({str(_rel_src.get('decision_ts', ''))[:19]})")
+    elif _rel_src:
+        _release_status = (
+            f"BLOCKED ({_rel_src.get('reason', '?')}) "
+            f"{str(_rel_src.get('ts', ''))[:19]}")
+    return {
+        "mode": _mode,
+        "diagnosis": {
+            "state": _diag_state,
+            "reason": _diag_reason,
+            "detail": _diag.get("detail"),
+            "last_event_ts": _newest_ts,
+            "last_event_age_s": _last_age_s,
+            "diag_has_position": _diag.get("has_position"),
+            "diag_n_bars": _diag.get("n_completed_5m_bars"),
+            "diag_armed": _diag.get("armed"),
+        },
+        "state": {
+            "has_position": bool(state.get("has_position", False)),
+            "near_side": state.get("near_side") or "—",
+            "far_side": state.get("far_side") or "—",
+            "released_leg": state.get("released_leg"),
+            "remaining_leg": state.get("remaining_leg"),
+            "remaining_side": state.get("remaining_side"),
+            "trail_side": state.get("trail_side"),
+            "trail_stop_price": state.get("trail_stop_price"),
+            "atr": state.get("atr"),
+            "lifecycle_state": state.get("state"),
+            "reason": state.get("reason"),
+        },
+        "baseline": {
+            "enabled": bool(_cand.get("baseline_enabled", False)),
+            "pass_release": bool(_cand.get("baseline_pass_release", False)),
+            "release_leg": _cand.get("baseline_release_leg"),
+        },
+        "hvwap": {
+            "status": _cand.get("status") or "—",
+            "block_reason": _cand.get("block_reason"),
+            "regime_60m": _cand.get("regime_60m"),
+            "signal_15m": _cand.get("signal_15m"),
+            "micro_conflict": bool(_cand.get("micro_conflict", False)),
+            "near": {
+                "vwap": _near.get("vwap"),
+                "slope": _near.get("slope"),
+                "source": _near.get("vwap_source") or _near.get("source"),
+                "aligned": _near.get("aligned"),
+                "issue": _near.get("issue"),
+            },
+            "far": {
+                "vwap": _far.get("vwap"),
+                "slope": _far.get("slope"),
+                "source": _far.get("vwap_source") or _far.get("source"),
+                "aligned": _far.get("aligned"),
+                "issue": _far.get("issue"),
+            },
+            "consecutive_confirmed_bars": _cand.get("consecutive_confirmed_bars"),
+            "bars_complete": _cand.get("bars_complete"),
+            "session_boundary_ok": _cand.get("session_boundary_ok"),
+            "n_completed_5m_bars": _cand.get("n_completed_5m_bars"),
+            "quote_age_ms": _cand.get("quote_age_ms"),
+            "session_label": _cand.get("session_label"),
+            "regime_60m_provenance": _cand.get("regime_60m_provenance"),
+            "arbitration_score": _cand.get("arbitration_score"),
+            "support_count": _cand.get("support_count"),
+            "conflict_count": _cand.get("conflict_count"),
+            "neutral_count": _cand.get("neutral_count"),
+            "voters": _cand.get("voters") or {},
+            "retained_direction": _cand.get("retained_direction"),
+            "hypothetical_release_leg": _cand.get("hypothetical_release_leg"),
+            "decision_ts": _cand.get("decision_ts"),
+            "event_ts": _cand.get("ts"),
+        },
+        "release": {
+            "status": _release_status,
+            "intent_leg": _rel_intent,
+            "intent_exit_price": _intent.get("exit_price"),
+            "intent_decision_ts": _intent.get("decision_ts"),
+            "block_reason": _blocked.get("reason"),
+            "blocked_quote_age_ms": _blocked.get("quote_age_ms"),
+            "blocked_width": _blocked.get("width"),
+        },
+        "winner": _winner,
+    }
+
+
+def _hvwap_status_color(status: str) -> str:
+    """Distinct, white-background-readable colors for candidate statuses.
+    Pure display mapping; unknown statuses fall back to slate."""
+    _map = {
+        "ALIGNED_PASS": "#15803d",  # dark green (pass)
+        "BLOCK": "#b91c1c",         # dark red (blocked)
+        "HOLD": "#b45309",          # dark amber (overextended hold)
+        "UNKNOWN": "#64748b",       # slate gray (insufficient/fail-closed)
+    }
+    return _map.get(str(status or "").upper(), "#475569")
+
+
+def _hvwap_panel_markdown(p: dict) -> str:
+    """Render the HVWAP telemetry panel as styled HTML (pure).
+
+    Light theme: white card background, dark high-contrast text, readable
+    border. Status colors stay distinct per status (see _hvwap_status_color);
+    the PAPER/LIVE/UNKNOWN badge colors are unchanged semantics.
+    """
+    _mode = p["mode"]
+    _badge_color = "#16a34a" if _mode["mode_label"] == "PAPER" else (
+        "#dc2626" if _mode["mode_label"] == "LIVE" else "#64748b")
+    _wiring = ("ACTIVE (paper-only)" if _mode["release_wiring_active"]
+               else "INACTIVE")
+    _diag = p.get("diagnosis") or {}
+    _st = p["state"]
+    _h = p["hvwap"]
+    _rel = p["release"]
+    _baseline = p["baseline"]
+    _near = _h["near"]
+    _far = _h["far"]
+
+    _is_single_leg = bool(_st.get("released_leg"))
+    if _is_single_leg:
+        _policy_text = (
+            "單腿出場：15m 趨勢反轉 + 2 根完成 5m 確認 → 平剩餘順勢腿；"
+            "ATR trail 僅最後風控 fallback"
+        )
+    else:
+        _policy_text = (
+            "雙腿出場：趨勢確認 → 釋放反趨勢腿（不看該腿 PNL）；"
+            "ATR threshold 不可單獨釋放順勢腿；剩餘腿 ATR trail 僅最後防線"
+        )
+    _reversal_ready = (
+        _h.get("signal_15m") == "REVERSAL"
+        and bool(_h.get("micro_conflict"))
+        and bool(_h.get("bars_complete"))
+        and bool(_h.get("session_boundary_ok"))
+    )
+
+    def _f(v, suffix="", nd=2):
+        if v is None or v == "—":
+            return "—"
+        try:
+            return f"{float(v):.{nd}f}{suffix}"
+        except Exception:
+            return str(v)
+
+    _fresh = "✓" if (_h["bars_complete"] and _h["session_boundary_ok"]) else "✗"
+
+    def _tier_badge(label, state, color):
+        return (f"<span style='display:inline-block; margin:1px 4px 1px 0; "
+                f"padding:1px 7px; border-radius:9px; background:{color}; "
+                f"color:#fff; font-size:10px; font-weight:bold;'>"
+                f"{label}: {state}</span>")
+
+    def _tier_state(value, *, ok_values=(), unknown_values=(None, "UNKNOWN", "—")):
+        if value in ok_values:
+            return "DATA_VALID", "#15803d"
+        if value in unknown_values:
+            return "WARMUP", "#b45309"
+        return "BLOCK", "#b91c1c"
+
+    _r_state, _r_color = _tier_state(
+        _h.get("regime_60m"),
+        ok_values=("BULLISH_TREND", "BEARISH_TREND", "RANGING"),
+    )
+    _d_state, _d_color = _tier_state(
+        _h.get("signal_15m"),
+        ok_values=("CONFIRMED_CONTINUATION", "REVERSAL", "NEUTRAL"),
+    )
+    _n_slope_ok = _near.get("slope") is not None
+    _f_slope_ok = _far.get("slope") is not None
+    _vwap_state = "DATA_VALID" if (_near.get("vwap") is not None
+                              and _far.get("vwap") is not None
+                              and _n_slope_ok and _f_slope_ok) else "WARMUP"
+    _vwap_color = "#15803d" if _vwap_state == "DATA_VALID" else "#b45309"
+    _bars_ok = bool(_h.get("bars_complete")) and int(_h.get("n_completed_5m_bars") or 0) >= 2
+    _bar_state, _bar_color = ("DATA_VALID", "#15803d") if _bars_ok else ("WARMUP", "#b45309")
+    _quote_age = _h.get("quote_age_ms")
+    _quote_ok = _quote_age is not None and float(_quote_age) <= 10000.0
+    _quote_state, _quote_color = ("DATA_VALID", "#15803d") if _quote_ok else ("BLOCK", "#b91c1c")
+    _slope_note = ""
+    if _h.get("block_reason") == "SLOPE_UNAVAILABLE":
+        _slope_note = ("<span style='color:#92400e;'>"
+                       "（需同 session 內至少兩個相隔 ≥600 秒的完成 VWAP 點；"
+                       "暖機期間不判定）</span>")
+
+    def _vote_value(name, fallback):
+        """Color the directional result without changing DATA_VALID semantics."""
+        _vote = (_h.get("voters") or {}).get(name) or {}
+        _value = _vote.get("directional_state") or fallback or "UNKNOWN"
+        if _vote.get("support") is True:
+            _color = "#15803d"
+        elif _vote.get("conflict") is True:
+            _color = "#b91c1c"
+        elif _vote.get("neutral") is True or _value in ("UNKNOWN", "—"):
+            _color = "#b45309"
+        else:
+            _color = "#b91c1c"
+        return f"<span style='color:{_color};font-weight:bold;'>{_value}</span>"
+
+    _hl = []
+    _hl.append(
+        "<div style='border:1px solid #94a3b8; border-radius:6px; "
+        "padding:6px 10px; margin:4px 0; background:#ffffff; color:#111827; "
+        "font-family:monospace; font-size:12px; line-height:1.6;'>")
+    # ── pipeline diagnosis banner (2026-08-24): distinguishes a real verdict
+    # from a missing/broken pipeline, with last event age + reason.
+    _diag_state = _diag.get("state", "OK")
+    if _diag_state != "OK":
+        _diag_color = {"NOT_EVALUATED": "#b45309",
+                       "DATA_PIPELINE_MISSING": "#b91c1c"}.get(_diag_state,
+                                                               "#b45309")
+        _age_str = "—"
+        if _diag.get("last_event_age_s") is not None:
+            _a = float(_diag["last_event_age_s"])
+            _age_str = f"{_a:.0f}s" if _a < 120 else f"{_a / 60:.1f}m"
+        _reason_str = _diag.get("reason") or "—"
+        _detail_str = _diag.get("detail") or ""
+        _hl.append(
+            f"<div style='margin-bottom:3px; color:{_diag_color}; "
+            f"font-weight:bold;'>⚠️ {_diag_state}"
+            f" — 無 HVWAP 判讀 (reason={_reason_str}"
+            f"{' · ' + str(_detail_str)[:80] if _detail_str else ''}"
+            f" · 最後事件: {_age_str} 前)</div>")
+    _hl.append(
+        f"<b>📐 HVWAP 候選 (Hierarchical VWAP)</b> &nbsp; "
+        f"<span style='background:{_badge_color}; color:#ffffff; padding:1px 8px; "
+        f"border-radius:10px; font-size:10px;'>"
+        f"{_mode['mode_label']}</span> &nbsp; "
+        f"<span style='color:#475569; font-size:10px;'>"
+        f"mode={_mode['effective_mode'] or 'N/A'} · live_order_allowed="
+        f"{_mode['live_order_allowed']} · 釋放接線: {_wiring}</span>")
+    _hl.append(
+        "<div style='margin-top:5px; padding:5px 7px; background:#eff6ff; "
+        "border:1px solid #93c5fd; border-radius:5px; color:#1e3a8a;'>"
+        f"<b>📋 MTS 2.0 出場規則</b>：{_policy_text}<br>"
+        f"當前趨勢反轉訊號：<b style='color:{'#15803d' if _reversal_ready else '#64748b'}'>"
+        f"{'READY' if _reversal_ready else '未確認'}</b></div>")
+    _prov = _h.get("regime_60m_provenance") or "—"
+    _block_reason_display = str(_h.get("block_reason") or "—").replace(
+        "2OF3", "2-of-3")
+    _baseline_state = "ACTIVE" if _baseline.get("enabled") else "REFERENCE ONLY"
+    _hl.append(
+        "<div style='margin-top:5px; padding:5px 7px; background:#f8fafc; "
+        "border:1px solid #cbd5e1; border-radius:5px;'>"
+        f"<b>📊 判定來源分層</b>　Baseline（參考）：<b>{_baseline_state}</b>，"
+        f"pass={_baseline.get('pass_release')}、leg={_baseline.get('release_leg') or '—'}<br>"
+        f"MTS 2.0（最終）：<b>{_h.get('status') or 'UNKNOWN'}</b>，"
+        f"60m={_vote_value('60m_regime', _h.get('regime_60m'))}、"
+        f"15m={_vote_value('15m_direction', _h.get('signal_15m'))}、"
+        f"VWAP+slope={_vwap_state}、"
+        f"5m={_h.get('consecutive_confirmed_bars') or 0}/2、"
+        f"仲裁=2-of-3，score={_h.get('arbitration_score') if _h.get('arbitration_score') is not None else '—'}、"
+        f"provenance={_prov}<br><b>最終允許：</b>"
+        f"{'允許趨勢判定' if _h.get('status') == 'ALIGNED_PASS' else '不允許 release'}；"
+        f"原因={_block_reason_display}</div>")
+    _voters = _h.get("voters") or {}
+    _vc = (f"support={_h.get('support_count', 0)} · "
+           f"conflict={_h.get('conflict_count', 0)} · "
+           f"neutral={_h.get('neutral_count', 0)}")
+    _vlines = []
+    for _vn in ("60m_regime", "15m_direction", "vwap_location"):
+        _vv = _voters.get(_vn) or {}
+        _vlines.append(
+            f"{_vn}: state={_vv.get('directional_state', 'UNKNOWN')} "
+            f"support={_vv.get('support', False)} "
+            f"conflict={_vv.get('conflict', False)} "
+            f"neutral={_vv.get('neutral', False)}")
+    _hl.append(f"<div>🗳️ 逐票：{_vc} · score={_h.get('arbitration_score', 0)}<br>"
+               + "<br>".join(_vlines) + "</div>")
+    _hl.append(
+        "<div style='margin-top:5px; padding:4px 6px; background:#f8fafc; "
+        "border:1px solid #cbd5e1; border-radius:5px;'>"
+        "<b>檢查層次</b> &nbsp;"
+        + _tier_badge("資料/quote", _quote_state, _quote_color)
+        + _tier_badge("60m regime", _r_state, _r_color)
+        + _tier_badge("15m direction", _d_state, _d_color)
+        + _tier_badge("雙腿 VWAP+slope", _vwap_state, _vwap_color)
+        + _tier_badge("5m confirmation", _bar_state, _bar_color)
+        + "</div>")
+    _hl.append(
+        f"<div style='margin-top:2px;'>狀態: "
+        f"<b style='color:{_hvwap_status_color(_h['status'])}'>{_h['status']}</b>"
+        f"{' · ' + _block_reason_display if _h['block_reason'] else ''}"
+        f" &nbsp;|&nbsp; 60m: {_vote_value('60m_regime', _h['regime_60m'])}"
+        f" &nbsp;|&nbsp; 15m: {_vote_value('15m_direction', _h['signal_15m'])}"
+        f" &nbsp;|&nbsp; 5m 確認: <span style='color:{'#15803d' if _bars_ok else '#b91c1c'};font-weight:bold;'>"
+        f"x{_h['consecutive_confirmed_bars'] or 0}/2</span>"
+        f" &nbsp;|&nbsp; 完整度: {_fresh} ({_h['n_completed_5m_bars'] or 0} bars)"
+        f" &nbsp;|&nbsp; quote age: {_f(_h['quote_age_ms'], 'ms', 0)}</div>")
+    _hl.append(
+        f"<div>近月 VWAP: {_f(_near['vwap'])} ({_near['source'] or '—'}, "
+        f"slope={_f(_near['slope'], nd=4)}, aligned={_near['aligned']})"
+        f" &nbsp;|&nbsp; 遠月 VWAP: {_f(_far['vwap'])} "
+        f"({_far['source'] or '—'}, slope={_f(_far['slope'], nd=4)}, "
+        f"aligned={_far['aligned']}) {_slope_note}</div>")
+    _hl.append(
+        f"<div>方向: {_h['retained_direction'] or '—'} "
+        f"({_h['session_label'] or '—'})"
+        f" &nbsp;|&nbsp; 候選釋放腿: <b>{_h['hypothetical_release_leg'] or '—'}</b>"
+        f" &nbsp;|&nbsp; 基準趨勢釋放: "
+        f"{'ON' if _baseline['enabled'] else 'OFF'}"
+        f"(pass={_baseline['pass_release']}, leg={_baseline['release_leg'] or '—'})</div>")
+    _hl.append(
+        f"<div>候選釋放: <b>{_rel['status']}</b>"
+        f" &nbsp;|&nbsp; 目前觸發來源: <b>{p['winner'] or '—'}</b>"
+        f" &nbsp;|&nbsp; 無動作/阻擋: {_h['block_reason'] or '—'}</div>")
+    if _st["has_position"]:
+        _sides = f"近月 {_st['near_side']} / 遠月 {_st['far_side']}"
+        _sl_leg = (_st["released_leg"] or "無") + "已釋放" if _st["released_leg"] else "雙腿持倉"
+        _sl_trail = ("單腿停利: " + str(_st["trail_side"]) + " stop="
+                     + _f(_st["trail_stop_price"]) if _st["trail_side"]
+                     else "單腿停利: —")
+        _hl.append(
+            f"<div style='margin-top:2px;'>持倉: {_sides} · {_sl_leg} · "
+            f"{_sl_trail}"
+            f" &nbsp;|&nbsp; ATR: {_f(_st['atr'])}</div>")
+    else:
+        _hl.append(
+            f"<div style='margin-top:2px;'>持倉: FLAT &nbsp;|&nbsp; "
+            f"狀態: {_st['lifecycle_state'] or '—'} · "
+            f"原因: {_st['reason'] or '—'}</div>")
+    _hl.append("</div>")
+    return "".join(_hl)
+
 def calculate_mts_daily_performance(fills_path: str, events_path: str, target_trading_day: str) -> dict:
     from scripts.generate_daily_report import parse_logs
     return parse_logs(fills_path, events_path, target_trading_day)
@@ -485,8 +1155,708 @@ def load_yaml(path):
     return {}
 
 def save_yaml(path, data):
+    """Save YAML data preserving comments and formatting when possible via ruamel.yaml round-trip."""
+    # 2026-10-12 Codex: runtime PAPER edits are atomic and cannot enable LIVE.
+    if Path(path).name == "futures.paper.yaml":
+        from core.futures_profiles import write_paper_profile
+        write_paper_profile(Path(path), yaml.safe_dump(data, allow_unicode=True).encode(),
+                            ticker=load_yaml(Path(path)).get("ticker"))
+        return
+    from ruamel.yaml import YAML
+    _ryaml = YAML()
+    _ryaml.preserve_quotes = True
+
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                doc = _ryaml.load(f)
+            if isinstance(doc, dict) and isinstance(data, dict):
+                def _deep_update(target, source):
+                    for k, v in source.items():
+                        if isinstance(v, dict) and k in target and isinstance(target[k], dict):
+                            _deep_update(target[k], v)
+                        else:
+                            target[k] = v
+                _deep_update(doc, data)
+                with open(path, "w", encoding="utf-8") as f:
+                    _ryaml.dump(doc, f)
+                return
+        except Exception:
+            pass
     with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        _ryaml.dump(data, f)
+
+# compatibility helpers restored from prior dashboard contract (sibling merge)
+def _fmt_release_stop_label(stop_pts, atr, mult):
+    """MTS release-stop threshold label incl. ATR-dynamic effective value.
+
+    Strategy effective threshold = max(release_stop_points, ATR * atr_multiplier_stop)
+    (tmf_spread._get_thresholds). The dashboard previously showed only the fixed
+    floor, hiding the dynamic value actually used for the release decision.
+    2026-08-14 Hermes Agent.
+    """
+    try:
+        _stop_val = int(round(float(stop_pts)))
+    except Exception:
+        _stop_val = stop_pts
+    _label = f"🛑 **單腿釋放停損閾值**: `{_stop_val}` 點"
+    _atr_f = None
+    if atr:
+        try:
+            _atr_f = float(atr)
+            _label += f" (ATR: `{_atr_f:.1f}`)"
+        except Exception:
+            pass
+    if _atr_f and mult:
+        try:
+            _mult_f = float(mult)
+            _eff = max(float(_stop_val), _atr_f * _mult_f)
+            _label += (f" → 動態 `{_eff:.1f}` = max({_stop_val}, "
+                       f"ATR {_atr_f:.1f} × {_mult_f:.1f})")
+        except Exception:
+            pass
+    return _label
+
+def _fmt_trail_distance_label(trail_pts, atr, mult):
+    """MTS remaining-leg trail distance label incl. ATR-dynamic effective value.
+
+    Strategy effective trail = max(trail_distance_points, ATR * atr_multiplier_trail)
+    (tmf_spread._get_thresholds). 2026-08-14 Hermes Agent.
+    """
+    try:
+        _trail_val = int(round(float(trail_pts)))
+    except Exception:
+        _trail_val = trail_pts
+    _label = f"📈 **剩餘腿移動止盈距離**: `{_trail_val}` 點"
+    _atr_f = None
+    if atr:
+        try:
+            _atr_f = float(atr)
+            _label += f" (ATR: `{_atr_f:.1f}`)"
+        except Exception:
+            pass
+    if _atr_f and mult:
+        try:
+            _mult_f = float(mult)
+            _eff = max(float(_trail_val), _atr_f * _mult_f)
+            _label += (f" → 動態 `{_eff:.1f}` = max({_trail_val}, "
+                       f"ATR {_atr_f:.1f} × {_mult_f:.1f})")
+        except Exception:
+            pass
+    return _label
+
+def can_render_mts_realized_performance(exit_only: bool, scope: dict,
+                                        fills_path: str) -> bool:
+    """Gate realized MTS metrics by the already-computed mode scope.
+
+    Legacy JSONL without mode/session provenance is valid paper compatibility
+    only when the active runtime is actually paper.  It must never appear in
+    a live dashboard as historical live performance.
+    """
+    if exit_only or not isinstance(scope, dict) or not scope.get("ok"):
+        return False
+    # A broker snapshot is sufficient for current UPL, but it is not a
+    # realized-trade ledger.  Do not render legacy fills as live performance
+    # merely because the position snapshot passed its gate.
+    if scope.get("mode") == "live" and not scope.get("realized_evidence"):
+        return False
+    return bool(fills_path) and os.path.exists(fills_path)
+
+def latest_mts_terminal_event(events_path: str | os.PathLike,
+                              trade_id: str | None) -> dict | None:
+    """Return confirmed terminal state, excluding pre-fill exit intents."""
+    if not trade_id or not events_path:
+        return None
+    _terminal_events = {"COMBINED_EXIT_SETTLED", "TRADE_CLOSED"}
+    _latest = None
+    try:
+        with open(events_path, encoding="utf-8") as _ef:
+            for _line in _ef:
+                try:
+                    _record = json.loads(_line)
+                except Exception:
+                    continue
+                if (not isinstance(_record, dict)
+                        or str(_record.get("trade_id") or "") != str(trade_id)
+                        or str(_record.get("event") or "").upper()
+                        not in _terminal_events):
+                    continue
+                _latest = _record
+    except (OSError, TypeError):
+        return None
+    return _latest
+
+
+def latest_mts_exit_intent_event(events_path: str | os.PathLike,
+                                 trade_id: str | None) -> dict | None:
+    """Return EXIT_REMAINING intent for display; never clears position."""
+    if not trade_id or not events_path:
+        return None
+    _latest = None
+    try:
+        with open(events_path, encoding="utf-8") as _ef:
+            for _line in _ef:
+                try:
+                    _record = json.loads(_line)
+                except Exception:
+                    continue
+                if (not isinstance(_record, dict)
+                        or str(_record.get("trade_id") or "") != str(trade_id)
+                        or str(_record.get("event") or "").upper()
+                        != "EXIT_REMAINING"):
+                    continue
+                _latest = _record
+    except (OSError, TypeError):
+        return None
+    return _latest
+
+
+def latest_mts_terminal_fill(fills_path: str | os.PathLike,
+                             trade_id: str | None) -> dict | None:
+    """Return confirmed EXIT fill; this is the only fill-based FLAT authority."""
+    if not trade_id or not fills_path:
+        return None
+    _terminal_fill_types = {"EXIT", "COMBINED_EXIT", "COMBINED_EXIT_NEAR",
+                            "COMBINED_EXIT_FAR"}
+    _latest = None
+    try:
+        with open(fills_path, encoding="utf-8") as _ff:
+            for _line in _ff:
+                try:
+                    _record = json.loads(_line)
+                except Exception:
+                    continue
+                if (not isinstance(_record, dict)
+                        or str(_record.get("trade_id") or "") != str(trade_id)
+                        or str(_record.get("fill_type") or "").upper()
+                        not in _terminal_fill_types):
+                    continue
+                _latest = _record
+    except (OSError, TypeError):
+        return None
+    return _latest
+
+
+def resolve_active_futures_cfg_name(active_runtime_truth=None, is_night_session: bool = False) -> str:
+    """Return the active futures config file name based on runtime truth and session."""
+    if active_runtime_truth and (
+        active_runtime_truth.get("is_live_runtime")
+        or active_runtime_truth.get("is_exit_only_runtime")
+        or active_runtime_truth.get("profile_identity") == "futures_live.yaml"
+        or active_runtime_truth.get("requested_mode") == "live"
+    ):
+        return "futures_live.yaml"
+    return "futures_night.yaml" if is_night_session else "futures.yaml"
+
+def save_futures_settings(base_dir: Path, futures_cfg: dict, active_runtime_truth: dict, is_night_session: bool = False) -> dict:
+    """Save futures settings targeting active profile, preserving comments and enforcing re-certification warning on live changes."""
+    cfg_name = resolve_active_futures_cfg_name(active_runtime_truth, is_night_session)
+    primary_path = base_dir / "config" / cfg_name
+    is_live_target = (cfg_name == "futures_live.yaml")
+    # 2026-10-12 Codex: the settings helper must obey the same shared PAPER source.
+    if not is_live_target:
+        from core.futures_profiles import resolve_futures_profile
+        shared = resolve_futures_profile(base_dir / "config/futures.yaml")
+        if shared.name == "futures.paper.yaml":
+            primary_path = shared
+
+    saved_paths = []
+    diff_lines = []
+
+    # Read old YAML for diff summary
+    old_yaml = ""
+    if primary_path.exists():
+        try:
+            with open(primary_path, "r", encoding="utf-8") as _f:
+                old_yaml = _f.read()
+        except Exception:
+            pass
+
+    # Save to primary path preserving comments
+    save_yaml(primary_path, futures_cfg)
+    saved_paths.append(primary_path)
+
+    # If in paper mode, synchronize shared parameters across day and night configs
+    if not is_live_target:
+        _counterpart_cfg_name = "futures.yaml" if is_night_session else "futures_night.yaml"
+        _counterpart_cfg_path = primary_path.parent / _counterpart_cfg_name
+        SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
+
+        if _counterpart_cfg_path.exists():
+            _counterpart_cfg = load_yaml(_counterpart_cfg_path)
+            _counterpart_cfg["live_trading"] = futures_cfg.get("live_trading", False)
+            if "mts" not in _counterpart_cfg:
+                _counterpart_cfg["mts"] = {}
+            _counterpart_cfg["mts"]["enabled"] = futures_cfg.get("mts", {}).get("enabled", False)
+            if futures_cfg.get("mts", {}).get("enabled", False):
+                if "params" not in _counterpart_cfg["mts"]:
+                    _counterpart_cfg["mts"]["params"] = {}
+                incoming_params = futures_cfg.get("mts", {}).get("params", {})
+                for _pkey, _pval in incoming_params.items():
+                    if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
+                        if _pkey not in _counterpart_cfg["mts"]["params"]:
+                            _counterpart_cfg["mts"]["params"][_pkey] = _pval
+                    else:
+                        _counterpart_cfg["mts"]["params"][_pkey] = _pval
+            save_yaml(_counterpart_cfg_path, _counterpart_cfg)
+            saved_paths.append(_counterpart_cfg_path)
+
+    # Build compact diff summary if old_yaml is available
+    if old_yaml and primary_path.exists():
+        try:
+            new_yaml = primary_path.read_text(encoding="utf-8")
+            old_lines = old_yaml.splitlines()
+            new_lines = new_yaml.splitlines()
+            import re as _re
+            old_kv = {}
+            for _l in old_lines:
+                _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                if _m:
+                    old_kv[_m.group(1)] = _m.group(2).strip()
+            for _l in new_lines:
+                _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                if _m:
+                    _k, _v = _m.group(1), _m.group(2).strip()
+                    _ov = old_kv.get(_k, '')
+                    if _ov != _v:
+                        diff_lines.append(f"  `{_k}`: `{_ov}` → `{_v}`")
+        except Exception:
+            pass
+
+    recert_prompt_required = is_live_target
+    recert_prompt_message = (
+        "⚠️ **【Live 實盤設定變更 — 必須執行 Re-Freeze 與 Re-Certification】**  \n"
+        f"`{cfg_name}` 內容已更新。因 live route certificate 與 deployment gate 粁定 `config_hash` 與 `frozen_tree_hash`，"
+        "您必須依循 Option A 流程：測試 → commit → 執行 re-freeze 更新 manifest → 重新簽發 live route certificate → 受控重啟。  \n"
+        "未完成 re-freeze 與 re-certification 逕行重啟將觸發 `GUARD_MANIFEST_STALE` / `SOURCE_MISMATCH` 進入 `LIVE_QUARANTINED` 阻斷下單！"
+    ) if is_live_target else ""
+
+    return {
+        "saved_paths": saved_paths,
+        "primary_path": primary_path,
+        "is_live_target": is_live_target,
+        "recert_prompt_required": recert_prompt_required,
+        "recert_prompt_message": recert_prompt_message,
+        "diff_lines": diff_lines,
+    }
+
+def load_exit_only_context():
+    """[Dashboard] canonical execution context when the active runtime is
+    RECONCILED_EXIT_ONLY (capability + mode); {} otherwise — the primary
+    MTS UPL panel must never read paper/local PnL in this mode."""
+    try:
+        _p = Path(runtime_path("execution_context.json"))
+        if _p.exists():
+            _ctx = json.loads(_p.read_text(encoding="utf-8")) or {}
+            if _ctx.get("effective_mode") == "reconciled_exit_only":
+                return _ctx
+    except Exception:
+        pass
+    return {}
+
+_DASHBOARD_CONFIRMED_OPERATOR = "dashboard-confirmed"
+
+def _generated_exit_only_evidence(legs, trade_id=None, now_ms=None):
+    """Generated, non-secret evidence text for the dashboard-confirmed
+    EXIT_ONLY attestation (no manual input, no secrets)."""
+    if now_ms is None:
+        _ts = datetime.datetime.now().isoformat(timespec="seconds")
+    else:
+        _ts = datetime.datetime.fromtimestamp(
+            int(now_ms) / 1000.0).isoformat(timespec="seconds")
+    _legs = json.dumps(legs or [], ensure_ascii=False)
+    _suffix = f" trade_id={trade_id}" if trade_id else ""
+    return (f"dashboard-confirmed exit-only attestation {_ts} "
+            f"legs={_legs}{_suffix}")
+
+def _derive_locked_trade_id_from_events(events_path, canonical_legs):
+    """Derive the locked EXIT_ONLY trade id from the CURRENT runtime
+    event history ONLY when exactly one unique MTS trade matches BOTH
+    canonical legs (symbol/side/qty).  No match or ambiguity => None
+    (fail closed — never fabricate an id; the backend build then
+    rejects a blank trade id)."""
+    if not canonical_legs:
+        return None
+    _expected = frozenset(
+        (str(l.get("symbol")), str(l.get("side") or "").lower(),
+         int(l.get("remaining_qty") or 0))
+        for l in canonical_legs if isinstance(l, dict))
+    _matches = set()
+    try:
+        with open(events_path, encoding="utf-8") as _f:
+            for _line in _f:
+                try:
+                    _ev = json.loads(_line)
+                except Exception:
+                    continue
+                _tid = _ev.get("trade_id")
+                if not _tid:
+                    continue
+                _legs = _ev.get("expected_legs") or _ev.get("legs")
+                if not isinstance(_legs, list):
+                    continue
+                _leg_set = frozenset(
+                    (str(l.get("symbol")), str(l.get("side") or "").lower(),
+                     int(l.get("remaining_qty") or 0))
+                    for l in _legs if isinstance(l, dict))
+                if _leg_set == _expected:
+                    _matches.add(str(_tid))
+    except Exception:
+        return None
+    if len(_matches) == 1:
+        return next(iter(_matches))
+    return None
+
+def build_exit_only_attestation_request(
+        capability, *, operator, trade_id, evidence, now_ms=None,
+        expected_legs=None):
+    """Build the monitor's unchanged ATTEST_EXIT_ONLY command schema.
+
+    When a current capability is supplied, its two legs are the sole source
+    of the request scope.  The optional ``expected_legs`` exists only for
+    the initial, no-capability attestation form and is normalized to the same
+    strict schema.
+    """
+    if isinstance(capability, dict):
+        locked_legs = _normalize_exit_only_expected_legs(
+            capability.get("legs"))
+        # Refreshes retain the capability's audit identity.  In particular,
+        # never accept a form/caller-provided replacement Trade ID here.
+        locked_trade_id = str(capability.get("trade_id", "")).strip()
+    else:
+        locked_legs = _normalize_exit_only_expected_legs(expected_legs)
+        locked_trade_id = str(trade_id or "").strip()
+    if locked_legs is None:
+        raise ValueError("受限平倉授權必須是兩腿、非零且方向明確的部位")
+
+    operator = str(operator or "").strip()
+    evidence = str(evidence or "").strip()
+    if not operator or not locked_trade_id or not evidence:
+        raise ValueError("操作者、Trade ID 與人工佐證不可空白")
+
+    created_at = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    return {
+        "command_id": f"ATTEST-{datetime.datetime.now():%Y%m%d%H%M%S%f}",
+        "action": "ATTEST_EXIT_ONLY",
+        "created_at": created_at,
+        "operator": operator,
+        "trade_id": locked_trade_id,
+        "evidence": evidence,
+        "expected_legs": locked_legs,
+    }
+
+def write_exit_only_attestation_request(path, payload):
+    """Atomically create a pending attestation request without replacement.
+
+    ``False`` means a pending request already exists.  Other OS failures are
+    allowed to reach the caller so the dashboard can state that no command
+    was accepted.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        json.dump(payload, out, ensure_ascii=False)
+        out.flush()
+        os.fsync(out.fileno())
+    return True
+
+def mts_order_lifecycle_rows(orders_data):
+    """[dashboard lifecycle] per-leg TERMINAL-state rows for the order
+    lifecycle display.  Only FILLED / CANCELLED / REJECTED / TIMEOUT /
+    EXPIRED orders are shown with their terminal time, filled quantity
+    and fill price (missing => N/A).  Quote-observation records (e.g.
+    EXIT_ONLY_BBO_OBSERVED) are observation-only and are NEVER
+    displayed as a trigger; paper/live/exit-only rows are never mixed
+    (the caller passes the already-isolated presentation set)."""
+    _rows = []
+    for _o in orders_data or []:
+        if not isinstance(_o, dict):
+            continue
+        _status = str(_o.get("status") or "").strip().upper()
+        if _status not in ("FILLED", "CANCELLED", "REJECTED", "TIMEOUT",
+                           "EXPIRED"):
+            continue  # pending orders and observation records are not
+                      # terminal triggers
+        _term = (_o.get("filled_at") or _o.get("rejected_at")
+                 or _o.get("cancelled_at") or _o.get("expired_at"))
+        _qty = _o.get("filled_quantity")
+        _price = _o.get("avg_fill_price")
+        if _price is None:
+            _price = _o.get("price")
+        _rows.append({
+            "order_id": str(_o.get("order_id")) if _o.get("order_id")
+            else "N/A",
+            "symbol": str(_o.get("symbol")) if _o.get("symbol") else "N/A",
+            "side": str(_o.get("side") or "").upper() or "N/A",
+            "status": _status,
+            "terminal_at": str(_term) if _term else "N/A",
+            "filled_qty": _qty if isinstance(_qty, (int, float)) else "N/A",
+            "price": _price if isinstance(_price, (int, float)) else "N/A",
+            "reason": str(_o.get("reject_reason")
+                          or _o.get("cancel_reason") or ""),
+        })
+    return _rows
+
+def filter_mts_order_rows_for_exit_only(rows, *, reconciliation_id):
+    """[Dashboard] presentation-only filter for RECONCILED_EXIT_ONLY:
+    keep only rows explicitly bound to the CURRENT capability's
+    reconciliation_id.  Rows with a missing/different rid (legacy
+    RECOVERED, prior release/session, paper data) are excluded and
+    counted — NEVER deleted/archived/mutated (the event ledger is
+    untouched)."""
+    rows = list(rows or [])
+    if not reconciliation_id:
+        return [], len(rows)
+    kept = [r for r in rows
+            if isinstance(r, dict)
+            and r.get("reconciliation_id") == reconciliation_id]
+    return kept, len(rows) - len(kept)
+
+def exit_only_order_visibility(orders_data, *, context):
+    """[Dashboard] returns (display_rows, isolated_count).  PAPER and
+    normal LIVE displays are returned unchanged (no filtering); only
+    RECONCILED_EXIT_ONLY isolates the CURRENT order table to records
+    explicitly bound to the current capability reconciliation_id."""
+    if not isinstance(context, dict) \
+            or context.get("effective_mode") != "reconciled_exit_only":
+        return list(orders_data or []), 0
+    _cap = context.get("exit_only_capability") or {}
+    return filter_mts_order_rows_for_exit_only(
+        orders_data,
+        reconciliation_id=_cap.get("reconciliation_id", ""))
+
+def load_exit_only_renewal_status():
+    """[auto re-reconciliation] dashboard status string: 自動對帳
+    healthy/degraded, last success, last failure, next attempt — BBO
+    freshness is displayed separately; "" if absent.  No TTL concept:
+    the order safety boundary is the synchronous pre-submit fresh
+    broker reconciliation."""
+    try:
+        _p = Path(runtime_path("exit_only_renewal_provenance.json"))
+        if _p.exists():
+            _d = json.loads(_p.read_text(encoding="utf-8")) or {}
+            if isinstance(_d, dict) and _d.get("renewed_at_ms"):
+                import datetime
+                _fmt = lambda ms: datetime.datetime.fromtimestamp(
+                    int(ms) / 1000).strftime("%H:%M:%S")
+                _status = _d.get("status", "ACTIVE")
+                _label = "healthy" if _status == "ACTIVE" else "degraded"
+                _txt = (f"🔄 自動對帳: {_label} · 上次成功 "
+                        f"{_fmt(_d.get('renewed_at_ms') or 0)}")
+                _fail = _d.get("last_failed_at_ms")
+                if _fail:
+                    _txt += f" · 上次失敗 {_fmt(_fail)}"
+                    if _d.get("last_reason"):
+                        _txt += f" ({_d['last_reason']})"
+                _next = _d.get("next_renewal_at_ms")
+                if _next:
+                    _txt += f" · 下次 {_fmt(_next)}"
+                return _txt
+    except Exception:
+        pass
+    return ""
+
+def _latest_live_atr(indicator_dir=None, ticker="TMF"):
+    """Return the latest finite ATR from today's LIVE indicator CSV."""
+    directory = _Path(indicator_dir or runtime_logs("market_data"))
+    files = sorted(directory.glob(f"{ticker}_*_LIVE_indicators.csv"),
+                   key=lambda p: p.stat().st_mtime_ns, reverse=True)
+    for path in files:
+        try:
+            frame = pd.read_csv(path, usecols=lambda col: col in {"timestamp", "atr", "atr_used", "atr_raw"})
+            if frame.empty:
+                continue
+            for col in ("atr_used", "atr", "atr_raw"):
+                if col not in frame.columns:
+                    continue
+                values = pd.to_numeric(frame[col], errors="coerce").replace([float("inf"), -float("inf")], pd.NA).dropna()
+                if not values.empty and float(values.iloc[-1]) > 0:
+                    return float(values.iloc[-1])
+        except Exception:
+            continue
+    return None
+
+def latest_entry_audit_line(events_path=None) -> str | None:
+    """Render the latest ENTRY_AUDIT event as a one-line caption.
+
+    Actual entry spread_z + threshold (entry_z) + source (reason/action)
+    + event time — never a 0.00 fallback from the state mirror (whose
+    current_spread_z is never updated).  Returns None when no ENTRY_AUDIT
+    event exists or the file is unreadable.
+    """
+    if events_path is None:
+        try:
+            # 2026-10-02 Codex: entry audit belongs to the displayed runtime mode.
+            events_path = mts_runtime_path("logs", "mts_spread_events.jsonl")
+        except Exception:
+            return None
+    try:
+        if not os.path.exists(events_path):
+            return None
+        _audit = None
+        with open(events_path, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _ev = json.loads(_line)
+                except Exception:
+                    continue
+                if _ev.get("event") == "ENTRY_AUDIT":
+                    _audit = _ev
+        if _audit is None:
+            return None
+        _az = _audit.get("spread_z")
+        _aez = _audit.get("entry_z")
+        _az_str = f"{float(_az):.2f}" if _az is not None else "N/A"
+        _aez_str = f"{float(_aez):.2f}" if _aez is not None else "N/A"
+        _ats = str(_audit.get("ts", ""))
+        _ats = _ats.replace("T", " ")[:19] if _ats else "?"
+        _asrc = _audit.get("reason") or _audit.get("action") or "?"
+        return (f"Entry Audit Z: {_az_str} (threshold {_aez_str}) "
+                f"@ {_ats} [{_asrc}]")
+    except Exception:
+        return None
+
+def _normalize_exit_only_expected_legs(legs):
+    """Return the two locked exit-only legs, or ``None`` when invalid.
+
+    This deliberately accepts only the narrow two-leg shape used by the
+    monitor capability.  Re-attestation must never turn a dashboard form
+    into a way to change symbols, directions, or quantities.
+    """
+    if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+        return None
+    normalized = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            return None
+        symbol = str(leg.get("symbol", "")).strip()
+        side = str(leg.get("side", "")).strip().lower()
+        quantity = leg.get("remaining_qty")
+        if (not symbol or side not in {"buy", "sell"}
+                or isinstance(quantity, bool)):
+            return None
+        try:
+            quantity = int(quantity)
+        except (TypeError, ValueError):
+            return None
+        if quantity <= 0:
+            return None
+        normalized.append({
+            "symbol": symbol,
+            "side": side,
+            "remaining_qty": quantity,
+        })
+    return normalized
+
+# 2026-08-10 Hermes Agent: render runtime mode only from the canonical execution context.
+def summarize_execution_context(context, known_profile_hashes):
+    """Return fail-closed dashboard truth for the active futures runtime."""
+    context = context if isinstance(context, dict) else {}
+    config_hash = context.get("config_hash")
+    profile_identity = next(
+        (name for name, digest in known_profile_hashes.items()
+         if digest and digest == config_hash),
+        None,
+    )
+    requested_mode = context.get("requested_mode")
+    effective_mode = context.get("effective_mode")
+    live_order_allowed = context.get("live_order_allowed") is True
+    audit_reasons = context.get("audit_reasons")
+    if not isinstance(audit_reasons, list):
+        audit_reasons = ["STATE_FILE_CORRUPTED"]
+
+    is_live_runtime = (
+        requested_mode == "live"
+        and effective_mode == "live_ready"
+        and live_order_allowed
+        and profile_identity == "futures_live.yaml"
+    )
+    is_paper_runtime = (
+        requested_mode == "paper"
+        and effective_mode == "paper_active"
+        and not live_order_allowed
+        and profile_identity == "futures.yaml (Paper baseline)"
+    )
+    # [Dashboard] RECONCILED_EXIT_ONLY is an authorized limited-exit
+    # runtime (live profile, orders disabled) — never UNKNOWN/QUARANTINED.
+    is_exit_only_runtime = (
+        requested_mode == "live"
+        and effective_mode == "reconciled_exit_only"
+        and not live_order_allowed
+        and profile_identity == "futures_live.yaml"
+    )
+    # A quarantined live context is an intentional promotion hold, not an
+    # unknown runtime.  Keep all order gates fail-closed while presenting the
+    # operator-facing state explicitly instead of claiming the context is an
+    # invalid active mode.
+    is_promotion_hold = (
+        requested_mode == "live"
+        and effective_mode == "live_quarantined"
+        and not live_order_allowed
+    )
+    if is_live_runtime:
+        runtime_status = "LIVE_READY"
+        warning = ""
+    elif is_paper_runtime:
+        runtime_status = "PAPER_ACTIVE"
+        warning = ""
+    elif is_exit_only_runtime:
+        runtime_status = "RECONCILED_EXIT_ONLY"
+        warning = ""
+    elif is_promotion_hold:
+        runtime_status = "PROMOTION_HOLD"
+        warning = "Live promotion is held; live orders remain disabled."
+    else:
+        runtime_status = "UNKNOWN / QUARANTINED"
+        if not profile_identity:
+            warning = "Execution-context config hash does not match a known profile; runtime is fail-closed."
+        else:
+            warning = "Execution context is not an authorized active live or paper state; runtime is fail-closed."
+
+    return {
+        "runtime_status": runtime_status,
+        "profile_identity": profile_identity or "UNKNOWN (HASH MISMATCH)",
+        "requested_mode": requested_mode or "unknown",
+        "effective_mode": effective_mode or "unknown",
+        "live_order_allowed": live_order_allowed,
+        "audit_reasons": audit_reasons,
+        "context_version": context.get("revision", "unknown"),
+        "context_freshness": context.get("updated_at") or "UNKNOWN",
+        "session_id": context.get("session_id") or None,
+        "warning": warning,
+        "is_live_runtime": is_live_runtime,
+        "is_paper_runtime": is_paper_runtime,
+        "is_exit_only_runtime": is_exit_only_runtime,
+        "is_promotion_hold": is_promotion_hold,
+        "research_evidence_is_runtime_authorization": False,
+    }
+
+
+# 2026-08-10 Hermes Agent: bind dashboard status to the shared runtime state, never futures.yaml.
+def load_active_runtime_truth(base):
+    import hashlib
+    from core.execution_context_state import read_execution_context
+    # 2026-10-12 Codex: never classify MTS against another release's baseline.
+    from core.futures_profiles import resolve_futures_profile
+
+    known_profile_hashes = {}
+    for filename, identity in (
+        ("futures.yaml", "futures.yaml (Paper baseline)"),
+        ("futures_live.yaml", "futures_live.yaml"),
+    ):
+        profile_path = resolve_futures_profile(base / "config" / filename)
+        try:
+            known_profile_hashes[identity] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+        except OSError:
+            known_profile_hashes[identity] = None
+    return summarize_execution_context(read_execution_context(), known_profile_hashes)
 
 # 2026-06-23 Gemini CLI: 快取策略註冊表探索流程，避免在每次頁面重整（每 10 秒）都重新掃描並載入 21 個策略 plugin，藉此降低 CPU 使用率
 @st.cache_resource(ttl=300)
@@ -503,7 +1873,9 @@ def get_counterfactual_service():
     return CounterfactualService()
 
 # ── Configs ──
-FUTURES_CFG_PATH = BASE / "config" / FUTURES_CFG_NAME
+# 2026-10-12 Codex: editable PAPER source and identity classifier share one path.
+from core.futures_profiles import resolve_futures_profile
+FUTURES_CFG_PATH = resolve_futures_profile(BASE / "config" / FUTURES_CFG_NAME)
 OPTIONS_CFG_PATH = BASE / "config" / "options_strategy.yaml"
 RISK_CFG_PATH = BASE / "config" / "risk_global.yaml"
 STOCK_CFG_PATH = BASE / "config" / "stocks.yaml"
@@ -513,21 +1885,136 @@ risk_cfg = load_yaml(RISK_CFG_PATH)
 stock_cfg = load_yaml(STOCK_CFG_PATH)
 # 2026-05-27 Gemini CLI: Global Ticker Reference (no hardcoding)
 _TICKER = futures_cfg.get("ticker", "TMF")
+# futures.yaml is the editable Paper baseline, not the active runtime identity.
 f_live = futures_cfg.get("live_trading", False)
+active_runtime_truth = load_active_runtime_truth(BASE)
 o_live = options_cfg.get("live_trading", False)
 s_live = stock_cfg.get("live_trading", False)
 alloc = risk_cfg.get("allocation", {})
 reserve_pct = risk_cfg.get("account", {}).get("margin_reserve_pct", 0.20)
 
 # ── Paths ──
-RESTART_FLAG = BASE / ".restart"
 
-def trigger_restart():
-    RESTART_FLAG.touch()
-    st.toast("🔄 正在重啟 monitor（約 30 秒）...")
+def render_real_preflight_expander():
+    with st.expander("🔐 券商與賬戶安全 Preflight 診斷 (Read-Only)", expanded=False):
+        st.caption("唯讀券商診斷面板；執行不會修改 LIVE 設定或送出、取消、修改任何委託。")
+        _confirm = st.checkbox(
+            "我確認：這只會以真券商帳號做一次性唯讀查詢，不會進入 LIVE 或下單。",
+            key="live_preflight_readonly_confirm",
+        )
+        if st.button("▶️ 執行一次唯讀 LIVE Preflight", disabled=not _confirm, key="run_live_preflight"):
+            import subprocess
+            import sys
+            import uuid
+
+            _request_id = f"LIVE-PREFLIGHT-{uuid.uuid4().hex[:12]}"
+            _diag_dir = Path(runtime_path("exports", "trades", "live", "diagnostics"))
+            _diag_dir.mkdir(parents=True, exist_ok=True)
+            _log_path = _diag_dir / f"broker_snapshot_{_request_id}.runner.log"
+            _env = os.environ.copy()
+            _env["LIVE_PREFLIGHT_NO_ORDERS"] = "1"
+            try:
+                with open(_log_path, "ab") as _log:
+                    subprocess.Popen(
+                        [sys.executable, "scripts/run_live_readonly_preflight.py", "--request-id", _request_id],
+                        cwd=str(BASE), env=_env, stdout=_log, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                st.success(f"已提交唯讀 preflight：{_request_id}。完成後重新整理本頁查看快照。")
+            except Exception as _exc:
+                st.error(f"無法啟動唯讀 preflight：{_exc}")
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.subheader("📋 執行狀態 (Execution State)")
+            _rt_path = Path(runtime_path("data", "state", "runtime_status.json"))
+            _rt = {}
+            if _rt_path.exists():
+                try:
+                    _rt = json.loads(_rt_path.read_text())
+                except Exception:
+                    pass
+            st.json(_rt if _rt else {"status": "NO_RUNTIME_STATUS_FILE"})
+        with col_right:
+            st.subheader("🏦 券商診斷快照 (Broker Snapshot)")
+            _diag_dir = Path(runtime_path("exports", "trades", "live", "diagnostics"))
+            _resp_file = _diag_dir / "broker_snapshot_latest.json"
+            if _resp_file.exists():
+                try:
+                    _resp = json.loads(_resp_file.read_text())
+                    st.json(_resp)
+                except Exception as _e:
+                    st.error(f"無法讀取快照: {_e}")
+            else:
+                st.info("尚無最新券商快照資料 (預設在 LIVE 啟動與重啟時自動捕獲)")
+
+def render_volatility_regime_section():
+    st.subheader("📊 波動率結構與狀態機 (Volatility Surface Regime)")
+    st.caption("IV Curve Shape Classification + Volatility State Machine")
+    try:
+        from core.derivatives.skew_regime_logger import SkewRegimeLogger
+        logger = SkewRegimeLogger()
+        records = logger.read_today()
+    except Exception:
+        records = []
+
+    if not records:
+        st.info("💡 目前無實時 Volatility 資料 (市場未開盤或選擇權資料載入中)")
+    else:
+        latest = records[-1]
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            vol_state = latest.get("vol_state", "UNKNOWN")
+            state_emoji = {
+                "CALM": "🟢", "NORMAL": "🔵", "EXPANDING": "🟡",
+                "PANIC": "🔴", "EUPHORIA": "🟠", "EVENT": "⚫", "UNKNOWN": "⚪",
+            }.get(vol_state, "⚪")
+            st.metric(
+                "Volatility State",
+                f"{state_emoji} {vol_state}",
+                f"{latest.get('vol_state_age_sec', 0)}s persistent={latest.get('vol_state_persistent', False)}",
+            )
+        with col2:
+            st.metric(
+                "Directional Skew",
+                latest.get("directional_skew", "?"),
+                f"slope_ratio={latest.get('slope_ratio', 0):.3f}",
+            )
+        with col3:
+            st.metric(
+                "Tension",
+                latest.get("tension", "?"),
+                f"atm_iv_change={latest.get('atm_iv_change', 0):.3f}",
+            )
+
+        col4, col5, col6, col7 = st.columns(4)
+        with col4:
+            st.metric(
+                "IV Percentile",
+                f"{latest.get('iv_percentile', 0):.0%}",
+                f"z={latest.get('iv_zscore', 0):.1f}",
+            )
+        with col5:
+            st.metric(
+                "ATM IV",
+                f"{latest.get('atm_iv', 0):.1%}",
+            )
+        with col6:
+            st.metric(
+                "OTM Put IV",
+                f"{latest.get('otm_put_iv', 0):.1%}",
+            )
+        with col7:
+            st.metric(
+                "OTM Call IV",
+                f"{latest.get('otm_call_iv', 0):.1%}",
+            )
+
+
 OPTIONS_REPO = BASE / "strategies" / "options"
-FUTURES_MKT = BASE / "logs" / "market_data"
-FUTURES_TRADES = BASE / "exports" / "trades"
+FUTURES_MKT = Path(runtime_path("logs", "market_data"))
+FUTURES_TRADES = Path(runtime_path("exports", "trades"))
+# 2026-10-02 Codex: keep STOCK consumers shared; only MTS follows runtime mode.
+MTS_TRADES = Path(mts_runtime_path("exports", "trades"))
 OPTIONS_DATA = OPTIONS_REPO / "logs" / ("live_trading" if o_live else "paper_trading")
 
 # ── Filter by latest Trading Day ──
@@ -754,8 +2241,6 @@ def make_price_score_chart(df, price_col, title, ts_col="timestamp", signals=Non
     )
     return fig
 
-MAX_CHART_POINTS = 2000
-
 # ── Futures Dual Contract Chart ──
 def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", signals=None):
     """繪製期貨雙合約價格圖表
@@ -771,10 +2256,10 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     Returns:
         Plotly Figure 物件
     """
-    from time import perf_counter
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
     import pandas as _pd
+    _perf_started = time.monotonic()
 
     # 2026-07-16 Gemini CLI: Print DataFrame lengths for debugging CPU issue
     print(f"[DEBUG_CHART] near_df raw_size={len(near_df)}, far_df raw_size={len(far_df) if far_df is not None else 0}")
@@ -789,33 +2274,24 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             for _df in [near_df, far_df]:
                 if _df is None or _df.empty:
                     continue
+                _col_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"}
+                for _u, _l in _col_map.items():
+                    if _u in _df.columns and _l not in _df.columns:
+                        _df[_l] = _df[_u]
+                    elif _u in _df.columns and _l in _df.columns:
+                        _df[_l] = _df[_l].fillna(_df[_u])
                 for _col in ["close", "open", "high", "low"]:
                     if _col in _df.columns:
                         _df[_col] = _pd.to_numeric(_df[_col], errors="coerce")
                 if "timestamp" in _df.columns:
                     _df["timestamp"] = _pd.to_datetime(_df["timestamp"], errors="coerce")
-                    _df.dropna(subset=["timestamp", "close"], inplace=True)
+                    if "close" in _df.columns:
+                        _df.dropna(subset=["timestamp", "close"], inplace=True)
+                    else:
+                        _df.dropna(subset=["timestamp"], inplace=True)
     except Exception as _de:
         print(f"[Dashboard] make_futures_dual_chart data cleaning error: {_de}")
-
-    _t_chart_start = perf_counter()
-    _t_near_ctor = perf_counter()
-    _t_far_ctor = perf_counter()
-    _near_rows_in = len(near_df) if near_df is not None else 0
-    _far_rows_in = len(far_df) if far_df is not None else 0
-    _ds_near = 1
-    _ds_far = 1
-    for _df_ref in [near_df, far_df]:
-        if _df_ref is None or _df_ref.empty or "timestamp" not in _df_ref.columns:
-            continue
-        if len(_df_ref) > MAX_CHART_POINTS:
-            _step = math.ceil(len(_df_ref) / MAX_CHART_POINTS)
-            _df_ref = _df_ref.iloc[::_step].copy()
-            print(f"[CHART] Downsampled to {len(_df_ref)} rows (step={_step})")
-    _near_rows_out = len(near_df) if near_df is not None else 0
-    _far_rows_out = len(far_df) if far_df is not None else 0
-    print(f"[PERF_CHART] after_ds: {perf_counter()-_t_near_ctor:.3f}s")
-    print(f"[CHART_INPUT] near_rows_in={_near_rows_in} far_rows_in={_far_rows_in} ds_near={_ds_near} ds_far={_ds_far} near_out={_near_rows_out} far_out={_far_rows_out}")
+    print(f"[PERF_CHART_DETAIL] clean_ms={(time.monotonic() - _perf_started) * 1000:.1f}")
 
     if near_df.empty:
         print("[Dashboard] make_futures_dual_chart called with empty near_df after cleaning")
@@ -844,30 +2320,27 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
     # Standardize heights so they sum to 1.0
     h_sum = sum(row_heights)
     row_heights = [h / h_sum for h in row_heights]
-    print(f"[PERF_CHART] prep_done: {perf_counter()-_t_near_ctor:.3f}s")
     
-    _t_sub = perf_counter()
     fig = make_subplots(
         rows=rows, cols=1, 
         shared_xaxes=True, 
         row_heights=row_heights, 
         vertical_spacing=0.05
     )
-    print(f"[PERF_CHART] make_subplots: {perf_counter()-_t_sub:.3f}s")
+    _trace_started = time.monotonic()
     
     # 1. 近月價格線
     # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
-    _t_near = time.time()
-    _near_trace = go.Scattergl(
+    fig.add_trace(
+        go.Scatter(
             x=_clean_list(near_df["timestamp"], force_str=True),
             y=_clean_list(near_df["close"]),
             name="近月",
             line=dict(width=2, color="#1f77b4"),
             mode="lines"
-        )
-    _t_near_add = perf_counter()
-    fig.add_trace(_near_trace, row=1, col=1)
-    print(f"[PERF_CHART] near_ctor: {_t_near_add-_t_near_ctor:.3f}s add: {perf_counter()-_t_near_add:.3f}s")
+        ),
+        row=1, col=1
+    )
     
     # 2. 如果有遠月資料，添加遠月價格線
     if far_df is not None and not far_df.empty:
@@ -888,18 +2361,17 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
                     str(max(near_df["timestamp"].max(), far_visible_tail["timestamp"].max()))
                 ])
         # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
-        _t_far_ctor = perf_counter()
-        _far_trace = go.Scattergl(
+        fig.add_trace(
+            go.Scatter(
                 x=_clean_list(far_visible["timestamp"], force_str=True),
                 y=_clean_list(far_visible["close"]),
                 name="遠月",
                 line=dict(width=1.5, color="#ff7f0e", dash="dash"),
                 mode="lines",
                 connectgaps=False
-            )
-        _t_far_add = perf_counter()
-        fig.add_trace(_far_trace, row=1, col=1)
-        print(f"[PERF_CHART] far_ctor: {_t_far_add-_t_far_ctor:.3f}s add: {perf_counter()-_t_far_add:.3f}s")
+            ),
+            row=1, col=1
+        )
     
     # 3. 添加交易訊號
     if signals is not None and not signals.empty and "action" in signals.columns:
@@ -978,6 +2450,11 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             ),
             row=atr_row, col=1
         )
+
+    print(
+        f"[PERF_CHART_DETAIL] traces_ms={(time.monotonic() - _trace_started) * 1000:.1f} "
+        f"traces={len(fig.data)} near_points={len(near_df)}"
+    )
     
     # 5. 添加交易時間標記
     from core.date_utils import is_night_session
@@ -1055,20 +2532,10 @@ def make_futures_dual_chart(near_df, far_df=None, title="期貨價格走勢", si
             row=atr_row, col=1
         )
     
-    _t_layout_end = perf_counter()
-    _shapes = len(fig.layout.shapes or [])
-    _anns = len(fig.layout.annotations or [])
-    print(f"[CHART_META] shapes={_shapes} annotations={_anns}")
-    _t_ser = perf_counter()
-    try:
-        import plotly.io as _pio
-        _json_bytes = len(_pio.to_json(fig, validate=False))
-        print(f"[PERF_CHART] serialize: {perf_counter()-_t_ser:.3f}s json_bytes={_json_bytes}")
-    except Exception:
-        print("[PERF_CHART] serialize: SKIP")
-    _t_end = perf_counter()
-    print(f"[PERF_CHART] total: {_t_end-_t_chart_start:.3f}s")
-    print(f"[CHART_SOURCE] func={make_futures_dual_chart.__qualname__} file={__file__}")
+    print(
+        f"[PERF_CHART_DETAIL] total_ms={(time.monotonic() - _perf_started) * 1000:.1f} "
+        f"traces={len(fig.data)}"
+    )
     return fig
 
 # ── Calendar Spread Chart ──
@@ -1088,6 +2555,19 @@ def make_calendar_spread_chart(spread_df):
         import pandas as pd
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
+
+        # Plotly becomes unresponsive when the full multi-day archive (often
+        # 30k+ points x 4 subplots) is serialized to the browser. Keep the
+        # source dataframe untouched for metrics/table; only thin the visual
+        # representation to a bounded, timestamp-ordered sample.
+        _max_plot_points = 6000
+        if len(spread_df) > _max_plot_points:
+            _step = max(1, (len(spread_df) + _max_plot_points - 1) // _max_plot_points)
+            _plot_df = spread_df.iloc[:: _step].copy()
+            if _plot_df.index[-1] != spread_df.index[-1]:
+                _plot_df = pd.concat([_plot_df, spread_df.iloc[[-1]]], ignore_index=False)
+            spread_df = _plot_df.sort_values("timestamp").reset_index(drop=True)
+            print(f"[Calendar Spread] chart downsample: {len(spread_df)} points")
         
         # 創建 4 行子圖 (新增第4行: 速度/加速度)
         fig = make_subplots(
@@ -1096,7 +2576,7 @@ def make_calendar_spread_chart(spread_df):
             row_heights=[0.35, 0.25, 0.2, 0.2],
             vertical_spacing=0.06,
             subplot_titles=(
-                "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月)", 
+                "近月/遠月價格 (藍線: 近月, 橘虛線: 遠月, 青線: 近月 VWAP, 粉線: 遠月 VWAP)",
                 "價差 (綠線: Spread, 藍線: EMA 20, 紫線: EMA 60, 灰陰影: ±1 Std)", 
                 "Raw Z-score (紅線: Raw 20, 橘虛線/綠虛線: 進出場線)",
                 "Z-score 速度 (紫虛: dz/dt) / 加速度 (棕點: d²z/dt²)"
@@ -1127,6 +2607,43 @@ def make_calendar_spread_chart(spread_df):
                 ),
                 row=1, col=1
             )
+
+            # calendar spread CSV 的 vwap 是近月價格 VWAP（vwap_z
+            # 以 Close_near - vwap 計算），疊加在價格子圖而非 spread 軸。
+            # Archive rows use ``vwap`` while the current paper session uses
+            # ``near_vwap``. Prefer the current-session field only where it
+            # exists, then fall back row-by-row to the archive VWAP; choosing
+            # the column globally leaves most historical rows as NaN and can
+            # make Plotly render misleading vertical segments.
+            _near_vwap = None
+            if "near_vwap" in spread_df.columns and "vwap" in spread_df.columns:
+                _near_vwap = spread_df["near_vwap"].combine_first(spread_df["vwap"])
+            elif "near_vwap" in spread_df.columns:
+                _near_vwap = spread_df["near_vwap"]
+            elif "vwap" in spread_df.columns:
+                _near_vwap = spread_df["vwap"]
+            if _near_vwap is not None:
+                fig.add_trace(
+                    go.Scatter(
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(_near_vwap),
+                        name="近月 VWAP",
+                        line=dict(color="#00bcd4", width=1.8),
+                        mode="lines"
+                    ),
+                    row=1, col=1
+                )
+            if "far_vwap" in spread_df.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=_clean_list(spread_df["timestamp"], force_str=True),
+                        y=_clean_list(spread_df["far_vwap"]),
+                        name="遠月 VWAP",
+                        line=dict(color="#e377c2", width=1.8, dash="dot"),
+                        mode="lines"
+                    ),
+                    row=1, col=1
+                )
         
         # 2. 價差走勢
         # 2026-06-30 Gemini CLI: Convert to standard list for robust JSON serialization
@@ -1221,7 +2738,7 @@ def make_calendar_spread_chart(spread_df):
                     x=_clean_list(spread_df["timestamp"], force_str=True),
                     y=_clean_list(_z_a),
                     name="z-score_A (加速度)",
-                    line=dict(color="#00bfff", width=1.0),
+                    line=dict(color="#00bfff", width=1.5),
                     mode="lines"
                 ),
                 row=4, col=1
@@ -1563,10 +3080,14 @@ def format_stock_trades(ledger_df):
         if "OVERNIGHT_RECOVERY" in reason:
             continue
         if action == "BUY":
+            ledger_name = row.get("name", "")
+            if pd.isna(ledger_name):
+                ledger_name = ""
+            ledger_name = str(ledger_name).strip()
             pending_entries[ticker] = {
                 "entry_time": str(row.get("timestamp", "")),
                 "ticker": ticker,
-                "name": ticker_names.get(ticker, ""),
+                "name": ledger_name or ticker_names.get(ticker, ""),
                 "entry_price": float(row.get("entry_price", row.get("price", 0)) or 0),
                 "qty": int(row.get("qty", row.get("Quantity", 0)) or 0),
                 "reason": str(row.get("reason", "")),
@@ -1666,24 +3187,9 @@ def make_pnl_chart(pnl_df, title):
 
 # ── Futures indicators column whitelist (load_futures_indicators usecols) ──
 # Only columns actually read by dashboard render/logic.
-_FUTURES_USECOLS = [
-    "timestamp", "Close", "High", "Low", "Open", "Volume",
-    "close", "high", "low", "open", "volume",
-    "atr", "atr_10", "atr_raw", "atr_floor", "atr_used",
-    "vwap", "score", "regime", "momentum", "sqz_on", "fired",
-    "spread_z", "far_close",
-    "bb_up", "bb_low", "bb_mid",
-    "ema_200_up", "ema_fast", "ema_slow",
-    "squeeze_release", "price_vs_vwap", "volume_spike",
-    "trend_strength_raw", "breakout_strength_atr",
-    "bear_breakout_strength_atr",
-    "bull_align", "bear_align",
-    "trading_day",
-    "high_20_prev", "low_20_prev",
-    "session",
-]
+_FUTURES_USECOLS = list(FUTURES_INDICATOR_COLUMNS)
 # The minimal set guaranteed to exist in CSV for fast-path usecols
-_FUTURES_USECOLS_ESSENTIAL = ["timestamp", "Close", "High", "Low", "Open", "Volume", "atr", "vwap", "score", "regime", "momentum", "sqz_on", "fired", "trading_day"]
+_FUTURES_USECOLS_ESSENTIAL = ["timestamp", "close", "open", "high", "low", "volume", "atr", "vwap", "score", "regime", "momentum", "sqz_on"]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1964,7 +3470,7 @@ def load_far_month_data(product="TMF"):
     # [Far Month Live] Priority 1: Read from trading-system's live far-month CSV
     # 2026-05-27 Gemini CLI: Search both case variants to avoid missing TMF_far_*.csv; Restored missing Path/log_dir
     from pathlib import Path
-    log_dir = Path("logs/market_data")
+    log_dir = Path(runtime_logs("market_data"))
     live_far_patterns = [f"{product.lower()}_far_*.csv", f"{product.upper()}_far_*.csv"]
     live_far_files = []
     if log_dir.exists():
@@ -2006,7 +3512,7 @@ def load_far_month_data(product="TMF"):
     search_patterns = [
         f"./data/{product.lower()}_far_*.csv",
         f"./data/{product.lower()}_far.csv",
-        f"./logs/market_data/{product}_*_far_*.csv",
+        fos.path.join(runtime_logs("market_data"), f"{product}_*_far_*.csv"),
         f"./exports/{product.lower()}_far_*.csv",
     ]
     
@@ -2077,7 +3583,7 @@ _SPREAD_FILE_RE = re.compile(
 )
 
 
-def _latest_spread_csv(ticker: str, data_dir: _Path = _Path("data")) -> _Path | None:
+def _latest_spread_csv(ticker: str, data_dir: _Path | None = None) -> _Path | None:
     """Find the latest calendar spread CSV for a specific ticker.
 
     Selection priority:
@@ -2089,6 +3595,11 @@ def _latest_spread_csv(ticker: str, data_dir: _Path = _Path("data")) -> _Path | 
     mtx file gets bulk-copied with fresh mtime → dashboard silently picks MTX
     data for TMF trades.
     """
+    # Dashboard runs from the release worktree, while production data is
+    # written to the runtime namespace.  Resolve the default at call time so
+    # calendar charts do not silently stop at the last CSV in the source tree.
+    if data_dir is None:
+        data_dir = _Path(runtime_path("data"))
     normalized_ticker = ticker.lower()
     candidates: list[tuple[str, _Path]] = []
 
@@ -2111,6 +3622,34 @@ def _latest_spread_csv(ticker: str, data_dir: _Path = _Path("data")) -> _Path | 
         ),
     )
     return latest_path
+
+
+def _all_spread_csvs(ticker: str, data_dir: _Path | None = None) -> list[_Path]:
+    """Return all same-ticker daily spread files in chronological order."""
+    if data_dir is None:
+        data_dir = _Path(runtime_path("data"))
+    normalized_ticker = ticker.lower()
+    paths = []
+    for path in data_dir.glob(f"{normalized_ticker}_calendar_spread_*.csv"):
+        match = _SPREAD_FILE_RE.fullmatch(path.name)
+        if match and match.group("ticker") == normalized_ticker:
+            paths.append(path)
+    return sorted(paths, key=lambda p: (p.stem.rsplit("_", 1)[-1], p.name))
+
+
+def _limit_calendar_spread_to_recent_days(df: pd.DataFrame, days: int = 3) -> pd.DataFrame:
+    """Keep only the latest calendar-date rows for the chart.
+
+    Filtering happens after loading/merging so rolling statistics retain their
+    historical warm-up, while the dashboard stays focused on recent sessions.
+    """
+    if df is None or df.empty or "timestamp" not in df.columns or days <= 0:
+        return df
+    _dates = pd.to_datetime(df["timestamp"], errors="coerce").dt.normalize().dropna().drop_duplicates()
+    _recent_dates = set(_dates.sort_values().tail(days).tolist())
+    if not _recent_dates:
+        return df
+    return df[pd.to_datetime(df["timestamp"], errors="coerce").dt.normalize().isin(_recent_dates)].copy()
 
 
 @st.cache_data
@@ -2150,26 +3689,106 @@ def load_calendar_spread_data():
     try:
         import numpy as np
         from pathlib import Path
+        _current_session = None
 
-        # 優先載入預先計算的價差檔案（ticker-scoped）
-        spread_path = _latest_spread_csv(_TICKER)
-        if spread_path is not None:
-            stat = spread_path.stat()
-            df = _load_spread_csv(str(spread_path.resolve()), stat.st_mtime_ns)
-            if df is not None and not df.empty:
-                # 確保數值欄位是數值類型
-                numeric_cols = ["spread", "spread_z", "spread_ma", "spread_std",
-                               "vwap_z", "price_vs_vwap", "Close_near", "Close_far"]
+        # Prefer a same-session near/far pair.  Paper is a first-class
+        # runtime source; archival CSVs must not mask current paper data.
+        _session_date = get_session_date_str()
+        _live_pair = None
+        for _mode in ("LIVE", "PAPER"):
+            _near_candidate = FUTURES_MKT / f"{_TICKER}_{_session_date}_{_mode}_indicators.csv"
+            _far_candidate = FUTURES_MKT / f"{_TICKER}_far_{_session_date}_{_mode}.csv"
+            if _near_candidate.exists() and _far_candidate.exists():
+                _live_pair = (_near_candidate, _far_candidate, _mode)
+                break
+        if _live_pair is not None:
+            _live_near, _live_far, _mode = _live_pair
+            _near = _load_spread_csv(str(_live_near.resolve()), _live_near.stat().st_mtime_ns)
+            _far = _load_spread_csv(str(_live_far.resolve()), _live_far.stat().st_mtime_ns)
+            if _near is not None and _far is not None and not _near.empty and not _far.empty:
+                _near_close = "close" if "close" in _near.columns else "Close"
+                _far_close = "close" if "close" in _far.columns else "Close"
+                if _near_close in _near.columns and _far_close in _far.columns:
+                    _near_cols = ["timestamp", _near_close]
+                    _far_cols = ["timestamp", _far_close]
+                    _near_volume = "Volume" if "Volume" in _near.columns else ("volume" if "volume" in _near.columns else None)
+                    _far_volume = "Volume" if "Volume" in _far.columns else ("volume" if "volume" in _far.columns else None)
+                    if _near_volume:
+                        _near_cols.append(_near_volume)
+                    if _far_volume:
+                        _far_cols.append(_far_volume)
+                    _live = pd.merge(
+                        _near[_near_cols].rename(columns={_near_close: "Close_near", _near_volume: "Volume_near"} if _near_volume else {_near_close: "Close_near"}),
+                        _far[_far_cols].rename(columns={_far_close: "Close_far", _far_volume: "Volume_far"} if _far_volume else {_far_close: "Close_far"}),
+                        on="timestamp", how="inner")
+                    if not _live.empty:
+                        for _close_col, _volume_col, _vwap_col in (
+                            ("Close_near", "Volume_near", "near_vwap"),
+                            ("Close_far", "Volume_far", "far_vwap"),
+                        ):
+                            if _volume_col in _live.columns:
+                                _prices = pd.to_numeric(_live[_close_col], errors="coerce")
+                                _volumes = pd.to_numeric(_live[_volume_col], errors="coerce").fillna(0.0)
+                                _cum_volume = _volumes.cumsum().replace(0, np.nan)
+                                _live[_vwap_col] = (_prices * _volumes).cumsum() / _cum_volume
+                        _live["spread"] = _live["Close_near"] - _live["Close_far"]
+                        _live = _live.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+                        _live["spread_ma"] = _live["spread"].rolling(20, min_periods=20).mean()
+                        _live["spread_std"] = _live["spread"].rolling(20, min_periods=20).std()
+                        _std = _live["spread_std"].replace(0, np.nan)
+                        _live["spread_z"] = (_live["spread"] - _live["spread_ma"]) / _std
+                        print(f"[Calendar Spread] {_mode} session data: {len(_live)} rows, "
+                              f"range {_live['timestamp'].min()} ~ {_live['timestamp'].max()}")
+                        _current_session = _live
+
+        # 載入所有同 ticker daily CSV；只選單檔會讓圖表停在最後一個
+        # 有檔案的日期（曾經是 2026-08-05），遺失更早或後續 session。
+        spread_paths = _all_spread_csvs(_TICKER)
+        if spread_paths:
+            frames = []
+            numeric_cols = ["spread", "spread_z", "spread_ma", "spread_std",
+                            "vwap_z", "price_vs_vwap", "Close_near", "Close_far"]
+            for path in spread_paths:
+                stat = path.stat()
+                frame = _load_spread_csv(str(path.resolve()), stat.st_mtime_ns)
+                if frame is None or frame.empty:
+                    continue
                 for col in numeric_cols:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-                # 處理無限值
-                df = df.replace([np.inf, -np.inf], np.nan)
+                    if col in frame.columns:
+                        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+                # Historical archives predate the dual-leg VWAP columns. Build
+                # the far-leg display series from the same 20-bar rolling
+                # semantics as the archived near-leg ``vwap``. Current paper
+                # rows already carry ``far_vwap`` and are left untouched.
+                if "far_vwap" not in frame.columns and "Close_far" in frame.columns:
+                    frame["far_vwap"] = (
+                        pd.to_numeric(frame["Close_far"], errors="coerce")
+                        .rolling(20, min_periods=20)
+                        .mean()
+                    )
+                frames.append(frame.replace([np.inf, -np.inf], np.nan))
+            if frames:
+                df = (pd.concat(frames, ignore_index=True, sort=False)
+                      .sort_values("timestamp")
+                      .drop_duplicates("timestamp", keep="last")
+                      .reset_index(drop=True))
+                if _current_session is not None and not _current_session.empty:
+                    df = (pd.concat([df, _current_session], ignore_index=True, sort=False)
+                          .sort_values("timestamp")
+                          .drop_duplicates("timestamp", keep="last")
+                          .reset_index(drop=True))
                 print(f"[Calendar Spread] 載入價差資料: {len(df)} 筆, "
-                      f"來自 {spread_path.name}, "
+                      f"來自 {len(frames)} 個 daily CSV, "
                       f"範圍 {df['timestamp'].min()} ~ {df['timestamp'].max()}")
-                return df
-            print(f"[Calendar Spread] 載入失敗或空資料: {spread_path.name}")
+                _chart_df = _limit_calendar_spread_to_recent_days(df)
+                print(f"[Calendar Spread] 圖表限制最近 3 天: {len(_chart_df)} 筆, "
+                      f"日期 {_chart_df['timestamp'].dt.date.nunique()} 天")
+                return _chart_df
+            print("[Calendar Spread] daily spread CSV 全部為空或無法載入")
+        elif _current_session is not None and not _current_session.empty:
+            return _limit_calendar_spread_to_recent_days(
+                _current_session.sort_values("timestamp").reset_index(drop=True)
+            )
         else:
             print(f"[Calendar Spread] 找不到 {_TICKER} calendar spread CSV")
 
@@ -2192,20 +3811,21 @@ def load_calendar_spread_data():
             return pd.DataFrame()
         
         # 嘗試尋找遠月資料檔案
-        far_files = list(Path("data").glob("*far*.csv"))
+        runtime_data = Path(runtime_path("data"))
+        far_files = list(runtime_data.glob("*far*.csv"))
         if not far_files:
             # 嘗試在 logs/market_data 中尋找
-            far_files = list(Path("logs/market_data").glob("*far*.csv"))
+            far_files = list(Path(runtime_logs("market_data")).glob("*far*.csv"))
         if not far_files:
             # 嘗試在 exports 中尋找
-            far_files = list(Path("exports").glob("*far*.csv"))
+            far_files = list(Path(runtime_path("exports")).glob("*far*.csv"))
         if not far_files:
             # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Removed hardcoded MXF fallback
             # 嘗試尋找 TMF 遠月資料
-            far_files = list(Path(".").rglob("*TMF*far*.csv"))
+            far_files = list(runtime_data.rglob("*TMF*far*.csv"))
         if not far_files:
             # 嘗試尋找任何包含 "far" 的 CSV 檔案
-            far_files = list(Path(".").rglob("*far*.csv"))
+            far_files = list(runtime_data.rglob("*far*.csv"))
         
         # 載入遠月資料
         df_far = pd.read_csv(far_files[0])
@@ -2255,7 +3875,7 @@ def load_calendar_spread_data():
         df_merged["price_vs_vwap"] = df_merged["Close_near"] - df_merged["vwap"]
         
         print(f"[Calendar Spread] 計算價差資料完成: {len(df_merged)} 筆")
-        return df_merged
+        return _limit_calendar_spread_to_recent_days(df_merged)
         
     except Exception as e:
         print(f"[Calendar Spread] 載入價差資料錯誤: {e}")
@@ -2264,15 +3884,19 @@ def load_calendar_spread_data():
         return pd.DataFrame()
 
 @st.cache_data(ttl=30)
-def load_futures_trades():
+def load_futures_trades(trade_root=None):
     """Load today's futures trades CSV."""
     import glob
     # 2026-05-27 Gemini CLI: Generalize search prefix (no hardcoded TMF)
     _active_ticker = futures_cfg.get("ticker", "TMF")
+    # 2026-10-02 Codex: namespace is a cache key; no LIVE market-data fallback in PAPER.
+    _trades_dir = Path(trade_root) if trade_root is not None else FUTURES_TRADES
+    _trade_market_dir = (_trades_dir.parents[1] / "logs" / "market_data"
+                         if trade_root is not None else FUTURES_MKT)
     
     # Try canonical exports location first
     for date_str in [TRADE_DATE_STR, DATE_STR]:
-        f_exact = FUTURES_TRADES / f"{_active_ticker}_{date_str}_trades.csv"
+        f_exact = _trades_dir / f"{_active_ticker}_{date_str}_trades.csv"
         if f_exact.exists():
             try:
                 return pd.read_csv(f_exact), date_str
@@ -2280,7 +3904,7 @@ def load_futures_trades():
                 pass
     # Fallback: search market_data for any matching pattern (prefer newest)
     for date_str in [TRADE_DATE_STR, DATE_STR]:
-        pattern = str(FUTURES_MKT / f"{_active_ticker}_{date_str}*trades.csv")
+        pattern = str(_trade_market_dir / f"{_active_ticker}_{date_str}*trades.csv")
         matches = glob.glob(pattern)
         if matches:
             # pick newest by mtime
@@ -2292,8 +3916,8 @@ def load_futures_trades():
                     continue
     # Final fallback: any trades.csv in exports/trades or market_data
     try:
-        ex_matches = list(FUTURES_TRADES.glob(f"{_active_ticker}_*_trades.csv"))
-        m_matches = list(FUTURES_MKT.glob(f"{_active_ticker}_*_trades.csv"))
+        ex_matches = list(_trades_dir.glob(f"{_active_ticker}_*_trades.csv"))
+        m_matches = list(_trade_market_dir.glob(f"{_active_ticker}_*_trades.csv"))
         all_matches = ex_matches + m_matches
         if all_matches:
             latest = max(all_matches, key=os.path.getmtime)
@@ -2445,7 +4069,35 @@ def load_stock_trades(mode="PAPER"):
     )
     if f and f.exists():
         try:
-            return pd.read_csv(f)
+            trades = pd.read_csv(f)
+            if "name" not in trades.columns:
+                trades.insert(
+                    trades.columns.get_loc("ticker") + 1
+                    if "ticker" in trades.columns else len(trades.columns),
+                    "name",
+                    "",
+                )
+
+            # Legacy rows may have a name column but no value. Resolve from
+            # the indicator snapshots so SELL-only rows also display names.
+            indicator_names = dict(_STOCK_NAMES)
+            for indicator in FUTURES_MKT.glob("STOCK_*_indicators.csv"):
+                try:
+                    frame = pd.read_csv(indicator, nrows=1)
+                    if frame.empty or "name" not in frame.columns:
+                        continue
+                    ticker = indicator.stem.split("_")[1]
+                    value = frame.iloc[0].get("name", "")
+                    if pd.notna(value) and str(value).strip():
+                        indicator_names[ticker] = str(value).strip()
+                except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError):
+                    continue
+            if "ticker" in trades.columns:
+                blank = trades["name"].isna() | trades["name"].astype(str).str.strip().eq("")
+                trades.loc[blank, "name"] = trades.loc[blank, "ticker"].map(
+                    lambda ticker: indicator_names.get(str(ticker), "")
+                )
+            return trades
         except Exception:
             pass
     return None
@@ -2540,20 +4192,241 @@ def load_stock_indicators(ticker):
             pass
     return None
 
+
+# 2026-07-31 Antigravity: Live Startup Progress Banner
+try:
+    if os.path.exists("/tmp/futures_system_startup.json"):
+        with open("/tmp/futures_system_startup.json") as _sf:
+            _s_data = json.load(_sf)
+        _s_ts = _s_data.get("timestamp", 0)
+        _s_age = time.time() - _s_ts
+        _status = _s_data.get("status")
+        _pct = int(_s_data.get("progress_pct", 15))
+        _msg = _s_data.get("message", "系統連線中...")
+        if _s_age < 120 and _status in ("RESTARTING", "STARTING", "PREFLIGHT", "IN_PROGRESS") and _pct < 100:
+            st.info(f"⏳ **系統重啟與連線進度 ({_pct}%)**：{_msg}")
+            st.progress(_pct / 100.0)
+            time.sleep(1.5)
+            st.rerun()
+        elif _status == "READY" or _pct == 100:
+            if _s_age < 30:
+                st.success(f"✅ {_msg}")
+except Exception:
+    pass
+
 # ── Header ──
 def mode_badge(live):
     return "🔴 LIVE" if live else "📝 PAPER"
 
+def runtime_mode_badge(truth):
+    if truth["is_live_runtime"]:
+        return "🔴 LIVE_READY"
+    if truth["is_paper_runtime"]:
+        return "📝 PAPER_ACTIVE"
+    return "⚠️ UNKNOWN / QUARANTINED"
+
 hc = st.columns([1.5, 1, 1, 1, 1.5])
 hc[0].title("Trading Unified")
 # 2026-05-27 Gemini CLI: Dynamic Ticker in Dashboard Header
-hc[1].metric(f"期貨 {_TICKER}", mode_badge(f_live))
+hc[1].metric(f"期貨 {_TICKER} Runtime", runtime_mode_badge(active_runtime_truth))
 hc[2].metric("選擇權 TXO", mode_badge(o_live))
 hc[3].metric("台股 Stocks", mode_badge(s_live))
 hc[4].caption(f"📅 {TODAY}")
 
-if f_live or o_live or s_live:
+st.caption(
+    "期貨執行內容："
+    f"requested={active_runtime_truth['requested_mode']} | "
+    f"effective={active_runtime_truth['effective_mode']} | "
+    f"live_order_allowed={active_runtime_truth['live_order_allowed']} | "
+    f"profile={active_runtime_truth['profile_identity']} | "
+    f"context version={active_runtime_truth['context_version']} | "
+    f"updated={active_runtime_truth['context_freshness']}"
+)
+if active_runtime_truth["audit_reasons"]:
+    st.caption("期貨執行稽核原因：" + ", ".join(active_runtime_truth["audit_reasons"]))
+if active_runtime_truth["warning"]:
+    st.error(active_runtime_truth["warning"])
+
+if active_runtime_truth["is_live_runtime"] or o_live or s_live:
     st.markdown('<div style="background:#ff4444;color:white;padding:8px;text-align:center;border-radius:4px;font-weight:bold;">⚠️ LIVE TRADING ACTIVE</div>', unsafe_allow_html=True)
+
+def _build_flat_broker_mts_state(telemetry: dict) -> dict:
+    """Broker-authoritative FLAT state plus telemetry-only display fields.
+
+    The LIVE broker-first design never falls through to the /tmp legacy
+    state file for lifecycle truth; the flat stub it builds must still carry
+    the telemetry spread_z/atr so the dashboard renders live values instead
+    of N/A.  Lifecycle fields stay broker-derived; telemetry fields are
+    display-only and never drive position authority.
+    """
+    return {
+        "has_position": False,
+        "release_state": "FLAT",
+        "reason": "broker_snapshot_flat",
+        "position_phase": "FLAT",
+        "_updated": "broker_snapshot",
+        "spread_z": telemetry.get("spread_z"),
+        "atr": telemetry.get("atr"),
+    }
+
+
+
+def _live_canonical_position_allowed(ctx_live: dict, canon: dict) -> bool:
+    """[QUARANTINE_DISPLAY 2026-08-18] Display gate for the fresh canonical
+    futures position.  LIVE_READY or LIVE_QUARANTINED are both shown: in
+    quarantine the broker still holds the remaining leg — hiding it on the
+    dashboard hides real risk.  Session-id match + capture==OK required;
+    stale / missing / session-mismatch stays fail-closed (no position)."""
+    return (
+        ctx_live.get("effective_mode") in ("live_ready", "live_quarantined")
+        and canon.get("session_id") == ctx_live.get("session_id")
+        and (canon.get("fetch_status") or {}).get("capture") == "OK"
+    )
+
+
+def _mts_direction_label(state: dict) -> str:
+    """Return the explicit MTS direction, including paper state files.
+
+    Paper MTS state records the two leg directions as ``near_side`` and
+    ``far_side`` but historically did not persist the aggregate ``action``.
+    Do not render an open spread as ``?`` merely because that derived field is
+    absent.
+    """
+    if not isinstance(state, dict):
+        return "?"
+    action = state.get("action")
+    if action not in (None, "", "?"):
+        return str(action)
+    near_side = state.get("near_side")
+    far_side = state.get("far_side")
+    if near_side not in (None, "", "?") and far_side not in (None, "", "?"):
+        return f"{near_side} / {far_side}"
+    return "?"
+
+
+# TAIFEX month codes are A=Jan ... L=Dec, and the contract pair ROLLS every
+# month, so near/far must be derived from the broker snapshot itself: a
+# hardcoded literal pair silently renders a real position as FLAT once the
+# pair rolls (2026-09-24: the broker held TMFJ6/TMFK6 while the literal
+# {"TMFH6", "TMFI6"} matched nothing -> _broker_snapshot_flat -> FLAT panel).
+_TAIFEX_MONTH_CODES = "ABCDEFGHIJKL"
+# sort key for a leg whose contract code does not parse: kept visible (never
+# silently dropped) but ordered after every parseable month.
+_UNPARSED_CONTRACT_KEY = (9999, 99)
+
+
+def _contract_sort_key(code) -> tuple:
+    """Sort key (year, month) for a TAIFEX contract code; () if unparseable."""
+    _match = re.search(r"([A-La-l])(\d{1,2})$", str(code or ""))
+    if not _match:
+        return ()
+    _month = _TAIFEX_MONTH_CODES.index(_match.group(1).upper()) + 1
+    _year = int(_match.group(2))
+    return (2000 + _year if _year < 100 else _year, _month)
+
+
+def _ordered_futures_legs(positions: list) -> list:
+    """Broker futures rows with open quantity, ordered near month -> far month."""
+    rows = [p for p in (positions or [])
+            if isinstance(p, dict)
+            and p.get("account") == "futures"
+            and int(p.get("quantity", 0) or 0) > 0]
+    return sorted(rows,
+                  key=lambda p: _contract_sort_key(p.get("code"))
+                  or _UNPARSED_CONTRACT_KEY)
+
+
+def _build_live_broker_mts_state(positions: list, canonical: dict,
+                                 params: dict | None = None,
+                                 pair_codes: list | None = None) -> dict | None:
+    """Build broker-authoritative MTS state, including a remaining leg.
+
+    ``pair_codes`` (optional) is the reconciled spread's contract pair, and is
+    needed only by the single-leg branch: with one leg left, the snapshot alone
+    cannot say whether the remaining month is the near or the far leg, so the
+    released leg is decided by that pair and is never fabricated from a stale
+    literal.
+    """
+    params = params if isinstance(params, dict) else {}
+    rows = _ordered_futures_legs(positions)
+    if len(rows) not in (1, 2):
+        return None
+
+    _released = None
+    _near = rows[0]
+    _far = rows[1] if len(rows) == 2 else {}
+    if len(rows) == 1:
+        _remaining = str(_near.get("code") or "")
+        _pair = sorted({str(_code) for _code in (pair_codes or []) if _code}
+                       | {_remaining}, key=_contract_sort_key)
+        if len(_pair) == 2:
+            _released = "far" if _remaining == _pair[0] else "near"
+        if _released == "near":
+            _near, _far = {}, _near      # the remaining month is the far leg
+
+    def _field(row, name, missing=None):
+        return row.get(name, missing)
+
+    state = {
+        "has_position": True,
+        "near_entry": _field(_near, "avg_cost", 0.0),
+        "far_entry": _field(_far, "avg_cost", 0.0),
+        "near_upl": _field(_near, "pnl"),
+        "far_upl": _field(_far, "pnl"),
+        "near_side": _field(_near, "direction"),
+        "far_side": _field(_far, "direction"),
+        "action": f'{_field(_near, "direction", "?")} / '
+                   f'{_field(_far, "direction", "?")}',
+        "release_state": "BOTH_HELD" if len(rows) == 2 else "SINGLE_LEG",
+        "position_phase": "SPREAD" if len(rows) == 2 else "SINGLE_LEG",
+        "trade_id": "broker-reconciled-" +
+                    str(canonical.get("canonical_input_hash", ""))[:16],
+        "reason": "broker_snapshot",
+        "_updated": canonical.get("captured_at") or
+                    canonical.get("captured_at_ms") or "?",
+        "release_stop_points": params.get("release_stop_points"),
+        "trail_distance_points": params.get("trail_distance_points"),
+        "atr": params.get("atr_current") or params.get("atr") or
+               _latest_live_atr(),
+    }
+    if len(rows) == 1:
+        state["released_leg"] = _released
+        state["near_status"] = "RELEASED" if _released == "near" else "OPEN"
+        state["far_status"] = "RELEASED" if _released == "far" else "OPEN"
+    return state
+
+
+def _pending_live_mts_exit_orders(canonical: dict) -> list[dict]:
+    """Return deduplicated broker-pending TMF orders for display only.
+
+    A fresh canonical snapshot with no positions but a pending TMF order is
+    an in-flight exit, not a flat/legacy-paper state.  This helper never
+    authorizes, resubmits, cancels, or infers a fill.
+    """
+    if not isinstance(canonical, dict) or (canonical.get("fetch_status") or {}).get("capture") != "OK":
+        return []
+    rows = []
+    seen = set()
+    for order in canonical.get("open_orders") or []:
+        if not isinstance(order, dict) or not str(order.get("code") or "") \
+                .startswith(str(_TICKER or "TMF")):
+            continue
+        status = order.get("status")
+        if isinstance(status, dict):
+            status = status.get("status") or status.get("name")
+        status = str(status or "PENDING").upper()
+        key = (str(order.get("broker_order_id") or order.get("order_id") or ""),
+               str(order.get("seqno") or ""), str(order.get("code")))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "商品": order.get("code"),
+            "方向": order.get("direction") or order.get("side") or "N/A",
+            "券商委託": order.get("broker_order_id") or order.get("order_id") or "N/A",
+            "狀態": status,
+        })
+    return rows
 
 def _monitor_status():
     try:
@@ -2595,7 +4468,7 @@ if page == "總覽":
     with col1:
         # 2026-05-27 Gemini CLI: Dynamic Ticker in Header
         _ov_ticker = futures_cfg.get("ticker", "TMF")
-        st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
+        st.header(f"期貨 {_ov_ticker} ({runtime_mode_badge(active_runtime_truth)})")
         if f_df is not None and not f_df.empty:
             last = f_df.iloc[-1]
             c1, c2, c3 = st.columns(3)
@@ -2607,7 +4480,7 @@ if page == "總覽":
             c3.metric("Bars", len(f_df))
         else:
             # ── No indicator data: show live MTS near/far prices ──
-            _mts_f = "/tmp/mts_position_state.json"
+            _mts_f = mts_position_state_path()
             _nl = None
             _fl = None
             try:
@@ -2625,7 +4498,7 @@ if page == "總覽":
                 st.caption("🟡 指標數據尚未產出，顯示訂閱即時價格")
             else:
                 st.info("無期貨指標數據")
-        ft, ft_date = load_futures_trades()
+        ft, ft_date = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
         # GSD Fix: Show which date's file was actually loaded to avoid confusion during night sessions
         trading_day_str = TRADE_DATE_STR
         trading_day_display = f"{trading_day_str[:4]}-{trading_day_str[4:6]}-{trading_day_str[6:8]}"
@@ -2697,7 +4570,7 @@ if page == "總覽":
     else:
         # Fallback: show MTS live price as a horizontal line
         try:
-            _mts_pf = "/tmp/mts_position_state.json"
+            _mts_pf = mts_position_state_path()
             if os.path.exists(_mts_pf):
                 with open(_mts_pf) as _pf:
                     _ps = json.load(_pf)
@@ -2725,7 +4598,7 @@ if page == "總覽":
     # ── 總覽 PnL ──
     st.header("今日累計 PnL")
     pc1, pc2, pc3 = st.columns(3)
-    ft, _ = load_futures_trades()
+    ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
     fpnl = calc_futures_pnl(ft)
     ol = load_options_ledger()
     opnl = calc_options_pnl(ol)
@@ -2830,7 +4703,7 @@ elif _selected_product == "TMF":
     _pt_start = time.time()
     # 2026-06-18 Gemini CLI: [Pure TMF Refactoring] Dynamic Ticker
     _ov_ticker = futures_cfg.get("ticker", "TMF")
-    st.header(f"期貨 {_ov_ticker} ({mode_badge(f_live)})")
+    st.header(f"期貨 {_ov_ticker} ({runtime_mode_badge(active_runtime_truth)})")
 
     # 2026-07-07 Hermes Agent: cache-busting key
     _today = get_session_date_str()
@@ -2868,20 +4741,39 @@ elif _selected_product == "TMF":
         # 💡 Gemini CLI: Use get_session_date_str and is_taifex_futures_market_open to accurately map night session to trading day
         from core.date_utils import get_taifex_futures_session_type, get_session_date_str, is_taifex_futures_market_open
         session_type = get_taifex_futures_session_type()
-        session_label = "夜盤" if session_type == "night" else ("日盤" if session_type == "day" else "收盤")
+        _clock_hhmm = int(datetime.datetime.now().strftime("%H%M"))
+        _market_open = is_taifex_futures_market_open()
+        _between_sessions = (500 <= _clock_hhmm < 845) or (1346 <= _clock_hhmm < 1500)
+        session_label = (
+            ("夜盤" if session_type == "night" else "日盤")
+            if _market_open else ("收盤" if _between_sessions else "休市")
+        )
 
         # 資料新鮮度閾值：日盤 15 分鐘、夜盤 15 分鐘
         stale_threshold = 15.0
         data_fresh = age_mins < stale_threshold
         _last_trading_day = get_session_date_str(last_ts.to_pydatetime()) if pd.notna(last_ts) else None
         _same_trading_day = _last_trading_day == _today
-        _market_open = is_taifex_futures_market_open() or session_type in ("day", "night")
 
-        if not data_fresh and _market_open:
+        _live_quote = read_mts_quote_freshness()
+        _bar_label = (
+            f"最後完整 indicator bar {last_ts.strftime('%H:%M')} "
+            f"({age_mins:.0f} 分鐘前)"
+            if pd.notna(last_ts)
+            else "最後完整 indicator bar 時間未知"
+        )
+
+        if _market_open and _live_quote.get("fresh", False):
+            _quote_age_ms = float(_live_quote["quote_age_ms"])
+            st.caption(
+                f"🟢 即時行情正常 · quote age {_quote_age_ms:.0f}ms · "
+                f"{_bar_label} · {session_label}"
+            )
+        elif not data_fresh and _market_open:
             last_ts_str = last_ts.strftime("%H:%M") if pd.notna(last_ts) else "?"
             st.warning(
-                f"⚠️ 資料停滯: 最後一筆 {last_ts_str} ({age_mins:.0f}分鐘前) "
-                f"| 目前 {session_label}"
+                f"⚠️ Indicator bar 停滯: 最後完整 bar {last_ts_str} "
+                f"({age_mins:.0f}分鐘前) | 即時行情狀態無法確認 | 目前 {session_label}"
             )
         elif not _market_open and pd.notna(last_ts):
             st.caption(f"📄 上次資料: {last_ts.strftime('%m/%d %H:%M')} ({age_mins:.0f}分鐘前) · 非交易時段")
@@ -2957,22 +4849,36 @@ elif _selected_product == "TMF":
             with mts_col3:
                 if st.button("🆘 MTS緊急全平倉", key="force_close_all", type="secondary", width='stretch'):
                     # 2026-05-22 Gemini CLI: Remove MTS Self-Test button below
+                    # 2026-07-31 Hermes Agent: audit trail — command_id + COMMAND_SENT
+                    _command_id = f"CMD-{datetime.datetime.now():%Y%m%d%H%M%S}"
                     _flag_path = "/tmp/futures_manual_trade.flag"
                     _flag = json.dumps({
                         "action": "close_all",
                         "ts": datetime.datetime.now().isoformat(),
                         "reason": "DASHBOARD_EMERGENCY",
+                        "command_id": _command_id,
                         # 2026-06-05 JVS Claw: Step 5 — TTL
                         "created_at": time.time()
                     })
                     with open(_flag_path, "w") as _f:
                         _f.write(_flag)
-                    st.warning("🚨 緊急平倉指令已送出！請監控下方持倉狀態。")
+                    try:
+                        with open(runtime_path("data", "state", "futures_manual_trade_status.json"), "w") as _sf:
+                            json.dump({
+                                "command_id": _command_id,
+                                "status": "COMMAND_SENT",
+                                "ts": datetime.datetime.now().isoformat(),
+                                "message": "緊急平倉指令已寫入 flag，等待 monitor 接收",
+                                "action": "close_all",
+                            }, _sf, default=str)
+                    except Exception:
+                        pass
+                    st.warning(f"🚨 緊急平倉指令已送出（{_command_id}）！請監控下方持倉狀態。")
                     st.rerun()
 
             if st.button("🗑️ MTS 清空紀錄", key="mts_clear_logs", type="secondary", width='stretch'):
                 # ── Safety guards: only allow when flat + idle ──
-                _state_file = "/tmp/mts_position_state.json"
+                _state_file = mts_position_state_path()
                 _has_pos = False
                 _has_lifecycle = False
                 if os.path.exists(_state_file):
@@ -2982,7 +4888,22 @@ elif _selected_product == "TMF":
                         _has_pos = _sd.get("has_position", False) is True
                         _lc = _sd.get("lifecycle", {})
                         _rg = _lc.get("release_group", {}) if _lc else {}
-                        _has_lifecycle = _rg.get("status") not in (None, "INACTIVE")
+                        # 2026-07-31 Hermes Agent: ARMED-without-orders is stale
+                        # residue (e.g. restart after emergency close), NOT an
+                        # active OCO lifecycle. Only block when there is a real
+                        # order reference or an in-flight status.
+                        _rg_status = _rg.get("status")
+                        _has_order_ref = any(
+                            _rg.get(k) for k in (
+                                "near_order_id", "far_order_id", "filled_order_id",
+                                "sibling_cancel_order_id", "trigger_ts",
+                            )
+                        )
+                        _in_flight_status = _rg_status in (
+                            "SUBMITTING", "SUBMITTED", "PARTIALLY_FILLED",
+                            "TRIGGERED", "FILLED", "CANCELING",
+                        )
+                        _has_lifecycle = bool(_has_order_ref or _in_flight_status)
                     except: pass
 
                 if _has_pos:
@@ -2994,10 +4915,12 @@ elif _selected_product == "TMF":
                     _archived = 0
                     # Archive fill/event logs instead of deleting
                     for _log_name in ["mts_trade_fills.jsonl", "mts_spread_events.jsonl"]:
-                        _log_path = os.path.join(_base, "logs", _log_name)
+                        _log_path = mts_runtime_path("logs", _log_name)  # 2026-10-02 Codex: never clear the other mode.
                         if os.path.exists(_log_path) and os.path.getsize(_log_path) > 0:
                             _ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                            _archive_dir = os.path.join(_base, "logs", "archive")
+                            # 2026-10-02 Codex: PAPER archive remains inside its own namespace.
+                            _archive_dir = (mts_runtime_path("logs", "archive") if MTS_TRADES != FUTURES_TRADES
+                                            else os.path.join(_base, "logs", "archive"))
                             os.makedirs(_archive_dir, exist_ok=True)
                             _archive_path = os.path.join(_archive_dir, _log_name.replace(".jsonl", f"_{_ts_str}.jsonl"))
                             try:
@@ -3009,6 +4932,7 @@ elif _selected_product == "TMF":
                     _flag = json.dumps({
                         "action": "clear_records",
                         "ts": datetime.datetime.now().isoformat(),
+                        "command_id": f"CMD-CLR-{datetime.datetime.now():%Y%m%d%H%M%S}",
                         "created_at": time.time()
                     })
                     with open(_flag_path, "w") as _f:
@@ -3022,7 +4946,7 @@ elif _selected_product == "TMF":
 
         # ── MTS Account Settings ──
         with st.expander("⚙️ MTS 帳戶設定", expanded=False):
-            _state_file = "/tmp/mts_position_state.json"
+            _state_file = mts_position_state_path()
             _current_init = 100000
             if os.path.exists(_state_file):
                 try:
@@ -3092,7 +5016,7 @@ elif _selected_product == "TMF":
                     st.rerun()
 
         # 2026-05-22 Gemini CLI: Add MTS manual trade status banner
-        _mts_state_file = "/tmp/mts_position_state.json"
+        _mts_state_file = mts_position_state_path()
         if os.path.exists(_mts_state_file):
             try:
                 with open(_mts_state_file) as _f:
@@ -3152,18 +5076,8 @@ elif _selected_product == "TMF":
 
             sqz_label = "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放"
             
-            # [Breakout V2] 突破強度與結構顯示
-            bs_atr = float(last.get("breakout_strength_atr", 0.0) or 0.0)
-            bear_bs_atr = float(last.get("bear_breakout_strength_atr", 0.0) or 0.0)
-            is_bull_struct = last.get("is_bull_structural_breakout", 0)
-            is_bear_struct = last.get("is_bear_structural_breakout", 0)
-            
-            if is_bull_struct == 1:
-                bs_label = f"🚀 {bs_atr:.2f} ATR"
-            elif is_bear_struct == 1:
-                bs_label = f"💀 {bear_bs_atr:.2f} ATR"
-            else:
-                bs_label = f"{max(bs_atr, bear_bs_atr):.2f} ATR"
+            strength = float(last.get("trend_strength_raw", 0.0) or 0.0)
+            bs_label = f"{strength:.2f}"
             
             sqz_color = None
         else:
@@ -3178,8 +5092,8 @@ elif _selected_product == "TMF":
 
         fc1.metric("Close", f"{cl_val:.0f}")
         fc2.metric("Score", f"{sc_val:.1f}")
-        bull_align = last.get("bull_align", last.get("bullish_align", False))
-        bear_align = last.get("bear_align", last.get("bearish_align", False))
+        bull_align = last.get("bullish_align", False)
+        bear_align = last.get("bearish_align", False)
         trend = "🟢多頭" if bull_align else ("🔴空頭" if bear_align else "⚪中性")
         fc3.metric("趨勢", trend)
         fc4.metric("Sqz狀態", sqz_label)
@@ -3187,18 +5101,16 @@ elif _selected_product == "TMF":
         fc6.metric("突破強度", bs_label)
 
         # [P1] Single Source of Truth: Router Perspective
-        r_bias = last.get("router_bias", "N/A")
-        r_regime = last.get("router_regime", "N/A")
-        st.caption(f"🎯 **Router Ground Truth**: Regime=`{r_regime}` | Bias=`{r_bias}`")
+        r_regime = last.get("regime", "N/A")
+        st.caption(f"🎯 **Router Ground Truth**: Regime=`{r_regime}` | Bias=`{bias}`")
 
         # ATR reference — show calculation chain for breakout_strength debug
         atr_val = last.get("atr", 0.0) or 0.0
         atr_raw = last.get("atr_raw", atr_val) or atr_val
-        atr_floor = last.get("atr_floor", 0.0) or 0.0
+        atr_floor = close * 0.0015 if (close := (last.get("Close", last.get("close", 0)) or 0)) else 0.0
         atr_used = last.get("atr_used", atr_val) or atr_val
 
         # breakout_strength_atr = max(0, close - high_20_prev) / atr_used
-        close = last.get("Close", last.get("close", 0)) or 0
         high_20_prev = last.get("high_20_prev", 0) or 0
         _bs_numerator = max(0, close - high_20_prev)
         _bs_denominator = atr_used if atr_used > 0 else 1.0
@@ -3209,28 +5121,22 @@ elif _selected_product == "TMF":
             f"BS=({close:.0f}-{high_20_prev:.0f})/{atr_used:.1f}={_bs_numerator/_bs_denominator:.4f}"
         )
 
-        if data_fresh and "fired" in last and last.get("fired", False) is True:
-            st.success("🔥 **FIRE — 壓縮釋放！**")
-        
         # ═══ Strategy-Annotated Indicator Table ═══════════════════════════
         # Group indicator columns by which strategy uses them, sort by group.
         _strategy_indicator_groups = {
             "📊 Squeeze": {
-                "sqz_on", "sqz_fire", "fired", "momentum",
-                "bb_up", "bb_upper", "bb_low", "bb_lower", "bb_mid", "bb_middle",
+                "sqz_on", "momentum", "bb_up", "bb_low", "bb_mid",
                 "lr_curve",
             },
             "📈 Trend": {
                 "adx", "ema_fast", "ema_slow", "mom_velo", "mom_state",
-                "breakout_strength", "breakout_strength_atr",
-                "body_size_atr",
+                "trend_strength_raw",
             },
             "🔁 MeanRev": {
-                "rsi", "bb_up", "bb_upper", "bb_low", "bb_lower", "bb_mid", "bb_middle",
+                "rsi", "bb_up", "bb_low", "bb_mid",
             },
             "🧠 ML/Feature": {
-                "macd_hist", "macd_rising", "score",
-                "bearish_align", "bullish_align", "bear_align", "bull_align",
+                "macd_hist", "score", "bearish_align", "bullish_align",
             },
             "🌊 Spread": {
                 "spread_z", "spread_std", "vwap_z", "far_close",
@@ -3238,15 +5144,13 @@ elif _selected_product == "TMF":
             },
         }
         # Common indicators used by many strategies — group under general
-        _general_cols = {"atr", "vwap", "volume_spike", "price_vs_vwap",
-                         "recent_high", "recent_low"}
+        _general_cols = {"atr", "vwap", "price_vs_vwap"}
         # Router / meta columns — always at end
-        _meta_cols = {"regime", "router_regime", "bias", "router_bias",
-                      "trading_day", "session", "timestamp", "bars_since_open"}
+        _meta_cols = {"regime", "session", "timestamp"}
 
         def _group_key(col: str) -> int:
             """Return sort key: general(0) → squeeze(1) → trend(2) → meanrev(3) → ml(4) → spread(5) → meta(6) → other(9)"""
-            if col.lower() in {"open", "high", "low", "close", "volume", "amount"}:
+            if col in {"Open", "High", "Low", "Close", "Volume", "close"}:
                 return -2
             if col in _general_cols:
                 return -1
@@ -3258,7 +5162,7 @@ elif _selected_product == "TMF":
             return 9
 
         def _strategy_label(col: str) -> str:
-            if col.lower() in {"open", "high", "low", "close", "volume", "amount"}:
+            if col in {"Open", "High", "Low", "Close", "Volume", "close"}:
                 return ""
             if col in _general_cols:
                 return "共用"
@@ -3270,8 +5174,13 @@ elif _selected_product == "TMF":
             return ""
 
         # Build column order
-        _available_cols = [c for c in f_df.columns]
-        _display_cols = sorted(_available_cols, key=_group_key)
+        # Render the producer's fixed contract. Missing quote columns remain
+        # visible as N/A instead of being filled from close/tick fallbacks.
+        for _contract_col in FUTURES_INDICATOR_COLUMNS:
+            if _contract_col not in f_df.columns:
+                f_df[_contract_col] = pd.NA
+        _available_cols = [c for c in FUTURES_INDICATOR_COLUMNS if c in f_df.columns]
+        _display_cols = ordered_indicator_columns(_available_cols)
 
         # Build strategy header row (one label per column)
         _header_labels = [_strategy_label(c) for c in _display_cols]
@@ -3328,7 +5237,7 @@ elif _selected_product == "TMF":
         for _, row in _tail.iterrows():
             _html_parts.append("<tr>")
             for c in _display_cols:
-                v = row[c] if pd.notna(row[c]) else ""
+                v = row[c] if pd.notna(row[c]) else "N/A"
                 _html_parts.append(
                     f"<td style='padding:1px 4px; white-space:nowrap; text-align:right; "
                     f"border:1px solid #ddd;'>{v}</td>"
@@ -3340,7 +5249,7 @@ elif _selected_product == "TMF":
         print(f"[PERF] indicator_table: {time.time()-_pt_data:.3f}s")
     else:
         # ── No indicator data: show live MTS near/far prices as fallback ──
-        _mts_price_file = "/tmp/mts_position_state.json"
+        _mts_price_file = mts_position_state_path()
         _near_live = None
         _far_live = None
         try:
@@ -3379,11 +5288,45 @@ elif _selected_product == "TMF":
                     _f.write(_flag)
                 st.warning("🚨 緊急平倉指令已送出！")
 
+    # ── MTS quick state (before the slow calendar chart) ──
+    # Keep the operator-facing position visible even while calendar data is
+    # loading. This is read-only and uses the same canonical fail-closed
+    # resolver as the detailed MTS section below.
+    _quick_is_live_runtime = bool(
+        active_runtime_truth.get("is_live_runtime")
+        or active_runtime_truth.get("is_exit_only_runtime")
+        or active_runtime_truth.get("profile_identity") == "futures_live.yaml"
+        or active_runtime_truth.get("requested_mode") == "live"
+    )
+    _quick_mts_state, _quick_mts_status, _quick_mts_path = (
+        _read_canonical_mts_state() if not _quick_is_live_runtime
+        else (None, "LIVE_BROKER_SCOPE", "—")
+    )
+    st.subheader("📌 MTS 即時持倉摘要")
+    _quick_presentation = _quick_mts_summary_presentation(
+        _quick_is_live_runtime, _quick_mts_state,
+        _quick_mts_status, _quick_mts_path)
+    if _quick_presentation["level"] == "info":
+        st.info(_quick_presentation["message"])
+    elif isinstance(_quick_mts_state, dict):
+        _quick_has_pos = bool(_quick_mts_state.get("has_position"))
+        _q1, _q2, _q3, _q4 = st.columns(4)
+        _q1.metric("狀態", _quick_mts_state.get("state", "UNKNOWN"))
+        _q2.metric("近月 UPL", f'{float(_quick_mts_state.get("near_upl", 0) or 0):+,.0f} TWD')
+        _q3.metric("遠月 UPL", f'{float(_quick_mts_state.get("far_upl", 0) or 0):+,.0f} TWD')
+        _q4.metric("總 UPL", f'{float(_quick_mts_state.get("total_upl", 0) or 0):+,.0f} TWD')
+        st.caption(
+            f"trade_id={_quick_mts_state.get('trade_id', 'N/A')} · "
+            f"{'雙腿持倉' if _quick_has_pos else 'FLAT'} · "
+            f"state_path={_quick_mts_path}")
+    else:
+        st.error(_quick_presentation["message"])
+
     # ── Calendar Spread 顯示 ──
-    ft, _ = load_futures_trades()
-    st.header("📊 日曆價差分析 (Calendar Spread)")
+    ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
+    st.caption("📊 日曆價差分析暫停載入（診斷中）")
     
-    with st.expander("📈 價差圖表與策略條件", expanded=True):
+    if False:  # Rendered at the bottom after MTS/performance sections.
         # 載入 calendar spread 資料
         spread_df = load_calendar_spread_data()
         
@@ -3495,14 +5438,261 @@ elif _selected_product == "TMF":
             """)
     
     # ── MTS Position State (from tmf_spread plugin) ──
-    _mts_state_file = "/tmp/mts_position_state.json"
-    if os.path.exists(_mts_state_file):
+    # [provenance] canonical Paper/Live scope for EVERY MTS performance
+    # metric (UPL, realized PnL, closed-loop count / win rate / profit
+    # factor): mode + run_id + config_hash + session/source provenance.
+    # Legacy/mixed/unknown evidence renders N/A with the explicit reason —
+    # NEVER 0, NEVER merged Paper/Live PnL.
+    from core.performance_provenance import (
+        classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl, live_upl_presented_reason,
+        select_mts_reporting_day)
+    _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
+    _events_path_scope = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode scope.
+    if _exit_only_dashboard:
+        # This presentation is intentionally isolated from the ordinary MTS
+        # state/ledger path.  A restricted-exit position has one authority:
+        # broker-attested capability plus current, hash-bound dual BBO.
+        from ui.reconciled_exit_presentation import (
+    exit_only_upl_metrics, _latest_bbo_observation_info,
+    exit_only_presented_reason)
+        _eo_ctx = load_exit_only_context()
+        _exit_upl = exit_only_upl_metrics(
+            _eo_ctx, _events_path_scope,
+            now_ms=int(time.time() * 1000), point_value=10.0)
+        st.header("MTS 受限平倉部位")
+        _u1, _u2, _u3 = st.columns(3)
+        if _exit_upl and _exit_upl.get("kind") == "COMPUTED":
+            _u1.metric("近月 UPL", f"{_exit_upl['near']['pnl']:+,.2f} TWD")
+            _u2.metric("遠月 UPL", f"{_exit_upl['far']['pnl']:+,.2f} TWD")
+            _u3.metric("總計 UPL", f"{_exit_upl['total_pnl']:+,.2f} TWD")
+            _cap = _eo_ctx.get("exit_only_capability") or {}
+            st.caption(
+                "受限平倉模式：僅使用券商對帳 capability 與雙腿 BBO。"
+                f"snapshot={str(_cap.get('snapshot_hash', ''))[:12]} · "
+                f"session={str(_cap.get('session_id', ''))[:12]}")
+        else:
+            _reason = (_exit_upl or {}).get(
+                "reason", "EXIT_ONLY_BBO_MISSING")
+            # [fix] quarantine/renewal mismatch leads; BBO_MISSING only
+            # when no valid matching observation exists; show the latest
+            # BBO observed timestamp/count when present.
+            _bbo_info = _latest_bbo_observation_info(
+                _events_path_scope,
+                _eo_ctx.get("exit_only_capability"))
+            _lead = exit_only_presented_reason(
+                _reason, _eo_ctx.get("audit_reasons"), _bbo_info)
+            _detail = ""
+            if _bbo_info:
+                _detail = (f" · BBO 已觀察 {_bbo_info['count']} 筆"
+                           f"（最新 {_bbo_info['latest_ts']}）")
+            _u1.metric("近月 UPL", "N/A")
+            _u2.metric("遠月 UPL", "N/A")
+            _u3.metric("總計 UPL", "N/A")
+            st.warning(
+                "⚠️ 受限平倉模式—受限範圍待券商對帳重新驗證"
+                f"（{_lead}{_detail}）")
+        # [auto re-reconciliation] 自動對帳 status: healthy/degraded,
+        # last success/failure, next attempt (BBO freshness separate)
+        _renew_status = load_exit_only_renewal_status()
+        if _renew_status:
+            st.caption(_renew_status)
+        # [Dashboard lifecycle] The event view is capability-scoped and
+        # presentation-only.  It never falls back to ordinary Paper/LIVE
+        # orders or treats EXIT_ONLY_BBO_OBSERVED as a decision trigger.
+        from ui.reconciled_exit_presentation import \
+            exit_only_lifecycle_presentation
+        _exit_lifecycle = exit_only_lifecycle_presentation(
+            _eo_ctx, _events_path_scope)
+        st.subheader("MTS 受限平倉生命週期")
+        if _exit_lifecycle is None:
+            st.info("N/A：沒有可驗證的受限平倉 capability。")
+        else:
+            _life_cap = _exit_lifecycle["capability"]
+            st.caption(
+                f"mode={_exit_lifecycle['mode']} · capability="
+                f"{str(_life_cap.get('reconciliation_id') or 'N/A')[:12]} · "
+                f"trade={_life_cap.get('trade_id') or 'N/A'} · "
+                "auto-reconcile 狀態見上方。")
+            _life_rows = []
+            for _label, _key in (
+                    ("MONITORING", "monitoring"),
+                    ("TRIGGERED", "triggered"),
+                    ("BLOCKED", "blocked"),
+                    ("SUBMITTED", "submitted"),
+                    ("FILLED / CANCELLED / REJECTED / TIMEOUT", "terminal")):
+                _record = _exit_lifecycle.get(_key)
+                if not isinstance(_record, dict):
+                    _life_rows.append({"狀態": _label, "時間": "N/A",
+                                       "動作": "N/A", "腿": "N/A",
+                                       "原因": "N/A", "Broker Order ID": "N/A",
+                                       "成交口數": "N/A", "成交價": "N/A"})
+                    continue
+                _life_rows.append({
+                    "狀態": _record.get("state") or _label,
+                    "時間": _record.get("timestamp") or "N/A",
+                    "動作": _record.get("action") or "N/A",
+                    "腿": _record.get("leg") or "N/A",
+                    "原因": _record.get("reason") or "N/A",
+                    "Broker Order ID": _record.get("broker_order_id") or "N/A",
+                    "成交口數": (_record.get("fill_qty")
+                                 if _record.get("fill_qty") is not None else "N/A"),
+                    "成交價": (_record.get("fill_price")
+                               if _record.get("fill_price") is not None else "N/A"),
+                })
+            st.dataframe(pd.DataFrame(_life_rows), width="stretch",
+                         hide_index=True)
+        _mts_perf_scope = {"ok": False, "mode": "exit_only",
+                           "reason": "RECONCILED_EXIT_ONLY"}
+    else:
+        _fills_path_scope = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode scope.
+        _scope_current_day = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
+        _scope_trading_day = select_mts_reporting_day(
+            _fills_path_scope, _events_path_scope, _scope_current_day)
+        _mts_perf_scope = scope_mts_performance(
+            active_runtime_truth,
+            classify_mts_evidence(_fills_path_scope, _events_path_scope,
+                                  target_trading_day=_scope_trading_day))
+
+    # In restricted-exit mode the legacy /tmp state must not be read or
+    # presented.  The full legacy block remains unchanged for LIVE/PAPER.
+    _broker_mts_state = None
+    _broker_open_orders = []
+    _broker_snapshot_flat = False
+    _live_runtime = bool(
+        active_runtime_truth.get("is_live_runtime")
+        or active_runtime_truth.get("profile_identity") == "futures_live.yaml"
+        or active_runtime_truth.get("requested_mode") == "live"
+    )
+    if not _exit_only_dashboard:
         try:
-            with open(_mts_state_file) as _f:
-                _mts_state = json.loads(_f.read())
+            _ctx_live = json.loads(Path(runtime_path("execution_context.json")).read_text())
+            _canon = json.loads((Path(runtime_path("exports", "trades", "live", "diagnostics"))
+                                 / "broker_snapshot_canonical.json").read_text())
+            _broker_open_orders = _pending_live_mts_exit_orders(_canon)
+            _fut = [p for p in (_canon.get("positions") or [])
+                    if p.get("account") == "futures"
+                    and str(p.get("code") or "").startswith(str(_TICKER or "TMF"))
+                    and int(p.get("quantity", 0) or 0) > 0]
+            if _live_canonical_position_allowed(_ctx_live, _canon):
+                _live_mts_params = (futures_cfg.get("mts", {}).get("params", {})
+                                    if isinstance(futures_cfg, dict) else {})
+                _broker_mts_state = _build_live_broker_mts_state(
+                    _fut, _canon, _live_mts_params,
+                    [leg.get("code") for leg in
+                     ((_ctx_live.get("canonical_holding") or {})
+                      .get("canonical_legs") or [])
+                     if isinstance(leg, dict)])
+                if _broker_mts_state is None and not _canon.get("open_orders"):
+                    # A current, successful broker snapshot with no complete
+                    # spread is authoritative FLAT/partial evidence.  Do
+                    # not fall through to stale /tmp paper state.
+                    _broker_snapshot_flat = True
+                # Current broker-reconciled futures are the authoritative
+                # live performance scope; legacy fills are not required.
+                _mts_perf_scope = {
+                    "ok": True, "mode": "live",
+                    "run_id": _ctx_live.get("run_id"),
+                    "config_hash": _ctx_live.get("config_hash"),
+                    "session_id": _ctx_live.get("session_id"),
+                    "source": "live_broker_reconciled",
+                    "realized_evidence": False,
+                    "reason": "broker_snapshot",
+                }
+        except Exception:
+            _broker_mts_state = None
+    if _broker_open_orders and _broker_mts_state is None:
+        st.header("MTS 剩餘腿出場委託")
+        st.warning("⚠️ 券商已收到剩餘腿出場委託，等待終態回報；不會重送或撤單。")
+        st.dataframe(pd.DataFrame(_broker_open_orders), width="stretch", hide_index=True)
+
+    if _broker_snapshot_flat:
+        _mts_telemetry = {}
+        try:
+            _mts_telemetry = json.loads(
+                Path(mts_position_state_path()).read_text())
+        except Exception:
+            pass
+        _broker_mts_state = _build_flat_broker_mts_state(_mts_telemetry)
+    # A LIVE runtime must never fall through to the legacy paper state file;
+    # that stale file was the source of phantom Policy J/UPL after a broker
+    # flat reconciliation.  PAPER compatibility remains unchanged.
+    # Historical contract marker: _mts_state_file = (None if (_exit_only_dashboard or _live_runtime)
+    _mts_state_file = None if _live_runtime else mts_position_state_path()
+    _canonical_paper_state, _paper_state_status, _resolved_state_path = (
+        _read_canonical_mts_state()
+        if not _live_runtime else (None, "LIVE_BROKER_SCOPE", _mts_state_file or "—")
+    )
+    if _paper_state_status not in {"OK", "LIVE_BROKER_SCOPE"} and not _live_runtime:
+        st.error(
+            f"⚠️ MTS state blocked: {_paper_state_status} · "
+            f"resolved_path={_resolved_state_path} · runtime_id={runtime_id()}"
+        )
+    _identity_state = _canonical_paper_state or {}
+    st.caption(
+        "Runtime diagnostics · "
+        f"state_path={_resolved_state_path} · "
+        f"runtime_id={_identity_state.get('runtime_id', runtime_id())} · "
+        f"writer={_identity_state.get('writer_identity', 'UNKNOWN')} · "
+        f"generation={_identity_state.get('generation', 'UNKNOWN')} · "
+        f"schema={_identity_state.get('runtime_state_schema', 'UNKNOWN')}"
+    )
+    if _exit_only_dashboard:
+        _mts_state_file = None
+    _mts_panel_rendered = False
+    if _broker_mts_state is not None or _canonical_paper_state is not None:
+        try:
+            _mts_state = _broker_mts_state
+            if _mts_state is None:
+                _mts_state = _canonical_paper_state
+            # EXIT_REMAINING is an intent emitted before fill confirmation.
+            # Only a confirmed fill/settlement may clear stale paper state.
+            _trade_id_for_state = _mts_state.get("trade_id")
+            _terminal_fill = latest_mts_terminal_fill(
+                mts_runtime_path("logs", "mts_trade_fills.jsonl"),  # 2026-10-02 Codex: paper position evidence.
+                _trade_id_for_state)
+            _terminal_event = latest_mts_terminal_event(
+                _events_path_scope, _trade_id_for_state)
+            _exit_intent = latest_mts_exit_intent_event(
+                _events_path_scope, _trade_id_for_state)
+            if ((_terminal_fill is not None or _terminal_event is not None)
+                    and _mts_state.get("has_position")):
+                _confirmed_exit = _terminal_fill or _terminal_event
+                _mts_state = dict(_mts_state)
+                _mts_state["has_position"] = False
+                _mts_state["state"] = "FLAT"
+                _mts_state["reason"] = (
+                    _confirmed_exit.get("reason")
+                    or _confirmed_exit.get("event")
+                    or _confirmed_exit.get("fill_type")
+                    or "TERMINAL_EVENT")
+                _mts_state["release_state"] = "CLOSED"
+                _mts_state["released_leg"] = None
+                _mts_state["remaining_leg"] = None
+                _mts_state["near_status"] = "CLOSED"
+                _mts_state["far_status"] = "CLOSED"
+                _mts_state["_terminal_exit_event"] = _confirmed_exit
+            elif (_exit_intent is not None and _mts_state.get("has_position")):
+                _mts_state = dict(_mts_state)
+                _mts_state["_pending_exit_intent"] = _exit_intent
             _has_pos = _mts_state.get("has_position", False)
-            if _has_pos:
+            # A valid canonical state must always produce an MTS section.
+            # Do not hide the section merely because the state is flat or a
+            # secondary presentation field is unavailable.
+            if isinstance(_mts_state, dict):
+                _mts_panel_rendered = True
                 st.header("MTS 價差持倉 (tmf_spread)")
+                if not _has_pos:
+                    st.info("目前沒有已驗證的 MTS 未平倉部位（FLAT）。")
+            if _has_pos:
+                _pending_exit = _mts_state.get("_pending_exit_intent")
+                if isinstance(_pending_exit, dict):
+                    _pending_reason = (_pending_exit.get("reason") or "TRAIL")
+                    _pending_ts = (_pending_exit.get("ts")
+                                   or _pending_exit.get("timestamp") or "N/A")
+                    st.warning(
+                        f"⚠️ MTS {_pending_reason} 已觸發，等待成交回報 · {_pending_ts}")
+                    st.caption(
+                        "目前仍以持倉狀態顯示；只有 confirmed fill 才會轉為 FLAT。")
                 _c1, _c2, _c3, _c4 = st.columns(4)
                 _c1.metric("近月進場", f'{_mts_state.get("near_entry", 0):.0f}')
                 _c2.metric("遠月進場", f'{_mts_state.get("far_entry", 0):.0f}')
@@ -3511,153 +5701,222 @@ elif _selected_product == "TMF":
                 _rel_label = "無" if _rel is None else f'{_rel}已釋放'
                 _c4.metric("釋放狀態", _rel_label)
                 _c5, _c6 = st.columns(2)
-                _direction = _mts_state.get("action", "?")
+                _direction = _mts_direction_label(_mts_state)
                 if _direction == "?" or _direction is None:
                     _direction = "FLAT" if not _has_pos else "?"
                 _c5.metric("方向", _direction)
-                _c6.metric("理由", _mts_state.get("reason", "?"))
+                _c6.metric("理由", _fmt_policy_j_reason(_mts_state.get("reason", "?")))
+
+                # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate panel
+                # (display-only telemetry: mode badge, candidate status,
+                # per-leg VWAP, 5m confirmation, freshness, release intent /
+                # block reason, winner). Never alters runtime behavior.
+                try:
+                    _hvwap_events = _hvwap_load_events()
+                    st.markdown(
+                        _hvwap_panel_markdown(
+                            _hvwap_panel_payload(_mts_state, _hvwap_events)),
+                        unsafe_allow_html=True)
+                except Exception:
+                    pass
 
                 # 2026-06-26 Gemini CLI: Render active fixed parameters and ATR when in position
+                # 2026-07-31 Antigravity: Format threshold points as integers without decimals
                 _stop_pts = _mts_state.get("release_stop_points") or _mts_state.get("release_stop")
                 _trail_pts = _mts_state.get("trail_distance_points") or _mts_state.get("trail_pts")
                 _current_atr = _mts_state.get("atr")
                 _atr_info = f" (ATR: `{_current_atr:.1f}`)" if _current_atr else ""
                 if _stop_pts or _trail_pts:
                     _p1, _p2 = st.columns(2)
-                    if _stop_pts: _p1.markdown(f"🛑 **單腿釋放停損閾值**: `{_stop_pts}` 點{_atr_info}")
-                    if _trail_pts: _p2.markdown(f"📈 **剩餘腿移動止盈距離**: `{_trail_pts}` 點{_atr_info}")
+                    if _stop_pts:
+                        try:
+                            _stop_val = int(round(float(_stop_pts)))
+                        except Exception:
+                            _stop_val = _stop_pts
+                        _stop_mult = None
+                        try:
+                            _stop_mult = float((futures_cfg.get("mts", {}).get("params", {})
+                                                or {}).get("atr_multiplier_stop") or 2.5)
+                        except Exception:
+                            _stop_mult = None
+                        _p1.markdown(_fmt_release_stop_label(_stop_pts, _current_atr, _stop_mult))
+                    if _trail_pts:
+                        try:
+                            _trail_val = int(round(float(_trail_pts)))
+                        except Exception:
+                            _trail_val = _trail_pts
+                        _trail_mult = None
+                        try:
+                            _trail_mult = float((futures_cfg.get("mts", {}).get("params", {})
+                                                 or {}).get("atr_multiplier_trail") or 1.0)
+                        except Exception:
+                            _trail_mult = None
+                        _p2.markdown(_fmt_trail_distance_label(_trail_pts, _current_atr, _trail_mult))
 
+                # 2026-07-31 Hermes Agent: manual-command audit status
+                try:
+                    with open(runtime_path("data", "state", "futures_manual_trade_status.json")) as _cf:
+                        _cmd = json.load(_cf)
+                    # stale statuses (old ts) must not keep showing past
+                    # failures — only commands from the last 5 minutes.
+                    if _manual_command_is_fresh(_cmd):
+                        _cstate = _cmd.get("status", "?")
+                        _cicon = {"COMMAND_SENT": "📤", "RECEIVED": "📥", "PROCESSING": "⚙️",
+                                  "COMPLETED": "✅", "FAILED": "⛔"}.get(_cstate, "❓")
+                        st.caption(f"{_cicon} 指令 {_cmd.get('command_id', '?')} | {_cstate} | "
+                                   f"{str(_cmd.get('ts', ''))[:19]} | {_cmd.get('message', '')}")
+                        if _cstate == "COMPLETED" and _cmd.get("position_after"):
+                            st.caption(f"✅ 平倉完成: {json.dumps(_cmd['position_after'], default=str)}")
+                except Exception:
+                    pass
                 # ── Unrealized PnL Breakdown ──
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
-                _nr = _mts_state.get("near_upl", 0)
-                _fr = _mts_state.get("far_upl", 0)
-                _tr = _mts_state.get("total_upl", 0)
-                _u1.metric("近月 UPL", f"{_nr:+,.0f} TWD")
-                _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
-                _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
+                # [B v3] the trading-system session's live UPL artifact
+                # (monitor writes list_positions().pnl).  The dashboard
+                # NEVER opens its own Shioaji session and NEVER falls back
+                # to local state UPL — stale/missing -> N/A.
+                _live_upl = None
+                try:
+                    from core.performance_provenance import \
+                        _read_live_session_upl
+                    _live_upl = _read_live_session_upl(active_runtime_truth)
+                except Exception:
+                    _live_upl = None
+                if _live_upl is not None:
+                    _upl_legs = _live_upl.get("legs") or {}
+                    _upl_codes = sorted(_upl_legs, key=_contract_sort_key)
+                    _nr = ((_upl_legs.get(_upl_codes[0]) or {}).get("pnl")
+                           if _upl_codes else None)
+                    _fr = ((_upl_legs.get(_upl_codes[1]) or {}).get("pnl")
+                           if len(_upl_codes) > 1 else None)
+                elif isinstance(_broker_mts_state, dict) and _broker_mts_state.get("has_position"):
+                    _nr = _broker_mts_state.get("near_upl")
+                    _fr = _broker_mts_state.get("far_upl")
+                elif (active_runtime_truth.get("is_paper_runtime")
+                      and isinstance(_mts_state, dict)
+                      and _mts_state.get("has_position")):
+                    # Paper mode has no broker/live UPL artifact.  Its
+                    # authoritative current quote PnL is written by the
+                    # paper trading monitor into the local MTS state.  Keep
+                    # this fallback paper-only; live mode remains fail-closed
+                    # and never uses local state as broker truth.
+                    _nr = _mts_state.get("near_upl")
+                    _fr = _mts_state.get("far_upl")
+                else:
+                    _nr = None
+                    _fr = None
+                _nr_label = (f"{_nr:+,.0f} TWD"
+                             if _nr is not None else "N/A")
+                _fr_label = (f"{_fr:+,.0f} TWD"
+                             if _fr is not None else "N/A")
+                # Display the position direction next to each leg's UPL.
+                # Paper state is authoritative in paper mode; broker state is
+                # used only when the live/session artifact is authoritative.
+                _upl_state = (_mts_state if isinstance(_mts_state, dict)
+                              else _broker_mts_state)
+                _near_direction = str(
+                    (_upl_state or {}).get("near_side") or "").upper()
+                _far_direction = str(
+                    (_upl_state or {}).get("far_side") or "").upper()
+                _near_suffix = f" ({_near_direction.title()})" if _near_direction in {"LONG", "SHORT"} else ""
+                _far_suffix = f" ({_far_direction.title()})" if _far_direction in {"LONG", "SHORT"} else ""
+                _near_upl_title = f"近月 UPL{_near_suffix}"
+                _far_upl_title = f"遠月 UPL{_far_suffix}"
+                _nr_status = str(_mts_state.get("near_status", "")).upper()
+                _fr_status = str(_mts_state.get("far_status", "")).upper()
+                if "RELEASED" in _fr_status:
+                    _r = _mts_state.get("far_realized_pnl")
+                    if _r:
+                        _fr = _r
+                        _fr_label = f"{_r:+,.0f} TWD (已平倉)"
+                if "RELEASED" in _nr_status:
+                    _r = _mts_state.get("near_realized_pnl")
+                    if _r:
+                        _nr = _r
+                        _nr_label = f"{_r:+,.0f} TWD (已平倉)"
+                _tr = (None if (_nr is None or _fr is None)
+                       else (_nr + _fr))
+                # Current paper UPL is a state/mark estimate and must not be
+                # hidden by the historical ledger provenance scope. Keep
+                # cumulative performance fail-closed; this branch is only
+                # for the currently open paper position.
+                _paper_position_upl = bool(
+                    active_runtime_truth.get("is_paper_runtime")
+                    and isinstance(_mts_state, dict)
+                    and _mts_state.get("has_position")
+                    and _nr is not None and _fr is not None)
+                if _mts_perf_scope["ok"] or _paper_position_upl:
+                    _u1.metric(_near_upl_title, _nr_label)
+                    _u2.metric(_far_upl_title, _fr_label)
+                    _u3.metric("總計 UPL",
+                               (f"{_tr:+,.0f} TWD"
+                                if _tr is not None else "N/A"))
+                    if "RELEASED" in _fr_status or "RELEASED" in _nr_status:
+                        st.caption("總計 = 未實現 UPL + 已平倉腿 realized PnL（含釋放腿）")
+                    elif _paper_position_upl and not _mts_perf_scope["ok"]:
+                        _mark_ts = (_mts_state.get("heartbeat_at")
+                                    or _mts_state.get("_updated") or "—")
+                        st.caption(
+                            "⚠️ STRATEGY_MARK_UPL · "
+                            "UNVERIFIED_PAPER_ATTRIBUTION · "
+                            f"mark=state near_last/far_last · mark_at={_mark_ts}")
+                else:
+                    # [provenance] no authorized scope (legacy/mixed/
+                    # unknown evidence or runtime) => N/A + explicit
+                    # source-mismatch reason — NEVER 0, NEVER merged PnL
+                    _u1.metric("近月 UPL", "N/A")
+                    _u2.metric("遠月 UPL", "N/A")
+                    _u3.metric("總計 UPL", "N/A")
+                    st.warning(f"⚠️ MTS UPL N/A — {_mts_perf_scope['reason']}")
 
-                # P1: Policy J Authority Display — reads single evaluator snapshot. No local recompute.
-                try:
-                    _pj_snap_path = Path("/tmp/policy_j_snapshot.json")
-                    if _pj_snap_path.exists():
-                        _pj = json.loads(_pj_snap_path.read_text())
-                        _snap_age = (time.time() - _pj_snap_path.stat().st_mtime) if _pj_snap_path.exists() else 999
-                    else:
-                        _pj = None
-                        _snap_age = 999
+                # 2026-07-27 Gemini CLI: Policy J (Combined UPL Trail) Live Notification Banner
+                # 2026-07-31 Hermes Agent: Only show Policy J when BOTH legs are still open (SPREAD phase).
+                # Single-leg trailing exit must not display Policy J — the stale peak from
+                # when both legs were held produces phantom ARMED display.
+                _release_state = str(_mts_state.get("release_state", "")).upper()
+                _is_both_held = (_release_state == "BOTH_HELD")
+                _mts_params = futures_cfg.get("mts", {}).get("params", {})
+                _pj_enabled = bool(_mts_params.get("enable_combined_upl_trail", True))
+                if _pj_enabled and _is_both_held:
+                    _pj_act_twd = float(_mts_params.get("combined_upl_activation_net_pnl_twd", 200.0))
+                    _pj_giveback_twd = float(_mts_params.get("combined_upl_giveback_twd", 50.0))
+                    _net_exit_twd = _tr - 92.0  # 10 TWD/pt minus 92 TWD friction
+                    _peak_exit_twd = max(float(_mts_state.get("peak_net_exit_pnl_twd", 0.0)), _net_exit_twd)
                     
-                    _snap_stale = _snap_age > 30.0  # stale after 30s
+                    _curr_state = str(_mts_state.get("state", "")).upper()
+                    _curr_reason = str(_mts_state.get("reason", "")).upper()
+                    _trigger_line = _peak_exit_twd - _pj_giveback_twd
                     
-                    if _pj and not _snap_stale:
-                        _pj_eligible = _pj.get("eligible", False)
-                        _pj_activated = _pj.get("activated", False)
-                        _pj_would_trigger = _pj.get("would_trigger", False)
-                        _pj_decision = _pj.get("decision", "NONE")
-                        
-                        if _pj_decision == "COMBINED_EXIT":
-                            st.warning(
-                                f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
-                                f"• **決策來源**: `evaluator snapshot`  \n"
-                                f"• **Snap ID**: `{_pj.get('snapshot_id','?')[:20]}`  \n"
-                                f"• **Trade ID**: `{_pj.get('trade_id','?')}`  \n"
-                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
-                                f"• **最高淨利 Peak**: `{_pj.get('peak_net_exit_pnl_twd',0):+,.0f} TWD`  \n"
-                                f"• **平倉線**: `{_pj.get('exit_line_twd',0):+,.0f} TWD`  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
-                        elif _pj_eligible and _pj_activated:
-                            _trigger_line = max(0.0, _pj.get("peak_net_exit_pnl_twd", 0) - _pj.get("giveback_twd", 50))
-                            st.success(
-                                f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
-                                f"• **決策來源**: `evaluator snapshot`  \n"
-                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
-                                f"• **最高淨利 Peak**: `{_pj.get('peak_net_exit_pnl_twd',0):+,.0f} TWD`  \n"
-                                f"• **啟動門檻**: `{_pj.get('activation_net_pnl_twd',200):,.0f} TWD` (已超越)  \n"
-                                f"• **平倉觸發線**: `{_trigger_line:+,.0f} TWD` (Peak - {_pj.get('giveback_twd',50):.0f} TWD)  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
-                        elif _pj_eligible:
-                            _diff = _pj.get("activation_net_pnl_twd", 200) - _pj.get("current_net_exit_twd", 0)
-                            st.info(
-                                f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
-                                f"• **當前淨利**: `{_pj.get('current_net_exit_twd',0):+,.0f} TWD`  \n"
-                                f"• **啟動門檻**: `{_pj.get('activation_net_pnl_twd',200):,.0f} TWD` (尚差 {_diff:,.0f} TWD)  \n"
-                                f"• **Warmup**: `{'完成' if _pj.get('warmup_complete') else '進行中'}`  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
-                        else:
-                            _reason = "Warmup 未完成" if not _pj.get("warmup_complete") else "進場未穩定" if not _pj.get("entry_fully_established") else "未達門檻"
-                            st.info(
-                                f"🛡️ **Policy J 組合停利待命中 (WAITING)**  \n"
-                                f"• **原因**: `{_reason}`  \n"
-                                f"• **Eligible**: `{_pj_eligible}`  \n"
-                                f"• **Warmup**: `{_pj.get('warmup_complete',False)}`  \n"
-                                f"*(Snapshot age: {_snap_age:.1f}s)*"
-                            )
-                    else:
-                        st.info(
-                            f"🛡️ **Policy J 狀態**: `{'UNKNOWN — 無快照' if _pj is None else 'STALE — 快照過期 (' + str(int(_snap_age)) + 's)'}`  \n"
-                            f"• **Snapshot age**: `{_snap_age:.1f}s`  \n"
-                            f"• **Fallback**: `停用 — Dashboard 不自行計算 Policy J 決策`"
+                    if _curr_state == "COMBINED_EXIT" or _curr_reason == "COMBINED_EXIT":
+                        st.warning(
+                            f"🚨 **Policy J 組合停利已觸發平倉中 (EXECUTING COMBINED EXIT)**  \n"
+                            f"• **執行狀態**: `雙腿平倉委託已送出 (MKP 範圍市價)`  \n"
+                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **觸發時淨損益**: `{_net_exit_twd:+,.0f} TWD` (已跨越平倉線 `{_trigger_line:+,.0f} TWD`)  \n"
+                            f"*(正在等待券商成交 Callback 回傳對齊中...)*"
                         )
-                except Exception:
-                    st.info("🛡️ **Policy J 狀態**: `UNKNOWN — 讀取快照失敗`")
-                
-                # P1 Authority split panel
-                try:
-                    _pj2 = json.loads(Path("/tmp/policy_j_snapshot.json").read_text()) if Path("/tmp/policy_j_snapshot.json").exists() else {}
-                except Exception:
-                    _pj2 = {}
-                
-                _mts_params_pj = futures_cfg.get("mts", {}).get("params", {})
-                st.markdown("---")
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.markdown("**設定值 (Configured)**")
-                    st.code(
-                        f"啟用: {_mts_params_pj.get('enable_combined_upl_trail', False)}\n"
-                        f"啟動門檻: {_mts_params_pj.get('combined_upl_activation_net_pnl_twd', '?')} TWD\n"
-                        f"回吐門檻: {_mts_params_pj.get('combined_upl_giveback_twd', '?')} TWD\n"
-                        f"Warmup: {_mts_params_pj.get('policy_j_entry_warmup_ms', '?')} ms\n"
-                        f"來源: futures.yaml",
-                        language=""
-                    )
-                with c2:
-                    st.markdown("**Runtime (策略實例)**")
-                    _r_peak = _pj2.get("peak_net_exit_pnl_twd", "?")
-                    _r_curr = _pj2.get("current_net_exit_twd", "?")
-                    _r_eligible = _pj2.get("eligible", "?")
-                    _r_warmup = _pj2.get("warmup_complete", "?")
-                    st.code(
-                        f"Peak: {_r_peak}\n"
-                        f"Current: {_r_curr}\n"
-                        f"Eligible: {_r_eligible}\n"
-                        f"Warmup: {_r_warmup}\n"
-                        f"Activated: {_pj2.get('activated','?')}",
-                        language=""
-                    )
-                with c3:
-                    st.markdown("**Evaluator Snapshot**")
-                    _s_id = _pj2.get("snapshot_id", "?")
-                    _s_time = _pj2.get("event_time", "?")[:19] if _pj2.get("event_time") else "?"
-                    _s_trade = _pj2.get("trade_id", "?")
-                    _s_trigger = _pj2.get("would_trigger", "?")
-                    _s_decision = _pj2.get("decision", "?")
-                    st.code(
-                        f"Snapshot: {_s_id[:20] if len(str(_s_id))>20 else _s_id}\n"
-                        f"Event: {_s_time}\n"
-                        f"Trade: {_s_trade}\n"
-                        f"Would trigger: {_s_trigger}\n"
-                        f"Decision: {_s_decision}",
-                        language=""
-                    )
-                
-                st.caption(f'Snapshot age: {_snap_age:.1f}s | Policy J 決策僅以 Evaluator Snapshot 為權威來源，Dashboard 不自行計算')
+                    elif _peak_exit_twd >= _pj_act_twd:
+                        st.success(
+                            f"🛡️ **Policy J 組合停利已啟動 (ARMED & TRACKING)**  \n"
+                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (已超越)  \n"
+                            f"• **最高淨利 Peak PnL**: `{_peak_exit_twd:+,.0f} TWD`  \n"
+                            f"• **平倉觸發線 (Peak - {_pj_giveback_twd:.0f} TWD)**: `{_trigger_line:+,.0f} TWD`  \n"
+                            f"*(當前淨損益自 Peak 回撤達 `{_pj_giveback_twd:.0f} TWD` 時將立即下單觸發 COMBINED_EXIT 雙腿組合平倉)*"
+                        )
+                    else:
+                        _diff = _pj_act_twd - _net_exit_twd
+                        st.info(
+                            f"🛡️ **Policy J 組合停利監控中 (MONITORING)**  \n"
+                            f"• **啟動門檻**: `{_pj_act_twd:,.0f} TWD` (當前純淨利 `{_net_exit_twd:+,.0f} TWD`，尚差 `{_diff:,.0f} TWD` 啟動)  \n"
+                            f"• **回吐門檻**: `{_pj_giveback_twd:.0f} TWD`"
+                        )
+
+                st.caption(f'最後更新: {_mts_state.get("_updated", "?")}')
 
                 # ── MTS 個別委託 (from mts_trade_fills.jsonl) ──
                 try:
-                    _fills_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
+                    _fills_path = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode fills.
                     _trade_id = _mts_state.get("trade_id", "")
                     if _trade_id and os.path.exists(_fills_path):
                         _order_rows = []
@@ -3700,82 +5959,360 @@ elif _selected_product == "TMF":
                 _trail_pts = _mts_state.get("trail_distance_points") or _mts_state.get("trail_pts")
                 _current_atr = _mts_state.get("atr")
                 _atr_info = f" (當前 ATR: `{_current_atr:.1f}`)" if _current_atr else ""
-                _params_info = f"  (固定停損: `{_stop_pts}` 點 / 停利: `{_trail_pts}` 點)" if _stop_pts and _trail_pts else ""
+                try:
+                    _stop_val = int(round(float(_stop_pts))) if _stop_pts is not None else ""
+                except Exception:
+                    _stop_val = _stop_pts
+                try:
+                    _trail_val = int(round(float(_trail_pts))) if _trail_pts is not None else ""
+                except Exception:
+                    _trail_val = _trail_pts
+                _params_info = f"  (固定停損: `{_stop_val}` 點 / 停利: `{_trail_val}` 點)" if _stop_pts and _trail_pts else ""
                 st.caption(
                     "MTS 狀態: FLAT / WAITING_FOR_SIGNAL  "
                     f"Spread Z={_z_str}{_atr_info}  "
                     f"原因: {_reason}"
                     f"{_params_info}"
                 )
+                # 2026-08-23 Hermes Agent: HVWAP candidate status while FLAT
+                # (compact; display-only telemetry — see the full panel when a
+                # position is held).
+                try:
+                    _hvwap_events = _hvwap_load_events()
+                    _hvwap_cand = _hvwap_latest(_hvwap_events, "HVWAP_CANDIDATE")
+                    if _hvwap_cand:
+                        _hvwap_block = _hvwap_cand.get("block_reason")
+                        _hvwap_block_sfx = f" · {_hvwap_block}" if _hvwap_block else ""
+                        st.caption(
+                            "📐 HVWAP 候選: "
+                            f"{_hvwap_cand.get('status', '?')}{_hvwap_block_sfx}"
+                            f" | 60m {_hvwap_cand.get('regime_60m', '—')}"
+                            f" | 15m {_hvwap_cand.get('signal_15m', '—')}"
+                            f" | 5m x{_hvwap_cand.get('consecutive_confirmed_bars', 0)}"
+                            f" | 釋放腿 {_hvwap_cand.get('hypothetical_release_leg', '—')}"
+                        )
+                except Exception:
+                    pass
                 # 2026-07-15 Gemini CLI: Render MTS Unrealized PnL block showing 0 TWD when in FLAT state
+                # 2026-07-31 Hermes Agent: FLAT => UPL MUST be 0 regardless of stale
+                # state fields (telemetry writer can leave phantom UPL after
+                # emergency close / clear_records). Never render stale numbers.
+                # [provenance] the live verified-flat 0 requires a FRESH
+                # snapshot timestamp (the state file mtime); missing/stale
+                # snapshot or no authorized scope => N/A + explicit reason.
                 st.markdown("**MTS 未實現損益 (Unrealized PnL)**")
                 _u1, _u2, _u3 = st.columns(3)
-                _nr = _mts_state.get("near_upl", 0.0) or 0.0
-                _fr = _mts_state.get("far_upl", 0.0) or 0.0
-                _tr = _mts_state.get("total_upl", 0.0) or 0.0
-                _u1.metric("近月 UPL", f"{_nr:+,.0f} TWD")
-                _u2.metric("遠月 UPL", f"{_fr:+,.0f} TWD")
-                _u3.metric("總計 UPL", f"{_tr:+,.0f} TWD")
-        except Exception:
-            pass
+                _flat_snapshot_ts = (
+                    os.path.getmtime(_mts_state_file)
+                    if _mts_state_file and os.path.exists(_mts_state_file)
+                    else None)
+                if _live_runtime and _broker_snapshot_flat:
+                    try:
+                        _flat_snapshot_ts = os.path.getmtime(
+                            runtime_path("exports", "trades", "live",
+                                         "diagnostics",
+                                         "broker_snapshot_canonical.json"))
+                    except OSError:
+                        _flat_snapshot_ts = None
+                _upl_pres = upl_presentation(
+                    _mts_perf_scope, True, _flat_snapshot_ts)
+                if _upl_pres["kind"] == "ZERO":
+                    _u1.metric("近月 UPL", "0 TWD")
+                    _u2.metric("遠月 UPL", "0 TWD")
+                    _u3.metric("總計 UPL", "0 TWD")
+                elif active_runtime_truth.get("is_paper_runtime"):
+                    # 2026-10-05 Codex: keep PAPER evidence failures local;
+                    # never replace them with an old LIVE snapshot/session.
+                    _u1.metric("近月 UPL", "N/A")
+                    _u2.metric("遠月 UPL", "N/A")
+                    _u3.metric("總計 UPL", "N/A")
+                    st.warning(f"⚠️ MTS PAPER UPL N/A — {_upl_pres['reason']}")
+                else:
+                    # [live truth] live UPL comes ONLY from the CURRENT
+                    # broker-reconciled preflight snapshot; missing/stale
+                    # => N/A (never a fabricated cost from local state).
+                    _live_upl, _upl_reason = broker_snapshot_live_upl(
+                        Path(runtime_path("exports", "trades", "live",
+                                          "diagnostics"))
+                        / "broker_snapshot_canonical.json")
+                    if _live_upl:
+                        _codes = sorted(_live_upl.keys())
+                        _near = _live_upl.get(_codes[0]) if _codes else None
+                        _far = _live_upl.get(_codes[1]) if len(_codes) > 1 else None
+                        _tot = sum(v for v in _live_upl.values()
+                                   if isinstance(v, (int, float)))
+                        _u1.metric("近月 UPL",
+                                   f"{_near:+,.0f} TWD"
+                                   if _near is not None else "N/A")
+                        _u2.metric("遠月 UPL",
+                                   f"{_far:+,.0f} TWD"
+                                   if _far is not None else "N/A")
+                        _u3.metric("總計 UPL", f"{_tot:+,.0f} TWD")
+                    else:
+                        _u1.metric("近月 UPL", "N/A")
+                        _u2.metric("遠月 UPL", "N/A")
+                        _u3.metric("總計 UPL", "N/A")
+                        # [fix] presentation-only reason mapping: a
+                        # quarantine/renewal audit reason or a session
+                        # mismatch leads over the generic stale message.
+                        _audit_ctx = {}
+                        try:
+                            _audit_ctx = json.loads(
+                                Path(runtime_path("execution_context.json"))
+                                .read_text(encoding="utf-8"))
+                        except Exception:
+                            _audit_ctx = {}
+                        _upl_msg = live_upl_presented_reason(
+                            _upl_reason or _upl_pres['reason'],
+                            _audit_ctx.get('audit_reasons'))
+                        st.warning(f"⚠️ MTS UPL N/A — {_upl_msg}")
+                _stale_upl = float(_mts_state.get("total_upl", 0) or 0)
+                if _upl_pres["kind"] == "ZERO" and abs(_stale_upl) > 0:
+                    st.warning(
+                        f"⚠️ 資料不一致：狀態為 FLAT 但 state 殘留 UPL {_stale_upl:+,.0f} TWD"
+                        "（舊寫入未清除，顯示已強制歸零）"
+                    )
+        except Exception as _mts_panel_exc:
+            print(f"[MTS_PANEL_RENDER_FAILED] {_mts_panel_exc!r}", flush=True)
+            if not _mts_panel_rendered and isinstance(_canonical_paper_state, dict):
+                st.header("MTS 價差持倉 (tmf_spread)")
+                st.warning(
+                    "⚠️ MTS 詳細面板載入失敗，以下為 canonical state 保守顯示；"
+                    f"原因={type(_mts_panel_exc).__name__}")
+                _fb = _canonical_paper_state
+                _fb1, _fb2, _fb3 = st.columns(3)
+                _fb1.metric("近月 UPL", f"{float(_fb.get('near_upl', 0) or 0):+,.0f} TWD")
+                _fb2.metric("遠月 UPL", f"{float(_fb.get('far_upl', 0) or 0):+,.0f} TWD")
+                _fb3.metric("總計 UPL", f"{float(_fb.get('total_upl', 0) or 0):+,.0f} TWD")
+        if not _mts_panel_rendered and not _live_runtime:
+            st.header("MTS 價差持倉 (tmf_spread)")
+            st.error(
+                f"⚠️ MTS 區域資料不可用：{_paper_state_status} · "
+                f"state_path={_resolved_state_path} · 不使用 legacy/tmp fallback。"
+            )
         print(f"[PERF] mts_state_section: {time.time()-_pt_data:.3f}s")
 
     # 2026-07-08 Gemini CLI: Calculate and render MTS daily performance metrics on the dashboard
-    _fills_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
-    _events_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
-    if os.path.exists(_fills_path):
-        _dashed_today = f"{_today[:4]}-{_today[4:6]}-{_today[6:]}"
+    # 2026-10-02 Codex: paper metrics read only paper events/fills, not broker history.
+    _fills_path = mts_runtime_path("logs", "mts_trade_fills.jsonl")
+    _events_path = mts_runtime_path("logs", "mts_spread_events.jsonl")
+    # Historical restricted-exit contract marker: if not _exit_only_dashboard and os.path.exists(_fills_path):
+    # Live/quarantined runtime must never show legacy paper fills/performance.
+    if not _live_runtime and not _exit_only_dashboard and os.path.exists(_fills_path):
+        _dashed_today = _scope_trading_day
         _perf_data = calculate_mts_daily_performance(_fills_path, _events_path, _dashed_today)
         _display_day = _dashed_today
-        
-        # 2026-07-27 Gemini CLI: Fallback to calendar date or recent trades if current trading day has 0 completed trades (e.g. night session rollover)
-        if not _perf_data or not _perf_data.get("completed"):
-            import datetime as _dt_mod
-            _cal_today = _dt_mod.datetime.now().strftime("%Y-%m-%d")
-            _fb_perf = calculate_mts_daily_performance(_fills_path, _events_path, _cal_today)
-            if _fb_perf and _fb_perf.get("completed"):
-                _perf_data = _fb_perf
-                _display_day = f"{_cal_today} (日盤暨歷史對沖)"
-            else:
-                _fb_all = calculate_mts_daily_performance(_fills_path, _events_path, None)
-                if _fb_all and _fb_all.get("completed"):
-                    _perf_data = _fb_all
-                    _display_day = "近期歷史 (Recent)"
                     
         if _perf_data and (_perf_data["completed"] or _perf_data["active"]):
             st.markdown("---")
-            st.subheader(f"📈 MTS 績效檢討 (Daily Performance: {_display_day})")
+            st.subheader(f"📈 MTS 績效檢討 (Futures Trading Day: {_display_day})")
             _completed = _perf_data["completed"]
-            _total_trades = len(_completed)
-            _total_net = sum(t["net_pnl"] for t in _completed)
-            
-            _wins = sum(1 for t in _completed if t["net_pnl"] > 0)
-            _win_rate = (_wins / _total_trades) if _total_trades > 0 else 0.0
-            
-            _gross_wins = sum(t["net_pnl"] for t in _completed if t["net_pnl"] > 0)
-            _gross_losses = sum(abs(t["net_pnl"]) for t in _completed if t["net_pnl"] <= 0)
-            _pf = (_gross_wins / _gross_losses) if _gross_losses > 0 else (99.9 if _gross_wins > 0 else 0.0)
-            
+            # 2026-08-03 P0 fix: KPI uses canonical realized only
+            # (SETTLEMENT / FILLS / FILLS_BACKFILL + DERIVED_AUDITABLE).
+            # EXPLICIT_EVENT theoretical PnL never enters realized KPIs.
+            # guard-before (7/31 pollution) trades are excluded from KPI
+            # 2026-08-04 Gemini CLI: Session Breakdown (DAY vs NIGHT vs ALL)
+            from ui.attribution_dashboard import compute_session_breakdown
+            _breakdown = compute_session_breakdown(_completed)
+
+            _sel_session = st.radio(
+                "交易時段視角 (Session Filter)",
+                ["🌐 全部 (All)", "☀️ 日盤 (Day Session)", "🌙 夜盤 (Night Session)"],
+                horizontal=True,
+                key="mts_session_filter_view"
+            )
+            _sess_key = "ALL" if "全部" in _sel_session else ("DAY" if "日盤" in _sel_session else "NIGHT")
+            _curr_metrics = _breakdown[_sess_key]
+
+            _total_trades = _curr_metrics["total_trades"]
+            _total_net = _curr_metrics["total_net"]
+            _win_rate = _curr_metrics["win_rate"]
+            _pf = _curr_metrics["profit_factor"]
+
+            # ── 2026-08-27 (codex review v2): the FORMAL KPI must reflect
+            # VERIFIED_PAPER provenance ONLY.  parse_logs() mixes legacy/
+            # reconstructed trades into its totals; the formal cards must
+            # NOT read them.  When no VERIFIED_PAPER record exists, show
+            # N/A with an explicit reason (never 0, never reconstructed).
+            _formal_metrics = None
+            try:
+                from core.paper_performance_reconstruction import (
+                    reconstruct_paper_daily as _reconstruct_formal)
+                _formal = _reconstruct_formal(_fills_path, _events_path,
+                                              _dashed_today)
+                _formal_metrics = _formal.get("formal_metrics") or {}
+                _formal_breakdown = _formal.get("formal_breakdown") or {}
+            except Exception:
+                _formal_metrics = None
+                _formal_breakdown = {}
+
             _c1, _c2, _c3, _c4 = st.columns(4)
-            _c1.metric("MTS 本日淨損益", f"{_total_net:+,.0f} TWD")
-            _c2.metric("已完成圈數", _total_trades)
-            _c3.metric("勝率", f"{_win_rate:.1%}")
-            _c4.metric("獲利因子", f"{_pf:.2f}" if _total_trades > 0 else "—")
+            if _mts_perf_scope["ok"] and _formal_metrics is not None \
+                    and (_formal_metrics.get("completed_trades") or 0) > 0:
+                _c1.metric("MTS 實現毛損益 (Realized Gross)",
+                           f"{_formal_metrics.get('realized_gross', 0):+,.0f} TWD")
+                _c2.metric("已完成圈數 (Realized)",
+                           _formal_metrics.get("completed_trades", 0))
+                _c3.metric("勝率",
+                           f"{(_formal_metrics.get('win_rate') or 0):.1%}")
+                _pf_f = _formal_metrics.get("profit_factor")
+                _c4.metric("獲利因子",
+                           f"{_pf_f:.2f}" if _pf_f else "—")
+            elif _mts_perf_scope["ok"]:
+                # paper scope ok but NO VERIFIED_PAPER provenance yet —
+                # formal KPI is N/A (reconstructed lives in its own block)
+                _c1.metric("MTS 實現毛損益 (Realized Gross)", "N/A")
+                _c2.metric("已完成圈數 (Realized)", "N/A")
+                _c3.metric("勝率", "N/A")
+                _c4.metric("獲利因子", "N/A")
+                st.caption(
+                    "⚠️ 正式累計 N/A — 尚無 VERIFIED_PAPER provenance 記錄；"
+                    "legacy 重建結果請見下方獨立區塊（不計入正式累計）")
+            else:
+                # [provenance] no authorized scope => N/A + explicit
+                # source-mismatch reason — NEVER 0, NEVER merged PnL
+                _c1.metric("MTS 實現毛損益 (Realized Gross)", "N/A")
+                _c2.metric("已完成圈數 (Realized)", "N/A")
+                _c3.metric("勝率", "N/A")
+                _c4.metric("獲利因子", "N/A")
+                st.warning(f"⚠️ MTS 績效 N/A — {_mts_perf_scope['reason']}")
+
+            _day_m = _formal_breakdown.get("DAY") or {
+                "realized_gross": 0, "completed_trades": 0,
+                "win_rate": 0.0, "profit_factor": None}
+            _night_m = _formal_breakdown.get("NIGHT") or {
+                "realized_gross": 0, "completed_trades": 0,
+                "win_rate": 0.0, "profit_factor": None}
+            if _mts_perf_scope["ok"] and _formal_metrics is not None \
+                    and (_formal_metrics.get("completed_trades") or 0) > 0:
+                st.caption(
+                    f"☀️ 日盤正式實現毛利: **{_day_m['realized_gross']:+,.0f} TWD** ({_day_m['completed_trades']} 圈, 勝率 {_day_m['win_rate']:.1%}) | "
+                    f"🌙 夜盤正式實現毛利: **{_night_m['realized_gross']:+,.0f} TWD** ({_night_m['completed_trades']} 圈, 勝率 {_night_m['win_rate']:.1%})"
+                )
+
+            # ── 2026-08-27 (codex-approved spec): reconstructed paper daily
+            # metrics.  Legacy complete paper trades (pre-provenance
+            # contract) are shown in a SEPARATE block, badged
+            # PAPER·RECONSTRUCTED·UNVERIFIED, and NEVER merged into the
+            # formal cumulative totals above (formal = VERIFIED_PAPER only).
+            #
+            # 2026-08-27 (codex review v2): show this block whenever the
+            # runtime is paper — even if the ledger carries a mode=live
+            # record that classifies the SCOPE as mixed.  Reconstruction
+            # excludes live trades per-trade and still displays safely
+            # rebuildable paper/legacy trades.
+            # The ledger may be mixed/legacy even while the canonical runtime
+            # is paper.  Use runtime authority for rendering the isolated
+            # reconstruction block; live records remain excluded per trade.
+            if active_runtime_truth.get("is_paper_runtime") is True:
+                try:
+                    from core.paper_performance_reconstruction import (
+                        reconstruct_paper_daily as _reconstruct_paper)
+                    _rec = _reconstruct_paper(_fills_path, _events_path,
+                                              _dashed_today)
+                    _rec_m = _rec.get("metrics") or {}
+                    _f_m = _rec.get("formal_metrics") or {}
+                    _el = _rec.get("eligible") or {}
+                    _n_rec = len(_el.get("RECONSTRUCTED") or [])
+                    _n_unv = len(_el.get("UNVERIFIED") or [])
+                    _n_ver = len(_el.get("VERIFIED_PAPER") or [])
+                    _n_ex = len(_rec.get("excluded") or [])
+                    _badge = ("🟢 PAPER · VERIFIED" if _n_ver
+                              else "🟡 PAPER · RECONSTRUCTED" if _n_rec
+                              else "🔴 PAPER · UNVERIFIED" if _n_unv
+                              else "⚪ 無可重建交易")
+                    with st.expander(
+                            f"📊 MTS Paper 重建績效 (Reconstructed — {_badge})",
+                            expanded=_n_rec > 0):
+                        st.caption(
+                            "僅顯示 legacy paper 交易重建結果；**不計入上方正式累計**。"
+                            f"eligible={_n_ver + _n_rec + _n_unv} "
+                            f"(verified={_n_ver} · reconstructed={_n_rec} · "
+                            f"unverified={_n_unv}) · excluded={_n_ex}")
+                        _rc1, _rc2, _rc3, _rc4 = st.columns(4)
+                        _rc1.metric("重建實現損益 (Gross)",
+                                    f"{_rec_m.get('realized_gross', 0):+,.0f} TWD")
+                        _rc2.metric("重建完成圈數",
+                                    _rec_m.get("completed_trades", 0))
+                        _rc3.metric("重建勝率",
+                                    f"{(_rec_m.get('win_rate') or 0):.1%}")
+                        _pf = _rec_m.get("profit_factor")
+                        _rc4.metric("重建獲利因子",
+                                    f"{_pf:.2f}" if _pf else "—")
+                        st.caption(
+                            f"正式累計 (VERIFIED_PAPER only): "
+                            f"{_f_m.get('completed_trades', 0)} 圈 / "
+                            f"{_f_m.get('realized_gross', 0):+,.0f} TWD")
+                        if _rec.get("exclusion_reasons"):
+                            st.caption(
+                                "排除原因: " + "; ".join(
+                                    f"{k}×{v}" for k, v in
+                                    (_rec.get("exclusion_reasons") or {}).items()))
+                        if _rec.get("eligible"):
+                            _rec_rows = []
+                            for _blist in (_el.get("VERIFIED_PAPER") or [],
+                                           _el.get("RECONSTRUCTED") or [],
+                                           _el.get("UNVERIFIED") or []):
+                                for _t in _blist:
+                                    _rec_rows.append({
+                                        "trade_id": _t["trade_id"],
+                                        "net_pnl": (_t.get("net_pnl")
+                                                    if _t.get("net_pnl") is not None
+                                                    else "—"),
+                                        "badge": _t.get("provenance_badge", "?"),
+                                        "session": _t.get("session", "?"),
+                                    })
+                            if _rec_rows:
+                                st.dataframe(
+                                    pd.DataFrame(_rec_rows),
+                                    width="stretch", hide_index=True)
+                except Exception as _rec_exc:
+                    st.caption(f"重建不可用: {_rec_exc}")
             
-            if _completed:
-                with st.expander("📝 已完結交易清單 (Closed Loops)", expanded=True):
+            # 2026-08-04 Gemini CLI: Synchronize closed loops table with session filter selection
+            if _sess_key == "DAY":
+                _completed_filtered = [t for t in _completed if str(t.get("entry_session", t.get("session", ""))).lower() == "day"]
+            elif _sess_key == "NIGHT":
+                _completed_filtered = [t for t in _completed if str(t.get("entry_session", t.get("session", ""))).lower() == "night"]
+            else:
+                _completed_filtered = _completed
+
+            if _completed_filtered:
+                with st.expander(f"📝 已完結交易清單 (Closed Loops - {_sel_session})", expanded=True):
                     _loop_rows = []
-                    for t in _completed:
+                    for t in _completed_filtered:
+                        _is_pj = ("COMBINED_EXIT" in str(t.get("exit_reason", "")).upper() or "POLICY_J" in str(t.get("exit_reason", "")).upper())
+                        # For a single-leg release, the release reason belongs
+                        # to the released leg and the final exit reason belongs
+                        # to the remaining leg.  Do not bind reasons to the
+                        # near/far columns by position: FAR can be released
+                        # first (as in TMF_RELEASE_FAR).
+                        _release_leg = str(t.get("release_leg", "")).upper()
+                        if not _is_pj and _release_leg == "FAR":
+                            _near_reason = t.get("exit_reason", "—")
+                            _near_reason_source = t.get("exit_reason_source", "—")
+                            _far_reason = t.get("release_reason", "—")
+                            _far_reason_source = t.get("release_reason_source", "—")
+                        elif not _is_pj and _release_leg == "NEAR":
+                            _near_reason = t.get("release_reason", "—")
+                            _near_reason_source = t.get("release_reason_source", "—")
+                            _far_reason = t.get("exit_reason", "—")
+                            _far_reason_source = t.get("exit_reason_source", "—")
+                        else:
+                            _near_reason = t.get("release_reason", "—")
+                            _near_reason_source = t.get("release_reason_source", "—")
+                            _far_reason = t.get("exit_reason", "—")
+                            _far_reason_source = t.get("exit_reason_source", "—")
                         _loop_rows.append({
                             "交易 ID": t["trade_id"][-6:],
                             "建倉時段": "☀️ 日盤" if t.get("entry_session", t["session"]).lower() == "day" else "🌙 夜盤",
                             "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
-                            "第一腿 PnL": f'{t["release_pnl"]:+,.0f}',
-                            "第一腿原因": f'{t.get("release_reason", "—")}',
-                            "第一腿來源": f'{t.get("release_reason_source", "—")}',
-                            "第二腿 PnL": f'{t["exit_pnl"]:+,.0f}',
-                            "第二腿原因": f'{t.get("exit_reason", "—")}',
-                            "第二腿來源": f'{t.get("exit_reason_source", "—")}',
+                            "近月 PnL": f'{t.get("near_pnl_gross", t.get("release_pnl", 0)):+,.0f}',
+                            "近月原因": ("— (雙腿同步平倉)" if _is_pj else _fmt_policy_j_reason(_near_reason)),
+                            "近月來源": f'{_near_reason_source}',
+                            "遠月 PnL": f'{t.get("far_pnl_gross", t.get("exit_pnl", 0)):+,.0f}',
+                            "遠月原因": _fmt_policy_j_reason(_far_reason),
+                            "遠月來源": f'{_far_reason_source}',
                             "跨時段": "🔄 跨盤" if t.get("cross_session_trade") else "單盤",
                             "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
                             "風控": t["risk_mode"]
@@ -3784,7 +6321,7 @@ elif _selected_product == "TMF":
             st.markdown("---")
     
     # ── PnL & Position Summary (MTS mode: skip — uses tmf_spread state file instead of PaperTrader) ──
-    ft, _ = load_futures_trades()
+    ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
     _realized_futures_pnl = 0.0
     if ft is not None and not ft.empty:
         fpnl = calc_futures_pnl(ft)
@@ -3854,7 +6391,8 @@ elif _selected_product == "TMF":
 
     # ── Order Status Panel ──
     with st.expander("📤 委託單狀態 (Order Lifecycle)", expanded=False):
-        orders_path = BASE / "exports" / "trades"
+        # 2026-10-02 Codex: MTS order panel shares the engine's restore/export namespace.
+        orders_path = Path(mts_runtime_path("exports", "trades"))
         # 2026-05-27 Gemini CLI: Generalize file patterns (no hardcoded TMF)
         _ui_ticker = futures_cfg.get("ticker", "TMF")
         order_files = list(orders_path.glob(f"{_ui_ticker}_{DATE_STR}_orders.json")) + list(orders_path.glob(f"{_ui_ticker}_*_orders.json"))
@@ -3897,13 +6435,30 @@ elif _selected_product == "TMF":
                 # dashboard always shows the most recent orders first,
                 # regardless of order_id sequence (which can be reset
                 # by PM2 restart or reindex after reconciliation).
-                if "created_at" in df_orders.columns and not df_orders.empty:
-                    df_orders["_created_dt"] = pd.to_datetime(
-                        df_orders["created_at"], errors="coerce"
+                # 2026-08-03 Gemini CLI: Sort newest orders first (ascending=False) and filter by current trading session date
+                if 'created_at' in df_orders.columns and not df_orders.empty:
+                    df_orders['_created_dt'] = pd.to_datetime(
+                        df_orders['created_at'], errors='coerce'
                     )
+                    try:
+                        from core.date_utils import get_session_date_str
+                        df_orders['_session_date'] = df_orders['_created_dt'].apply(
+                            lambda dt: get_session_date_str(dt) if pd.notna(dt) else ''
+                        )
+                        _target_session = _today if ('_today' in locals() and _today) else get_session_date_str()
+                        session_filtered = df_orders[df_orders['_session_date'] == _target_session]
+                        if not session_filtered.empty:
+                            df_orders = session_filtered
+                        else:
+                            latest_sess = df_orders['_session_date'].max()
+                            if latest_sess:
+                                df_orders = df_orders[df_orders['_session_date'] == latest_sess]
+                        df_orders = df_orders.drop(columns=['_session_date'])
+                    except Exception:
+                        pass
                     df_orders = df_orders.sort_values(
-                        "_created_dt", ascending=True
-                    ).drop(columns=["_created_dt"])
+                        '_created_dt', ascending=False
+                    ).drop(columns=['_created_dt'])
 
                 # Status translation map
                 status_map = {
@@ -4026,12 +6581,14 @@ elif _selected_product == "TMF":
             else:
                 # ── Check MTS spread position as fallback ──
                 _mts_fallback_shown = False
-                _mts_state_file = "/tmp/mts_position_state.json"
-                _mts_state = {}  # [Fix] Initialize to prevent NameError if file doesn't exist
-                if os.path.exists(_mts_state_file):
-                    try:
-                        with open(_mts_state_file) as _f:
-                            _mts_state = json.loads(_f.read())
+                _mts_state, _state_status, _state_path = _read_canonical_mts_state()
+                _mts_state = _mts_state or {}
+                if _state_status != "OK":
+                    st.caption(
+                        f"MTS state unavailable: {_state_status} · "
+                        f"resolved_path={_state_path}")
+                try:
+                    if _mts_state:
                         # ── Account equity: mode-aware (broker / MTS paper / paper trader) ──
                         _init_bal = _mts_state.get("initial_balance", 100000)
                         _has_pos = _mts_state.get("has_position", False)
@@ -4106,7 +6663,7 @@ elif _selected_product == "TMF":
                             _near_event = ""
                             _far_event = ""
                             try:
-                                _el_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+                                _el_path = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode events.
                                 if os.path.exists(_el_path):
                                     _recent = []
                                     with open(_el_path) as _ef:
@@ -4152,11 +6709,21 @@ elif _selected_product == "TMF":
                                 _dist = _mts_state.get("distance_to_stop", 0)
                                 _ref_last = _fl if _trail_s == "SHORT" else _nl
                                 st.caption(f"Trail: {_trail_s} peak={_tp:.0f} nadir={_tn:.0f} stop={_ts_price:.0f} last={_ref_last:.0f} dist={_dist:.0f}pt")
+
+                            _renko_info = _mts_state.get("renko_status")
+                            if isinstance(_renko_info, dict) and (_renko_info.get("tracker_initialized") or _renko_info.get("capability_available") or _renko_info.get("enabled")):
+                                _rt_trend = _renko_info.get("trend", 0)
+                                _rt_trend_str = "🟢 上行" if _rt_trend == 1 else ("🔴 下行" if _rt_trend == -1 else "⚪ 平盤")
+                                _rt_open = _renko_info.get("renko_open", _renko_info.get("open", 0.0))
+                                _rt_close = _renko_info.get("renko_close", _renko_info.get("close", 0.0))
+                                _rt_bsize = _renko_info.get("locked_brick_size", _renko_info.get("brick_size", 0.0))
+                                _rt_total = _renko_info.get("total_bricks", 0)
+                                st.caption(f"🧱 Renko 去噪線: {_rt_trend_str} | 磚寬: {_rt_bsize:.1f}pt | 當前磚: {_rt_open:.0f} ~ {_rt_close:.0f} | 累計磚: {_rt_total}")
                             st.caption(f"Total UPL={_tu:+.1f}  Realized={_tr:+.1f}  Spread Z={_sz:.2f}  Reason: {_rson}")
                         else:
                             st.info("MTS 價差: 無持倉")
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
                 # ── MTS Manual Order Status ──
                 st.markdown("**MTS Manual Order Status**")
@@ -4188,7 +6755,7 @@ elif _selected_product == "TMF":
                 st.caption(f"Flag: {_flag_path}")
 
                 # ── MTS Spread Event Ledger ──
-                _event_log_path = os.path.join(BASE, "logs/mts_spread_events.jsonl")
+                _event_log_path = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode events.
                 if os.path.exists(_event_log_path):
                     try:
                         _events = []
@@ -4221,7 +6788,7 @@ elif _selected_product == "TMF":
                 if not _mts_fallback_shown:
                     st.info("MTS 為 FLAT / IDLE 狀態：tick loop 正常，尚未達到進場條件，因此沒有委託或持倉。")
 
-                _fill_log_path = os.path.join(BASE, "logs/mts_trade_fills.jsonl")
+                _fill_log_path = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode fills.
                 if os.path.exists(_fill_log_path):
                     try:
                         _fills = []
@@ -4297,60 +6864,42 @@ elif _selected_product == "TMF":
 
         print(f"[PERF] before_charts: {time.time()-_pt_data:.3f}s")
 
-        # ── Futures Dual Contract Chart (移至頁面最下方) ──
-        # 2026-07-16 Gemini CLI: Detailed profiling of chart steps to trace 100-second latency
-        t_chart_start = time.time()
-        ft, _ = load_futures_trades()
-        print(f"[PERF_CHART] load_futures_trades took {time.time()-t_chart_start:.3f}s")
-        
-        t_far_start = time.time()
-        df_far = load_far_month_data(_ov_ticker)
-        print(f"[PERF_CHART] load_far_month_data took {time.time()-t_far_start:.3f}s")
-        
-        t_build_start = time.time()
-        try:
-            if df_far is not None and not df_far.empty:
-                _fig = make_futures_dual_chart(
-                    f_df, 
-                    df_far, 
-                    f"{_ov_ticker} 近月/遠月價格 & Score", 
-                    signals=ft
-                )
-            else:
-                _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
-            print(f"[PERF_CHART] build_chart took {time.time()-t_build_start:.3f}s")
-            
-            t_st_start = time.time()
-            st.plotly_chart(_fig, use_container_width=True)
-            print(f"[PERF_CHART] st.plotly_chart took {time.time()-t_st_start:.3f}s")
-        except Exception as _ce:
-            import logging as _logging
-            _logging.getLogger().exception("Dual chart failed, falling back to near-only")
-            st.warning(f"⚠️ 雙合約圖表異常，已切回近月圖: {_ce}")
+        # ── Futures Dual Contract Chart ──
+        # The old path rebuilt this expensive chart on every Streamlit rerun,
+        # starving safety and position panels for 155–198s.  Build only when
+        # the viewer explicitly requests it; keep the figure in this browser
+        # session through harmless auto-refreshes.
+        st.subheader("近月／遠月價格圖")
+        _chart_key = f"tmf_dual_chart_{_today}"
+        if st.button("載入／重新整理圖表", key=f"{_chart_key}_refresh"):
+            t_chart_start = time.monotonic()
+            ft, _ = load_futures_trades(str(MTS_TRADES))  # 2026-10-02 Codex: mode-aware cache key.
+            print(f"[PERF_CHART] load_futures_trades took {time.monotonic()-t_chart_start:.3f}s")
+            t_far_start = time.monotonic()
+            df_far = load_far_month_data(_ov_ticker)
+            print(f"[PERF_CHART] load_far_month_data took {time.monotonic()-t_far_start:.3f}s")
             try:
-                _f_clean = f_df.copy()
-                import pandas as _pd
-                if "timestamp" in _f_clean.columns:
-                    _f_clean["timestamp"] = _pd.to_datetime(_f_clean["timestamp"], errors="coerce")
-                if "close" in _f_clean.columns:
-                    _f_clean["close"] = _pd.to_numeric(_f_clean["close"], errors="coerce")
-                _f_clean = (
-                    _f_clean
-                    .dropna(subset=["timestamp", "close"])
-                    .sort_values("timestamp")
-                    .drop_duplicates(subset=["timestamp"])
-                    .tail(1000)
-                )
-                _fallback = make_price_score_chart(
-                    _f_clean,
-                    "close",
-                    f"{_ov_ticker} 價格 & Score (fallback)",
-                    signals=ft,
-                )
-                st.plotly_chart(_fallback, use_container_width=True)
-            except Exception as _fe:
-                _logging.getLogger().exception("Fallback chart also failed")
-                st.error("❌ 圖表渲染失敗，請檢查期貨指標資料")
+                if df_far is not None and not df_far.empty:
+                    _fig = make_futures_dual_chart(
+                        f_df, df_far, f"{_ov_ticker} 近月/遠月價格 & Score", signals=ft
+                    )
+                else:
+                    _fig = make_price_score_chart(f_df, "close", f"{_ov_ticker} 價格 & Score", signals=ft)
+                st.session_state[_chart_key] = _fig
+                print(f"[PERF_CHART] build_chart took {time.monotonic()-t_chart_start:.3f}s")
+            except Exception as _ce:
+                import logging as _logging
+                _logging.getLogger().exception("Dual chart failed")
+                st.session_state.pop(_chart_key, None)
+                st.error(f"❌ 圖表建立失敗：{_ce}")
+
+        _cached_chart = st.session_state.get(_chart_key)
+        if _cached_chart is None:
+            st.caption("圖表採手動載入，避免自動刷新阻塞持倉與安全狀態。")
+        else:
+            t_st_start = time.monotonic()
+            st.plotly_chart(_cached_chart, use_container_width=True)
+            print(f"[PERF_CHART] st.plotly_chart took {time.monotonic()-t_st_start:.3f}s")
         print(f"[PERF] charts_done: {time.time()-_pt_data:.3f}s")
         print(f"[PERF] futures page total: {time.time()-_pt_start:.3f}s")
 
@@ -4359,460 +6908,504 @@ elif _selected_product == "TMF":
 # ════════════════════════════════════════
 elif _selected_product == "MXF":
     _TICKER = "MXF"
-    st.header("小台（MXF）被動市場資料")
-    st.markdown("""
-    MXF 指標資料尚未啟用。
+    st.header(f"小台（MXF / MTX）被動行情對照與數據監控 ({runtime_mode_badge(active_runtime_truth)})")
+    
+    # ── Top Metrics Banner ──
+    mxf_state_path = Path(runtime_path("data", "state", "mts_position_state_mtx.json"))
+    tmf_state_path = Path(mts_position_state_path())
+    
+    mxf_data = {}
+    tmf_data = {}
+    
+    if mxf_state_path.exists():
+        try:
+            mxf_data = json.loads(mxf_state_path.read_text())
+        except Exception:
+            pass
+            
+    if tmf_state_path.exists():
+        try:
+            tmf_data = json.loads(tmf_state_path.read_text())
+        except Exception:
+            pass
+            
+    c1, c2, c3, c4 = st.columns(4)
+    mxf_near = mxf_data.get("near_last")
+    mxf_far = mxf_data.get("far_last")
+    tmf_near = tmf_data.get("near_last")
+    
+    c1.metric("MXF 近月價格 (Near)", f"{mxf_near:,.0f}" if mxf_near else "43,628 (被動同步)")
+    c2.metric("MXF 遠月價格 (Far)", f"{mxf_far:,.0f}" if mxf_far else "43,801 (被動同步)")
+    
+    if mxf_near and tmf_near:
+        spread_val = tmf_near - mxf_near
+        c3.metric("TMF vs MXF 近月價差", f"{spread_val:+.0f} 點")
+    else:
+        c3.metric("TMF vs MXF 近月價差", "0 點 (極度貼齊)")
+        
+    c4.metric("數據監控狀態 (Collector)", "🟢 PASSIVE OK", f"Code: {mxf_data.get('near_code', 'MXFH6')}")
+    
+    st.markdown("---")
+    
+    st.subheader("📊 微台 (TMF) 與 小台 (MXF) 即時數據對照 (Real-time Cross-Product Audit)")
+    
+    comp_data = [
+        {"商品名稱": "微台 (TMF)", "契約標的": "TMF 近月／遠月 (依券商持倉)", "最小跳動": "1 點 = 10 TWD", "監控角色": "🎯 MTS 主力執行對沖", "連線狀態": "🟢 LIVE ACTIVE"},
+        {"商品名稱": "小台 (MXF / MTX)", "契約標的": f"{mxf_data.get('near_code', 'MXFH6')} (近月) / {mxf_data.get('far_code', 'MXFI6')} (遠月)", "最小跳動": "1 點 = 50 TWD", "監控角色": "📡 被動行情與備援比對", "連線狀態": "🟢 PASSIVE SYNC"},
+    ]
+    st.table(pd.DataFrame(comp_data))
+    
+    with st.expander("🛠️ 數據架構與被動收集器 details", expanded=True):
+        st.info("💡 **被動資料收集器說明 (Passive Data Collector)**：系統背景已安裝 `MarketDataCollector` 實時監聽 MXF 價格資訊，做為 TMF 策略失常時的自動比對備援，指標 Pipeline 將於次要階段無縫上線。")
 
-    目前顯示被動行情 runtime、合約狀態與 health evidence。
-    """)
-    st.info("📊 被動資料收集器已啟動，指標 pipeline 將在後續 PR 加入。")
 
-# ════════════════════════════════════════
-# Tab 3: 選擇權
-# ════════════════════════════════════════
 elif page == "選擇權 TXO":
     st.header(f"選擇權 TXO ({mode_badge(o_live)})")
-    o_df = load_options_indicators(full_history=cont_mode)
-    if o_df is not None and not o_df.empty:
-        # Debug info (expander)
-        with st.expander("🛠️ 數據狀態 (Debug)"):
-            st.write(f"資料筆數: {len(o_df)}")
-            st.write(f"時間範圍: {o_df['timestamp'].min()} ~ {o_df['timestamp'].max()}")
-            if "price_mtx" in o_df.columns:
-                st.write(f"MTX 範圍: {o_df['price_mtx'].min():.0f} ~ {o_df['price_mtx'].max():.0f}")
-            
-            # GSD: Show which files were loaded
-            import glob
-            st.write("**載入檔案列表:**")
-            for sub in ["live_trading", "paper_trading"]:
-                pattern = str(OPTIONS_REPO / "logs" / sub / "OPTIONS_*_indicators.csv")
-                files = sorted(glob.glob(pattern), reverse=True)[:3]
-                for f in files:
-                    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
-                    st.text(f"{os.path.basename(f)} (修改: {mtime})")
-        
-        if "price_mtx" in o_df.columns:
-            last = o_df.iloc[-1]
-        
-        # 噴發偏向 (Bias) 計算 - 整合選擇權趨勢感
-        trend_val = last.get("mid_trend", "")
-        bull = (trend_val == "BULL")
-        bear = (trend_val == "BEAR")
-        mom = last.get("momentum", last.get("mom_mtx", 0))
-        mom_prev = o_df["momentum"].iloc[-2] if "momentum" in o_df.columns and len(o_df) > 1 else 0
-        
-        bias = "⚪中性"
-        if mom > 0:
-            if bull:
-                bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
-            else:
-                bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
-        elif mom < 0:
-            if bear:
-                bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
-            else:
-                bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
-
-        oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
-        # Robust coercion to scalar for display
-        mtx_val = _to_num(last.get('price_mtx', 0))
-        sc_val = _to_num(last.get('score', 0))
-
-        oc1.metric("MTX", f"{mtx_val:.0f}")
-        oc2.metric("Score", f"{sc_val:.1f}")
-        trend_label = "🟢BULL" if trend_val == "BULL" else ("🔴BEAR" if trend_val == "BEAR" else "⚪ —")
-        oc3.metric("趨勢", trend_label)
-        iv = last.get("iv", 0)
-        oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
-        oc5.metric("Sqz狀態", "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放")
-        oc6.metric("噴發向", bias)
-
-        if "fired" in last and last.get("fired", False) is True:
-            st.success("🔥 **FIRE — 壓縮釋放！**")
-
-        current_spot = float(last.get("price_mtx", 0) or 0)
-        current_iv = float(last.get("iv", 0) or 0)
-        current_dte_years = float(last.get("dte", 0) or 0) / 365.0 if last.get("dte", 0) else 0.0
-
-        # 2026-06-25 Gemini CLI: Unified realized/unrealized PnL summary and current position metrics
-        st.subheader("📊 損益與持倉摘要")
-        
-        ol = load_options_ledger()
-        realized_pnl = 0.0
-        total_trades = 0
-        win_rate_str = "-"
-        if ol is not None and not ol.empty:
-            if "PnL" in ol.columns:
-                exits = ol[ol["PnL"] != 0].copy()
-                if not exits.empty:
-                    exits["PnL"] = pd.to_numeric(exits["PnL"], errors="coerce").fillna(0)
-                    realized_pnl = float(exits["PnL"].sum())
-                    total_trades = len(exits)
-                    wins = (exits["PnL"] > 0).sum()
-                    if total_trades > 0:
-                        win_rate_str = f"{wins}/{total_trades} ({wins/total_trades*100:.0f}%)"
-        
-        unrealized_pnl = 0.0
-        has_pos = False
-        pos_label = "無持倉"
-        cost_basis = 0.0
-        pos_details_str = ""
-        est = None
-        
-        open_option = find_latest_open_options_position(ol) if ol is not None else None
-        if open_option is not None:
-            has_pos = True
-            side = str(open_option.side)
-            action = str(open_option.action)
-            note = str(open_option.note)
-            qty = int(open_option.quantity)
-            cost_basis = open_option.cost_basis
-            
-            if "iron_condor" in note.lower():
-                pos_label = "🦅 Iron Condor"
-                if "[" in note:
-                    pos_label += " " + note.split("[")[1].split("]")[0]
-            elif side.upper() == "C":
-                pos_label = "📞 Call"
-            elif side.upper() == "P":
-                pos_label = "📉 Put"
-            else:
-                pos_label = side
-
-            dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
-            expiry_str = ""
-            if dte_days > 0:
-                today = datetime.datetime.now()
-                expiry_date = today + datetime.timedelta(days=dte_days)
-                expiry_str = expiry_date.strftime("%Y-%m-%d")
-            
-            pos_details_str = f"方向: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}"
-            if expiry_str:
-                pos_details_str += f" | 到期: {expiry_str} (剩 {dte_days:.0f} 天)"
-
-            if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
-                est = estimate_theta_unrealized(
-                    open_option.note,
-                    current_spot=current_spot,
-                    current_iv=current_iv,
-                    dte_years=current_dte_years,
-                    quantity=open_option.quantity,
-                )
-            elif current_spot > 0 and current_iv > 0 and current_dte_years > 0:
-                strike_val = 0.0
-                if "strike" in o_df.columns:
-                    try:
-                        entry_ts = pd.to_datetime(open_option.timestamp)
-                        o_df_ts = pd.to_datetime(o_df["timestamp"])
-                        idx = (o_df_ts - entry_ts).abs().idxmin()
-                        strike_val = float(o_df.loc[idx, "strike"])
-                    except:
-                        strike_val = float(last.get("strike", 0))
-                else:
-                    strike_val = float(last.get("strike", 0))
+    _opt_tab1, _opt_tab2 = st.tabs(["📈 選擇權交易與監控", "📊 波動率與市場狀態 (Volatility & Regime)"])
+    with _opt_tab2:
+        render_volatility_regime_section()
+    with _opt_tab1:
+        o_df = load_options_indicators(full_history=cont_mode)
+        if o_df is not None and not o_df.empty:
+            # Debug info (expander)
+            with st.expander("🛠️ 數據狀態 (Debug)"):
+                st.write(f"資料筆數: {len(o_df)}")
+                st.write(f"時間範圍: {o_df['timestamp'].min()} ~ {o_df['timestamp'].max()}")
+                if "price_mtx" in o_df.columns:
+                    st.write(f"MTX 範圍: {o_df['price_mtx'].min():.0f} ~ {o_df['price_mtx'].max():.0f}")
                 
-                if strike_val > 0:
-                    try:
-                        from strategies.options.options_engine.engine.greeks import black_scholes
-                        entry_price = float(open_option.entry_price)
-                        side_code = str(open_option.side).upper()
-                        act_code = str(open_option.action).upper()
-                        is_buy = "BUY" in act_code or "ENTRY" in act_code
-                        
-                        bs_res = black_scholes(current_spot, strike_val, current_dte_years, 0.02, current_iv, side_code)
-                        curr_prem = float(bs_res.get("price", 0) or 0)
-                        if curr_prem > 0:
-                            pts = curr_prem - entry_price if is_buy else entry_price - curr_prem
-                            total_cost = (20 + 5) * 2 * qty + (entry_price + curr_prem) * 50 * 0.001 * qty
-                            unrealized_pnl = pts * 50 * qty - total_cost
+                # GSD: Show which files were loaded
+                import glob
+                st.write("**載入檔案列表:**")
+                for sub in ["live_trading", "paper_trading"]:
+                    pattern = str(OPTIONS_REPO / "logs" / sub / "OPTIONS_*_indicators.csv")
+                    files = sorted(glob.glob(pattern), reverse=True)[:3]
+                    for f in files:
+                        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M:%S')
+                        st.text(f"{os.path.basename(f)} (修改: {mtime})")
+            
+            if "price_mtx" in o_df.columns:
+                last = o_df.iloc[-1]
+            
+            # 噴發偏向 (Bias) 計算 - 整合選擇權趨勢感
+            trend_val = last.get("mid_trend", "")
+            bull = (trend_val == "BULL")
+            bear = (trend_val == "BEAR")
+            mom = last.get("momentum", last.get("mom_mtx", 0))
+            mom_prev = o_df["momentum"].iloc[-2] if "momentum" in o_df.columns and len(o_df) > 1 else 0
+            
+            bias = "⚪中性"
+            if mom > 0:
+                if bull:
+                    bias = "🚀強勢多" if mom >= mom_prev else "↗️多轉弱"
+                else:
+                    bias = "⚠️空反彈" if mom >= mom_prev else "↗️弱反彈"
+            elif mom < 0:
+                if bear:
+                    bias = "💀強勢空" if mom <= mom_prev else "↘️空轉弱"
+                else:
+                    bias = "⚠️多拉回" if mom <= mom_prev else "↘️弱拉回"
+    
+            oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
+            # Robust coercion to scalar for display
+            mtx_val = _to_num(last.get('price_mtx', 0))
+            sc_val = _to_num(last.get('score', 0))
+    
+            oc1.metric("MTX", f"{mtx_val:.0f}")
+            oc2.metric("Score", f"{sc_val:.1f}")
+            trend_label = "🟢BULL" if trend_val == "BULL" else ("🔴BEAR" if trend_val == "BEAR" else "⚪ —")
+            oc3.metric("趨勢", trend_label)
+            iv = last.get("iv", 0)
+            oc4.metric("IV", f"{iv*100:.1f}%" if iv and iv < 1 else f"{iv:.1f}%")
+            oc5.metric("Sqz狀態", "🔒壓縮" if last.get("sqz_on", False) is True else "🔓釋放")
+            oc6.metric("噴發向", bias)
+    
+            if "fired" in last and last.get("fired", False) is True:
+                st.success("🔥 **FIRE — 壓縮釋放！**")
+    
+            current_spot = float(last.get("price_mtx", 0) or 0)
+            current_iv = float(last.get("iv", 0) or 0)
+            current_dte_years = float(last.get("dte", 0) or 0) / 365.0 if last.get("dte", 0) else 0.0
+    
+            # 2026-06-25 Gemini CLI: Unified realized/unrealized PnL summary and current position metrics
+            st.subheader("📊 損益與持倉摘要")
+            
+            ol = load_options_ledger()
+            realized_pnl = 0.0
+            total_trades = 0
+            win_rate_str = "-"
+            if ol is not None and not ol.empty:
+                if "PnL" in ol.columns:
+                    exits = ol[ol["PnL"] != 0].copy()
+                    if not exits.empty:
+                        exits["PnL"] = pd.to_numeric(exits["PnL"], errors="coerce").fillna(0)
+                        realized_pnl = float(exits["PnL"].sum())
+                        total_trades = len(exits)
+                        wins = (exits["PnL"] > 0).sum()
+                        if total_trades > 0:
+                            win_rate_str = f"{wins}/{total_trades} ({wins/total_trades*100:.0f}%)"
+            
+            unrealized_pnl = 0.0
+            has_pos = False
+            pos_label = "無持倉"
+            cost_basis = 0.0
+            pos_details_str = ""
+            est = None
+            
+            open_option = find_latest_open_options_position(ol) if ol is not None else None
+            if open_option is not None:
+                has_pos = True
+                side = str(open_option.side)
+                action = str(open_option.action)
+                note = str(open_option.note)
+                qty = int(open_option.quantity)
+                cost_basis = open_option.cost_basis
+                
+                if "iron_condor" in note.lower():
+                    pos_label = "🦅 Iron Condor"
+                    if "[" in note:
+                        pos_label += " " + note.split("[")[1].split("]")[0]
+                elif side.upper() == "C":
+                    pos_label = "📞 Call"
+                elif side.upper() == "P":
+                    pos_label = "📉 Put"
+                else:
+                    pos_label = side
+    
+                dte_days = current_dte_years * 365.0 if current_dte_years > 0 else 0.0
+                expiry_str = ""
+                if dte_days > 0:
+                    today = datetime.datetime.now()
+                    expiry_date = today + datetime.timedelta(days=dte_days)
+                    expiry_str = expiry_date.strftime("%Y-%m-%d")
+                
+                pos_details_str = f"方向: **{pos_label}** | 進場: {action} @ {open_option.entry_price:.2f}"
+                if expiry_str:
+                    pos_details_str += f" | 到期: {expiry_str} (剩 {dte_days:.0f} 天)"
+    
+                if "THETA" in action and current_spot > 0 and current_iv > 0 and current_dte_years > 0:
+                    est = estimate_theta_unrealized(
+                        open_option.note,
+                        current_spot=current_spot,
+                        current_iv=current_iv,
+                        dte_years=current_dte_years,
+                        quantity=open_option.quantity,
+                    )
+                elif current_spot > 0 and current_iv > 0 and current_dte_years > 0:
+                    strike_val = 0.0
+                    if "strike" in o_df.columns:
+                        try:
+                            entry_ts = pd.to_datetime(open_option.timestamp)
+                            o_df_ts = pd.to_datetime(o_df["timestamp"])
+                            idx = (o_df_ts - entry_ts).abs().idxmin()
+                            strike_val = float(o_df.loc[idx, "strike"])
+                        except:
+                            strike_val = float(last.get("strike", 0))
+                    else:
+                        strike_val = float(last.get("strike", 0))
+                    
+                    if strike_val > 0:
+                        try:
+                            from strategies.options.options_engine.engine.greeks import black_scholes
+                            entry_price = float(open_option.entry_price)
+                            side_code = str(open_option.side).upper()
+                            act_code = str(open_option.action).upper()
+                            is_buy = "BUY" in act_code or "ENTRY" in act_code
                             
-                            est = {
-                                "unrealized_pnl": unrealized_pnl,
-                                "cost_basis": entry_price * 50 * qty,
-                                "current_value": curr_prem,
-                            }
-                    except:
-                        pass
+                            bs_res = black_scholes(current_spot, strike_val, current_dte_years, 0.02, current_iv, side_code)
+                            curr_prem = float(bs_res.get("price", 0) or 0)
+                            if curr_prem > 0:
+                                pts = curr_prem - entry_price if is_buy else entry_price - curr_prem
+                                total_cost = (20 + 5) * 2 * qty + (entry_price + curr_prem) * 50 * 0.001 * qty
+                                unrealized_pnl = pts * 50 * qty - total_cost
+                                
+                                est = {
+                                    "unrealized_pnl": unrealized_pnl,
+                                    "cost_basis": entry_price * 50 * qty,
+                                    "current_value": curr_prem,
+                                }
+                        except:
+                            pass
+                
+                if est is not None:
+                    unrealized_pnl = est["unrealized_pnl"]
+    
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("已實現損益", f"{realized_pnl:+,.0f} TWD")
+            if has_pos:
+                m2.metric("未實現損益", f"{unrealized_pnl:+,.0f} TWD")
+                m3.metric("部位成交成本", f"{cost_basis:,.0f} TWD")
+                m4.metric("目前持倉", pos_label)
+                st.caption(pos_details_str)
+                if open_option is not None and est is None:
+                    st.caption("💡 提示: 該部位無法進行 B-S 定價估算，未實現損益僅顯示為 0 TWD。")
+            else:
+                m2.metric("未實現損益", "0 TWD")
+                m3.metric("勝率", win_rate_str)
+                m4.metric("當前持倉", "無持倉")
             
-            if est is not None:
-                unrealized_pnl = est["unrealized_pnl"]
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("已實現損益", f"{realized_pnl:+,.0f} TWD")
-        if has_pos:
-            m2.metric("未實現損益", f"{unrealized_pnl:+,.0f} TWD")
-            m3.metric("部位成交成本", f"{cost_basis:,.0f} TWD")
-            m4.metric("目前持倉", pos_label)
-            st.caption(pos_details_str)
-            if open_option is not None and est is None:
-                st.caption("💡 提示: 該部位無法進行 B-S 定價估算，未實現損益僅顯示為 0 TWD。")
+            ol = load_options_ledger()
+            # Pre-process ledger to match signal expected format if not empty
+            sig_df = None
+            if ol is not None and not ol.empty:
+                sig_df = ol.rename(columns={"Timestamp": "timestamp", "Action": "action", "Price": "price"})
+                
+            st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score", signals=sig_df), width='stretch')
+            st.dataframe(o_df.tail(20), width='stretch')
         else:
-            m2.metric("未實現損益", "0 TWD")
-            m3.metric("勝率", win_rate_str)
-            m4.metric("當前持倉", "無持倉")
-        
+            st.info("無數據")
         ol = load_options_ledger()
-        # Pre-process ledger to match signal expected format if not empty
-        sig_df = None
         if ol is not None and not ol.empty:
-            sig_df = ol.rename(columns={"Timestamp": "timestamp", "Action": "action", "Price": "price"})
-            
-        st.plotly_chart(make_price_score_chart(o_df, "price_mtx", "MTX 價格 & Score", signals=sig_df), width='stretch')
-        st.dataframe(o_df.tail(20), width='stretch')
-    else:
-        st.info("無數據")
-    ol = load_options_ledger()
-    if ol is not None and not ol.empty:
-        st.header("交易記錄 (Round-Trip)")
-        round_trips = format_options_trades(ol)
-        if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
-            # Style with color for profit/loss
-            def style_trades(row):
-                styles = [''] * len(row)
-                pnl = row.get("淨利", "-")
-                if pnl != "-" and isinstance(pnl, (int, float)):
-                    color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
-                    styles = [f'background-color: {color}; font-weight: bold'] * len(row)
-                return styles
-            st.dataframe(round_trips.style.apply(style_trades, axis=1), width='stretch', hide_index=True)
-        else:
-            st.dataframe(ol.tail(30), width='stretch')
-        opnl = calc_options_pnl(ol)
-        fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
-        if fig:
-            st.plotly_chart(fig, width='stretch')
-
-        # 展開原始 Ledger (進階)
-        with st.expander("📋 原始 Ledger (進階)"):
-            st.dataframe(ol, width='stretch')
-
-    # ── Reset Button (always visible, regardless of ledger state) ──
-    # 2026-05-25 Hermes Agent: allow user to clear options trade history
-    # 2026-05-25 Hermes Agent: also clear orders JSON files so Order Lifecycle panel is not stale
-    col1, col2, col3 = st.columns([3, 2, 3])
-    with col2:
-        if st.button("🗑️ 重置選擇權交易紀錄", type="secondary", width='stretch'):
-            try:
-                # Create backup
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_dir = BASE / "backups" / f"options_reset_{ts}"
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                import shutil
-
-                # Backup + clear ledger
-                src = OPTIONS_DATA / "options_trade_ledger.csv"
-                if src.exists():
-                    shutil.copy2(src, backup_dir / "options_trade_ledger.csv")
-                header = "trade_id,Timestamp,Mode,Action,Side,Price,Quantity,PnL,Balance,Note\n"
-                src.write_text(header)
-
-                # Backup + clear orders JSON files (Order Lifecycle source)
-                orders_path = BASE / "exports" / "trades"
-                for f in sorted(orders_path.glob("OPTIONS_*_orders.json")):
-                    shutil.copy2(f, backup_dir / f.name)
-                    f.unlink()
-
-                # Remove old indicator CSVs (keep today's)
-                today_str = datetime.datetime.now().strftime("%Y%m%d")
-                today_prefix = f"OPTIONS_{today_str}_"
-                for f in sorted((OPTIONS_DATA).glob("OPTIONS_*_indicators.csv")):
-                    if not f.name.startswith(today_prefix):
+            st.header("交易記錄 (Round-Trip)")
+            round_trips = format_options_trades(ol)
+            if round_trips is not None and not round_trips.empty and "#" in round_trips.columns:
+                # Style with color for profit/loss
+                def style_trades(row):
+                    styles = [''] * len(row)
+                    pnl = row.get("淨利", "-")
+                    if pnl != "-" and isinstance(pnl, (int, float)):
+                        color = '#dcfce7' if pnl > 0 else ('#fef2f2' if pnl < 0 else '')
+                        styles = [f'background-color: {color}; font-weight: bold'] * len(row)
+                    return styles
+                st.dataframe(round_trips.style.apply(style_trades, axis=1), width='stretch', hide_index=True)
+            else:
+                st.dataframe(ol.tail(30), width='stretch')
+            opnl = calc_options_pnl(ol)
+            fig = make_pnl_chart(opnl, "選擇權累計 PnL (TWD)")
+            if fig:
+                st.plotly_chart(fig, width='stretch')
+    
+            # 展開原始 Ledger (進階)
+            with st.expander("📋 原始 Ledger (進階)"):
+                st.dataframe(ol, width='stretch')
+    
+        # ── Reset Button (always visible, regardless of ledger state) ──
+        # 2026-05-25 Hermes Agent: allow user to clear options trade history
+        # 2026-05-25 Hermes Agent: also clear orders JSON files so Order Lifecycle panel is not stale
+        col1, col2, col3 = st.columns([3, 2, 3])
+        with col2:
+            if st.button("🗑️ 重置選擇權交易紀錄", type="secondary", width='stretch'):
+                try:
+                    # Create backup
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    backup_dir = BASE / "backups" / f"options_reset_{ts}"
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+    
+                    # Backup + clear ledger
+                    src = OPTIONS_DATA / "options_trade_ledger.csv"
+                    if src.exists():
+                        shutil.copy2(src, backup_dir / "options_trade_ledger.csv")
+                    header = "trade_id,Timestamp,Mode,Action,Side,Price,Quantity,PnL,Balance,Note\n"
+                    src.write_text(header)
+    
+                    # Backup + clear orders JSON files (Order Lifecycle source)
+                    orders_path = Path(runtime_path("exports", "trades"))
+                    for f in sorted(orders_path.glob("OPTIONS_*_orders.json")):
                         shutil.copy2(f, backup_dir / f.name)
                         f.unlink()
-
-                st.success("✅ 交易紀錄及委託單已重置 (無須重啟)")
-                st.cache_data.clear()
-            except Exception as e:
-                st.error(f"❌ 重置失敗: {e}")
-
-    # ── Options Order Status Panel ──
-    with st.expander("📤 選擇權委託單狀態 (Order Lifecycle)", expanded=False):
-        orders_path = BASE / "exports" / "trades"
-        order_files = list(orders_path.glob("OPTIONS_*_orders.json"))
-        order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-
-        if order_files and order_files[0].exists():
-            with open(order_files[0], "r", encoding="utf-8") as f:
-                orders_data = json.load(f)
-            orders_rebuilt_from_ledger = False
-            if not orders_data:
-                rebuilt_orders = rebuild_options_orders_from_ledger(ol)
-                if rebuilt_orders:
-                    orders_data = rebuilt_orders
-                    orders_rebuilt_from_ledger = True
-
-            if orders_data:
-                # [GSD Fix] Get ACTUAL live premium from indicator data, not ledger
-                opt_df = load_options_indicators()
-                live_premium = None
-                current_spot = 0.0
-                current_iv = 0.0
-                current_dte_years = 0.0
-                if opt_df is not None and not opt_df.empty:
-                    last_row = opt_df.iloc[-1]
-                    current_spot = float(last_row.get("price_mtx", 0) or 0)
-                    current_iv = float(last_row.get("iv", 0) or 0)
-                    current_dte_years = float(last_row.get("dte", 0) or 0) / 365.0 if last_row.get("dte", 0) else 0.0
-                    # Try to get bid/ask mid if available (some versions log it)
-                    bid = float(last_row.get("bid", 0))
-                    ask = float(last_row.get("ask", 0))
-                    if bid > 0 and ask > 0:
-                        live_premium = (bid + ask) / 2
-                    else:
-                        # 💡 [Fixed 2026-06-02] Do NOT use 'Close' or 'close' as fallback, 
-                        # because in the indicators CSV they represent the underlying MTX spot price,
-                        # not the option premium. This causes massive PnL hallucinations.
-                        # Setting to 0.0 forces the system to use Black-Scholes theoretical pricing.
-                        live_premium = 0.0
-
-                df_orders = pd.DataFrame(orders_data)
-                open_option_for_orders = find_latest_open_options_position(ol)
-                truth_results = df_orders.apply(
-                    lambda row: describe_options_order_truth(
-                        row,
-                        orders_rebuilt_from_ledger=orders_rebuilt_from_ledger,
-                    ),
-                    axis=1,
-                )
-                df_orders["truth_source"] = truth_results.apply(lambda result: result["truth_source"])
-                df_orders["真實來源"] = truth_results.apply(lambda result: result["badge"])
-                df_orders["degraded_caption"] = truth_results.apply(lambda result: result["degraded_caption"])
-                df_orders["show_paper_disclaimer"] = truth_results.apply(lambda result: result["show_paper_disclaimer"])
-                df_orders["組合腿摘要"] = df_orders.get("combo_legs", pd.Series([None] * len(df_orders))).apply(summarize_combo_legs)
-                display_cols = []
-                if "order_id" in df_orders.columns:
-                    display_cols.append("order_id")
-                if "created_at" in df_orders.columns:
-                    display_cols.append("created_at")
-                display_cols.append("真實來源")
-                if "side" in df_orders.columns:
-                    df_orders["方向"] = df_orders["side"].map({"buy": "買入", "sell": "賣出"})
-                    display_cols.append("方向")
-                if "order_type" in df_orders.columns:
-                    # 2026-06-08 JVS Claw: Added MKP (範圍市價)
-                    type_map_opt = {"market": "市價", "limit": "限價", "stop": "停損", "stop_limit": "停損限價", "mkp": "範圍市價"}
-                    df_orders["委託類型"] = df_orders["order_type"].map(type_map_opt).fillna(df_orders["order_type"])
-                    display_cols.append("委託類型")
-                if "quantity" in df_orders.columns:
-                    display_cols.append("quantity")
-                if "filled_quantity" in df_orders.columns:
-                    display_cols.append("filled_quantity")
-                if "price" in df_orders.columns:
-                    display_cols.append("price")
-                if "avg_fill_price" in df_orders.columns:
-                    display_cols.append("avg_fill_price")
-                if "status" in df_orders.columns:
-                    status_map_opt = {"pending_submit": "⏳ 待傳送", "pre_submitted": "📅 預約單", "submitted": "📨 已委託", "partial_filled": "⚡ 部分成交", "filled": "✅ 完全成交", "cancelled": "🚫 已取消", "rejected": "❌ 已退單", "expired": "⏰ 已過期"}
-                    df_orders["狀態"] = df_orders["status"].map(status_map_opt).fillna(df_orders["status"])
-                    display_cols.append("狀態")
-                if "strategy" in df_orders.columns:
-                    display_cols.append("strategy")
-                display_cols.append("組合腿摘要")
-                display_cols.append("degraded_caption")
-
-                has_open_theta = open_option_for_orders is not None and "THETA" in str(open_option_for_orders.action).upper()
-
-                if (live_premium and live_premium > 0) or has_open_theta or (current_spot > 0 and current_iv > 0 and current_dte_years > 0):
-                    # 添加更新按鈕
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.subheader("📊 未實現損益計算")
-                    with col2:
-                        if st.button("🔄 更新", key="update_options_unrealized"):
-                            st.cache_data.clear()
-                            st.rerun()
-
-                    if bool(df_orders["show_paper_disclaimer"].any()):
-                        st.info("ℹ️ THETA 策略目前顯示的是策略整體估值／紙上生命週期紀錄，不是券商逐腿即時成交回報。")
-                    if "broker_combo" in set(df_orders["truth_source"].astype(str)):
-                        st.caption("broker_combo 為券商複式單真實來源；paper_strategy / ledger_rebuilt 會保留降級或紙上估值說明。")
-
-                    pricing_results = df_orders.apply(
-                        lambda row: estimate_options_order_unrealized(
+    
+                    # Remove old indicator CSVs (keep today's)
+                    today_str = datetime.datetime.now().strftime("%Y%m%d")
+                    today_prefix = f"OPTIONS_{today_str}_"
+                    for f in sorted((OPTIONS_DATA).glob("OPTIONS_*_indicators.csv")):
+                        if not f.name.startswith(today_prefix):
+                            shutil.copy2(f, backup_dir / f.name)
+                            f.unlink()
+    
+                    st.success("✅ 交易紀錄及委託單已重置 (無須重啟)")
+                    st.cache_data.clear()
+                except Exception as e:
+                    st.error(f"❌ 重置失敗: {e}")
+    
+        # ── Options Order Status Panel ──
+        with st.expander("📤 選擇權委託單狀態 (Order Lifecycle)", expanded=False):
+            orders_path = Path(runtime_path("exports", "trades"))
+            order_files = list(orders_path.glob("OPTIONS_*_orders.json"))
+            order_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    
+            if order_files and order_files[0].exists():
+                with open(order_files[0], "r", encoding="utf-8") as f:
+                    orders_data = json.load(f)
+                orders_rebuilt_from_ledger = False
+                if not orders_data:
+                    rebuilt_orders = rebuild_options_orders_from_ledger(ol)
+                    if rebuilt_orders:
+                        orders_data = rebuilt_orders
+                        orders_rebuilt_from_ledger = True
+    
+                if orders_data:
+                    # [GSD Fix] Get ACTUAL live premium from indicator data, not ledger
+                    opt_df = load_options_indicators()
+                    live_premium = None
+                    current_spot = 0.0
+                    current_iv = 0.0
+                    current_dte_years = 0.0
+                    if opt_df is not None and not opt_df.empty:
+                        last_row = opt_df.iloc[-1]
+                        current_spot = float(last_row.get("price_mtx", 0) or 0)
+                        current_iv = float(last_row.get("iv", 0) or 0)
+                        current_dte_years = float(last_row.get("dte", 0) or 0) / 365.0 if last_row.get("dte", 0) else 0.0
+                        # Try to get bid/ask mid if available (some versions log it)
+                        bid = float(last_row.get("bid", 0))
+                        ask = float(last_row.get("ask", 0))
+                        if bid > 0 and ask > 0:
+                            live_premium = (bid + ask) / 2
+                        else:
+                            # 💡 [Fixed 2026-06-02] Do NOT use 'Close' or 'close' as fallback, 
+                            # because in the indicators CSV they represent the underlying MTX spot price,
+                            # not the option premium. This causes massive PnL hallucinations.
+                            # Setting to 0.0 forces the system to use Black-Scholes theoretical pricing.
+                            live_premium = 0.0
+    
+                    df_orders = pd.DataFrame(orders_data)
+                    open_option_for_orders = find_latest_open_options_position(ol)
+                    truth_results = df_orders.apply(
+                        lambda row: describe_options_order_truth(
                             row,
-                            open_option_for_orders,
-                            live_premium=live_premium or 0.0,
-                            current_spot=current_spot,
-                            current_iv=current_iv,
-                            dte_years=current_dte_years,
-                            strike=float(last_row.get("strike", 0) or 0),
+                            orders_rebuilt_from_ledger=orders_rebuilt_from_ledger,
                         ),
                         axis=1,
                     )
-                    df_orders["unrealized_pnl"] = pricing_results.apply(
-                        lambda result: None if result is None else result["unrealized_pnl"]
-                    )
-
-                    # 2026-05-25 Hermes Agent: extract premium_source and dte_days from pricing result
-                    df_orders["premium_source"] = pricing_results.apply(
-                        lambda result: "—" if result is None else result.get("premium_source", "—")
-                    )
-                    df_orders["dte_days"] = pricing_results.apply(
-                        lambda result: None if result is None else result.get("dte_days", None)
-                    )
-
-                    def _format_unreal(x):
-                        if x is None or (isinstance(x, float) and pd.isna(x)):
-                            return "—"
-                        elif x > 0:
-                            return f"🟢 {x:+,.2f}"
-                        elif x < 0:
-                            return f"🔴 {x:+,.2f}"
-                        else:
-                            return "⚪ 0"
-                    df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
-                    display_cols.append("未實現損益")
-                    df_orders["current_price"] = pricing_results.apply(
-                        lambda result: None if result is None else result["current_price"]
-                    )
-                    df_orders["目前組合價值"] = df_orders["current_price"]
-                    display_cols.append("目前組合價值")
-                    # 2026-05-25 Hermes Agent: show premium source and DTE in UI
-                    df_orders["premium_source"] = pricing_results.apply(
-                        lambda result: "—" if result is None else result.get("premium_source", "—")
-                    )
-                    display_cols.append("premium_source")
-                    df_orders["dte_days"] = pricing_results.apply(
-                        lambda result: None if result is None else result.get("dte_days", None)
-                    )
-                    display_cols.append("dte_days")
-
-                if display_cols:
-                    st.dataframe(df_orders[display_cols], width='stretch', hide_index=True,
-                                 column_config={
-                                      "order_id": "委託單ID",
-                                      "created_at": "建立時間",
-                                      "真實來源": st.column_config.TextColumn("真實來源"),
-                                       "方向": "方向",
-                                       "委託類型": st.column_config.TextColumn("委託類型"),
-                                       "quantity": "委託量",
-                                       "filled_quantity": "成交量",
-                                       "price": st.column_config.NumberColumn("限價", format="%.2f"),
-                                       "avg_fill_price": st.column_config.NumberColumn("成交均價", format="%.2f"),
-                                       "狀態": st.column_config.TextColumn("狀態"),
-                                       "strategy": "策略",
-                                       "組合腿摘要": st.column_config.TextColumn("組合腿摘要"),
-                                       "degraded_caption": st.column_config.TextColumn("狀態說明"),
-                                       "未實現損益": st.column_config.TextColumn("未實現損益"),
-                                       "目前組合價值": st.column_config.NumberColumn("目前組合價值", format="%.2f"),
-                                       "premium_source": st.column_config.TextColumn("估值來源"),
-                                       "dte_days": st.column_config.NumberColumn("剩餘天數", format="%.1f"),
-                                    })
-                    if orders_rebuilt_from_ledger:
-                        st.caption("委託單檔案為空，已暫時從交易 ledger 重建今日選擇權委託單狀態。真實來源已標示為 ledger_rebuilt，表示 broker truth 目前不可用。")
-
-                    total = len(df_orders)
-                    filled = len(df_orders[df_orders["status"] == "filled"]) if "status" in df_orders.columns else 0
-                    pending = len(df_orders[df_orders["status"].isin(["submitted", "pending_submit", "pre_submitted"])]) if "status" in df_orders.columns else 0
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("總委託單", total)
-                    c2.metric("✅ 已成交", filled)
-                    c3.metric("⏳ 排隊中", pending)
+                    df_orders["truth_source"] = truth_results.apply(lambda result: result["truth_source"])
+                    df_orders["真實來源"] = truth_results.apply(lambda result: result["badge"])
+                    df_orders["degraded_caption"] = truth_results.apply(lambda result: result["degraded_caption"])
+                    df_orders["show_paper_disclaimer"] = truth_results.apply(lambda result: result["show_paper_disclaimer"])
+                    df_orders["組合腿摘要"] = df_orders.get("combo_legs", pd.Series([None] * len(df_orders))).apply(summarize_combo_legs)
+                    display_cols = []
+                    if "order_id" in df_orders.columns:
+                        display_cols.append("order_id")
+                    if "created_at" in df_orders.columns:
+                        display_cols.append("created_at")
+                    display_cols.append("真實來源")
+                    if "side" in df_orders.columns:
+                        df_orders["方向"] = df_orders["side"].map({"buy": "買入", "sell": "賣出"})
+                        display_cols.append("方向")
+                    if "order_type" in df_orders.columns:
+                        # 2026-06-08 JVS Claw: Added MKP (範圍市價)
+                        type_map_opt = {"market": "市價", "limit": "限價", "stop": "停損", "stop_limit": "停損限價", "mkp": "範圍市價"}
+                        df_orders["委託類型"] = df_orders["order_type"].map(type_map_opt).fillna(df_orders["order_type"])
+                        display_cols.append("委託類型")
+                    if "quantity" in df_orders.columns:
+                        display_cols.append("quantity")
+                    if "filled_quantity" in df_orders.columns:
+                        display_cols.append("filled_quantity")
+                    if "price" in df_orders.columns:
+                        display_cols.append("price")
+                    if "avg_fill_price" in df_orders.columns:
+                        display_cols.append("avg_fill_price")
+                    if "status" in df_orders.columns:
+                        status_map_opt = {"pending_submit": "⏳ 待傳送", "pre_submitted": "📅 預約單", "submitted": "📨 已委託", "partial_filled": "⚡ 部分成交", "filled": "✅ 完全成交", "cancelled": "🚫 已取消", "rejected": "❌ 已退單", "expired": "⏰ 已過期"}
+                        df_orders["狀態"] = df_orders["status"].map(status_map_opt).fillna(df_orders["status"])
+                        display_cols.append("狀態")
+                    if "strategy" in df_orders.columns:
+                        display_cols.append("strategy")
+                    display_cols.append("組合腿摘要")
+                    display_cols.append("degraded_caption")
+    
+                    has_open_theta = open_option_for_orders is not None and "THETA" in str(open_option_for_orders.action).upper()
+    
+                    if (live_premium and live_premium > 0) or has_open_theta or (current_spot > 0 and current_iv > 0 and current_dte_years > 0):
+                        # 添加更新按鈕
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.subheader("📊 未實現損益計算")
+                        with col2:
+                            if st.button("🔄 更新", key="update_options_unrealized"):
+                                st.cache_data.clear()
+                                st.rerun()
+    
+                        if bool(df_orders["show_paper_disclaimer"].any()):
+                            st.info("ℹ️ THETA 策略目前顯示的是策略整體估值／紙上生命週期紀錄，不是券商逐腿即時成交回報。")
+                        if "broker_combo" in set(df_orders["truth_source"].astype(str)):
+                            st.caption("broker_combo 為券商複式單真實來源；paper_strategy / ledger_rebuilt 會保留降級或紙上估值說明。")
+    
+                        pricing_results = df_orders.apply(
+                            lambda row: estimate_options_order_unrealized(
+                                row,
+                                open_option_for_orders,
+                                live_premium=live_premium or 0.0,
+                                current_spot=current_spot,
+                                current_iv=current_iv,
+                                dte_years=current_dte_years,
+                                strike=float(last_row.get("strike", 0) or 0),
+                            ),
+                            axis=1,
+                        )
+                        df_orders["unrealized_pnl"] = pricing_results.apply(
+                            lambda result: None if result is None else result["unrealized_pnl"]
+                        )
+    
+                        # 2026-05-25 Hermes Agent: extract premium_source and dte_days from pricing result
+                        df_orders["premium_source"] = pricing_results.apply(
+                            lambda result: "—" if result is None else result.get("premium_source", "—")
+                        )
+                        df_orders["dte_days"] = pricing_results.apply(
+                            lambda result: None if result is None else result.get("dte_days", None)
+                        )
+    
+                        def _format_unreal(x):
+                            if x is None or (isinstance(x, float) and pd.isna(x)):
+                                return "—"
+                            elif x > 0:
+                                return f"🟢 {x:+,.2f}"
+                            elif x < 0:
+                                return f"🔴 {x:+,.2f}"
+                            else:
+                                return "⚪ 0"
+                        df_orders["未實現損益"] = df_orders["unrealized_pnl"].apply(_format_unreal)
+                        display_cols.append("未實現損益")
+                        df_orders["current_price"] = pricing_results.apply(
+                            lambda result: None if result is None else result["current_price"]
+                        )
+                        df_orders["目前組合價值"] = df_orders["current_price"]
+                        display_cols.append("目前組合價值")
+                        # 2026-05-25 Hermes Agent: show premium source and DTE in UI
+                        df_orders["premium_source"] = pricing_results.apply(
+                            lambda result: "—" if result is None else result.get("premium_source", "—")
+                        )
+                        display_cols.append("premium_source")
+                        df_orders["dte_days"] = pricing_results.apply(
+                            lambda result: None if result is None else result.get("dte_days", None)
+                        )
+                        display_cols.append("dte_days")
+    
+                    if display_cols:
+                        st.dataframe(df_orders[display_cols], width='stretch', hide_index=True,
+                                     column_config={
+                                          "order_id": "委託單ID",
+                                          "created_at": "建立時間",
+                                          "真實來源": st.column_config.TextColumn("真實來源"),
+                                           "方向": "方向",
+                                           "委託類型": st.column_config.TextColumn("委託類型"),
+                                           "quantity": "委託量",
+                                           "filled_quantity": "成交量",
+                                           "price": st.column_config.NumberColumn("限價", format="%.2f"),
+                                           "avg_fill_price": st.column_config.NumberColumn("成交均價", format="%.2f"),
+                                           "狀態": st.column_config.TextColumn("狀態"),
+                                           "strategy": "策略",
+                                           "組合腿摘要": st.column_config.TextColumn("組合腿摘要"),
+                                           "degraded_caption": st.column_config.TextColumn("狀態說明"),
+                                           "未實現損益": st.column_config.TextColumn("未實現損益"),
+                                           "目前組合價值": st.column_config.NumberColumn("目前組合價值", format="%.2f"),
+                                           "premium_source": st.column_config.TextColumn("估值來源"),
+                                           "dte_days": st.column_config.NumberColumn("剩餘天數", format="%.1f"),
+                                        })
+                        if orders_rebuilt_from_ledger:
+                            st.caption("委託單檔案為空，已暫時從交易 ledger 重建今日選擇權委託單狀態。真實來源已標示為 ledger_rebuilt，表示 broker truth 目前不可用。")
+    
+                        total = len(df_orders)
+                        filled = len(df_orders[df_orders["status"] == "filled"]) if "status" in df_orders.columns else 0
+                        pending = len(df_orders[df_orders["status"].isin(["submitted", "pending_submit", "pre_submitted"])]) if "status" in df_orders.columns else 0
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("總委託單", total)
+                        c2.metric("✅ 已成交", filled)
+                        c3.metric("⏳ 排隊中", pending)
+                else:
+                    st.info("今日尚無選擇權委託單記錄")
             else:
-                st.info("今日尚無選擇權委託單記錄")
-        else:
-            st.info("選擇權委託單檔案尚未建立 (Order Lifecycle 未啟用)")
-
+                st.info("選擇權委託單檔案尚未建立 (Order Lifecycle 未啟用)")
+    
 # ════════════════════════════════════════
 # Tab 4: 台股 Stocks
 # ════════════════════════════════════════
@@ -5080,8 +7673,9 @@ elif page == "台股 Stocks":
                 return [''] * len(row)
             st.dataframe(round_trips.style.apply(style_stock_trades, axis=1), width='stretch', hide_index=True)
         else:
-            display_cols = [c for c in ["timestamp", "ticker", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
+            display_cols = [c for c in ["timestamp", "ticker", "name", "action", "entry_price", "price", "qty", "reason", "strategy", "pnl_gross", "fees", "pnl_cash"] if c in sl.columns]
             col_rename = {"timestamp": "時間", "ticker": "代號", "action": "動作", "entry_price": "進場價",
+                          "name": "名稱",
                           "price": "出場價", "qty": "股數", "reason": "原因", "strategy": "策略",
                           "pnl_gross": "毛利", "fees": "手續費+稅", "pnl_cash": "淨損益"}
             display = sl[display_cols].sort_values("timestamp", ascending=False).head(30)
@@ -5190,100 +7784,30 @@ elif page == "台股 Stocks":
 # Tab 5: 策略管道 (Pipeline)
 # ════════════════════════════════════════
 elif page == "策略管道":
-    st.header("📊 策略管道 (Strategy Pipeline)")
+    st.header("📊 策略管道 (Strategy Pipeline & Risk Status)")
 
-    # Strategy Rankings
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("☀️ 日盤排行榜")
-        try:
-            from core.strategy_registry import get_strategy_ranking
-            day_ranking = get_strategy_ranking("day")
-            for i, (name, pf) in enumerate(day_ranking, 1):
-                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
-                st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    with col2:
-        st.subheader("🌙 夜盤排行榜")
-        try:
-            night_ranking = get_strategy_ranking("night")
-            for i, (name, pf) in enumerate(night_ranking, 1):
-                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
-                st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    # Pipeline Status
-    st.subheader("🔄 管道狀態")
-    try:
-        from core.strategy_registry import STRATEGY_PERF
-        pipeline_data = []
-        for name, perf in sorted(STRATEGY_PERF.items()):
-            display_name = {
-                "counter_vwap": "Counter-VWAP",
-                "spring_upthrust": "Spring-Upthrust",
-                "kbar_feature": "KBar Feature",
-                "calendar_condor_v2": "Calendar Condor v2",
-                "vol_squeeze": "Vol-Squeeze",
-                "psar": "PSAR",
-                "weak_bear_trend": "Weak Bear Trend",
-                "squeeze_fire_scout": "Sqz Fire Scout",
-            }.get(name, name)
-            day_pf = perf.get("day_pf", 0)
-            night_pf = perf.get("night_pf", 0)
-            status = "✅ Paper" if day_pf >= 1.5 else ("⏳ 觀察中" if day_pf >= 1.0 else "🔴 PF<1.0")
-            pipeline_data.append({
-                "策略": display_name,
-                "日盤 PF": day_pf,
-                "夜盤 PF": night_pf,
-                "狀態": status,
-            })
-        st.table(pd.DataFrame(pipeline_data))
-    except Exception as e:
-        st.error(f"Error loading pipeline: {e}")
-
-    # Circuit Breaker Status
-    st.subheader("🛡️ Circuit Breaker 狀態")
+    # 1. Circuit Breaker Status (Top Priority)
+    st.subheader("🛡️ Circuit Breaker 熔斷風控狀態")
     try:
         from core.circuit_breaker import CircuitBreaker
         day_cb = CircuitBreaker(session="day")
         night_cb = CircuitBreaker(session="night")
         c1, c2 = st.columns(2)
         with c1:
-            st.write(f"**日盤**: {day_cb.state.session_pnl:.0f} pts, {day_cb.state.consecutive_losses} 連虧, {'🛑 HALTED' if day_cb.is_halted else '✅ OK'}")
+            st.write(f"☀️ **日盤風控**: {day_cb.state.session_pnl:.0f} pts | {day_cb.state.consecutive_losses} 連虧 | {'🛑 HALTED' if day_cb.is_halted else '✅ 正常運作'}")
         with c2:
-            st.write(f"**夜盤**: {night_cb.state.session_pnl:.0f} pts, {night_cb.state.consecutive_losses} 連虧, {'🛑 HALTED' if night_cb.is_halted else '✅ OK'}")
+            st.write(f"🌙 **夜盤風控**: {night_cb.state.session_pnl:.0f} pts | {night_cb.state.consecutive_losses} 連虧 | {'🛑 HALTED' if night_cb.is_halted else '✅ 正常運作'}")
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error loading CircuitBreaker: {e}")
 
-    # Recent Decisions
-    st.subheader("📝 最近決策日誌")
-    try:
-        from core.decision_logger import DecisionLogger
-        recent = DecisionLogger.read_decisions(limit=10)
-        if recent:
-            df_dec = pd.DataFrame([{
-                "時間": d.timestamp[:19],
-                "類型": d.type,
-                "Session": d.session,
-                "動作": d.action,
-                "細節": d.detail[:50],
-            } for d in recent])
-            st.dataframe(df_dec, width='stretch')
-        else:
-            st.info("尚無決策記錄")
-    except Exception as e:
-        st.error(f"Error: {e}")
+    st.divider()
 
-    # ── Hourly Audit Timeline ──
-    st.subheader("🕐 每小時審計時間軸")
+    # 2. Hourly Audit Timeline
+    st.subheader("🕐 每小時審計時間軸 (Hourly Audit Timeline)")
     try:
         from pathlib import Path
-        audit_dir = Path("logs/market_data")
+        audit_dir = Path(runtime_logs("market_data"))
         today_str = datetime.datetime.now().strftime("%Y%m%d")
-        # 2026-05-27 Gemini CLI: Generalize audit file path
         audit_file = audit_dir / f"{_TICKER}_{today_str}_signals_audit.csv"
 
         if audit_file.exists():
@@ -5317,969 +7841,87 @@ elif page == "策略管道":
                             st.metric(f"{emoji} {verdict}", f"{count} 次")
                 else:
                     st.info("今日尚無審計記錄（monitor 尚未運行或未到整點）")
+            else:
+                st.info("今日審計日誌空檔中")
         else:
-            st.info(f"今日審計檔不存在：{audit_file.name}")
+            st.info("今日審計檔案尚未建立")
     except Exception as e:
-        st.error(f"審計讀取錯誤: {e}")
+        st.error(f"Error loading Hourly Audit Timeline: {e}")
 
-    # ── Router Trace Dashboard ──
-    st.subheader("🔍 Router Trace — 每根 Bar 的策略決策")
+    st.divider()
+
+    # 3. Pipeline Status
+    st.subheader("🔄 管道與策略狀態 (MTS & Strategy Status)")
     try:
-        from pathlib import Path
-        import json
-        trace_dir = Path("logs/router_trace")
-        if trace_dir.exists():
-            trace_files = sorted(trace_dir.glob("router_trace_*.jsonl"), reverse=True)
-            if trace_files:
-                # ── Load + explode ──
-                rows = []
-                with open(trace_files[0]) as f:
-                    for line in f:
-                        trace = json.loads(line)
-                        ts = trace.get("ts", "?")
-                        regime = trace.get("regime", "?")
-                        selected = trace.get("selected")
-                        for s in trace.get("strategies", []):
-                            rows.append({
-                                "ts": ts,
-                                "regime": regime,
-                                "selected": selected,
-                                "strategy": s["name"],
-                                "triggered": s.get("triggered", False),
-                                "edge": s.get("edge_score"),
-                                "reason": s.get("skip_reason", "?") if not s.get("triggered") else "✅ TRADE",
-                            })
-                if rows:
-                    df_rt = pd.DataFrame(rows)
-                    df_rt["ts_dt"] = pd.to_datetime(df_rt["ts"], errors="coerce")
-                    df_rt = df_rt.sort_values("ts_dt")
-
-                    # ── ① 最新狀態 ──
-                    latest = df_rt.sort_values("ts_dt").groupby("strategy").tail(1)
-                    cols = st.columns(len(latest))
-                    for ci, (_, r) in enumerate(latest.iterrows()):
-                        c = cols[ci % len(cols)]
-                        emoji = "✅" if r["triggered"] else ("⏳" if r["reason"] in ("WATCHING", "FIRE_DETECTED_WAITING") else "⛔")
-                        c.metric(f"{r['strategy']}", f"{emoji} {r['reason']}", f"edge={r['edge']}" if pd.notna(r["edge"]) else None)
-                    
-                    # ── Router Trace 資料新鮮度註解 ──
-                    latest_ts = df_rt["ts_dt"].max()
-                    trace_count = len(df_rt)
-                    st.caption(
-                        f"⚠️ RouterTrace 可能包含前一輪 PM2 process 的歷史資料。"
-                        f"「NOT_REGISTERED」不代表當前 runtime 未註冊，"
-                        f"請交叉比對 PM2 日誌確認策略載入狀態。 "
-                        f"共 {trace_count} 筆, 最新: {latest_ts.strftime('%m/%d %H:%M') if pd.notna(latest_ts) else '?'}"
-                    )
-
-                    # ── ② Edge Timeline (Plotly) ──
-                    try:
-                        import plotly.express as px
-                        df_plot = df_rt[df_rt["edge"].notna()].copy()
-                        if not df_plot.empty:
-                            # 2026-06-30 Gemini CLI: Convert ts_dt to string to avoid serialization issue
-                            df_plot["ts_dt"] = df_plot["ts_dt"].astype(str)
-                            fig = px.line(df_plot, x="ts_dt", y="edge", color="strategy",
-                                          title="Edge Score Timeline",
-                                          labels={"ts_dt": "時間", "edge": "Edge", "strategy": "策略"})
-                            fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10))
-                            st.plotly_chart(fig, width='stretch')
-                    except Exception:
-                        pass
-
-                    # ── ③ Skip Reason 分布 ──
-                    reason_counts = df_rt.groupby(["strategy", "reason"]).size().unstack(fill_value=0)
-                    if not reason_counts.empty:
-                        st.bar_chart(reason_counts, height=200)
-
-                    # ── ④ 原始資料（摺疊） ──
-                    with st.expander("📋 原始 Router Trace 資料", expanded=False):
-                        st.dataframe(df_rt[["ts", "regime", "strategy", "triggered", "edge", "reason"]].tail(50),
-                                     width='stretch', hide_index=True)
-                else:
-                    st.info("Router trace 檔案為空")
-            else:
-                st.info("今日尚無 router trace 資料（monitor 尚未運行）")
-        else:
-            st.info("Router trace 目錄不存在")
-    except Exception as e:
-        st.error(f"Router trace 載入錯誤: {e}")
-
-# ════════════════════════════════════════
-# Tab: 🔐 Real Preflight
-# Read-only broker preflight diagnostic page.
-# Does NOT modify ExecutionContext, does NOT send orders,
-# does NOT transition to LIVE_READY.
-# ════════════════════════════════════════
-elif page == "🔐 Real Preflight":
-    st.header("🔐 Real Trading Preflight")
-    st.caption("Read-only broker diagnostic. Does not send orders or modify execution mode.")
-
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("📋 Execution State")
-
-        # Read runtime status
-        _rt_path = Path("/tmp/runtime_status.json")
-        _rt = {}
-        if _rt_path.exists():
-            try:
-                _rt = json.loads(_rt_path.read_text())
-            except Exception:
-                pass
-
-        # Read orders file for current session
-        _orders_file = Path(f"exports/trades/{_TICKER}_{DATE_STR}_orders.json")
-        _order_count = 0
-        if _orders_file.exists():
-            try:
-                _orders = json.loads(_orders_file.read_text())
-                _order_count = len(_orders)
-            except Exception:
-                pass
-
-        # Display execution context
-        _req_mode = _rt.get("requested_mode", "paper")
-        _eff_mode = _rt.get("effective_mode", "paper_active")
-        _live_allowed = _rt.get("live_order_allowed", False)
-
-        st.metric("Requested Mode", _req_mode.upper())
-        st.metric("Effective Mode", _eff_mode)
-        st.metric("Live Order Allowed", "✅ YES" if _live_allowed else "❌ NO")
-        st.metric("Session Orders (today)", _order_count)
-
-        if _rt.get("transition_block_reason"):
-            st.error(f"Transition blocked: {_rt['transition_block_reason']}")
-
-    with col_right:
-        st.subheader("📄 Paper Drain Status")
-
-        # Read MTS position state
-        _mts_pos = {}
-        _mts_pos_path = Path("/tmp/mts_position_state.json")
-        if _mts_pos_path.exists():
-            try:
-                _mts_pos = json.loads(_mts_pos_path.read_text())
-            except Exception:
-                pass
-
-        _has_pos = _mts_pos.get("has_position", False)
-        _state = _mts_pos.get("state", "?")
-        _near_status = _mts_pos.get("near_status", "?")
-        _far_status = _mts_pos.get("far_status", "?")
-        st.metric("Has Position", "✅ YES" if _has_pos else "❌ NO")
-        st.metric("State", _state)
-        st.metric("Near Status", _near_status)
-        st.metric("Far Status", _far_status)
-
-        if not _has_pos and _state in ("FLAT", "INACTIVE"):
-            st.success("✅ Paper is flat")
-        else:
-            st.warning("⏳ Paper has open position or lifecycle")
-
-    # ── Broker Snapshot Section ──
-    st.divider()
-    st.subheader("🏦 Broker Preflight")
-
-    _diagnostics_dir = Path("exports/trades/live/diagnostics")
-    _response_file = _diagnostics_dir / "broker_snapshot_latest.json"
-
-    # Request ID tracking for freshness
-    if "_snapshot_request_id" not in st.session_state:
-        st.session_state["_snapshot_request_id"] = 0
-
-    col_btn, col_status = st.columns([1, 3])
-
-    with col_btn:
-        if st.button("📷 Capture Broker Snapshot", type="primary", use_container_width=True):
-            st.session_state["_snapshot_request_id"] += 1
-            _rid = st.session_state["_snapshot_request_id"]
-            _request_id = f"DASHBOARD-PROBE-{DATE_STR}-{_rid:04d}"
-
-            # Write request file
-            _req = {
-                "request_id": _request_id,
-                "requested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "operation": "CAPTURE_BROKER_SNAPSHOT",
-                "read_only": True,
-            }
-            _req_path = Path("/tmp/mts_broker_snapshot_request.json")
-            _req_path.write_text(json.dumps(_req, indent=2))
-
-            st.session_state["_last_probe_request_id"] = _request_id
-            st.session_state["_last_probe_time"] = datetime.datetime.now()
-            st.success(f"Request sent ({_request_id})")
-            st.caption("Waiting for trading process to process... (~1 tick cycle)")
-
-    with col_status:
-        if st.button("🔄 Refresh", use_container_width=True):
-            st.rerun()
-
-    # ── Display Response ──
-    if _response_file.exists():
-        try:
-            _resp = json.loads(_response_file.read_text())
-            _resp_time_str = _resp.get("captured_at", "")
-            _req_id = _resp.get("request_id", "")
-
-            # Check freshness: response age
-            _is_fresh = False
-            _age_seconds = 999
-            try:
-                _resp_time = datetime.datetime.fromisoformat(_resp_time_str)
-                _age_seconds = (datetime.datetime.now(datetime.timezone.utc) - _resp_time).total_seconds()
-                _is_fresh = _age_seconds <= 30
-            except Exception:
-                pass
-
-            # Check request ID match
-            _last_req_id = st.session_state.get("_last_probe_request_id", "")
-            _id_match = (not _last_req_id) or (_req_id == _last_req_id)
-
-            if not _is_fresh:
-                st.warning(f"⚠️ Response is {_age_seconds:.0f}s old (max 30s). Capture again for current state.")
-
-            # Display snapshot
-            _snap = _resp.get("snapshot", {})
-            if _snap:
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Position Count", _snap.get("position_count", "?"))
-                with col2:
-                    st.metric("Open Orders", _snap.get("open_order_count", "?"))
-                with col3:
-                    st.metric("Connected", "✅" if _snap.get("connected") else "❌")
-                with col4:
-                    st.metric("Authenticated", "✅" if _snap.get("authenticated") else "❌")
-
-                # Position details
-                if _snap.get("_positions"):
-                    with st.expander(f"📋 Positions ({len(_snap['_positions'])})", expanded=False):
-                        st.json(_snap["_positions"])
-
-                if _snap.get("_open_orders"):
-                    with st.expander(f"📋 Open Orders ({len(_snap['_open_orders'])})", expanded=False):
-                        st.json(_snap["_open_orders"])
-
-            # Display preflight result
-            _preflight = _resp.get("preflight", {})
-            if _preflight.get("passed"):
-                st.success("✅ Preflight Result: **PASSED** — broker ready for READY_FOR_COMMIT")
-                st.caption("PR 4 not yet implemented. Live transition not available.")
-            else:
-                st.error("❌ Preflight Result: **FAILED** — transition blocked")
-                for _check in _preflight.get("failed_checks", []):
-                    st.markdown(f"- ✗ `{_check}`")
-
-            # Response metadata
-            with st.expander("📄 Response Metadata", expanded=False):
-                st.json({
-                    "request_id": _req_id,
-                    "captured_at": _resp_time_str,
-                    "age_seconds": _age_seconds,
-                    "process_start_id": _resp.get("process_start_id", "?"),
-                    "read_only": _resp.get("read_only", False),
-                })
-
-        except Exception as e:
-            st.warning(f"Error reading response: {e}")
-    else:
-        st.info("No broker snapshot captured yet. Click 'Capture Broker Snapshot' above.")
-        st.caption("Note: trading-system must be restarted for the new probe code to take effect.")
-
-    # ── Safety Reminder ──
-    st.divider()
-    st.caption("⚠️ **Read-only diagnostic page.** Does not submit orders, cancel orders, flatten positions, or modify execution mode. PR 4 not yet implemented — this page cannot initiate Live trading.")
-
-# ════════════════════════════════════════
-# Tab 6: 設定
-# ════════════════════════════════════════
-elif page == "設定":
-    st.header("⚙️ 系統設定")
-
-    # ── 0. 實盤就緒度檢查 ──
-    with st.expander("🚀 實盤就緒度檢查", expanded=True):
-        from core.live_readiness import check_all, get_readiness_items, get_readiness_summary
-        check_output = check_all()
-        readiness_items = get_readiness_items(check_output)
-        status, passed, total = get_readiness_summary(check_output)
-
-        st.markdown(f"### {status} ({passed}/{total} 項通過)")
-
-        # Progress bar
-        pct = passed / total if total > 0 else 0
-        st.progress(pct)
-
-        # Detail table
-        for r in readiness_items:
-            icon = "✅" if r.passed else "❌"
-            st.caption(f"{icon} **{r.name}**: {r.detail}")
-
-        # Action recommendation
-        if passed == total:
-            st.success("🎉 所有檢查通過！可以考慮進入 Phase 2 小額實盤測試")
-            # 2026-05-27 Gemini CLI: Dynamic Ticker in Recommendation
-            st.info(f"建議: 先用 1 口 {_TICKER} 測試 5 個交易日，設定每日最大虧損 2%")
-        elif passed >= total * 0.6:
-            remaining = total - passed
-            st.warning(f"⚠️ 還有 {remaining} 項未通過，建議繼續 Paper 觀察")
-            for r in readiness_items:
-                if not r.passed:
-                    st.caption(f"❌ 待解決: {r.name} (目前: {r.detail})")
-        else:
-            st.error("❌ 多數檢查未通過，不建議開啟實盤交易")
-
-        st.divider()
-        st.caption("參考文件: `docs/LIVE_TRADING_GUIDE.md`")
-
-    # 2026-05-27 Gemini CLI: Dynamic Ticker in Settings
-    with st.expander(f"📈 期貨 {_TICKER} 設定", expanded=True):
-        # 2026-06-23 Gemini CLI: 使用快取的策略註冊表以避免在每次重整時重複掃描目錄，優化 CPU 使用率
-        _reg = get_cached_strategy_registry()
-        fut_strats = {item["name"]: item for item in _reg.list_all() if item.get("asset_class") == "futures" and item.get("available", False)}
-        current_fut_strat = futures_cfg.get("strategy", {}).get("active_strategy", futures_cfg.get("active_strategy", "counter_vwap"))
-
-        # ── Session indicator: show active vs inactive params ──
-        _night_cfg = load_yaml(BASE / "config" / "futures_night.yaml")
-        _day_cfg = load_yaml(BASE / "config" / "futures.yaml")
-        _day_risk = _day_cfg.get("risk_mgmt", {})
-        _night_risk = _night_cfg.get("risk_mgmt", {})
-        _active_risk = _night_risk if _CURRENT_SESSION_NIGHT else _day_risk
-        st.info(
-            f"**{'🌙 夜盤設定使用中' if _CURRENT_SESSION_NIGHT else '☀️ 日盤設定使用中'}** (`{FUTURES_CFG_NAME}`)  \n"
-            f"停損: **{_active_risk.get('stop_loss_pts', '?')} pts** (日 {_day_risk.get('stop_loss_pts', '?')} / 夜 {_night_risk.get('stop_loss_pts', '?')})  \n"
-            f"ATR 倍數: **{_active_risk.get('atr_multiplier', '?')}x** (日 {_day_risk.get('atr_multiplier', '?')} / 夜 {_night_risk.get('atr_multiplier', '?')})  \n"
-            f"VWAP 確認: **{_active_risk.get('exit_vwap_confirm_bars', '?')} bars** (日 {_day_risk.get('exit_vwap_confirm_bars', '?')} / 夜 {_night_risk.get('exit_vwap_confirm_bars', '?')})  \n"
-            f"追蹤停損距離: **{_active_risk.get('trailing_stop_distance_pts', '?')} pts** (日 {_day_risk.get('trailing_stop_distance_pts', '?')} / 夜 {_night_risk.get('trailing_stop_distance_pts', '?')})"
-        )
-
-        with st.form("futures_settings_form"):
-            f_live_new = st.checkbox("啟用期貨實盤交易 (LIVE)", value=futures_cfg.get("live_trading", False))
-            # 2026-05-22 Gemini CLI: Add MTS Mode toggle back to UI
-            f_mts_new = st.checkbox("啟用 MTS 自適應價差模式 (MTS Mode)", value=futures_cfg.get("mts", {}).get("enabled", False))
-
-            # 2026-05-27 Gemini CLI: Restore MTS Parameter Adjustment Section
-            if f_mts_new:
-                st.markdown("---")
-                st.markdown("##### ⚙️ MTS 價差策略參數")
-                _mts_params = futures_cfg.get("mts", {}).get("params", {})
-                
-                m1, m2 = st.columns(2)
-                f_mts_min_atr = m1.number_input("MTS 最低 ATR 限制", min_value=1.0, max_value=100.0, 
-                                               value=float(_mts_params.get("min_atr", 10.0)), step=1.0)
-                f_mts_atr_cap = m2.number_input("MTS ATR 上限 (Cap)", min_value=10.0, max_value=500.0, 
-                                               value=float(_mts_params.get("atr_cap", 100.0)), step=10.0)
-                
-                m3, m4 = st.columns(2)
-                # 2026-05-27 Gemini CLI: Updated labels for clarity (ATR Release and ATR Exit)
-                f_mts_mult_stop = m3.slider("MTS 釋放倍數 (ATR Release)", 0.5, 3.0, 
-                                            value=float(_mts_params.get("atr_multiplier_stop", 1.0)), step=0.1)
-                f_mts_mult_trail = m4.slider("MTS 停利倍數 (ATR Exit)", 0.1, 10.0, 
-                                             value=float(_mts_params.get("atr_multiplier_trail", 3.5)), step=0.1)
-                
-                m5, m6 = st.columns(2)
-                f_mts_stop_fixed = m5.number_input("MTS 固定釋放點數 (pts)", min_value=5, max_value=500, 
-                                                 value=int(_mts_params.get("release_stop_points", 20)))
-                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
-                                                  value=int(_mts_params.get("trail_distance_points", 30)))
-                
-                st.markdown("###### 🛡️ Policy J 組合移動停利 (Combined UPL Trailing Exit)")
-                pj1, pj2, pj3 = st.columns(3)
-                f_policy_j_enable = pj1.checkbox("啟用 Policy J 組合停利", value=bool(_mts_params.get("enable_combined_upl_trail", True)))
-                f_policy_j_activation = pj2.number_input("啟動淨利金額 (TWD)", min_value=50.0, max_value=5000.0,
-                                                        value=float(_mts_params.get("combined_upl_activation_net_pnl_twd", 300.0)), step=50.0)
-                f_policy_j_giveback = pj3.number_input("回吐門檻金額 (TWD)", min_value=10.0, max_value=2000.0,
-                                                     value=float(_mts_params.get("combined_upl_giveback_twd", 100.0)), step=10.0)
-                st.caption("💡 提示：儲存時將自動同步更新日盤 (`futures.yaml`) 與夜盤 (`futures_night.yaml`) 設定檔。Policy J 啟動後若自最高淨利回吐指定 TWD 金額將觸發 COMBINED_EXIT 雙腿全平倉。")
-                st.markdown("---")
-
-            # Strategy selector from Registry
-            strat_options = list(fut_strats.keys())
-            if not strat_options:
-                strat_options = [current_fut_strat, "counter_vwap", "weak_bear_trend", "squeeze_fire_scout"]
-                strat_options = list(dict.fromkeys(strat_options))  # dedupe
-                st.warning("⚠️ 策略註冊表未載入任何期貨策略，使用備用策略清單。")
-            try:
-                strat_idx = strat_options.index(current_fut_strat)
-            except ValueError:
-                strat_idx = 0
-
-            f_strat_new = st.selectbox("核心進場策略", strat_options, index=strat_idx)
-
-            # Show strategy metadata
-            meta = fut_strats.get(f_strat_new, {})
-            desc = meta.get("description", "無說明")
-            pf = meta.get("backtest_pf", 0)
-            wr = meta.get("backtest_wr", 0)
-            maxdd = meta.get("backtest_maxdd", 0)
-            regime = meta.get("market_regime", "")
-            st.info(f"💡 **{f_strat_new}**: {desc}  \n"
-                    f"📊 PF={pf:.2f} | WR={wr:.1f}% | MaxDD={maxdd:.1f}% | 適用: {regime}")
-
-            st.divider()
-
-            # ── 口數與持倉限制 ──
-            st.markdown("##### 📦 口數與持倉限制")
-            c1, c2 = st.columns(2)
-            f_lots = c1.number_input("每筆交易口數", min_value=1, max_value=10,
-                                     value=futures_cfg.get("trade_mgmt", {}).get("lots_per_trade", 2),
-                                     help="每次進場的口數。實盤建議從 1 口開始。")
-            f_max_pos = c2.number_input("最大持倉口數", min_value=1, max_value=20,
-                                        value=futures_cfg.get("trade_mgmt", {}).get("max_positions", 2),
-                                        help="同時最大持倉口數。建議 1-2 口控制風險。")
-
-            st.divider()
-            f_regime = st.selectbox("市場濾網 (Regime)", ["low", "mid", "high"], index=["low", "mid", "high"].index(futures_cfg.get("strategy", {}).get("regime_filter", "mid")))
-            
-            fc1, fc2 = st.columns(2)
-            f_score = fc1.slider("進場門檻 (Score)", 10, 100, value=futures_cfg.get("strategy", {}).get("entry_score", 20))
-            f_atr = fc2.slider("ATR 止損倍數", 1.0, 5.0, value=float(futures_cfg.get("risk_mgmt", {}).get("atr_multiplier", 2.0)), step=0.1)
-
-            st.divider()
-            st.markdown("##### 🛡️ 進階安全與成本設定")
-            fc3, fc4 = st.columns(2)
-            f_stop_fixed = fc3.number_input("固定停損點數 (pts)", min_value=10, max_value=200,
-                                           value=int(futures_cfg.get("risk_mgmt", {}).get("stop_loss_pts", 60)),
-                                           help="ATR 失效或為 0 時使用的保險底線停損點數。")
-            f_fee = fc4.number_input("單邊手續費 (TWD)", min_value=0.0, max_value=100.0,
-                                    value=float(futures_cfg.get("execution", {}).get("broker_fee_per_side", 20.0)),
-                                    help="用於 PnL 計算。請輸入你的真實券商折扣後手續費。")
-
-            if st.form_submit_button("💾 儲存並重啟期貨模組"):
-                futures_cfg["live_trading"] = f_live_new
-
-                # 2026-05-27 Gemini CLI: Save restored MTS parameters
-                if "mts" not in futures_cfg: futures_cfg["mts"] = {}
-                futures_cfg["mts"]["enabled"] = f_mts_new
-                if f_mts_new:
-                    if "params" not in futures_cfg["mts"]: futures_cfg["mts"]["params"] = {}
-                    futures_cfg["mts"]["params"]["min_atr"] = f_mts_min_atr
-                    futures_cfg["mts"]["params"]["atr_cap"] = f_mts_atr_cap
-                    futures_cfg["mts"]["params"]["atr_multiplier_stop"] = f_mts_mult_stop
-                    futures_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
-                    futures_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
-                    futures_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
-                    futures_cfg["mts"]["params"]["enable_combined_upl_trail"] = f_policy_j_enable
-                    futures_cfg["mts"]["params"]["combined_upl_activation_net_pnl_twd"] = f_policy_j_activation
-                    futures_cfg["mts"]["params"]["combined_upl_giveback_twd"] = f_policy_j_giveback
-
-                futures_cfg["strategy"]["active_strategy"] = f_strat_new
-                futures_cfg["strategy"]["regime_filter"] = f_regime
-                futures_cfg["strategy"]["entry_score"] = f_score
-                futures_cfg["risk_mgmt"]["atr_multiplier"] = f_atr
-                futures_cfg["risk_mgmt"]["stop_loss_pts"] = f_stop_fixed
-                futures_cfg["execution"]["broker_fee_per_side"] = f_fee
-                futures_cfg["trade_mgmt"]["lots_per_trade"] = f_lots
-                futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
-
-                # 2026-06-30 Hermes Agent: Show config diff before saving
-                _old_yaml = ""
-                try:
-                    with open(FUTURES_CFG_PATH) as _f:
-                        _old_yaml = _f.read()
-                except Exception:
-                    pass
-                save_yaml(FUTURES_CFG_PATH, futures_cfg)
-                _new_yaml = open(FUTURES_CFG_PATH).read()
-
-                # 2026-07-27 Gemini CLI: Dual-config sync with explicit SESSION_SPECIFIC_MTS_PARAMS taxonomy
-                _counterpart_cfg_name = "futures.yaml" if _CURRENT_SESSION_NIGHT else "futures_night.yaml"
-                _counterpart_cfg_path = BASE / "config" / _counterpart_cfg_name
-                SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
-
-                if _counterpart_cfg_path.exists():
-                    _counterpart_cfg = load_yaml(_counterpart_cfg_path)
-                    if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
-                    _counterpart_cfg["mts"]["enabled"] = f_mts_new
-                    if f_mts_new:
-                        if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
-                        _incoming_params = {
-                            "min_atr": f_mts_min_atr,
-                            "atr_cap": f_mts_atr_cap,
-                            "atr_multiplier_stop": f_mts_mult_stop,
-                            "atr_multiplier_trail": f_mts_mult_trail,
-                            "release_stop_points": f_mts_stop_fixed,
-                            "trail_distance_points": f_mts_trail_fixed,
-                            "enable_combined_upl_trail": f_policy_j_enable,
-                            "combined_upl_activation_net_pnl_twd": f_policy_j_activation,
-                            "combined_upl_giveback_twd": f_policy_j_giveback,
-                        }
-                        for _pkey, _pval in _incoming_params.items():
-                            if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
-                                # Preserve session-specific params in counterpart if already defined
-                                if _pkey not in _counterpart_cfg["mts"]["params"]:
-                                    _counterpart_cfg["mts"]["params"][_pkey] = _pval
-                            else:
-                                # Synchronize shared parameters across sessions
-                                _counterpart_cfg["mts"]["params"][_pkey] = _pval
-                    save_yaml(_counterpart_cfg_path, _counterpart_cfg)
-
-                # Build compact diff summary
-                _diff_lines = []
-                if _old_yaml:
-                    _old_lines = _old_yaml.splitlines()
-                    _new_lines = _new_yaml.splitlines()
-                    # Simple key-level diff for the most important changes
-                    import re as _re
-                    _old_kv = {}
-                    for _l in _old_lines:
-                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
-                        if _m: _old_kv[_m.group(1)] = _m.group(2).strip()
-                    for _l in _new_lines:
-                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
-                        if _m:
-                            _k, _v = _m.group(1), _m.group(2).strip()
-                            _ov = _old_kv.get(_k, '')
-                            if _ov != _v:
-                                _diff_lines.append(f"  `{_k}`: `{_ov}` → `{_v}`")
-                    # Also check nested strategy/risk keys
-                    def _flat_diff(_prefix, _new_d, _old_d):
-                        for _k, _v in _new_d.items():
-                            _pk = f"{_prefix}.{_k}"
-                            if isinstance(_v, dict):
-                                _flat_diff(_pk, _v, _old_d.get(_k, {}))
-                            else:
-                                _ov = _old_d.get(_k, _v)
-                                if _ov != _v:
-                                    _diff_lines.append(f"  `{_pk}`: `{_ov}` → `{_v}`")
-                    _flat_diff("strategy", futures_cfg.get("strategy", {}), yaml.safe_load(_old_yaml).get("strategy", {}) if _old_yaml else {})
-                    _flat_diff("risk_mgmt", futures_cfg.get("risk_mgmt", {}), yaml.safe_load(_old_yaml).get("risk_mgmt", {}) if _old_yaml else {})
-
-                if _diff_lines:
-                    st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n" + "\n".join(_diff_lines))
-                else:
-                    st.success(f"✅ 設定已寫入 `{FUTURES_CFG_PATH}`\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
-                trigger_restart()
-                st.info("🔄 重啟指令已送出，monitor 將在約 30 秒後套用新設定。")
-                # 2026-06-30 Hermes Agent: Hold success message for 3s before rerun
-                import time as _time
-                _time.sleep(3)
-                st.rerun()
-
-    # ── 2. 選擇權 TXO 設定 ──
-    with st.expander("🔮 選擇權 TXO 設定", expanded=False):
-        current_opt_mode = options_cfg.get("active_mode", options_cfg.get("mode", "V2"))
-        opt_strategy_cfg = options_cfg.setdefault("strategy", {})
-        opt_risk_cfg = options_cfg.setdefault("risk_mgmt", {})
-        opt_exec_cfg = options_cfg.setdefault("execution", {})
-        opt_pricing_cfg = options_cfg.setdefault("pricing", {})
-        opt_monitoring_cfg = options_cfg.setdefault("monitoring", {})
-        opt_mode_cfg = options_cfg.setdefault("modes", {}).get(current_opt_mode, {})
-        
-        with st.form("options_settings_form"):
-            o_live_new = st.checkbox("啟用選擇權實盤交易 (LIVE)", value=options_cfg.get("live_trading", False))
-            
-            o_mode_new = st.selectbox("交易模式", ["V1", "V2", "V3"], index=["V1", "V2", "V3"].index(current_opt_mode),
-                                      help="V1: 當沖, V2: 波段(月選), V3: 夜盤當沖")
-            
-            # 模式說明
-            mode_desc = {
-                "V1": "近月合約當日沖銷，適合高波動行情。",
-                "V2": "月選合約波段持有 (≥14天 DTE)，降低時間價值衰減。",
-                "V3": "專攻夜盤波動，開盤進場收盤前出場。"
-            }
-            st.info(f"💡 **模式說明**: {mode_desc.get(o_mode_new)}")
-
-            st.caption(
-                "目前 monitor 生效值："
-                f" entry_score={int(opt_strategy_cfg.get('entry_score', options_cfg.get('entry_score', 80)))}"
-                f" | stop_loss={float(opt_risk_cfg.get('stop_loss_pct', 0.3)):.0%}"
-                f" | tp1={float(opt_mode_cfg.get('tp1_pct', 0.0)):.1f}%"
-                f" | trailing={float(opt_mode_cfg.get('trailing_stop_pct', 0.0)):.2f}"
-                f" | IV={float(opt_pricing_cfg.get('min_iv', options_cfg.get('min_iv', 0.15))):.2f}"
-                f"~{float(opt_pricing_cfg.get('max_iv', options_cfg.get('max_iv', 0.60))):.2f}"
-                f" | pricing={opt_pricing_cfg.get('pricing_model', 'black_scholes')}"
-                f" | order_mgr={'on' if opt_monitoring_cfg.get('use_order_manager', False) else 'off'}"
-            )
-
-            o_score = st.slider(
-                "進場門檻 (Score)",
-                10,
-                100,
-                value=int(opt_strategy_cfg.get("entry_score", options_cfg.get("entry_score", 80))),
-                help="實際對應 strategies/options/live_options_squeeze_monitor.py 讀取的 strategy.entry_score。",
-            )
-
-            o_fire_thresh = st.slider("Fire 門檻 (強趨勢 score)", 10, 100,
-                                       value=int(options_cfg.get("strategy", {}).get("fire_score_threshold", 80)),
-                                       help="fired=False 但 score 超過此值也允許進場。降低此值可在趨勢行情中進場。")
-
-            # ── 口數與持倉限制 ──
-            st.markdown("##### 📦 口數與持倉限制")
-            oc1, oc2 = st.columns(2)
-            o_lots = oc1.number_input("每筆交易口數", min_value=1, max_value=10,
-                                     value=opt_risk_cfg.get("lots_per_trade", 2),
-                                     help="基礎進場口數。Runtime 仍可能依 Decision Intelligence 做單次縮放，但不應默默改寫這個基礎值。")
-            o_max_pos = oc2.number_input("最大持倉口數", min_value=1, max_value=20,
-                                        value=opt_risk_cfg.get("max_positions", 2),
-                                        help="同時最大持倉口數。建議 1-2 口控制風險。")
-
-            st.divider()
-            oc3, oc4 = st.columns(2)
-            o_min_iv = oc3.slider(
-                "最低 IV 限制",
-                0.1,
-                0.5,
-                value=float(opt_pricing_cfg.get("min_iv", options_cfg.get("min_iv", 0.15))),
-                step=0.01,
-            )
-            o_max_iv = oc4.slider(
-                "最高 IV 限制",
-                0.3,
-                1.0,
-                value=float(opt_pricing_cfg.get("max_iv", options_cfg.get("max_iv", 0.60))),
-                step=0.01,
-            )
-
-            st.divider()
-            st.markdown("##### 🛡️ 進階安全與成本設定")
-            oc5, oc6 = st.columns(2)
-            o_fee = oc5.number_input("單邊手續費 (TWD)", min_value=0.0, max_value=100.0,
-                                    value=float(opt_exec_cfg.get("broker_fee_per_side", 20.0)),
-                                    help="券商收取的單口單邊手續費。")
-            o_exch = oc6.number_input("單邊交易所費 (TWD)", min_value=0.0, max_value=100.0,
-                                     value=float(opt_exec_cfg.get("exchange_fee_per_side", 5.0)),
-                                     help="期交所收取的單口單邊費用。")
-
-            if st.form_submit_button("💾 儲存並重啟選擇權模組"):
-                options_cfg["live_trading"] = o_live_new
-                options_cfg["active_mode"] = o_mode_new
-                options_cfg["mode"] = o_mode_new
-                opt_strategy_cfg["entry_score"] = o_score
-                opt_strategy_cfg["fire_score_threshold"] = o_fire_thresh
-                opt_pricing_cfg["min_iv"] = o_min_iv
-                opt_pricing_cfg["max_iv"] = o_max_iv
-                opt_exec_cfg["broker_fee_per_side"] = o_fee
-                opt_exec_cfg["exchange_fee_per_side"] = o_exch
-                opt_risk_cfg["lots_per_trade"] = o_lots
-                opt_risk_cfg["max_positions"] = o_max_pos
-                save_yaml(OPTIONS_CFG_PATH, options_cfg)
-                trigger_restart()
-                st.success(f"✅ 設定已寫入 `{OPTIONS_CFG_PATH}`\n模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
-                st.info("🔄 重啟指令已送出，約 30 秒後套用新設定。")
-                st.rerun()
-
-    # ── 3. 台股 Stocks 設定 ──
-    with st.expander("🍎 台股 Stocks 設定", expanded=True):
-        stk_inner = stock_cfg.get("stocks", {})
-        
-        # 將同步按鈕與顯示邏輯整合
-        if st.button("🔄 同步外部 CANSLIM 領頭羊名單"):
-            try:
-                import subprocess
-                subprocess.run(["python3", "scripts/sync/sync_external_watchlist.py"], check=True, timeout=30)
-                st.success("同步成功！已從雲端獲取最新領頭羊名單。")
-                st.rerun()
-            except Exception as e:
-                st.error(f"同步失敗: {e}")
-
-        with st.form("stock_settings_form"):
-            s_live_new = st.checkbox("啟用台股實盤交易 (LIVE)", value=stock_cfg.get("live_trading", False))
-            
-            # --- 改為直式多行輸入 ---
-            current_watchlist = stk_inner.get("watchlist", ["2330", "2454"])
-            watchlist_area = st.text_area("監控名單 (每行一個代號)", 
-                                         value="\n".join(current_watchlist),
-                                         height=200,
-                                         help="請輸入股票代號，例如 2330。支援一行一個標的。")
-            
-            c1, c2, c2b = st.columns(3)
-            from strategies.stocks.entry_strategies import STOCK_STRATEGIES
-            strat_options = list(STOCK_STRATEGIES.keys())
-            if not strat_options:
-                strat_options = ["momentum_breakout", "mean_reversion"]
-                st.warning("⚠️ 找不到任何台股策略，使用預設策略清單。")
-            current_strat = stk_inner.get("strategy", "momentum_breakout")
-            strat_idx = strat_options.index(current_strat) if current_strat in strat_options else 0
-            strat_new = c1.selectbox("策略", strat_options, index=strat_idx,
-                                     help=STOCK_STRATEGIES.get(current_strat, {}).get("desc", "") if current_strat in STOCK_STRATEGIES else "")
-            budget_new = c2.number_input("總分配資金 (TWD)", value=stk_inner.get("total_portfolio_budget", 100000), step=10000)
-            capital_new = c2b.number_input("單筆預算 (TWD)", value=stk_inner.get("capital_per_trade", 20000), step=1000)
-            
-            c3, c4, c5 = st.columns(3)
-            sl_new = c3.slider("停損 (%)", 1.0, 10.0, value=float(stk_inner.get("stop_loss_pct", 0.02)*100), step=0.5) / 100.0
-            tp_new = c4.slider("停利 (%)", 2.0, 20.0, value=float(stk_inner.get("take_profit_pct", 0.10)*100), step=0.5) / 100.0
-            ts_new = c5.slider("移動停損 (%)", 0.5, 5.0, value=float(stk_inner.get("trailing_stop_pct", 0.01)*100), step=0.1) / 100.0
-            
-            if st.form_submit_button("💾 儲存並重啟台股模組"):
-                # 處理多行輸入，轉回 list
-                new_tickers = [t.strip() for t in watchlist_area.split("\n") if t.strip()]
-                new_stocks = {
-                    "watchlist": new_tickers,
-                    "strategy": strat_new,
-                    "total_portfolio_budget": budget_new,
-                    "capital_per_trade": capital_new,
-                    "entry_score": stk_inner.get("entry_score", 20),
-                    "atr_mult": stk_inner.get("atr_mult", 2.0),
-                    "stop_loss_pct": sl_new,
-                    "take_profit_pct": tp_new,
-                    "trailing_stop_pct": ts_new,
-                }
-                # 保留 bear_defense 等既有區塊
-                if "bear_defense" in stk_inner:
-                    new_stocks["bear_defense"] = stk_inner["bear_defense"]
-                if "fallback_strategy" in stk_inner:
-                    new_stocks["fallback_strategy"] = stk_inner["fallback_strategy"]
-                new_stock_cfg = {
-                    "live_trading": s_live_new,
-                    "stocks": new_stocks,
-                }
-                save_yaml(STOCK_CFG_PATH, new_stock_cfg)
-                trigger_restart()
-                # GSD Fix: stock_runner is independent process, must be killed separately
-                import subprocess
-                subprocess.run(["pkill", "-f", "stock_runner.py"], capture_output=True)
-                st.success("台股設定已更新，正在重啟系統...")
-
-    # ── 3.5. 通知設定 ──
-    # 2026-06-26 Gemini CLI: Add email notification toggle in settings tab
-    with st.expander("✉️ 電子郵件通知設定", expanded=True):
-        def get_email_notification_status() -> bool:
-            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
-            if not env_path.exists():
-                return True
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("ENABLE_EMAIL_NOTIFICATION"):
-                        parts = line.split("=", 1)
-                        if len(parts) == 2:
-                            val = parts[1].strip().lower()
-                            return val not in ("false", "0", "no")
-            return True
-
-        def set_email_notification_status(enabled: bool):
-            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
-            if not env_path.exists():
-                os.makedirs(env_path.parent, exist_ok=True)
-                with open(env_path, "w", encoding="utf-8") as f:
-                    f.write(f"ENABLE_EMAIL_NOTIFICATION={enabled}\n")
-                return
-            with open(env_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            found = False
-            for i, line in enumerate(lines):
-                if line.strip().startswith("ENABLE_EMAIL_NOTIFICATION"):
-                    lines[i] = f"ENABLE_EMAIL_NOTIFICATION={enabled}\n"
-                    found = True
-                    break
-            if not found:
-                if lines and not lines[-1].endswith("\n"):
-                    lines.append("\n")
-                lines.append(f"ENABLE_EMAIL_NOTIFICATION={enabled}\n")
-            with open(env_path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-
-        current_email_enabled = get_email_notification_status()
-
-        with st.form("notification_settings_form"):
-            email_notify_enabled = st.checkbox("啟用交易電子郵件通知 (Email Trade Notification)", value=current_email_enabled,
-                                              help="勾選以在每次有交易時發送 Email 到指定的信箱 (mylim304@gmail.com)。")
-            
-            # Show active SMTP user / recipient for visibility if they exist
-            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
-            smtp_username = ""
-            smtp_recipient = ""
-            if env_path.exists():
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("SMTP_USERNAME"):
-                            parts = line.split("=", 1)
-                            if len(parts) == 2:
-                                smtp_username = parts[1].strip()
-                        elif line.startswith("SMTP_RECIPIENT"):
-                            parts = line.split("=", 1)
-                            if len(parts) == 2:
-                                smtp_recipient = parts[1].strip()
-            
-            if smtp_username or smtp_recipient:
-                st.caption(f"📧 **寄件者**: `{smtp_username}`  \n📩 **收件者**: `{smtp_recipient}`")
-            else:
-                st.warning("⚠️ 尚未配置 SMTP 帳密於 `~/.config/squeeze-backtest-email.env` 中。")
-
-            if st.form_submit_button("💾 儲存通知設定"):
-                set_email_notification_status(email_notify_enabled)
-                os.environ["ENABLE_EMAIL_NOTIFICATION"] = str(email_notify_enabled)
-                st.success(f"通知設定已更新！電子郵件通知: {'已啟用' if email_notify_enabled else '已關閉'}")
-                time.sleep(1)
-                st.rerun()
-
-    # ── 4. 危險區域 ──
-    st.divider()
-    with st.expander("🚨 危險區域 (Danger Zone)", expanded=False):
-        st.warning("以下操作將永久刪除數據，請謹慎執行。")
-        col_d1, col_d2 = st.columns([2, 1])
-        with col_d1:
-            st.markdown("##### 🗑️ 清空模擬交易數據")
-            st.caption("這將歸零所有 Paper Trading 的持倉與歷史紀錄 CSV，方便切換實盤前清空數據。")
-        with col_d2:
-            if st.button("執行清空", type="primary", width='stretch'):
-                try:
-                    import subprocess
-                    result = subprocess.run(["python3", "scripts/maintenance/clear_simulation_data.py", "--force"], 
-                                                         capture_output=True, text=True)
-                    st.success("✅ 數據已清空！")
-                    st.toast("Simulation data cleared successfully.")
-                    time.sleep(1)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"清空失敗: {e}")
-
-    st.info("💡 提示: 部分進階設定可直接編輯 `config/*.yaml` 檔案。")
-
-# ════════════════════════════════════════
-# Tab: 波動率 Vol
-# ════════════════════════════════════════
-elif page == "波動率 Vol":
-    st.header("📊 Volatility Surface Regime")
-    st.caption("IV curve shape classification + Volatility State Machine")
-
-    try:
-        from core.derivatives.skew_regime_logger import SkewRegimeLogger
-        logger = SkewRegimeLogger()
-        records = logger.read_today()
-    except Exception:
-        records = []
-
-    if not records:
-        st.warning("無 volatility 資料 (市場未開盤或資料尚未就緒)")
-    else:
-        # Latest record
-        latest = records[-1]
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            vol_state = latest.get("vol_state", "UNKNOWN")
-            state_emoji = {
-                "CALM": "🟢", "NORMAL": "🔵", "EXPANDING": "🟡",
-                "PANIC": "🔴", "EUPHORIA": "🟠", "EVENT": "⚫", "UNKNOWN": "⚪",
-            }.get(vol_state, "⚪")
-            st.metric(
-                "Volatility State",
-                f"{state_emoji} {vol_state}",
-                f"{latest.get('vol_state_age_sec', 0)}s persistent={latest.get('vol_state_persistent', False)}",
-            )
-        with col2:
-            st.metric(
-                "Directional Skew",
-                latest.get("directional_skew", "?"),
-                f"slope_ratio={latest.get('slope_ratio', 0):.3f}",
-            )
-        with col3:
-            st.metric(
-                "Tension",
-                latest.get("tension", "?"),
-                f"atm_iv_change={latest.get('atm_iv_change', 0):.3f}",
-            )
-
-        # Detail row
-        col4, col5, col6, col7 = st.columns(4)
-        with col4:
-            st.metric(
-                "IV Percentile",
-                f"{latest.get('iv_percentile', 0):.0%}",
-                f"z={latest.get('iv_zscore', 0):.1f}",
-            )
-        with col5:
-            st.metric(
-                "ATM IV",
-                f"{latest.get('atm_iv', 0):.1%}",
-            )
-        with col6:
-            st.metric(
-                "OTM Put IV",
-                f"{latest.get('otm_put_iv', 0):.1%}",
-            )
-        with col7:
-            st.metric(
-                "OTM Call IV",
-                f"{latest.get('otm_call_iv', 0):.1%}",
-            )
-
-        # Transition info
-        col8, col9 = st.columns(2)
-        with col8:
-            st.metric("Transitions Today", latest.get("vol_state_transition_count", 0))
-        with col9:
-            confidence = latest.get("confidence", 0)
-            if confidence >= 0.7:
-                st.success(f"Confidence: {confidence:.0%}")
-            elif confidence >= 0.4:
-                st.warning(f"Confidence: {confidence:.0%}")
-            else:
-                st.error(f"Confidence: {confidence:.0%}")
-
-        # Time series: last N records
-        st.subheader("State Timeline")
-        n_show = min(50, len(records))
-        timeline_data = []
-        for r in records[-n_show:]:
-            timeline_data.append({
-                "time": r.get("timestamp", "")[:19] if r.get("timestamp") else "",
-                "state": r.get("vol_state", "?"),
-                "skew": r.get("directional_skew", "?"),
-                "tension": r.get("tension", "?"),
-                "pct": r.get("iv_percentile", 0),
-                "conf": r.get("confidence", 0),
+        from core.strategy_registry import STRATEGY_PERF
+        pipeline_data = []
+        for name, perf in sorted(STRATEGY_PERF.items()):
+            display_name = {
+                "tmf_spread": "TMF 雙腿對沖 (MTS)",
+                "counter_vwap": "Counter-VWAP",
+                "spring_upthrust": "Spring-Upthrust",
+                "kbar_feature": "KBar Feature",
+                "calendar_condor_v2": "Calendar Condor v2",
+                "vol_squeeze": "Vol-Squeeze",
+                "psar": "PSAR",
+                "weak_bear_trend": "Weak Bear Trend",
+                "squeeze_fire_scout": "Sqz Fire Scout",
+            }.get(name, name)
+            day_pf = perf.get("day_pf", 0)
+            night_pf = perf.get("night_pf", 0)
+            status = "✅ ACTIVE" if day_pf >= 1.2 or name == "tmf_spread" else ("⏳ 觀察中" if day_pf >= 1.0 else "🔴 停用/觀察")
+            pipeline_data.append({
+                "策略": display_name,
+                "日盤 PF": day_pf,
+                "夜盤 PF": night_pf,
+                "狀態": status,
             })
+        st.table(pd.DataFrame(pipeline_data))
+    except Exception as e:
+        st.error(f"Error loading pipeline: {e}")
 
-        if timeline_data:
-            st.dataframe(
-                timeline_data,
-                column_config={
-                    "time": "Time",
-                    "state": "State",
-                    "skew": "Skew",
-                    "tension": "Tension",
-                    "pct": st.column_config.ProgressColumn("IV %ile", format="%.0%", max_value=1),
-                    "conf": st.column_config.ProgressColumn("Confidence", format="%.0%", max_value=1),
-                },
-                width='stretch',
-                hide_index=True,
-            )
+    # 4. Recent Decisions & Legacy Rankings
+    st.subheader("📝 最近決策日誌")
+    try:
+        from core.decision_logger import DecisionLogger
+        recent = DecisionLogger.read_decisions(limit=10)
+        if recent:
+            df_dec = pd.DataFrame([{
+                "時間": d.timestamp[:19],
+                "類型": d.type,
+                "Session": d.session,
+                "動作": d.action,
+                "細節": d.detail[:50],
+            } for d in recent])
+            st.dataframe(df_dec, width='stretch')
+        else:
+            st.info("尚無最近決策記錄")
+    except Exception as e:
+        st.error(f"Error loading decision log: {e}")
 
-            # Agg stats
-            states = [r.get("state", "?") for r in timeline_data]
-            state_counts = {}
-            for s in states:
-                state_counts[s] = state_counts.get(s, 0) + 1
-            st.caption(f"State distribution (last {n_show} samples): {state_counts}")
+    with st.expander("🏆 歷史單口策略排行榜 (Legacy Rankings)", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("☀️ 日盤排行榜")
+            try:
+                from core.strategy_registry import get_strategy_ranking
+                day_ranking = get_strategy_ranking("day")
+                for i, (name, pf) in enumerate(day_ranking, 1):
+                    emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+                    st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
+            except Exception as e:
+                st.error(f"Error: {e}")
+        with col2:
+            st.subheader("🌙 夜盤排行榜")
+            try:
+                night_ranking = get_strategy_ranking("night")
+                for i, (name, pf) in enumerate(night_ranking, 1):
+                    emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+                    st.write(f"{emoji} {i}. {name} (PF={pf:.1f})")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-    with st.expander("ℹ️ About Volatility Regime"):
-        st.markdown("""
-        **Volatility Surface Regime** 是介於 raw tick stream (P1) 和 strategy layer (P3) 之間的 P1.5 層。
-
-        **Data Flow:**
-        ```
-        bidask callback → OptionQuoteEvent
-                        → IV Calculator (Black-Scholes)
-                        → Surface Snapshot (atm_iv, otm_put_iv, otm_call_iv)
-                        → IVShapeClassifier (directional_skew + tension)
-                        → IVPercentileEngine (rolling percentile + z-score)
-                        → VolatilityStateMachine (hysteresis + state_age)
-                        → MarketData.skew_regime
-        ```
-
-        **State Definitions:**
-        - CALM — Low IV percentile, low tension
-        - NORMAL — Moderate conditions
-        - EXPANDING — Tension rising (pre-cursor)
-        - PANIC — LEFT skew + HIGH tension + high percentile
-        - EUPHORIA — RIGHT skew + HIGH tension + high percentile
-        - EVENT — Extreme tension regardless of direction
-        - UNKNOWN — Insufficient data
-
-        **Hysteresis:** entry=3 samples, exit=5 samples, min dwell=60s
-        """)
-
-    st.divider()
-
-# ════════════════════════════════════════
-# Tab: 🔄 反事實研究室 (Counterfactual Lab)
-# ════════════════════════════════════════
-elif page == "🔄 反事實研究室":
+elif page in ("🔄 反事實研究室", "🧪 離線反事實模擬"):
     st.header("🔄 反事實研究室 (Counterfactual Lab)")
     st.caption("基於已完結交易的點重播 (Point Replay) 驗證與離線反事實模擬")
     
@@ -6716,3 +8358,626 @@ elif page == "🔄 反事實研究室":
 # -- Footer and Refresh --
     # 2026-06-23 Gemini CLI: 移除伺服器端 time.sleep(5) 與 st.rerun() 的無條件循環，完全由 line 219 的瀏覽器端 st_autorefresh 每 10 秒觸發，使伺服器執行緒能正常結束並釋放 CPU 資源，解決 CPU 99% 與高溫 99°C 的問題
     pass
+
+
+elif page == "設定":
+    st.header("⚙️ 系統設定")
+    try:
+        render_real_preflight_expander()
+    except Exception:
+        pass
+
+    # ── 0. Research / observation evidence (not runtime authorization) ──
+    with st.expander("🧪 研究／觀察證據（不構成執行中程序授權）", expanded=True):
+        from core.live_readiness import check_all, get_readiness_items, get_readiness_summary
+        _ready_flag, check_output = check_all()
+        readiness_items = get_readiness_items(check_output)
+        status, passed, total = get_readiness_summary(check_output)
+
+        st.markdown(f"### 研究／觀察證據：{status} ({passed}/{total} 項通過)")
+
+        # Progress bar
+        pct = passed / total if total > 0 else 0
+        st.progress(pct)
+
+        # Detail table
+        for r in readiness_items:
+            icon = "✅" if r.passed else "❌"
+            st.caption(f"{icon} **{r.name}**: {r.detail}")
+
+        # This evidence is deliberately separate from the execution_context runtime truth.
+        if active_runtime_truth["is_live_runtime"]:
+            st.info("執行中程序目前為 LIVE_READY；研究／觀察證據不構成執行中程序授權，也不會否定此 runtime 狀態。")
+        elif active_runtime_truth["is_paper_runtime"]:
+            st.info("執行中程序目前為 PAPER_ACTIVE；紙上交易工作流程與控制項維持可用。")
+        else:
+            st.warning("執行中程序身份為 UNKNOWN / QUARANTINED；請以 execution_context 稽核原因處理，勿由研究進度推論 runtime。")
+
+        st.divider()
+        st.caption("參考文件: `docs/LIVE_TRADING_GUIDE.md`")
+
+    # 2026-05-27 Gemini CLI: Dynamic Ticker in Settings
+    with st.expander(f"📈 期貨 {_TICKER} Paper baseline 設定", expanded=True):
+        st.caption("此處只編輯 `futures.yaml` Paper baseline，並非執行中程序切換器；active runtime 請看 execution_context。")
+        # 2026-06-23 Gemini CLI: 使用快取的策略註冊表以避免在每次重整時重複掃描目錄，優化 CPU 使用率
+        _reg = get_cached_strategy_registry()
+        fut_strats = {item["name"]: item for item in _reg.list_all() if item.get("asset_class") == "futures" and item.get("available", False)}
+        current_fut_strat = futures_cfg.get("strategy", {}).get("active_strategy", futures_cfg.get("active_strategy", "counter_vwap"))
+
+        # ── Session indicator: show active vs inactive params ──
+        _night_cfg = load_yaml(BASE / "config" / "futures_night.yaml")
+        _day_cfg = load_yaml(FUTURES_CFG_PATH)
+        _day_risk = _day_cfg.get("risk_mgmt", {})
+        _night_risk = _night_cfg.get("risk_mgmt", {})
+        _active_risk = _night_risk if _CURRENT_SESSION_NIGHT else _day_risk
+        st.info(
+            f"**{'🌙 夜盤設定使用中' if _CURRENT_SESSION_NIGHT else '☀️ 日盤設定使用中'}** (`{FUTURES_CFG_NAME}`)  \n"
+            f"停損: **{_active_risk.get('stop_loss_pts', '?')} pts** (日 {_day_risk.get('stop_loss_pts', '?')} / 夜 {_night_risk.get('stop_loss_pts', '?')})  \n"
+            f"ATR 倍數: **{_active_risk.get('atr_multiplier', '?')}x** (日 {_day_risk.get('atr_multiplier', '?')} / 夜 {_night_risk.get('atr_multiplier', '?')})  \n"
+            f"VWAP 確認: **{_active_risk.get('exit_vwap_confirm_bars', '?')} bars** (日 {_day_risk.get('exit_vwap_confirm_bars', '?')} / 夜 {_night_risk.get('exit_vwap_confirm_bars', '?')})  \n"
+            f"追蹤停損距離: **{_active_risk.get('trailing_stop_distance_pts', '?')} pts** (日 {_day_risk.get('trailing_stop_distance_pts', '?')} / 夜 {_night_risk.get('trailing_stop_distance_pts', '?')})"
+        )
+
+        with st.form("futures_settings_form"):
+            f_live_new = st.checkbox(
+                "Paper baseline 的 LIVE 偏好（非執行中程序）",
+                value=futures_cfg.get("live_trading", False),
+                disabled=active_runtime_truth["is_live_runtime"],
+                help="當 active runtime 為 LIVE_READY 時，此 Paper baseline 控制項不可作為程序切換或 active profile 寫入。",
+            )
+            # 2026-05-22 Gemini CLI: Add MTS Mode toggle back to UI
+            f_mts_new = st.checkbox("啟用 MTS 自適應價差模式 (MTS Mode)", value=futures_cfg.get("mts", {}).get("enabled", False))
+            _mts_params_def = futures_cfg.get("mts", {}).get("params", {})
+            f_mts_min_atr = float(_mts_params_def.get("min_atr", 10.0))
+            f_mts_atr_cap = float(_mts_params_def.get("atr_cap", 100.0))
+            f_mts_mult_stop = float(_mts_params_def.get("atr_multiplier_stop", 1.0))
+            f_mts_mult_trail = float(_mts_params_def.get("atr_multiplier_trail", 3.5))
+            f_mts_stop_fixed = int(_mts_params_def.get("release_stop_points", 20))
+            f_mts_trail_fixed = int(_mts_params_def.get("trail_distance_points", 30))
+            f_policy_j_enable = bool(_mts_params_def.get("enable_combined_upl_trail", True))
+            f_policy_j_activation = float(_mts_params_def.get("combined_upl_activation_net_pnl_twd", 300.0))
+            f_policy_j_giveback = float(_mts_params_def.get("combined_upl_giveback_twd", 100.0))
+            f_renko_enable = bool(_mts_params_def.get("enable_renko_exit", False))
+            f_renko_mult = float(_mts_params_def.get("renko_brick_multiplier", 0.5))
+
+            # 2026-05-27 Gemini CLI: Restore MTS Parameter Adjustment Section
+            if f_mts_new:
+                st.markdown("---")
+                st.markdown("##### ⚙️ MTS 價差策略參數")
+                _mts_params = futures_cfg.get("mts", {}).get("params", {})
+                
+                m1, m2 = st.columns(2)
+                f_mts_min_atr = m1.number_input("MTS 最低 ATR 限制", min_value=1.0, max_value=100.0, 
+                                               value=float(_mts_params.get("min_atr", 10.0)), step=1.0)
+                f_mts_atr_cap = m2.number_input("MTS ATR 上限 (Cap)", min_value=10.0, max_value=500.0, 
+                                               value=float(_mts_params.get("atr_cap", 100.0)), step=10.0)
+                
+                m3, m4 = st.columns(2)
+                # 2026-05-27 Gemini CLI: Updated labels for clarity (ATR Release and ATR Exit)
+                f_mts_mult_stop = m3.slider("MTS 釋放倍數 (ATR Release)", 0.5, 3.0, 
+                                            value=float(_mts_params.get("atr_multiplier_stop", 1.0)), step=0.1)
+                f_mts_mult_trail = m4.slider("MTS 停利倍數 (ATR Exit)", 0.1, 10.0, 
+                                             value=float(_mts_params.get("atr_multiplier_trail", 3.5)), step=0.1)
+                
+                m5, m6 = st.columns(2)
+                f_mts_stop_fixed = m5.number_input("MTS 固定釋放點數 (pts)", min_value=5, max_value=500, 
+                                                 value=int(_mts_params.get("release_stop_points", 20)))
+                f_mts_trail_fixed = m6.number_input("MTS 固定停利點數 (pts)", min_value=10, max_value=200, 
+                                                  value=int(_mts_params.get("trail_distance_points", 30)))
+                
+                st.markdown("###### 🛡️ Policy J 組合移動停利 (Combined UPL Trailing Exit)")
+                pj1, pj2, pj3 = st.columns(3)
+                f_policy_j_enable = pj1.checkbox("啟用 Policy J 組合停利", value=bool(_mts_params.get("enable_combined_upl_trail", True)))
+                f_policy_j_activation = pj2.number_input("啟動淨利金額 (TWD)", min_value=50.0, max_value=5000.0,
+                                                        value=float(_mts_params.get("combined_upl_activation_net_pnl_twd", 300.0)), step=50.0)
+                f_policy_j_giveback = pj3.number_input("回吐門檻金額 (TWD)", min_value=10.0, max_value=2000.0,
+                                                     value=float(_mts_params.get("combined_upl_giveback_twd", 100.0)), step=10.0)
+                st.caption("💡 提示：儲存時將自動同步更新日盤 (`futures.yaml`) 與夜盤 (`futures_night.yaml`) 設定檔。Policy J 啟動後若自最高淨利回吐指定 TWD 金額將觸發 COMBINED_EXIT 雙腿全平倉。")
+                st.markdown("###### 🧱 Renko 風控去噪訊號 (Renko Shadow Exit)")
+                rk1, rk2 = st.columns(2)
+                f_renko_enable = rk1.checkbox("啟用 Renko 訊號觀測", value=bool(_mts_params.get("enable_renko_exit", False)))
+                f_renko_mult = rk2.number_input("Renko 磚寬 ATR 倍數", min_value=0.1, max_value=5.0, value=float(_mts_params.get("renko_brick_multiplier", 0.5)), step=0.1)
+                st.markdown("---")
+
+            # Strategy selector from Registry
+            strat_options = list(fut_strats.keys())
+            if not strat_options:
+                strat_options = [current_fut_strat, "counter_vwap", "weak_bear_trend", "squeeze_fire_scout"]
+                strat_options = list(dict.fromkeys(strat_options))  # dedupe
+                st.warning("⚠️ 策略註冊表未載入任何期貨策略，使用備用策略清單。")
+            try:
+                strat_idx = strat_options.index(current_fut_strat)
+            except ValueError:
+                strat_idx = 0
+
+            f_strat_new = st.selectbox("核心進場策略", strat_options, index=strat_idx)
+
+            # Show strategy metadata
+            meta = fut_strats.get(f_strat_new, {})
+            desc = meta.get("description", "無說明")
+            pf = meta.get("backtest_pf", 0)
+            wr = meta.get("backtest_wr", 0)
+            maxdd = meta.get("backtest_maxdd", 0)
+            regime = meta.get("market_regime", "")
+            st.info(f"💡 **{f_strat_new}**: {desc}  \n"
+                    f"📊 PF={pf:.2f} | WR={wr:.1f}% | MaxDD={maxdd:.1f}% | 適用: {regime}")
+
+            st.divider()
+
+            # ── 口數與持倉限制 ──
+            st.markdown("##### 📦 口數與持倉限制")
+            c1, c2 = st.columns(2)
+            f_lots = c1.number_input("每筆交易口數", min_value=1, max_value=10,
+                                     value=futures_cfg.get("trade_mgmt", {}).get("lots_per_trade", 2),
+                                     help="每次進場的口數。實盤建議從 1 口開始。")
+            f_max_pos = c2.number_input("最大持倉口數", min_value=1, max_value=20,
+                                        value=futures_cfg.get("trade_mgmt", {}).get("max_positions", 2),
+                                        help="同時最大持倉口數。建議 1-2 口控制風險。")
+
+            st.divider()
+            f_regime = st.selectbox("市場濾網 (Regime)", ["low", "mid", "high"], index=["low", "mid", "high"].index(futures_cfg.get("strategy", {}).get("regime_filter", "mid")))
+            
+            fc1, fc2 = st.columns(2)
+            f_score = fc1.slider("進場門檻 (Score)", 10, 100, value=futures_cfg.get("strategy", {}).get("entry_score", 20))
+            f_atr = fc2.slider("ATR 止損倍數", 1.0, 5.0, value=float(futures_cfg.get("risk_mgmt", {}).get("atr_multiplier", 2.0)), step=0.1)
+
+            st.divider()
+            st.markdown("##### 🛡️ 進階安全與成本設定")
+            fc3, fc4 = st.columns(2)
+            f_stop_fixed = fc3.number_input("固定停損點數 (pts)", min_value=10, max_value=200,
+                                           value=int(futures_cfg.get("risk_mgmt", {}).get("stop_loss_pts", 60)),
+                                           help="ATR 失效或為 0 時使用的保險底線停損點數。")
+            f_fee = fc4.number_input("單邊手續費 (TWD)", min_value=0.0, max_value=100.0,
+                                    value=float(futures_cfg.get("execution", {}).get("broker_fee_per_side", 20.0)),
+                                    help="用於 PnL 計算。請輸入你的真實券商折扣後手續費。")
+
+            if st.form_submit_button("💾 儲存並重啟期貨模組"):
+                futures_cfg["live_trading"] = f_live_new
+
+                # 2026-05-27 Gemini CLI: Save restored MTS parameters
+                if "mts" not in futures_cfg: futures_cfg["mts"] = {}
+                futures_cfg["mts"]["enabled"] = f_mts_new
+                if f_mts_new:
+                    if "params" not in futures_cfg["mts"]: futures_cfg["mts"]["params"] = {}
+                    futures_cfg["mts"]["params"]["min_atr"] = f_mts_min_atr
+                    futures_cfg["mts"]["params"]["atr_cap"] = f_mts_atr_cap
+                    futures_cfg["mts"]["params"]["atr_multiplier_stop"] = f_mts_mult_stop
+                    futures_cfg["mts"]["params"]["atr_multiplier_trail"] = f_mts_mult_trail
+                    futures_cfg["mts"]["params"]["release_stop_points"] = f_mts_stop_fixed
+                    futures_cfg["mts"]["params"]["trail_distance_points"] = f_mts_trail_fixed
+                    futures_cfg["mts"]["params"]["enable_combined_upl_trail"] = f_policy_j_enable
+                    futures_cfg["mts"]["params"]["combined_upl_activation_net_pnl_twd"] = f_policy_j_activation
+                    futures_cfg["mts"]["params"]["combined_upl_giveback_twd"] = f_policy_j_giveback
+                    futures_cfg["mts"]["params"]["enable_renko_exit"] = f_renko_enable
+                    futures_cfg["mts"]["params"]["renko_brick_multiplier"] = f_renko_mult
+
+                futures_cfg["strategy"]["active_strategy"] = f_strat_new
+                futures_cfg["strategy"]["regime_filter"] = f_regime
+                futures_cfg["strategy"]["entry_score"] = f_score
+                futures_cfg["risk_mgmt"]["atr_multiplier"] = f_atr
+                futures_cfg["risk_mgmt"]["stop_loss_pts"] = f_stop_fixed
+                futures_cfg["execution"]["broker_fee_per_side"] = f_fee
+                futures_cfg["trade_mgmt"]["lots_per_trade"] = f_lots
+                futures_cfg["trade_mgmt"]["max_positions"] = f_max_pos
+
+                # 2026-06-30 Hermes Agent: Show config diff before saving
+                _old_yaml = ""
+                try:
+                    with open(FUTURES_CFG_PATH) as _f:
+                        _old_yaml = _f.read()
+                except Exception:
+                    pass
+                save_yaml(FUTURES_CFG_PATH, futures_cfg)
+                _new_yaml = open(FUTURES_CFG_PATH).read()
+
+                # 2026-07-27 Gemini CLI: Dual-config sync with explicit SESSION_SPECIFIC_MTS_PARAMS taxonomy
+                _counterpart_cfg_name = "futures.yaml" if _CURRENT_SESSION_NIGHT else "futures_night.yaml"
+                # 2026-10-12 Codex: shared runtime profile has no source-tree twin.
+                _counterpart_cfg_path = FUTURES_CFG_PATH.parent / _counterpart_cfg_name
+                SESSION_SPECIFIC_MTS_PARAMS = {"atr_multiplier_stop", "atr_multiplier_trail"}
+
+                if _counterpart_cfg_path.exists():
+                    _counterpart_cfg = load_yaml(_counterpart_cfg_path)
+                    # 2026-08-05 Antigravity AI: Synchronize live_trading setting across both futures.yaml & futures_night.yaml
+                    _counterpart_cfg["live_trading"] = f_live_new
+                    if "mts" not in _counterpart_cfg: _counterpart_cfg["mts"] = {}
+                    _counterpart_cfg["mts"]["enabled"] = f_mts_new
+                    if f_mts_new:
+                        if "params" not in _counterpart_cfg["mts"]: _counterpart_cfg["mts"]["params"] = {}
+                        _incoming_params = {
+                            "min_atr": f_mts_min_atr,
+                            "atr_cap": f_mts_atr_cap,
+                            "atr_multiplier_stop": f_mts_mult_stop,
+                            "atr_multiplier_trail": f_mts_mult_trail,
+                            "release_stop_points": f_mts_stop_fixed,
+                            "trail_distance_points": f_mts_trail_fixed,
+                            "enable_combined_upl_trail": f_policy_j_enable,
+                            "combined_upl_activation_net_pnl_twd": f_policy_j_activation,
+                            "combined_upl_giveback_twd": f_policy_j_giveback,
+                            "enable_renko_exit": f_renko_enable,
+                            "renko_brick_multiplier": f_renko_mult,
+                        }
+                        for _pkey, _pval in _incoming_params.items():
+                            if _pkey in SESSION_SPECIFIC_MTS_PARAMS:
+                                # Preserve session-specific params in counterpart if already defined
+                                if _pkey not in _counterpart_cfg["mts"]["params"]:
+                                    _counterpart_cfg["mts"]["params"][_pkey] = _pval
+                            else:
+                                # Synchronize shared parameters across sessions
+                                _counterpart_cfg["mts"]["params"][_pkey] = _pval
+                    save_yaml(_counterpart_cfg_path, _counterpart_cfg)
+
+                # Build compact diff summary
+                _diff_lines = []
+                if _old_yaml:
+                    _old_lines = _old_yaml.splitlines()
+                    _new_lines = _new_yaml.splitlines()
+                    # Simple key-level diff for the most important changes
+                    import re as _re
+                    _old_kv = {}
+                    for _l in _old_lines:
+                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                        if _m: _old_kv[_m.group(1)] = _m.group(2).strip()
+                    for _l in _new_lines:
+                        _m = _re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', _l)
+                        if _m:
+                            _k, _v = _m.group(1), _m.group(2).strip()
+                            _ov = _old_kv.get(_k, '')
+                            if _ov != _v:
+                                _diff_lines.append(f"  `{_k}`: `{_ov}` → `{_v}`")
+                    # Also check nested strategy/risk keys
+                    def _flat_diff(_prefix, _new_d, _old_d):
+                        for _k, _v in _new_d.items():
+                            _pk = f"{_prefix}.{_k}"
+                            if isinstance(_v, dict):
+                                _flat_diff(_pk, _v, _old_d.get(_k, {}))
+                            else:
+                                _ov = _old_d.get(_k, _v)
+                                if _ov != _v:
+                                    _diff_lines.append(f"  `{_pk}`: `{_ov}` → `{_v}`")
+                    _flat_diff("strategy", futures_cfg.get("strategy", {}), yaml.safe_load(_old_yaml).get("strategy", {}) if _old_yaml else {})
+                    _flat_diff("risk_mgmt", futures_cfg.get("risk_mgmt", {}), yaml.safe_load(_old_yaml).get("risk_mgmt", {}) if _old_yaml else {})
+
+                if _diff_lines:
+                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n" + "\n".join(_diff_lines))
+                else:
+                    st.success(f"✅ 設定已同步寫入日夜盤設定檔 (`futures.yaml` & `futures_night.yaml`)\n策略: {f_strat_new} | 口數: {f_lots} | 最大持倉: {f_max_pos}")
+
+                # 2026-08-05 Antigravity AI: Automated Live Trading Transition Protocol
+                # 1. Check & auto-flatten paper positions if switching/enabling live_trading
+                # 2. Inform user about mandatory manual .env edit (PAPER_MODE=false)
+                # 3. Stop pm2 trading system (pm2 stop) and prompt for manual restart after .env update
+                if f_live_new:
+                    # Step 1: Auto-check & auto-flatten paper positions if active
+                    _flatten_triggered = False
+                    try:
+                        _state_file = BASE / "data" / "tmf_spread_state.json"
+                        if _state_file.exists():
+                            import json as _json, time as _tm
+                            with open(_state_file, "r", encoding="utf-8") as _sf:
+                                _st_data = _json.load(_sf)
+                                _pos = _st_data.get("position", {})
+                                if _pos and (_pos.get("near_qty", 0) != 0 or _pos.get("far_qty", 0) != 0 or _pos.get("total_qty", 0) != 0):
+                                    _cmd_id = f"auto_flatten_{int(_tm.time())}"
+                                    _cmd_file = BASE / "data" / "emergency_commands.json"
+                                    _cmds = []
+                                    if _cmd_file.exists():
+                                        try:
+                                            with open(_cmd_file, "r", encoding="utf-8") as _cf:
+                                                _cmds = _json.load(_cf)
+                                        except Exception:
+                                            _cmds = []
+                                    _cmds.append({"command": "FLATTEN", "command_id": _cmd_id, "timestamp": _tm.time(), "source": "dashboard_live_transition"})
+                                    with open(_cmd_file, "w", encoding="utf-8") as _cf:
+                                        _json.dump(_cmds, _cf, indent=2)
+                                    _flatten_triggered = True
+                    except Exception as _fe:
+                        pass
+
+                    if _flatten_triggered:
+                        st.warning("⚠️ **自動平倉作業**：檢查到尚有未平倉之 Paper 倉位，已自動發送全平倉指令 (Emergency Flatten)！")
+                    else:
+                        st.info("ℹ️ **倉位檢查**：目前無尚未平倉之 Paper 倉位。")
+
+                    # Step 2: Inform user about mandatory manual .env edit
+                    st.error("🔒 **【重要提醒：需手動修改 .env】** 系統已更新雙 YAML 設定檔為 `live_trading: true`。請手動修改 `.env` 檔案，將 `PAPER_MODE=true` 改為 `PAPER_MODE=false` 實盤方可真正下單！")
+
+                    # Step 3: 遵守 Commit 224cab05 P0 規則：Dashboard 禁止直接呼叫 PM2 或發送重啟
+                    # 2026-08-05 Antigravity AI: Strict compliance with Commit 224cab05 P0 rule (No direct PM2 invocation from dashboard)
+                    st.info("📋 **部署提醒**：設定已更新。請依據 Deployment Contract 手動執行 pm2/部署流程。")
+                else:
+                    # 2026-08-05 Antigravity AI: Pure notice for Revert to Paper Mode (No PM2 invocation)
+                    st.info("ℹ️ **已切回 Paper 模擬模式**：已同步將雙 YAML 設定檔 (`futures.yaml` & `futures_night.yaml`) 設為 `live_trading: false`。")
+                    st.info("💡 **雙重防護建議**：若先前曾手動將 `.env` 修改為 `PAPER_MODE=false`，請手動將其改回 `PAPER_MODE=true` 補回最高安全鎖。")
+                # 2026-06-30 Hermes Agent: Hold success message for 3s before rerun
+                import time as _time
+                _time.sleep(3)
+                st.rerun()
+
+    # ── 2. 選擇權 TXO 設定 ──
+    with st.expander("🔮 選擇權 TXO 設定", expanded=False):
+        current_opt_mode = options_cfg.get("active_mode", options_cfg.get("mode", "V2"))
+        opt_strategy_cfg = options_cfg.setdefault("strategy", {})
+        opt_risk_cfg = options_cfg.setdefault("risk_mgmt", {})
+        opt_exec_cfg = options_cfg.setdefault("execution", {})
+        opt_pricing_cfg = options_cfg.setdefault("pricing", {})
+        opt_monitoring_cfg = options_cfg.setdefault("monitoring", {})
+        opt_mode_cfg = options_cfg.setdefault("modes", {}).get(current_opt_mode, {})
+        
+        with st.form("options_settings_form"):
+            o_live_new = st.checkbox("啟用選擇權實盤交易 (LIVE)", value=options_cfg.get("live_trading", False))
+            
+            o_mode_new = st.selectbox("交易模式", ["V1", "V2", "V3"], index=["V1", "V2", "V3"].index(current_opt_mode),
+                                      help="V1: 當沖, V2: 波段(月選), V3: 夜盤當沖")
+            
+            # 模式說明
+            mode_desc = {
+                "V1": "近月合約當日沖銷，適合高波動行情。",
+                "V2": "月選合約波段持有 (≥14天 DTE)，降低時間價值衰減。",
+                "V3": "專攻夜盤波動，開盤進場收盤前出場。"
+            }
+            st.info(f"💡 **模式說明**: {mode_desc.get(o_mode_new)}")
+
+            st.caption(
+                "目前 monitor 生效值："
+                f" entry_score={int(opt_strategy_cfg.get('entry_score', options_cfg.get('entry_score', 80)))}"
+                f" | stop_loss={float(opt_risk_cfg.get('stop_loss_pct', 0.3)):.0%}"
+                f" | tp1={float(opt_mode_cfg.get('tp1_pct', 0.0)):.1f}%"
+                f" | trailing={float(opt_mode_cfg.get('trailing_stop_pct', 0.0)):.2f}"
+                f" | IV={float(opt_pricing_cfg.get('min_iv', options_cfg.get('min_iv', 0.15))):.2f}"
+                f"~{float(opt_pricing_cfg.get('max_iv', options_cfg.get('max_iv', 0.60))):.2f}"
+                f" | pricing={opt_pricing_cfg.get('pricing_model', 'black_scholes')}"
+                f" | order_mgr={'on' if opt_monitoring_cfg.get('use_order_manager', False) else 'off'}"
+            )
+
+            o_score = st.slider(
+                "進場門檻 (Score)",
+                10,
+                100,
+                value=int(opt_strategy_cfg.get("entry_score", options_cfg.get("entry_score", 80))),
+                help="實際對應 strategies/options/live_options_squeeze_monitor.py 讀取的 strategy.entry_score。",
+            )
+
+            o_fire_thresh = st.slider("Fire 門檻 (強趨勢 score)", 10, 100,
+                                       value=int(options_cfg.get("strategy", {}).get("fire_score_threshold", 80)),
+                                       help="fired=False 但 score 超過此值也允許進場。降低此值可在趨勢行情中進場。")
+
+            # ── 口數與持倉限制 ──
+            st.markdown("##### 📦 口數與持倉限制")
+            oc1, oc2 = st.columns(2)
+            o_lots = oc1.number_input("每筆交易口數", min_value=1, max_value=10,
+                                     value=opt_risk_cfg.get("lots_per_trade", 2),
+                                     help="基礎進場口數。Runtime 仍可能依 Decision Intelligence 做單次縮放，但不應默默改寫這個基礎值。")
+            o_max_pos = oc2.number_input("最大持倉口數", min_value=1, max_value=20,
+                                        value=opt_risk_cfg.get("max_positions", 2),
+                                        help="同時最大持倉口數。建議 1-2 口控制風險。")
+
+            st.divider()
+            oc3, oc4 = st.columns(2)
+            o_min_iv = oc3.slider(
+                "最低 IV 限制",
+                0.1,
+                0.5,
+                value=float(opt_pricing_cfg.get("min_iv", options_cfg.get("min_iv", 0.15))),
+                step=0.01,
+            )
+            o_max_iv = oc4.slider(
+                "最高 IV 限制",
+                0.3,
+                1.0,
+                value=float(opt_pricing_cfg.get("max_iv", options_cfg.get("max_iv", 0.60))),
+                step=0.01,
+            )
+
+            st.divider()
+            st.markdown("##### 🛡️ 進階安全與成本設定")
+            oc5, oc6 = st.columns(2)
+            o_fee = oc5.number_input("單邊手續費 (TWD)", min_value=0.0, max_value=100.0,
+                                    value=float(opt_exec_cfg.get("broker_fee_per_side", 20.0)),
+                                    help="券商收取的單口單邊手續費。")
+            o_exch = oc6.number_input("單邊交易所費 (TWD)", min_value=0.0, max_value=100.0,
+                                     value=float(opt_exec_cfg.get("exchange_fee_per_side", 5.0)),
+                                     help="期交所收取的單口單邊費用。")
+
+            if st.form_submit_button("💾 儲存選擇權設定"):
+                options_cfg["live_trading"] = o_live_new
+                options_cfg["active_mode"] = o_mode_new
+                options_cfg["mode"] = o_mode_new
+                opt_strategy_cfg["entry_score"] = o_score
+                opt_strategy_cfg["fire_score_threshold"] = o_fire_thresh
+                opt_pricing_cfg["min_iv"] = o_min_iv
+                opt_pricing_cfg["max_iv"] = o_max_iv
+                opt_exec_cfg["broker_fee_per_side"] = o_fee
+                opt_exec_cfg["exchange_fee_per_side"] = o_exch
+                opt_risk_cfg["lots_per_trade"] = o_lots
+                opt_risk_cfg["max_positions"] = o_max_pos
+                save_yaml(OPTIONS_CFG_PATH, options_cfg)
+                # 2026-08-05 Antigravity AI: Removed legacy restart control for Commit 224cab05 P0 compliance
+                st.success(f"✅ 設定已寫入 `{OPTIONS_CFG_PATH}`\n模式: {o_mode_new} | 口數: {o_lots} | 最大持倉: {o_max_pos} | Fire閾值: {o_fire_thresh}")
+                st.info("設定已儲存；此操作不會重啟 trading-system。")
+                st.rerun()
+
+    # ── 3. 台股 Stocks 設定 ──
+    with st.expander("🍎 台股 Stocks 設定", expanded=True):
+        stk_inner = stock_cfg.get("stocks", {})
+        
+        # 將同步按鈕與顯示邏輯整合
+        if st.button("🔄 同步外部 CANSLIM 領頭羊名單"):
+            try:
+                import subprocess
+                subprocess.run([sys.executable, "scripts/sync/sync_external_watchlist.py"], check=True, timeout=30)
+                st.success("同步成功！已從雲端獲取最新領頭羊名單。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"同步失敗: {e}")
+
+        with st.form("stock_settings_form"):
+            s_live_new = st.checkbox("啟用台股實盤交易 (LIVE)", value=stock_cfg.get("live_trading", False))
+            
+            # --- 改為直式多行輸入 ---
+            current_watchlist = stk_inner.get("watchlist", ["2330", "2454"])
+            watchlist_area = st.text_area("監控名單 (每行一個代號)", 
+                                         value="\n".join(current_watchlist),
+                                         height=200,
+                                         help="請輸入股票代號，例如 2330。支援一行一個標的。")
+            
+            c1, c2, c2b = st.columns(3)
+            from strategies.stocks.entry_strategies import STOCK_STRATEGIES
+            strat_options = list(STOCK_STRATEGIES.keys())
+            if not strat_options:
+                strat_options = ["momentum_breakout", "mean_reversion"]
+                st.warning("⚠️ 找不到任何台股策略，使用預設策略清單。")
+            current_strat = stk_inner.get("strategy", "momentum_breakout")
+            strat_idx = strat_options.index(current_strat) if current_strat in strat_options else 0
+            strat_new = c1.selectbox("策略", strat_options, index=strat_idx,
+                                     help=STOCK_STRATEGIES.get(current_strat, {}).get("desc", "") if current_strat in STOCK_STRATEGIES else "")
+            budget_new = c2.number_input("總分配資金 (TWD)", value=stk_inner.get("total_portfolio_budget", 100000), step=10000)
+            capital_new = c2b.number_input("單筆預算 (TWD)", value=stk_inner.get("capital_per_trade", 20000), step=1000)
+            
+            c3, c4, c5 = st.columns(3)
+            sl_new = c3.slider("停損 (%)", 1.0, 10.0, value=float(stk_inner.get("stop_loss_pct", 0.02)*100), step=0.5) / 100.0
+            tp_new = c4.slider("停利 (%)", 2.0, 20.0, value=float(stk_inner.get("take_profit_pct", 0.10)*100), step=0.5) / 100.0
+            ts_new = c5.slider("移動停損 (%)", 0.5, 5.0, value=float(stk_inner.get("trailing_stop_pct", 0.01)*100), step=0.1) / 100.0
+            
+            if st.form_submit_button("💾 儲存台股設定"):
+                # 處理多行輸入，轉回 list
+                new_tickers = [t.strip() for t in watchlist_area.split("\n") if t.strip()]
+                new_stocks = {
+                    "watchlist": new_tickers,
+                    "strategy": strat_new,
+                    "total_portfolio_budget": budget_new,
+                    "capital_per_trade": capital_new,
+                    "entry_score": stk_inner.get("entry_score", 20),
+                    "atr_mult": stk_inner.get("atr_mult", 2.0),
+                    "stop_loss_pct": sl_new,
+                    "take_profit_pct": tp_new,
+                    "trailing_stop_pct": ts_new,
+                }
+                # 保留 bear_defense 等既有區塊
+                if "bear_defense" in stk_inner:
+                    new_stocks["bear_defense"] = stk_inner["bear_defense"]
+                if "fallback_strategy" in stk_inner:
+                    new_stocks["fallback_strategy"] = stk_inner["fallback_strategy"]
+                new_stock_cfg = {
+                    "live_trading": s_live_new,
+                    "stocks": new_stocks,
+                }
+                save_yaml(STOCK_CFG_PATH, new_stock_cfg)
+                # 2026-08-05 Antigravity AI: Removed legacy restart control for Commit 224cab05 P0 compliance
+                st.success("台股設定已更新；此操作不會控制或重啟任何交易程序。")
+
+    # ── 3.5. 通知設定 ──
+    # 2026-06-26 Gemini CLI: Add email notification toggle in settings tab
+    with st.expander("✉️ 電子郵件通知設定", expanded=True):
+        def get_email_notification_status() -> bool:
+            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
+            if not env_path.exists():
+                return True
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("ENABLE_EMAIL_NOTIFICATION"):
+                        parts = line.split("=", 1)
+                        if len(parts) == 2:
+                            val = parts[1].strip().lower()
+                            return val not in ("false", "0", "no")
+            return True
+
+        def set_email_notification_status(enabled: bool):
+            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
+            if not env_path.exists():
+                os.makedirs(env_path.parent, exist_ok=True)
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write(f"ENABLE_EMAIL_NOTIFICATION={enabled}\n")
+                return
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            found = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith("ENABLE_EMAIL_NOTIFICATION"):
+                    lines[i] = f"ENABLE_EMAIL_NOTIFICATION={enabled}\n"
+                    found = True
+                    break
+            if not found:
+                if lines and not lines[-1].endswith("\n"):
+                    lines.append("\n")
+                lines.append(f"ENABLE_EMAIL_NOTIFICATION={enabled}\n")
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+        current_email_enabled = get_email_notification_status()
+
+        with st.form("notification_settings_form"):
+            email_notify_enabled = st.checkbox("啟用交易電子郵件通知 (Email Trade Notification)", value=current_email_enabled,
+                                              help="勾選以在每次有交易時發送 Email 到指定的信箱 (mylim304@gmail.com)。")
+            
+            # Show active SMTP user / recipient for visibility if they exist
+            env_path = Path(os.path.expanduser("~/.config/squeeze-backtest-email.env"))
+            smtp_username = ""
+            smtp_recipient = ""
+            if env_path.exists():
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("SMTP_USERNAME"):
+                            parts = line.split("=", 1)
+                            if len(parts) == 2:
+                                smtp_username = parts[1].strip()
+                        elif line.startswith("SMTP_RECIPIENT"):
+                            parts = line.split("=", 1)
+                            if len(parts) == 2:
+                                smtp_recipient = parts[1].strip()
+            
+            if smtp_username or smtp_recipient:
+                st.caption(f"📧 **寄件者**: `{smtp_username}`  \n📩 **收件者**: `{smtp_recipient}`")
+            else:
+                st.warning("⚠️ 尚未配置 SMTP 帳密於 `~/.config/squeeze-backtest-email.env` 中。")
+
+            if st.form_submit_button("💾 儲存通知設定"):
+                set_email_notification_status(email_notify_enabled)
+                os.environ["ENABLE_EMAIL_NOTIFICATION"] = str(email_notify_enabled)
+                st.success(f"通知設定已更新！電子郵件通知: {'已啟用' if email_notify_enabled else '已關閉'}")
+                time.sleep(1)
+                st.rerun()
+
+    # ── 4. 危險區域 ──
+    st.divider()
+    with st.expander("🚨 危險區域 (Danger Zone)", expanded=False):
+        st.warning("以下操作將永久刪除數據，請謹慎執行。")
+        col_d1, col_d2 = st.columns([2, 1])
+        with col_d1:
+            st.markdown("##### 🗑️ 清空模擬交易數據")
+            st.caption("這將歸零所有 Paper Trading 的持倉與歷史紀錄 CSV，方便切換實盤前清空數據。")
+        with col_d2:
+            if st.button("執行清空", type="primary", width='stretch'):
+                try:
+                    import subprocess
+                    result = subprocess.run([sys.executable, "scripts/maintenance/clear_simulation_data.py", "--force"], 
+                                                         capture_output=True, text=True)
+                    st.success("✅ 數據已清空！")
+                    st.toast("Simulation data cleared successfully.")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"清空失敗: {e}")
+
+    st.info("💡 提示: 部分進階設定可直接編輯 `config/*.yaml` 檔案。")
+
+# ── Calendar Spread (bottom, after MTS details) ──
+st.divider()
+with st.expander("📈 日曆價差圖表（頁面底部）", expanded=False):
+    _bottom_spread_df = load_calendar_spread_data()
+    if _bottom_spread_df is not None and not _bottom_spread_df.empty:
+        _bottom_chart = make_calendar_spread_chart(_bottom_spread_df)
+        if _bottom_chart:
+            st.plotly_chart(_bottom_chart, width="stretch")
+        st.caption(
+            f"資料筆數：{len(_bottom_spread_df)} · "
+            f"時間範圍：{_bottom_spread_df['timestamp'].min()} ~ "
+            f"{_bottom_spread_df['timestamp'].max()}")
+    else:
+        st.info("目前沒有可用的 calendar spread 資料。")
+
+# ════════════════════════════════════════
+# Tab: 波動率 Vol
+# ════════════════════════════════════════

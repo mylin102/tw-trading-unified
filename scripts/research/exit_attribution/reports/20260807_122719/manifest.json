@@ -1,0 +1,33 @@
+{
+  "run_id": "20260807_122719",
+  "created_at_utc": "2026-08-07T04:27:19.638152+00:00",
+  "schema_version": "exit_attribution.v1",
+  "input_sha256": {
+    "fills": "35d6bf118ca9c8bbc716f244c65cc3940adcd4672e9a92ec63ee787a9b8f7e01"
+  },
+  "git": {
+    "commit": "03203659b07de31a1c10350af8ed01a2ae12e31c",
+    "dirty": true
+  },
+  "fee_source": {
+    "path": "",
+    "sha256": null,
+    "effective_date": "2026-07-01"
+  },
+  "config": {
+    "contracts": {
+      "TMFN": 10.0,
+      "TMF": 10.0,
+      "DEFAULT": 10.0
+    },
+    "age_bound_s": 5.0,
+    "tick_size": 1.0,
+    "fee_schedule": {
+      "per_contract": 57.4,
+      "effective_date": "2026-07-01",
+      "note": "derived from ledger (stored realized vs recomputed gross); validated by reconciliation",
+      "sample_size": 67
+    }
+  },
+  "seed": ""
+}

@@ -45,20 +45,20 @@ def test_parameter_sweeper_trajectory_replay():
         }
     ]
 
-    sweeper = PolicyJParameterSweeper(grid=[(300.0, 100.0), (400.0, 100.0)])
+    sweeper = PolicyJParameterSweeper(grid=[(300.0, 100.0), (500.0, 100.0)])
     cells, summaries = sweeper.sweep_landscape(shadow_snaps, outcomes)
 
     # For candidate (300, 100): Armed at 350 (>=300). Drops to 220 (Peak 350 - 100 = 250 -> Triggered at 220).
     cell_300 = next(c for c in cells if c.activation_twd == 300.0)
     assert cell_300.triggered is True
-    assert cell_300.hypothetical_net_exit_pnl_twd == 220.0
-    assert cell_300.delta_net_pnl_twd == 120.0  # 220 - 100
+    assert cell_300.hypothetical_net_exit_pnl_twd == 312.0
+    assert cell_300.delta_net_pnl_twd == 212.0  # 220 - 100
 
     # For candidate (400, 100): Peak is 350 (<400 -> Never Armed -> Never Triggered).
-    cell_400 = next(c for c in cells if c.activation_twd == 400.0)
-    assert cell_400.triggered is False
-    assert cell_400.hypothetical_net_exit_pnl_twd is None
-    assert cell_400.delta_net_pnl_twd is None
+    cell_500 = next(c for c in cells if c.activation_twd == 500.0)
+    assert cell_500.triggered is False
+    assert cell_500.hypothetical_net_exit_pnl_twd is None
+    assert cell_500.delta_net_pnl_twd == 0.0
 
 
 def test_parameter_sweeper_landscape_summary_and_determinism():

@@ -786,7 +786,7 @@ def route_futures_signal(
     if regime_result.regime == "BEAR":
         _bear_bs = context.market.last_bar.get("bear_breakout_strength", 0) if context.market.last_bar else 0
         _vwap_dist = context.market.last_bar.get("price_vs_vwap", 0) if context.market.last_bar else 0
-        console.print(
+        logger.info(
             f"[yellow][BearRoute] regime=BEAR bias={regime_result.bias} "
             f"bear_bs={_bear_bs:.3f} vwap_dist={_vwap_dist:.4f} "
             f"candidates={candidates}[/yellow]"
@@ -865,13 +865,13 @@ def route_futures_signal(
         except Exception as e:
             notes.append(f"{name}: error in on_bar ({e})")
             import traceback
-            console.print(f"[red][Router error] {name}.on_bar: {e}[/red]")
-            console.print(f"[dim]{''.join(traceback.format_exception(type(e), e, e.__traceback__)).strip()}[/dim]")
+            logger.error(f"[Router error] {name}.on_bar: {e}")
+            logger.error(''.join(traceback.format_exception(type(e), e, e.__traceback__)).strip())
             # [StrategyError] Log strategy name, reason, df_5m ready state, bar count
             df_5m = getattr(context.market, 'df_5m', None)
             df_5m_ready = f"ready(len={len(df_5m)})" if df_5m is not None and not df_5m.empty else "none/empty"
             bar_count = getattr(context, 'bar_counter', -1)
-            console.print(f"[bold yellow][StrategyError] name={name} reason={e} df_5m={df_5m_ready} bar_count={bar_count}[/bold yellow]")
+            logger.error(f"[StrategyError] name={name} reason={e} df_5m={df_5m_ready} bar_count={bar_count}")
             # Also log to attribution if recorder is present
             log_router_event(
                 recorder=recorder,
@@ -1043,8 +1043,8 @@ def route_futures_signal(
                 regime=regime_result.regime,
                 bias=regime_result.bias,
                 candidates=candidates,
-                winner=selected_name,
-                winner_action=selected_signal.action if selected_signal else None,
+                winner=name,
+                winner_action=getattr(signal, 'action', None),
                 strategy_evals=_evals,
                 system_status=sys_status
             )

@@ -13,6 +13,7 @@ initialization failures. Production code remains unchanged.
 from __future__ import annotations
 
 import os
+import tempfile
 
 import numba as nb
 import pytest
@@ -34,12 +35,17 @@ nb.jit = _strip_cache_flag(nb.jit)
 # Shioaji imports configure a file logger at import time. In the sandboxed test
 # environment, writing under the repo root is not allowed, so redirect broker
 # logs to a writable temp location before any module imports `shioaji`.
-os.environ.setdefault("SJ_LOG_PATH", "/tmp/shioaji.log")
+os.environ["SJ_LOG_PATH"] = "/tmp/shioaji.log"
 
 # 2026-06-25 Gemini CLI / Hermes Agent: Redirect MTS log paths for test environment isolation
-os.environ.setdefault("MTS_FILL_LOG_PATH", "/tmp/test_mts_trade_fills.jsonl")
-os.environ.setdefault("MTS_EVENT_LOG_PATH", "/tmp/test_mts_spread_events.jsonl")
-os.environ.setdefault("MTS_STATE_PATH", "/tmp/test_mts_position_state.json")
+os.environ["MTS_FILL_LOG_PATH"] = "/tmp/test_mts_trade_fills.jsonl"
+os.environ["MTS_EVENT_LOG_PATH"] = "/tmp/test_mts_spread_events.jsonl"
+os.environ["MTS_STATE_PATH"] = "/tmp/test_mts_position_state.json"
+os.environ["TRADING_SAFETY_STATUS_PATH"] = "/tmp/test_tw_trading_safety_state.json"
+# Test isolation is explicit DI.  Production modules must not inspect pytest
+# or test names to select a different runtime path.
+os.environ.setdefault("TRADING_RUNTIME_DIR", tempfile.mkdtemp(prefix="tw_trading_test_runtime_"))
+os.environ.setdefault("TRADING_TEST_EXPORT_DIR", tempfile.mkdtemp(prefix="tw_trading_test_exports_"))
 
 
 

@@ -16,11 +16,15 @@ class StockDataStorage:
         self.ticker = ticker
         self.tw_tz = pytz.timezone('Asia/Taipei')
         
-        # 數據目錄 - 使用絕對路徑
-        # 計算項目根目錄：從當前文件向上三級到項目根目錄
-        current_file = Path(__file__).resolve()
-        project_root = current_file.parent.parent.parent
-        self.market_dir = project_root / "logs" / "market_data"
+        # 數據目錄 - 使用 runtime_logs Authority 確保 Dashboard 與 Runner 路徑 100% 一致
+        # 2026-08-18 Gemini CLI: 統一對齊 TRADING_RUNTIME_DIR 數據總線
+        try:
+            from core.runtime_paths import runtime_logs
+            self.market_dir = Path(runtime_logs("market_data"))
+        except ImportError:
+            current_file = Path(__file__).resolve()
+            project_root = current_file.parent.parent.parent
+            self.market_dir = project_root / "logs" / "market_data"
         self.market_dir.mkdir(parents=True, exist_ok=True)
         
         # 當前數據文件

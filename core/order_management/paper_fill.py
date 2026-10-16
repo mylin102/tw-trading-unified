@@ -30,6 +30,9 @@ class PaperFillSimulator:
     def __init__(self, order_mgr: "OrderManager"):
         self._order_mgr = order_mgr
         self._pending_orders: Dict[str, "Order"] = {}  # order_id → Order
+        # Combo orders are kept separate from single-leg orders so a paper
+        # tick can never fill one leg of a calendar spread by itself.
+        self._pending_combos: Dict[str, dict] = {}
         # 2026-07-07 Hermes Agent: P0 — track consumed (filled/cancelled)
         # order IDs so OCO reconciliation cannot re-register them.
         # Without this, reconcile→register→fill→reconcile→register→fill
@@ -52,6 +55,84 @@ class PaperFillSimulator:
         if order.order_id in self.consumed_order_ids:
             return
         self._pending_orders[order.order_id] = order
+
+    def register_combo(self, order: "Order", *, near_symbol: str,
+                       far_symbol: str, metadata: dict | None = None) -> None:
+        """Register one paper calendar-spread lifecycle.
+
+        A combo is intentionally not split into two local orders.  The
+        simulator requires both leg ticks in the same polling cycle before it
+        emits one fill for the parent lifecycle order.  ``metadata`` is a
+        caller-owned record used to publish authoritative per-leg fill prices
+        to the MTS reconciliation code before the parent on_fill callback.
+        """
+        from core.order_management.order import OrderStatus
+
+        if order.status not in (OrderStatus.SUBMITTED, OrderStatus.PRE_SUBMITTED):
+            return
+        if order.order_id in self.consumed_order_ids:
+            return
+        self._pending_combos[order.order_id] = {
+            "order": order,
+            "near_symbol": str(near_symbol),
+            "far_symbol": str(far_symbol),
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        }
+
+    def process_combo_ticks(self, near_tick, far_tick) -> None:
+        """Fill a combo only when both legs have valid current prices."""
+        from core.order_management.order import OrderStatus
+
+        for order_id, record in list(self._pending_combos.items()):
+            order = record["order"]
+            if str(getattr(order, "status", "")).lower() in {
+                    "cancelled", "canceled", "filled", "rejected", "expired"}:
+                self._pending_combos.pop(order_id, None)
+                self.consumed_order_ids.add(order_id)
+                continue
+
+            near_symbol = getattr(near_tick, "symbol", getattr(near_tick, "code", None))
+            far_symbol = getattr(far_tick, "symbol", getattr(far_tick, "code", None))
+            if near_symbol != record["near_symbol"] or far_symbol != record["far_symbol"]:
+                continue
+            try:
+                near_price = float(near_tick.close)
+                far_price = float(far_tick.close)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not (math.isfinite(near_price) and math.isfinite(far_price)
+                    and near_price > 0 and far_price > 0):
+                continue
+
+            remaining = order.quantity - order.filled_quantity
+            if remaining <= 0:
+                self._pending_combos.pop(order_id, None)
+                self.consumed_order_ids.add(order_id)
+                continue
+            fill_qty = 1 if remaining >= 2 else remaining
+            metadata = record["metadata"]
+            metadata["near_fill_price"] = near_price
+            metadata["far_fill_price"] = far_price
+            action = str(metadata.get("spread_side") or metadata.get("action") or "")
+            net_price = (near_price - far_price
+                         if action == "BUY_NEAR_SELL_FAR"
+                         else far_price - near_price)
+            self._order_mgr.on_fill(
+                order_id=order_id, fill_price=net_price, fill_qty=fill_qty,
+                partial=(fill_qty < remaining))
+
+            order = self._pending_combos.get(order_id, {}).get("order")
+            if order is None or order.status == OrderStatus.FILLED:
+                self._pending_combos.pop(order_id, None)
+                self.consumed_order_ids.add(order_id)
+
+    def reject_combo(self, order_id: str, reason: str = "PAPER_COMBO_REJECTED") -> None:
+        """Reject and consume a pending combo without creating leg orders."""
+        if order_id not in self._pending_combos:
+            return
+        self._pending_combos.pop(order_id, None)
+        self.consumed_order_ids.add(order_id)
+        self._order_mgr.reject(order_id, reason=reason, source="paper_combo")
 
     def process_tick(self, tick) -> None:
         """
@@ -150,10 +231,12 @@ class PaperFillSimulator:
     def remove(self, order_id: str) -> None:
         """手動移除委託單（用於 cancel/reject/expire）"""
         self._pending_orders.pop(order_id, None)
+        self._pending_combos.pop(order_id, None)
         self.consumed_order_ids.add(order_id)
 
     def get_pending_count(self) -> int:
-        return len(self._pending_orders)
+        return len(self._pending_orders) + len(self._pending_combos)
 
     def __repr__(self) -> str:
-        return f"PaperFillSimulator(pending={len(self._pending_orders)})"
+        return (f"PaperFillSimulator(pending={self.get_pending_count()}, "
+                f"combos={len(self._pending_combos)})")

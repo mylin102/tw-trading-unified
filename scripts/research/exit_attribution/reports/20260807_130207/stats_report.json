@@ -1,0 +1,76 @@
+{
+  "run_id": "20260807_130207",
+  "n_trades": 67,
+  "n_ok": 0,
+  "sign_test": {
+    "deltas_used": 0,
+    "positive": 0,
+    "negative": 0,
+    "zero": 0,
+    "exact_two_sided_p": null,
+    "interpretation": "insufficient data"
+  },
+  "quote_coverage": {
+    "EXECUTABLE_BBO": 0,
+    "BOUNDED_TICK_PROXY": 3,
+    "UNUSABLE": 64,
+    "note": "raw last-price (bid/ask <= 0) is PROXY by design; 1-min OHLC Close used as last-price proxy only when within age bound",
+    "quote_age_s": {
+      "p50": 0.044,
+      "p95": 0.57,
+      "p99": 4.114,
+      "max": 4.114
+    },
+    "pair_skew_ms_pctiles": {
+      "p50": 1673.0,
+      "p95": 4084.0,
+      "p99": 4084.0,
+      "max": 4084.0
+    }
+  },
+  "reconciliation": {
+    "status_counts": {
+      "OK": 65,
+      "CORRUPT": 1,
+      "UNRECONCILED": 1
+    },
+    "flag_counts": {
+      "corrupt_realized_pnl": 1,
+      "overclosed_sibling_exit": 1
+    },
+    "mismatch_list": [],
+    "corrupt_trades_excluded_from_sign_stats": [
+      "mts-auto-222204-082"
+    ]
+  },
+  "sensitivity": {
+    "note": "tick adverse re-valuation NOT AVAILABLE for this run (quote tiers are proxy/unusable; see coverage)",
+    "available": false
+  },
+  "fee_model": {
+    "per_contract": 57.35,
+    "provenance": "LEDGER_INFERRED/UNVERIFIED",
+    "effective_date": "2026-07-01",
+    "note": "inferred from stored realized_pnl vs recomputed gross on release fills (CORRUPT trades excluded). Reconciliation against the same values is NOT validation — see per_contract/per_qty consistency.",
+    "sample_size": 66,
+    "per_contract_consistency": {
+      "TMF": {
+        "n": 66,
+        "median": 57.35,
+        "min": 56.9,
+        "max": 7277.3
+      }
+    },
+    "per_qty_consistency": {
+      "1": {
+        "n": 66,
+        "median": 57.35
+      }
+    }
+  },
+  "gate_notes": [
+    "research-only; no production change, no GO claim",
+    "immediate_executable_combined_pnl_gross populated ONLY for EXECUTABLE_BBO",
+    "fee provenance: LEDGER_INFERRED/UNVERIFIED (not validated)"
+  ]
+}

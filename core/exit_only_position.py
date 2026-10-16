@@ -1,0 +1,424 @@
+"""Hydrate an attested RECONCILED_EXIT_ONLY broker pair into a managed
+MTS position so the existing Policy J / combined / single-release exit
+evaluation can produce ONLY capability-bound closing orders.
+
+Fail-closed rules:
+- hydrate only when a valid exit_only_capability exists (schema v2 with
+  exact legs incl. broker avg costs); anything else raises a typed error
+- the hydrated position carries broker-attested costs + trade_id and
+  NEVER synthetic PnL
+- every exit decision must bind reconciliation_id + position snapshot
+  hash + a contemporaneous BBO snapshot hash/timestamp; missing / stale /
+  ambiguous BBO -> N/A + zero order
+- paper is never affected (callers gate on RECONCILED_EXIT_ONLY)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import time
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from core.reconciled_exit import AttestationError
+
+# Contemporaneous BBO window (ms) for an exit decision.
+BBO_TTL_MS: int = 15_000
+BBO_SKEW_MS: int = 1_000  # [S2] named conservative cross-leg skew bound
+
+ENTRY_ACTIONS: frozenset = frozenset(
+    {"BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"})
+
+
+@dataclass(frozen=True)
+class ExitEvaluation:
+    """Result of the single Collapse-2 exit evaluation chokepoint."""
+
+    status: str
+    intent: dict | None = None
+    reason: str | None = None
+
+
+class ReconciledPositionHydration:
+    """Atomic reconciliation/authorization boundary for controlled exits.
+
+    ``reconcile`` publishes the broker-attested position, mode, and order
+    authorization as one immutable state transition.  Evaluation cannot
+    create an intent until that transition exists.  The deliberately narrow
+    retry path is only for an ordering rejection with no broker receipt; all
+    timeout, unknown, receipt, active-order, and position-mismatch cases stay
+    pending and fail closed.
+
+    This is a pure coordination seam: the caller supplies broker queries and
+    the submit callback, so construction and tests never contact a broker.
+    ``durable_intents`` is the restart payload; restored pending intents are
+    never submitted until the caller performs a fresh reconciliation.
+    """
+
+    _PENDING = {"PENDING_RECONCILE", "PENDING_UNCONFIRMED"}
+
+    def __init__(self, *, durable_intents: Optional[dict] = None):
+        self._reconciled: dict | None = None
+        self._intents: dict[str, dict] = {
+            str(iid): dict(rec) for iid, rec in (durable_intents or {}).items()
+        }
+        self._used_keys = {
+            rec.get("idempotency_key") for rec in self._intents.values()
+            if rec.get("idempotency_key")
+        }
+
+    def guard_names(self) -> tuple[str, ...]:
+        return ("hydration_required", "retry_once", "active_order_recheck",
+                "position_recheck")
+
+    def authorization_ready(self, position: Optional[dict] = None) -> bool:
+        if not isinstance(self._reconciled, dict):
+            return False
+        if position is None:
+            return True
+        return self._same_position(self._reconciled, position)
+
+    def reconcile(self, position: dict) -> dict:
+        """Atomically publish hydrated position and exit authorization."""
+        if not isinstance(position, dict):
+            raise ValueError("reconciliation position must be an object")
+        mode = position.get("mode")
+        allowed = position.get("live_order_allowed")
+        if not isinstance(mode, str) or not isinstance(allowed, bool):
+            raise ValueError("mode and live_order_allowed are required")
+        legs = position.get("legs")
+        if not isinstance(legs, list) or not legs:
+            raise ValueError("reconciled position legs are required")
+        # One assignment is intentional: no observer can see hydrated legs
+        # with a stale authorization flag (or vice versa).
+        self._reconciled = {
+            "mode": mode, "live_order_allowed": allowed,
+            "legs": [dict(leg) for leg in legs],
+        }
+        return {**self._reconciled, "legs": [dict(leg) for leg in legs]}
+
+    def evaluate_exit(self, intent_id: str, idempotency_key: str) -> ExitEvaluation:
+        if not self._reconciled:
+            return ExitEvaluation("HYDRATION_REQUIRED", reason="HYDRATION_REQUIRED")
+        if not self._reconciled["live_order_allowed"]:
+            return ExitEvaluation("AUTHORIZATION_REQUIRED",
+                                  reason="LIVE_ORDER_AUTHORIZATION_FAILED")
+        if idempotency_key in self._used_keys:
+            return ExitEvaluation("REJECTED", reason="DUPLICATE_IDEMPOTENCY_KEY")
+        rec = self._intents.setdefault(str(intent_id), {
+            "intent_id": str(intent_id),
+            "idempotency_key": idempotency_key,
+            "state": "AUTHORIZED", "retry_count": 0,
+            "broker_receipt": None,
+        })
+        return ExitEvaluation("AUTHORIZED", intent=dict(rec))
+
+    def submit(self, intent_id: str, idempotency_key: str,
+               submit_callable) -> bool:
+        rec = self._intents.get(str(intent_id))
+        if (rec is None or rec.get("idempotency_key") != idempotency_key
+                or rec.get("state") != "AUTHORIZED"
+                or idempotency_key in self._used_keys):
+            return False
+        self._used_keys.add(idempotency_key)
+        try:
+            ok = bool(submit_callable())
+        except Exception:
+            ok = False
+        rec["state"] = "SUBMITTED" if ok else "PENDING_RECONCILE"
+        return ok
+
+    def record_rejection(self, intent_id: str, *, reason: str,
+                         receipt: Any = None,
+                         idempotency_key: Optional[str] = None) -> None:
+        rec = self._intents.setdefault(str(intent_id), {
+            "intent_id": str(intent_id), "retry_count": 0,
+        })
+        if idempotency_key is not None:
+            rec["idempotency_key"] = idempotency_key
+        rec["last_reason"] = reason
+        rec["broker_receipt"] = receipt
+        if receipt is not None:
+            rec["state"] = "PENDING_RECONCILE"
+        elif reason == "HYDRATION_AUTHORIZATION_ORDERING":
+            rec["state"] = "RETRYABLE_ORDERING"
+        else:
+            rec["state"] = "PENDING_RECONCILE"
+
+    @staticmethod
+    def _same_position(expected: dict, actual: dict) -> bool:
+        return (isinstance(actual, dict)
+                and expected.get("legs") == actual.get("legs"))
+
+    def retry_once(self, intent_id: str, idempotency_key: str,
+                   submit_callable, *, active_orders: list,
+                   position: dict) -> bool:
+        rec = self._intents.get(str(intent_id))
+        if (rec is None or rec.get("state") != "RETRYABLE_ORDERING"
+                or rec.get("idempotency_key") != idempotency_key
+                or rec.get("retry_count", 0) >= 1
+                or rec.get("broker_receipt") is not None
+                or active_orders
+                or not self._reconciled
+                or not self._same_position(self._reconciled, position)):
+            return False
+        rec["retry_count"] = 1
+        self._used_keys.add(idempotency_key)
+        try:
+            ok = bool(submit_callable())
+        except Exception:
+            ok = False
+        rec["state"] = "SUBMITTED" if ok else "PENDING_RECONCILE"
+        return ok
+
+    def partial_fill_recovery(self, legs: list[dict]) -> list[dict]:
+        return [dict(leg) for leg in legs
+                if isinstance(leg, dict) and (leg.get("quantity") or 0) > 0]
+
+    def intent_state(self, intent_id: str) -> Optional[str]:
+        rec = self._intents.get(str(intent_id))
+        return rec.get("state") if rec else None
+
+    def durable_view(self) -> dict:
+        return {iid: dict(rec) for iid, rec in self._intents.items()}
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def hydrate_exit_only_position(capability: Any) -> dict:
+    """Build the managed MTS position state from an attested capability.
+
+    Raises AttestationError with a typed code on any failure.
+    """
+    if not isinstance(capability, dict):
+        raise AttestationError("EXIT_ONLY_CAPABILITY_MISSING",
+                               "capability required")
+    if capability.get("schema_version") != 2:
+        raise AttestationError("EXIT_ONLY_CAPABILITY_INVALID",
+                               "schema_version must be 2")
+    trade_id = capability.get("trade_id")
+    reconciliation_id = capability.get("reconciliation_id")
+    snapshot_hash = capability.get("snapshot_hash")
+    snapshot_captured_at = capability.get("snapshot_captured_at")
+    if (not isinstance(trade_id, str) or not trade_id
+            or not isinstance(reconciliation_id, str) or not reconciliation_id
+            or not isinstance(snapshot_hash, str) or not snapshot_hash
+            or not isinstance(snapshot_captured_at, int)):
+        raise AttestationError("EXIT_ONLY_CAPABILITY_INVALID",
+                               "identity fields missing")
+
+    legs = capability.get("legs")
+    if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+        raise AttestationError("EXIT_ONLY_CAPABILITY_INVALID",
+                               "exactly two attested legs required")
+    normalized = []
+    seen = set()
+    for leg in legs:
+        if not isinstance(leg, dict):
+            raise AttestationError("EXIT_ONLY_CAPABILITY_INVALID",
+                                   "leg must be an object")
+        code = leg.get("symbol")
+        side = str(leg.get("side", "")).lower()
+        qty = leg.get("remaining_qty")
+        avg_cost = _positive_float(leg.get("avg_cost"))
+        if (not isinstance(code, str) or not code
+                or side not in ("buy", "sell")
+                or not isinstance(qty, int) or isinstance(qty, bool)
+                or qty <= 0 or avg_cost is None):
+            raise AttestationError("EXIT_ONLY_CAPABILITY_INVALID",
+                                   "attested leg invalid")
+        key = (code, side)
+        if key in seen:
+            raise AttestationError("EXIT_ONLY_CAPABILITY_INVALID",
+                                   "duplicate attested leg")
+        seen.add(key)
+        normalized.append({"code": code, "side": side,
+                           "quantity": qty, "avg_cost": avg_cost})
+
+    return {
+        "trade_id": trade_id,
+        "reconciliation_id": reconciliation_id,
+        "snapshot_hash": snapshot_hash,
+        "snapshot_captured_at": snapshot_captured_at,
+        "has_position": True,
+        "mode": "reconciled_exit_only",
+        # open legs with broker-attested costs; no pnl fields (no synthetic PnL)
+        "legs": normalized,
+    }
+
+
+def build_bbo_binding(bbo_slots: Any, *, now_ms: Optional[int] = None,
+                      ttl_ms: int = BBO_TTL_MS,
+                      skew_ms: int = BBO_SKEW_MS,
+                      near_code: Optional[str] = None,
+                      far_code: Optional[str] = None,
+                      identity: Optional[dict] = None) -> tuple:
+    """[S2] Validate contemporaneous near/far BBO + decision identity and
+    return a version-2 canonical binding (hash + raw payload).
+
+    Each leg (dedicated EXIT_ONLY BBO evidence cache entry) requires:
+    exact expected contract code (BBO_CODE_MISMATCH), source ==
+    "shioaji_bidask" (BBO_SOURCE_MISMATCH), positive finite bid <= ask
+    (BBO_MISSING / BBO_AMBIGUOUS), finite int epoch-ms EXCHANGE timestamp
+    (BBO_STALE), not future beyond 1s (BBO_FUTURE), TTL <= 15s
+    (BBO_STALE); cross-leg skew <= 1s on EXCHANGE timestamps (BBO_SKEW).
+    The decision identity (cap reconciliation_id, position snapshot hash,
+    config_hash, release_sha, session_id) must be present
+    (BBO_IDENTITY_MISSING).  The version-2 hash AND the raw payload bind
+    raw bid/ask, exchange timestamps, received_at, source, symbols and
+    the identity — any bad dimension returns (None, reason) =>
+    N/A/BLOCKED, zero evaluator submit/order.
+    """
+    if not isinstance(bbo_slots, dict):
+        return None, "BBO_MISSING"
+    if not isinstance(identity, dict):
+        return None, "BBO_IDENTITY_MISSING"
+    _id_keys = ("reconciliation_id", "snapshot_hash", "config_hash",
+                "release_sha", "session_id")
+    if any(not isinstance(identity.get(k), str)
+           or not identity.get(k) for k in _id_keys):
+        return None, "BBO_IDENTITY_MISSING"
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    expected = {"near": near_code, "far": far_code}
+    slots = {}
+    for leg in ("near", "far"):
+        slot = bbo_slots.get(leg)
+        if not isinstance(slot, dict):
+            return None, "BBO_MISSING"
+        bid = _positive_float(slot.get("bid"))
+        ask = _positive_float(slot.get("ask"))
+        if bid is None or ask is None:
+            return None, "BBO_MISSING"
+        if slot.get("code") != expected[leg]:
+            return None, "BBO_CODE_MISMATCH"
+        if slot.get("source") != "shioaji_bidask":
+            return None, "BBO_SOURCE_MISMATCH"
+        if bid > ask:
+            return None, "BBO_AMBIGUOUS"
+        ts = slot.get("exchange_ts_ms")
+        # [S2 audit] strict canonical timestamp: type(x) is int, not
+        # bool, >= 1e12 (epoch-ms).  float/seconds/missing are rejected —
+        # the binding NEVER rescales seconds-or-float timestamps.
+        if (not isinstance(ts, int) or isinstance(ts, bool)
+                or ts < 1e12):
+            return None, "BBO_STALE"
+        ts_ms = ts
+        if ts_ms > now + 1_000:
+            return None, "BBO_FUTURE"
+        if now - ts_ms > ttl_ms:
+            return None, "BBO_STALE"
+        slots[leg] = {
+            "symbol": slot.get("code"), "bid": bid, "ask": ask,
+            "exchange_ts": ts_ms,
+            # [S2 audit] optional raw fields are JSON-sanitized (NaN/Inf
+            # -> None) so the canonical hash can never crash; strict
+            # bid/ask/exchange_ts/code/source validation is unchanged.
+            "received_at_ms": _json_safe(slot.get("received_at_ms")),
+            "source": slot.get("source"),
+            "seq": _json_safe(slot.get("seq")),
+        }
+
+    if abs(slots["near"]["exchange_ts"] - slots["far"]["exchange_ts"]) \
+            > skew_ms:
+        return None, "BBO_SKEW"
+
+    payload = {
+        "version": 2,
+        "near": slots["near"],
+        "far": slots["far"],
+        "reconciliation_id": identity["reconciliation_id"],
+        "snapshot_hash": identity["snapshot_hash"],
+        "config_hash": identity["config_hash"],
+        "release_sha": identity["release_sha"],
+        "session_id": identity["session_id"],
+    }
+    bbo_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                   allow_nan=False).encode()
+    ).hexdigest()
+    captured_at = max(slots["near"]["exchange_ts"],
+                      slots["far"]["exchange_ts"])
+    return {"bbo_hash": bbo_hash, "bbo_captured_at": captured_at,
+            "bbo_payload": payload}, None
+
+
+def _json_safe(value):
+    """[S2 audit] JSON-safe deep-copy: datetime -> isoformat, other
+    non-serializable -> str; never raises."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        # [S2 audit] non-finite floats (NaN/+Inf/-Inf) are not
+        # JSON-compliant: deterministic None sentinel; finite preserved.
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    try:
+        return str(value)
+    except Exception:
+        return "<unserializable>"
+
+
+def build_bbo_failure_evidence(bbo_slots: Any, identity: Any,
+                               reason: str) -> dict:
+    """[S2 audit] canonical failure-evidence payload for every EXIT_ONLY
+    ORDER_INTENT_BLOCKED: version bbo_input_v2, JSON-safe raw near/far
+    slots, cap identity fields, reason and a deterministic hash of that
+    payload (dashboard/review can reproduce the rejection).  Never
+    writes secrets."""
+    payload = {"version": "bbo_input_v2",
+               "near": {}, "far": {},
+               "reconciliation_id": None, "snapshot_hash": None,
+               "config_hash": None, "release_sha": None,
+               "session_id": None, "reason": reason}
+    if isinstance(identity, dict):
+        for _k in ("reconciliation_id", "snapshot_hash", "config_hash",
+                   "release_sha", "session_id"):
+            payload[_k] = identity.get(_k)
+    if isinstance(bbo_slots, dict):
+        for _leg in ("near", "far"):
+            _slot = bbo_slots.get(_leg)
+            if isinstance(_slot, dict):
+                payload[_leg] = _json_safe(
+                    {k: _slot.get(k) for k in
+                     ("code", "bid", "ask", "exchange_ts_ms",
+                      "received_at_ms", "source", "seq") if k in _slot})
+    try:
+        _canon = json.dumps(payload, sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False).encode()
+        payload["evidence_hash"] = hashlib.sha256(_canon).hexdigest()
+    except Exception:
+        payload["evidence_hash"] = None
+    return payload
+
+
+def attach_decision_binding(event: dict, capability: dict,
+                            binding: dict) -> dict:
+    """Return a copy of the decision event bound to capability + BBO —
+    the raw versioned payload rides along (not just the hash) so the
+    dashboard/review can reproduce the decision evidence."""
+    merged = dict(event)
+    merged["reconciliation_id"] = capability.get("reconciliation_id")
+    merged["position_snapshot_hash"] = capability.get("snapshot_hash")
+    merged["bbo_hash"] = binding.get("bbo_hash")
+    merged["bbo_captured_at"] = binding.get("bbo_captured_at")
+    merged["bbo_payload"] = binding.get("bbo_payload")
+    return merged

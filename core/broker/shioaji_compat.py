@@ -91,19 +91,42 @@ def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
     """
     Safely logins using parameters compatible with the installed version.
     Uses fallback for versions that don't support contracts_timeout.
+
+    Live Route Certification hook (round-8): the SessionRegistry is
+    invalidated BEFORE each login/reconnect attempt and a NEW opaque
+    generation is registered ONLY after a successful login — a failed
+    relogin leaves no valid generation and old certificates die with the
+    old generation. Import is function-local to avoid a circular import
+    (core.live_route_certificate imports live_broker_preflight which
+    imports this module).
     """
+    from core.live_route_certificate import session_registry  # local import
+    session_registry.unregister(api)   # invalidate before every attempt
     try:
+        _login_kwargs = dict(kwargs)
+        # Futures order/deal callbacks are part of the live truth channel;
+        # keep Shioaji's documented default explicit across reconnects.
+        _login_kwargs.setdefault("subscribe_trade", True)
         # [rshioaji 1.5.9+] login with contracts_timeout returns True if contracts loaded
-        return api.login(
+        res = api.login(
             api_key=api_key,
             secret_key=secret_key,
-            contracts_timeout=kwargs.get("contracts_timeout", 10000),
-            **kwargs
+            contracts_timeout=_login_kwargs.pop("contracts_timeout", 10000),
+            **_login_kwargs
         )
+        if res:                        # round-11 #2: a falsey login return
+            # is treated as failure (fail-closed) even though Shioaji's
+            # documented failure mode is exceptions (AuthError/TokenError…)
+            session_registry.register(api)
+        return res
     except TypeError:
         # Fallback for 1.3.3
-        kwargs.pop("contracts_timeout", None)
-        return api.login(api_key=api_key, secret_key=secret_key, **kwargs)
+        _login_kwargs.pop("contracts_timeout", None)
+        _login_kwargs.pop("subscribe_trade", None)
+        res = api.login(api_key=api_key, secret_key=secret_key, **_login_kwargs)
+        if res:
+            session_registry.register(api)
+        return res
 
 def wait_for_contracts(api: sj.Shioaji, category: str = "Futures", symbol: str = "MXF", timeout: int = 30):
     """Wait for specific contracts to be available in the local cache."""
@@ -173,10 +196,20 @@ def get_contracts_list(api: sj.Shioaji, category: str, symbol: str) -> List[Any]
         return []
 
 def fetch_all_contracts(api: sj.Shioaji, timeout: int = 300):
-    """Aggressively ensure contracts are available in cache (5 min timeout)."""
-    from core.shioaji_session import fetch_contracts
-    
-    # 2026-06-26 Gemini CLI: Load the configured ticker dynamically to avoid hardcoded 'MXF' check (Rule 11)
+    """Return whether the authenticated parent's configured futures cache is ready.
+
+    Do not launch a secondary Shioaji login from a live parent session.  The
+    broker may revoke the parent's authenticated session when that child logs
+    in with the same credentials.  Cache population must therefore happen in
+    an independent preflight/maintenance phase; a missing cache is a safe
+    startup refusal, never a retry loop that risks the live session.
+
+    ``timeout`` remains accepted for caller compatibility, but no longer
+    authorizes a child refresh or sleep loop.
+    """
+    del timeout
+
+    # Load the configured ticker dynamically to avoid a hard-coded MXF check.
     from pathlib import Path
     import yaml
     
@@ -192,25 +225,11 @@ def fetch_all_contracts(api: sj.Shioaji, timeout: int = 300):
     except Exception:
         pass
     
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            # Check if Futures and Options categories are at least visible in dir()
-            # and contain actual contract data
-            cats = dir(api.Contracts)
-            if "Futures" in cats and "Options" in cats:
-                # 2026-07-01 Gemini CLI: Swig wrappers do not dynamically expose contract keys in dir(), use hasattr/repr check
-                if hasattr(api.Contracts.Futures, ticker) or ticker in repr(api.Contracts.Futures):
-                    return True
-        except Exception:
-            pass
-            
-        # Try/Retry fetching
-        fetch_contracts(api)
-        
-        # If not successful yet, wait a bit before next check/retry
-        time.sleep(10)
-    return False
+    try:
+        futures = getattr(getattr(api, "Contracts", None), "Futures", None)
+        return futures is not None and getattr(futures, ticker, None) is not None
+    except Exception:
+        return False
 
 def is_rust_version() -> bool:
     """Returns True if the current shioaji version is the Rust-based 1.5+ version."""

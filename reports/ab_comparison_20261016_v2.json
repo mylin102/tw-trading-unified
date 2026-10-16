@@ -1,0 +1,147 @@
+{
+  "schema_version": 2,
+  "promotion": "NO_GO",
+  "model": "OFFLINE_MTS_LIFECYCLE_BAR_PROXY_V2",
+  "paired_decisions": 807,
+  "initial_equity_twd": 100000,
+  "same_state_probe_difference_count": 52,
+  "common_reference_pairs": 577,
+  "availability_only_probe_difference_count": 3,
+  "same_state_probe_difference_pct": 6.44361833952912,
+  "portfolio_action_difference_count": 21,
+  "portfolio_action_difference_pct": 2.6022304832713754,
+  "baseline": {
+    "closed_spreads": 27,
+    "win_rate_pct": 25.925925925925927,
+    "mean_closed_net_twd": -281.0725333333333,
+    "closed_net_twd": -7588.9583999999995,
+    "final_cash_twd": 92411.04159999994,
+    "final_liquidation_equity_twd": 92411.04159999994,
+    "net_liquidation_change_twd": -7588.958400000061,
+    "max_drawdown_pct": -8.077252080474052,
+    "daily_sharpe": -16.95091449627537,
+    "open_episode": false,
+    "pending_unfilled": false,
+    "probe_pass_count": 134,
+    "probe_block_reasons": {
+      "LEG_DIRECTION_DIVERGENCE": 22,
+      "ENTRY_SIDE_DIRECTION_MISMATCH": 352,
+      "PRICE_DISTANCE_BELOW_THRESHOLD": 61,
+      "DIRECTION_NOT_CONFIRMED": 10,
+      "ADL_RENKO_WARMUP_OR_GAP": 78,
+      "CONFIRMED": 134,
+      "CONFIRMATION_GAP": 26,
+      "CONFIDENCE_BELOW_THRESHOLD": 42,
+      "DIVERGENCE_OR_INSUFFICIENT": 57,
+      "INSUFFICIENT_SAME_DIRECTION": 25
+    },
+    "actions": {
+      "HOLD": 736,
+      "ENTRY": 27,
+      "TIMEOUT": 20,
+      "TREND_RELEASE": 12,
+      "TRAIL": 11,
+      "COMBINED_EXIT": 1
+    },
+    "exit_reasons": {
+      "TIMEOUT": 29,
+      "TREND_RELEASE": 12,
+      "TRAIL": 11,
+      "COMBINED_EXIT": 2
+    },
+    "data_gaps": 14
+  },
+  "adaptive": {
+    "closed_spreads": 27,
+    "win_rate_pct": 18.51851851851852,
+    "mean_closed_net_twd": -298.8520740740741,
+    "closed_net_twd": -8069.006,
+    "final_cash_twd": 91930.99399999995,
+    "final_liquidation_equity_twd": 91930.99399999995,
+    "net_liquidation_change_twd": -8069.006000000052,
+    "max_drawdown_pct": -9.956181840580252,
+    "daily_sharpe": -8.785722313899772,
+    "open_episode": false,
+    "pending_unfilled": false,
+    "probe_pass_count": 79,
+    "probe_block_reasons": {
+      "REFERENCE_UNAVAILABLE": 230,
+      "REFERENCE_SHIFT_BELOW_THRESHOLD": 31,
+      "ENTRY_SIDE_DIRECTION_MISMATCH": 231,
+      "ALPHA_BELOW_THRESHOLD": 43,
+      "CONFIRMED": 79,
+      "CONFIDENCE_BELOW_THRESHOLD": 29,
+      "PRICE_DISTANCE_BELOW_THRESHOLD": 97,
+      "DIVERGENCE_OR_INSUFFICIENT": 23,
+      "DIRECTION_NOT_CONFIRMED": 4,
+      "LEG_DIRECTION_DIVERGENCE": 13,
+      "ADL_RENKO_WARMUP_OR_GAP": 11,
+      "INSUFFICIENT_SAME_DIRECTION": 16
+    },
+    "actions": {
+      "HOLD": 737,
+      "ENTRY": 27,
+      "TIMEOUT": 23,
+      "TREND_RELEASE": 10,
+      "TRAIL": 8,
+      "COMBINED_EXIT": 1,
+      "STOPLOSS": 1
+    },
+    "exit_reasons": {
+      "TIMEOUT": 33,
+      "TREND_RELEASE": 10,
+      "TRAIL": 8,
+      "COMBINED_EXIT": 2,
+      "STOPLOSS": 1
+    },
+    "data_gaps": 15
+  },
+  "common_entry_status": {
+    "REFERENCE_NOT_READY": 200,
+    "ENTRY_SCHEDULED": 27,
+    "POSITION_OR_EXIT_PENDING": 293,
+    "COOLDOWN": 110,
+    "NEXT_PAIR_MISSING": 8,
+    "MARGIN_INSUFFICIENT": 169
+  },
+  "both_spread_reference_ready_pairs": 199,
+  "paired_closed_spreads": 27,
+  "changed_exit_spreads": 7,
+  "paired_baseline_wins": 5,
+  "paired_adaptive_wins": 2,
+  "paired_ties": 20,
+  "capital_normalized_improvement_bps": -48.00475999999908,
+  "records_by_date": {
+    "2026-07-06": 149,
+    "2026-07-07": 183,
+    "2026-07-08": 211,
+    "2026-07-09": 216,
+    "2026-07-10": 48
+  },
+  "volume": {
+    "near": {
+      "valid": 696,
+      "unknown": 111,
+      "median_z": -0.24557932061057736,
+      "extreme_pct": 6.609195402298851,
+      "high_or_extreme_pct": 15.660919540229886
+    },
+    "far": {
+      "valid": 687,
+      "unknown": 120,
+      "median_z": -0.28137898676198014,
+      "extreme_pct": 6.986899563318778,
+      "high_or_extreme_pct": 13.24599708879185
+    }
+  },
+  "acceptance": {
+    "minimum_difference_pct": 5,
+    "same_state_probe_at_least_5pct": true,
+    "portfolio_action_at_least_5pct": false,
+    "different_paired_exits": true,
+    "decision_rule": "Both same-state and portfolio action rates must meet threshold; reasons alone are not differences"
+  },
+  "framework_acceptance": "NOT_MET",
+  "manifest_sha256": "791f2fd5bd90df7ab4c3fdef3702811b90ee8a8d197120481edf8d546b0feab8",
+  "comparator_sha256": "ab7fa339a98563158175fe5b57cb7ec80fb48731a491615d46faf73b19652b4a"
+}

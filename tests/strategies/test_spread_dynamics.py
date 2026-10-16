@@ -143,8 +143,11 @@ def test_event_ordering_invariants():
 
 def test_golden_dataset_replay():
     """Verify replay against tests/golden/entry_snapshot_v1.json produces 100% deterministic expected results."""
-    import json
-    with open("tests/golden/entry_snapshot_v1.json", "r") as f:
+    import json, os
+    golden_file = "tests/golden/entry_snapshot_v1.json"
+    if not os.path.exists(golden_file):
+        pytest.skip("Golden dataset file not present")
+    with open(golden_file, "r") as f:
         golden = json.load(f)
 
     calc = SpreadDynamicsCalculator(tau_sec=2.0)
@@ -181,3 +184,213 @@ def test_serialization_roundtrip_invariant():
     assert deserialized_snap["rolling_slope_at_entry"] is None  # None preserved, not "null" or 0
     assert deserialized_snap["velocity_ema_valid_at_entry"] is True  # bool preserved, not "True"
 
+
+def _bare_monitor_for_dynamics():
+    """Exercise only the monitor's research-only bar telemetry seam."""
+    from strategies.futures.monitor import FuturesMonitor
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._spread_dynamics = SpreadDynamicsCalculator(
+        tau_sec=2.0, max_derivative_gap_sec=15.0,
+        min_slope_samples=2, min_slope_duration_sec=0.1)
+    monitor._spread_dynamics_session = None
+    monitor.live_trading = False
+    monitor.ticker = "TMF"
+    monitor._execution_context = None
+    monitor.run_id = "test-run"
+    return monitor
+
+
+def test_monitor_dynamics_first_sample_warms_and_research_payload_is_raw(
+        monkeypatch):
+    """First input is telemetry warming-up only; it carries no derivative
+    and entry research sees the current raw near-minus-far spread, not a
+    future sample or a strategy gate."""
+    monitor = _bare_monitor_for_dynamics()
+    bar = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+           "far_close": 98.0, "spread_z": 2.0, "entry_z": 1.0}
+    metrics = monitor._update_mts_spread_dynamics(bar)
+
+    assert metrics.dynamics_status == DynamicsStatus.WARMING_UP
+    assert bar["raw_spread"] == 3.0
+    assert bar["dz"] is None
+    assert bar["spread_slope"] is None
+    assert bar["velocity_ema"] is None
+
+    captured = []
+    import core.entry_research_store as store
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kwargs: captured.append(audit) or True)
+    monitor._record_mts_entry_research_candidate(
+        type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None})(),
+        bar, __import__("datetime").datetime.now())
+    assert captured[-1]["spread"] == 3.0
+    assert captured[-1]["dz"] is None
+    assert captured[-1]["spread_slope"] is None
+    assert captured[-1]["velocity_ema"] is None
+
+
+def test_monitor_dynamics_is_causal_then_resets_for_gap_and_session():
+    monitor = _bare_monitor_for_dynamics()
+    first = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+             "far_close": 98.0, "spread_z": 1.0}
+    second = {"ts": 101.0, "session_type": "day", "near_close": 103.0,
+              "far_close": 98.0, "spread_z": 1.5}
+    monitor._update_mts_spread_dynamics(first)
+    second_metrics = monitor._update_mts_spread_dynamics(second)
+    assert second["raw_spread"] == 5.0
+    assert second["dz"] == 0.5
+    assert second["velocity_ema"] == second_metrics.velocity_ema
+    assert second["spread_slope"] == second_metrics.rolling_slope
+
+    gap = {"ts": 120.0, "session_type": "day", "near_close": 104.0,
+           "far_close": 98.0, "spread_z": 2.0}
+    assert monitor._update_mts_spread_dynamics(gap).dynamics_status \
+        == DynamicsStatus.GAP_REANCHORED
+    assert gap["dz"] is None
+
+    session = {"ts": 121.0, "session_type": "night", "near_close": 105.0,
+               "far_close": 98.0, "spread_z": 2.5}
+    assert monitor._update_mts_spread_dynamics(session).dynamics_status \
+        == DynamicsStatus.WARMING_UP
+    assert session["dz"] is None
+
+
+def test_monitor_dynamics_time_regression_does_not_leak_future_state():
+    monitor = _bare_monitor_for_dynamics()
+    monitor._update_mts_spread_dynamics(
+        {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+         "far_close": 98.0, "spread_z": 1.0})
+    backwards = {"ts": 99.0, "session_type": "day", "near_close": 200.0,
+                 "far_close": 98.0, "spread_z": 99.0}
+    assert monitor._update_mts_spread_dynamics(backwards).dynamics_status \
+        == DynamicsStatus.TIME_REGRESSION
+    assert backwards["dz"] is None
+
+    # The rejected 99.0/99.0 observation never becomes history: 101 only
+    # sees the causal 100.0 z=1.0 predecessor.
+    next_bar = {"ts": 101.0, "session_type": "day", "near_close": 102.0,
+                "far_close": 98.0, "spread_z": 2.0}
+    monitor._update_mts_spread_dynamics(next_bar)
+    assert next_bar["dz"] == 1.0
+
+
+def test_research_rejects_are_recorded_with_standardized_reasons(monkeypatch):
+    """P1 observability follow-up: post-threshold candidates are ALWAYS
+    recorded — decision=CANDIDATE when quotes are trustworthy, or
+    decision=REJECT with a standardized rejection_reason (STALE_QUOTE /
+    BBO_INVALID / BBO_MISSING / BBO_NONFINITE).  Valid-candidate behavior
+    is unchanged and the record path can never submit an order."""
+    monitor = _bare_monitor_for_dynamics()
+    captured = []
+    import core.entry_research_store as store
+    import datetime
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    strat = type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None,
+                                  "_max_quote_age_ms": 1000})()
+    now = datetime.datetime.now()
+
+    stale = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+             "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+             "bbo_near_bid": 100.5, "bbo_near_ask": 101.5,
+             "bbo_far_bid": 97.5, "bbo_far_ask": 98.5,
+             "bbo_near_age_ms": 5000, "bbo_far_age_ms": 5000}
+    monitor._record_mts_entry_research_candidate(strat, stale, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "STALE_QUOTE"
+    assert captured[-1]["spread_z"] == 2.5      # z preserved
+    assert captured[-1]["entry_z"] == 1.0       # threshold preserved
+    assert captured[-1]["quote_age_ms"] == 5000
+
+    invalid_bbo = {"ts": 101.0, "session_type": "day", "near_close": 101.0,
+                   "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+                   "bbo_near_bid": 0, "bbo_near_ask": 101.5,
+                   "bbo_far_bid": 97.5, "bbo_far_ask": 98.5,
+                   "bbo_near_age_ms": 100, "bbo_far_age_ms": 100}
+    monitor._record_mts_entry_research_candidate(strat, invalid_bbo, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_INVALID"
+
+    ok_bar = {"ts": 102.0, "session_type": "day", "near_close": 101.0,
+              "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+              "bbo_near_age_ms": 100, "bbo_far_age_ms": 100,
+              "bbo_near_bid": 100.5, "bbo_near_ask": 101.5,
+              "bbo_far_bid": 97.5, "bbo_far_ask": 98.5}
+    monitor._record_mts_entry_research_candidate(strat, ok_bar, now)
+    assert captured[-1]["decision"] == "CANDIDATE"
+
+    assert len(captured) == 3
+
+
+def test_research_bbomissing_and_bbo_nonfinite_reasons(monkeypatch):
+    """BBO_MISSING (None value / partial BBO) and BBO_NONFINITE (NaN/Inf)
+    land in the ledger with their standardized reasons; no order path is
+    ever touched (the bare monitor has no order manager at all)."""
+    monitor = _bare_monitor_for_dynamics()
+    captured = []
+    import core.entry_research_store as store
+    import datetime
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    strat = type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None})()
+    now = datetime.datetime.now()
+
+    none_bbo = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+                "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+                "bbo_near_bid": None}
+    monitor._record_mts_entry_research_candidate(strat, none_bbo, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_MISSING"
+
+    partial_bbo = {"ts": 101.0, "session_type": "day", "near_close": 101.0,
+                   "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+                   "bbo_near_bid": 100.5, "bbo_near_ask": 101.5}
+    monitor._record_mts_entry_research_candidate(strat, partial_bbo, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_MISSING"
+
+    nan_bbo = {"ts": 102.0, "session_type": "day", "near_close": 101.0,
+               "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+               "bbo_near_bid": float("nan"), "bbo_near_ask": 101.5,
+               "bbo_far_bid": 97.5, "bbo_far_ask": 98.5}
+    monitor._record_mts_entry_research_candidate(strat, nan_bbo, now)
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_NONFINITE"
+
+    # zero order side effects
+    assert getattr(monitor, "order_mgr", None) is None
+
+    assert len(captured) == 3
+
+
+def test_research_ma_std_evolve_across_observations(monkeypatch):
+    """P1-C: rolling mean/std are recorded per observation — never a
+    silently static cached constant across independent candidates, and the
+    dynamics features evolve with them."""
+    monitor = _bare_monitor_for_dynamics()
+    captured = []
+    import core.entry_research_store as store
+    import datetime
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    strat = type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None})()
+    now = datetime.datetime.now()
+
+    bar1 = {"ts": 100.0, "session_type": "day", "near_close": 101.0,
+            "far_close": 98.0, "spread_z": 2.5, "entry_z": 1.0,
+            "spread_ma": 2.0, "spread_std": 0.8}
+    bar2 = {"ts": 101.0, "session_type": "day", "near_close": 102.0,
+            "far_close": 98.0, "spread_z": 3.1, "entry_z": 1.0,
+            "spread_ma": 2.6, "spread_std": 1.1}
+
+    monitor._update_mts_spread_dynamics(bar1)
+    monitor._record_mts_entry_research_candidate(strat, bar1, now)
+    monitor._update_mts_spread_dynamics(bar2)
+    monitor._record_mts_entry_research_candidate(strat, bar2, now)
+
+    assert captured[0]["spread_ma"] == 2.0
+    assert captured[0]["spread_std"] == 0.8
+    assert captured[1]["spread_ma"] == 2.6
+    assert captured[1]["spread_std"] == 1.1
+    assert captured[1]["dz"] is not None      # dynamics evolve per bar

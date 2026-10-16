@@ -29,6 +29,7 @@ def monitor(tmp_path, monkeypatch):
     m._use_order_manager = True
     from core.order_management.order_manager import OrderManager
     m.order_mgr = OrderManager(m.api)
+    m.order_mgr.get_fills = MagicMock(return_value=[MagicMock(status=OrderStatus.FILLED, is_open=True)])
     
     # 2026-06-23 Gemini CLI: Unconditionally override the registry with a mock to prevent method attribute errors
     m._registry = MagicMock()
@@ -40,13 +41,34 @@ def monitor(tmp_path, monkeypatch):
     m._far_tick_bars_deque = deque(maxlen=300)
     
     m._write_raw_tick = MagicMock()
+    m._mts_has_open_position_from_fills = MagicMock(return_value=True)
+    m._reconcile_disabled = True
     m._refresh_runtime_status = MagicMock()
     m._process_manual_trade_flag = MagicMock()
+    m._verify_split_brain_recovery = MagicMock()
     
     return m, state_path
 
 def test_live_stream_flash_spike(monitor):
     m, state_path = monitor
+    # 2026-08-06: pre-gate authority is the fills-ledger projection (7e1bb459),
+    # not the state file and not the legacy _mts_has_open_position_from_fills
+    # mock. Simulate an OPEN authority matching the simulated position so the
+    # gate PASSes; without it the projection reads ambient stale/shared fills
+    # (repo logs or /tmp) and force-resets the strategy (_peak -> 0).
+    from strategies.futures.mts_ledger_authority import MtsAuthority, MtsAuthorityState
+    m._ledger_projection = MagicMock()
+    m._ledger_projection.sync_from_ledger.return_value = 0
+    m._ledger_projection.snapshot.return_value = MtsAuthorityState(
+        status=MtsAuthority.OPEN,
+        trade_id="live-stream-t1",
+        near_qty=-1,
+        far_qty=1,
+        near_side="SHORT",
+        far_side="LONG",
+        near_entry=43900.0,
+        far_entry=44000.0,
+    )
     from strategies.plugins.futures.active.tmf_spread import TMFSpread
     strat = TMFSpread()
     
@@ -67,10 +89,14 @@ def test_live_stream_flash_spike(monitor):
 
     # 1. Setup Active Position
     strat._has_position = True
+    strat._trade_id = "live-stream-t1"
     strat._lifecycle = "TRAILING_LONG"
     strat._side = "LONG"
     strat._released_leg = "near"
     strat._far_entry = 44000.0
+    strat._single_leg_peak = 44000.0
+    strat._single_leg_nadir = 44000.0
+    strat._single_leg_post_fill_ticks = 2
     strat._peak = 44000.0
     # ADR-011 Phase 4: simulate warmup expiry (entered 1s ago)
     import time as _time
@@ -143,3 +169,33 @@ def test_live_stream_flash_spike(monitor):
         strat._reset()
         assert strat._has_position is False
         assert strat._peak == 0.0
+
+
+def test_far_tick_freshness_valid(monitor):
+    import time
+    m, _ = monitor
+    dt = datetime(2026, 5, 26, 17, 30, 0)
+    m.on_tick(None, ShioajiTickMock("TMFG6", dt, 44050.0))
+    assert f"{m.ticker}_FAR" in m.market_data
+    assert m.market_data[f"{m.ticker}_FAR"]["close"] == 44050.0
+    age = (time.time() - m.market_data[f"{m.ticker}_FAR"]["local_arrival_at"]) * 1000
+    assert age < 3000.0
+
+
+def test_far_tick_stale_rejection(monitor):
+    import time
+    m, _ = monitor
+    dt = datetime(2026, 5, 26, 17, 30, 0)
+    m.on_tick(None, ShioajiTickMock("TMFG6", dt, 44050.0))
+    m.market_data[f"{m.ticker}_FAR"]["local_arrival_at"] = time.time() - 5.0
+    m.on_tick(None, ShioajiTickMock("TMFF6", dt, 43900.0))
+    age_ms = (time.time() - m.market_data[f"{m.ticker}_FAR"]["local_arrival_at"]) * 1000
+    assert age_ms > 3000.0
+
+
+def test_far_tick_zero_or_none_safety(monitor):
+    m, _ = monitor
+    dt = datetime(2026, 5, 26, 17, 30, 0)
+    m.on_tick(None, ShioajiTickMock("TMFG6", dt, 0.0))
+    m.on_tick(None, ShioajiTickMock("TMFG6", dt, None))
+    assert m.market_data.get(f"{m.ticker}_FAR", {}).get("close") != 0.0

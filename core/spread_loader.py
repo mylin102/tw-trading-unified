@@ -19,11 +19,13 @@ from __future__ import annotations
 import os
 import glob
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from core.runtime_paths import runtime_path
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +38,15 @@ class SpreadLoader:
     """Loads far-month data from CSV and computes spread metrics for bar enrichment."""
 
     def __init__(self, data_dir: str | None = None):
-        self.data_dir = data_dir or DATA_DIR
+        self.data_dir = data_dir if data_dir is not None else runtime_path("data")
         self._far_df: pd.DataFrame | None = None   # far-month price series (from CSV)
         self._near_df: pd.DataFrame | None = None  # near-month price series (optional override)
         self._last_spread_data: dict[str, Any] = {}  # cached latest spread values
         self._csv_paths: dict[str, str] = {}  # { 'far': path, 'near': path }
         self._spread_csv_mtime: float | None = None  # for hot-reload detection
+        self._spread_fingerprint: tuple | None = None
+        self._last_refresh_error: str | None = None
+        self._last_successful_refresh: str | None = None
         # 2026-06-26 Gemini CLI: Store active ticker to eliminate silent default fallbacks
         self._ticker: str | None = None
 
@@ -62,13 +67,14 @@ class SpreadLoader:
         self._ticker = ticker.lower()
 
         # Try calendar spread CSV first (most complete)
+        candidates = self._spread_candidates(self._ticker)
         ok_spread = self._find_and_load("spread", self._ticker)
         if ok_spread:
-            # Record initial mtime for hot-reload detection
-            spread_path = self._csv_paths.get("spread")
-            if spread_path and os.path.exists(spread_path):
-                self._spread_csv_mtime = os.path.getmtime(spread_path)
             return True
+
+        # A present but invalid formal file must not silently select older raw inputs.
+        if candidates:
+            return False
 
         # Fallback: far + near
         ok_far = self._find_and_load("far", self._ticker)
@@ -77,6 +83,8 @@ class SpreadLoader:
 
     def get_spread_z(self, timestamp: pd.Timestamp | None = None) -> float | None:
         """Get the spread z-score at a given timestamp (or latest)."""
+        self._check_reload()
+        row = None
         if self._far_df is None or self._far_df.empty:
             return None
         ts = timestamp or self._far_df.index[-1]
@@ -103,10 +111,12 @@ class SpreadLoader:
         else:
             ts = timestamp or self._find_bar_timestamp(bar)
             row = self._get_row_at(ts)
-            if row is not None and not pd.isna(row.get("spread_z", np.nan)):
-                bar["spread_z"] = float(row["spread_z"])
-                bar["spread_ma"] = float(row.get("spread_ma", 0.0))
-                bar["spread_std"] = float(row.get("spread_std", 0.0))
+            if row is not None:
+                for key in ("spread_z", "spread_ma", "spread_std"):
+                    if key not in row.index:
+                        continue
+                    value = row.get(key, np.nan)
+                    bar[key] = None if pd.isna(value) else float(value)
                 # 2026-07-09 Hermes Agent: Enrich Spread EMA 20 and EMA 60 values
                 bar["spread_ema_20"] = float(row.get("spread_ema_20", 0.0))
                 bar["spread_ema_60"] = float(row.get("spread_ema_60", 0.0))
@@ -131,7 +141,7 @@ class SpreadLoader:
                 bar["spread_age_minutes"] = None
 
         # vwap_z: use from CSV if available (calendar spread CSV has it)
-        if "vwap_z" in row.index and not pd.isna(row.get("vwap_z", np.nan)):
+        if row is not None and "vwap_z" in row.index and not pd.isna(row.get("vwap_z", np.nan)):
             bar["vwap_z"] = float(row["vwap_z"])
         elif "vwap_z" not in bar or bar["vwap_z"] is None:
             bar["vwap_z"] = self._calc_vwap_z(bar)
@@ -159,18 +169,94 @@ class SpreadLoader:
     # ── Loading ─────────────────────────────────────────────────────────
 
     def _check_reload(self) -> None:
-        """Hot-reload: if a newer CSV file exists (mtime changed), re-load it."""
-        spread_path = self._csv_paths.get("spread")
-        if spread_path and os.path.exists(spread_path):
-            current_mtime = os.path.getmtime(spread_path)
-            if current_mtime != getattr(self, '_spread_csv_mtime', None):
-                self._spread_csv_mtime = current_mtime
-                logger.info(f"[SpreadLoader] CSV changed, hot-reloading: {spread_path}")
-                self._far_df = None  # force reload
-                # 2026-06-26 Gemini CLI: use stored ticker for hot-reload, fail loud if missing
-                if not self._ticker:
+        """Reload the newest valid formal CSV or a changed atomic replacement."""
+        if not self._ticker:
+            spread_path = self._csv_paths.get("spread")
+            if spread_path and os.path.exists(spread_path):
+                current_mtime = os.path.getmtime(spread_path)
+                if current_mtime != self._spread_csv_mtime:
                     raise ValueError("[SpreadLoader] Cannot hot-reload because no ticker is cached in the loader.")
-                self._find_and_load("spread", self._ticker)
+            return
+        candidates = self._spread_candidates(self._ticker)
+        if not candidates:
+            if self._csv_paths.get("spread"):
+                self._last_refresh_error = "No valid formal calendar spread CSV found"
+            return
+        spread_path = candidates[-1][1]
+        fingerprint = self._file_fingerprint(spread_path)
+        if (spread_path == self._csv_paths.get("spread")
+                and fingerprint == self._spread_fingerprint):
+            return
+        self._find_and_load("spread", self._ticker)
+
+    def _spread_candidates(self, ticker: str) -> list[tuple[datetime, str]]:
+        pattern = re.compile(
+            rf"^{re.escape(ticker.lower())}_calendar_spread_(\d{{8}})\.csv$"
+        )
+        candidates = []
+        try:
+            names = os.listdir(self.data_dir)
+        except OSError:
+            return candidates
+        for name in names:
+            match = pattern.fullmatch(name)
+            if not match:
+                continue
+            try:
+                day = datetime.strptime(match.group(1), "%Y%m%d")
+            except ValueError:
+                continue
+            path = os.path.join(self.data_dir, name)
+            if os.path.isfile(path):
+                candidates.append((day, path))
+        return sorted(candidates)
+
+    @staticmethod
+    def _file_fingerprint(path: str) -> tuple:
+        stat = os.stat(path)
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    @staticmethod
+    def _validate_spread_frame(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            raise ValueError("calendar spread CSV is empty")
+        ts_col = next((c for c in ("ts", "timestamp", "datetime") if c in df.columns), None)
+        required = ("Close_near", "Close_far", "spread", "spread_ma", "spread_std", "spread_z")
+        missing = [c for c in required if c not in df.columns]
+        if ts_col is None or missing:
+            raise ValueError(f"calendar spread schema invalid: timestamp={ts_col}, missing={missing}")
+        parsed_ts = pd.to_datetime(df[ts_col], errors="coerce")
+        if parsed_ts.isna().any():
+            raise ValueError("calendar spread timestamp invalid")
+        df = df.copy()
+        for column in required:
+            original = df[column]
+            numeric = pd.to_numeric(original, errors="coerce")
+            malformed = numeric.isna() & original.notna() & original.astype(str).str.strip().ne("")
+            if malformed.any():
+                raise ValueError(f"calendar spread numeric field invalid: {column}")
+            if column in ("Close_near", "Close_far", "spread") and numeric.isna().any():
+                raise ValueError(f"calendar spread required quote missing: {column}")
+            if numeric.notna().any() and not np.isfinite(numeric.dropna()).all():
+                raise ValueError(f"calendar spread numeric field non-finite: {column}")
+            df[column] = numeric
+        df[ts_col] = parsed_ts
+        df = df.set_index(ts_col)
+        if df.index.has_duplicates or not df.index.is_monotonic_increasing:
+            raise ValueError("calendar spread timestamps must be unique and ordered")
+        rows = np.arange(len(df))
+        warmup_or_zero_std = (rows < 19) | df["spread_std"].eq(0).to_numpy()
+        for column in ("spread_ma", "spread_std"):
+            invalid = df[column].isna().to_numpy() & (rows >= 19)
+            if invalid.any():
+                raise ValueError(f"calendar spread rolling field incomplete: {column}")
+        invalid_z = df["spread_z"].isna().to_numpy() & ~warmup_or_zero_std
+        if invalid_z.any():
+            raise ValueError("calendar spread Z missing after warmup with nonzero std")
+        zero_std_has_z = df["spread_z"].notna().to_numpy() & df["spread_std"].eq(0).to_numpy()
+        if zero_std_has_z.any():
+            raise ValueError("calendar spread Z must be undefined when std is zero")
+        return df
 
     def _find_and_load(self, prefix: str, ticker: str | None = None) -> bool:
         """Find CSV matching the prefix and load it.
@@ -183,44 +269,50 @@ class SpreadLoader:
             raise ValueError("[SpreadLoader] Ticker must be explicitly provided. Silent fallbacks are forbidden.")
         _t_prefix = ticker.lower()
         if prefix == "spread":
-            pattern = os.path.join(self.data_dir, f"{_t_prefix}_calendar_spread_*.csv")
+            candidates = self._spread_candidates(_t_prefix)
+            files = [path for _, path in candidates]
         else:
             pattern = os.path.join(self.data_dir, f"{_t_prefix}_{prefix}_*.csv")
-        files = sorted(glob.glob(pattern))
+            files = sorted(glob.glob(pattern))
         if not files:
+            if prefix == "spread":
+                self._last_refresh_error = "No valid formal calendar spread CSV found"
             logger.warning(f"[SpreadLoader] No CSV files found for prefix={prefix}, ticker={_t_prefix} in {self.data_dir}")
             return False
 
-        csv_path = files[-1]  # latest by filename sort
-        self._csv_paths[prefix] = csv_path
-        df = pd.read_csv(csv_path)
-
-        # Normalize timestamp column
-        ts_col = None
-        for candidate in ["ts", "timestamp", "datetime"]:
-            if candidate in df.columns:
-                ts_col = candidate
-                break
-
-        if ts_col is None:
-            logger.warning(f"[SpreadLoader] No timestamp column in {csv_path}: cols={list(df.columns)}")
+        csv_path = files[-1]
+        try:
+            before = self._file_fingerprint(csv_path) if prefix == "spread" else None
+            df = pd.read_csv(csv_path)
+            if prefix == "spread":
+                df = self._validate_spread_frame(df)
+                after = self._file_fingerprint(csv_path)
+                if before != after:
+                    raise OSError("calendar spread replaced while being read")
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            if prefix == "spread":
+                self._last_refresh_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(f"[SpreadLoader] Rejected {csv_path}: {exc}")
             return False
 
-        df = df.copy()
-        # Handle nanosecond timestamps
-        sample = df[ts_col].iloc[0]
-        if isinstance(sample, (int, float)) and sample > 1e15:
-            # nanosecond epoch
-            df[ts_col] = pd.to_datetime(df[ts_col], unit="ns", errors="coerce")
-        else:
+        if prefix != "spread":
+            ts_col = next((c for c in ("ts", "timestamp", "datetime") if c in df.columns), None)
+            if ts_col is None:
+                logger.warning(f"[SpreadLoader] No timestamp column in {csv_path}: cols={list(df.columns)}")
+                return False
+            df = df.copy()
             df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
-
-        df = df.dropna(subset=[ts_col]).set_index(ts_col)
+            df = df.dropna(subset=[ts_col]).set_index(ts_col)
         df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
 
         if prefix == "spread":
             # Calendar spread CSV has pre-computed spread_z, vwap_z
             self._far_df = df  # store in _far_df for lookup
+            self._csv_paths[prefix] = csv_path
+            self._spread_fingerprint = after
+            self._spread_csv_mtime = os.path.getmtime(csv_path)
+            self._last_successful_refresh = datetime.now(timezone.utc).isoformat()
+            self._last_refresh_error = None
             logger.info(f"[SpreadLoader] Loaded calendar spread: {csv_path} ({len(df)} rows, "
                         f"cols={list(df.columns)})")
         elif prefix == "far":
@@ -320,6 +412,7 @@ class SpreadLoader:
         self._far_df = None
         self._near_df = None
         self._csv_paths = {}
+        self._spread_fingerprint = None
 
     def status(self) -> dict[str, Any]:
         return {
@@ -328,6 +421,8 @@ class SpreadLoader:
             "rows": len(self._far_df) if self._far_df is not None else 0,
             "near_rows": len(self._near_df) if self._near_df is not None else 0,
             "last_spread_z": self._last_spread_data.get("spread_z"),
+            "last_refresh_error": self._last_refresh_error,
+            "last_successful_refresh": self._last_successful_refresh,
         }
 
 

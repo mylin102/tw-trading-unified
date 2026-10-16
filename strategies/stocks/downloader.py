@@ -1,13 +1,14 @@
-import os
+import sys
 import pandas as pd
 from pathlib import Path
 from datetime import timedelta
-import shioaji as sj
-from dotenv import load_dotenv
 import yaml
 
 # Ensure project root is in path
-ROOT = Path(__file__).parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 DATA_DIR = ROOT / "data" / "taifex_raw"
 
 class StockDownloader:
@@ -19,6 +20,7 @@ class StockDownloader:
         interval: "5m" or "1d"
         """
         suffix = "5m" if interval == "5m" else "1d"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         file_path = DATA_DIR / f"STOCK_{ticker}_{suffix}.csv"
         
         # 1. 決定開始日期
@@ -39,9 +41,18 @@ class StockDownloader:
             except Exception as e:
                 print(f"⚠️ Error reading {file_path}: {e}. Restarting from scratch.")
 
-        # 2. 抓取數據 (使用整股 Kbars，預設為 1分鐘)
+        # 2. 抓取數據 (使用整股 Kbars)
         try:
-            contract = self.api.Contracts.Stocks[ticker]
+            contract = None
+            if hasattr(self.api, "contracts") and hasattr(self.api.contracts, "Stocks"):
+                contract = getattr(self.api.contracts.Stocks, ticker, None) or self.api.contracts.Stocks.get(ticker)
+            if contract is None and hasattr(self.api, "Contracts") and hasattr(self.api.Contracts, "Stocks"):
+                contract = self.api.Contracts.Stocks[ticker]
+            
+            if contract is None:
+                print(f"⚠️ {ticker}: Contract not found in Stocks contracts. Skipping.")
+                return
+
             kbars = self.api.kbars(contract, start=start_date)
             new_df = pd.DataFrame({**kbars})
             
@@ -49,7 +60,7 @@ class StockDownloader:
                 print(f"✅ {ticker}: Already up to date.")
                 return
 
-            new_df.ts = pd.to_datetime(new_df.ts)
+            new_df["ts"] = pd.to_datetime(new_df["ts"])
             # 標準化欄位名稱與 tw-trading-unified 一致
             new_df = new_df.rename(columns={
                 "ts": "Date", "Open": "Open", "High": "High", 
@@ -71,20 +82,21 @@ class StockDownloader:
             print(f"❌ Failed to update {ticker}: {e}")
 
 def run_update_all():
-    load_dotenv(override=True)
-    user_id = os.getenv('SHIOAJI_API_KEY') or os.getenv('SHIOAJI_PERSON_ID')
-    password = os.getenv('SHIOAJI_SECRET_KEY') or os.getenv('SHIOAJI_PASSWD')
+    """
+    2026-08-18 Gemini CLI: 統一採用 core.shioaji_session.get_api() 獲取已認證 Session (SSOT)，
+    修復 Shioaji.login() unexpected keyword argument contracts_timeout 錯誤。
+    """
+    from core.shioaji_session import get_api
+    # Resident stock code must share the one session authority.  A failed
+    # shared login is fail-closed; never create a second Shioaji owner here.
+    api = get_api()
 
     # Load watchlist from config
     with open(ROOT / "config" / "stocks.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     watchlist = cfg.get("stocks", {}).get("watchlist", [])
 
-    api = sj.Shioaji()
-    api.login(user_id, password, contracts_timeout=10000)
-    
     downloader = StockDownloader(api)
-    
     print(f"🔍 Found {len(watchlist)} tickers in watchlist.")
     
     for t in watchlist:
@@ -92,8 +104,6 @@ def run_update_all():
         downloader.update_ticker(t, interval="5m")
         # 下載日線 (CANSLIM 必備)
         downloader.update_ticker(t, interval="1d")
-        
-    api.logout()
 
 if __name__ == "__main__":
     run_update_all()

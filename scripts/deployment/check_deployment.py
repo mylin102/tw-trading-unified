@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Deployment Safety Gate — non-applied pre-deploy check (CLI).
+
+Usage:
+  python3 scripts/deployment/check_deployment.py \
+      --release-dir <repo> \
+      --runtime-dir <TRADING_RUNTIME_DIR> \
+      --pid-file <pm2 pid file> \
+      --position-state <runtime>/logs/position_state.json \
+      --monitor strategies/futures/monitor.py \
+      --session-generation <n> \
+      --margin-available <float> \
+      [--expected-sha <40-hex>] [--manifest PHASE1_RC_CANDIDATE.md] [--json]
+
+Exit code 0 = READY (all guards pass); 1 = NOT_READY (refusal codes printed).
+The gate NEVER deploys/restarts/unlocks LIVE.
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+_CLOSURE = [
+    "config/futures.yaml",
+    "core/execution_context_state.py",
+    "core/release_identity.py",
+    "main.py",
+    "strategies/futures/monitor.py",
+    "strategies/futures/squeeze_futures/data/shioaji_client.py",
+]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--release-dir", default=str(_REPO_ROOT))
+    ap.add_argument("--runtime-dir", default=None)
+    ap.add_argument("--pid-file", required=True)
+    ap.add_argument("--position-state", required=True)
+    ap.add_argument("--monitor", default=None)
+    ap.add_argument("--session-generation", default=None,
+                    help="registry-bound 32-hex token; when omitted in "
+                         "post_startup, read execution_context.json")
+    ap.add_argument("--margin-available", type=float, default=None)
+    ap.add_argument("--margin-evidence", default=None,
+                    help="path to the read-only preflight JSON carrying "
+                         "account_identity_hash/scope/captured_at/"
+                         "canonical_input_hash (bare --margin-available "
+                         "is insufficient)")
+    ap.add_argument("--config-profile", default=None,
+                    help="path to the sealed live config profile "
+                         "(config/futures_live.yaml)")
+    ap.add_argument("--config-hash", default=None,
+                    help="sha256 of the sealed live config profile "
+                         "(recorded at certification)")
+    ap.add_argument("--expected-sha", default=None)
+    ap.add_argument("--manifest", action="append", default=[])
+    ap.add_argument("--exclude-path", action="append", default=[])
+    ap.add_argument("--phase", choices=["pre_deploy", "post_startup"],
+                    default="pre_deploy")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--allow-existing-mts-position", action="store_true", help="Allow an exactly reconciled MTS spread during deployment")
+    args = ap.parse_args()
+
+    session_generation = args.session_generation
+    if session_generation is None and args.phase == "post_startup":
+        runtime_root = args.runtime_dir or os.environ.get(
+            "TRADING_RUNTIME_DIR", "")
+        try:
+            with open(Path(runtime_root) / "execution_context.json",
+                      encoding="utf-8") as _ctx_fh:
+                session_generation = json.load(_ctx_fh).get("session_id")
+        except (OSError, json.JSONDecodeError, TypeError):
+            # The gate remains fail-closed: an unreadable/missing ctx leaves
+            # the generation as None and guard_session_generation refuses it.
+            session_generation = None
+
+    from core.deployment_safety_gate import (
+    check_deployment, aggregate_gate_groups)
+
+    margin_evidence = None
+    if args.margin_evidence:
+        import json as _json
+        with open(args.margin_evidence, encoding="utf-8") as _fh:
+            _ev = _json.load(_fh)
+        margin_evidence = {k: _ev.get(k) for k in (
+            "account_identity_hash", "scope", "captured_at",
+            "canonical_input_hash")}
+        # the margin VALUE comes from the SAME evidence JSON — a bare CLI
+        # --margin-available must never pass (the evidence is the single
+        # source of truth; missing value => fail-closed UNAVAILABLE)
+        args.margin_available = _ev.get("available_margin")
+
+    manifests = args.manifest or [
+        str(_REPO_ROOT / "PHASE1_RC_CANDIDATE.md"),
+        str(_REPO_ROOT / "PHASE2_DEPLOYMENT_MANIFEST.md"),
+        str(_REPO_ROOT / "PHASE1_FINAL_FREEZE.md"),
+    ]
+    # exclude-self: the manifest/rollback docs are excluded from the tree
+    # identity (recording the freeze must not invalidate itself)
+    exclude = args.exclude_path or [
+        "PHASE1_RC_CANDIDATE.md", "PHASE2_DEPLOYMENT_MANIFEST.md",
+        "PHASE1_FINAL_FREEZE.md",
+    ]
+    check = check_deployment(
+        release_dir=args.release_dir,
+        closure_files=_CLOSURE,
+        runtime_dir=args.runtime_dir,
+        pid_file=args.pid_file,
+        position_state_path=args.position_state,
+        monitor_path=args.monitor
+        or str(_REPO_ROOT / "strategies/futures/monitor.py"),
+        session_generation=session_generation,
+        margin_available=args.margin_available,
+        margin_evidence=margin_evidence,
+        config_profile_path=args.config_profile,
+        config_profile_hash=args.config_hash,
+        manifest_paths=manifests,
+        manifest_exclude_paths=exclude,
+        expected_sha=args.expected_sha,
+        phase=args.phase,
+        allow_existing_mts_position=args.allow_existing_mts_position,
+    )
+    if args.json:
+        print(json.dumps({
+            "ok": check.ok,
+            "refusal_codes": list(check.refusal_codes),
+            "aggregates": aggregate_gate_groups(check.results, args.phase),
+            "guards": [
+                {"guard": g.guard, "ok": g.ok, "reasons": list(g.reasons),
+                 "detail": g.detail} for g in check.results
+            ],
+        }, indent=2, ensure_ascii=False))
+    else:
+        _mark_map = {"PASS": "PASS", "REFUSED": "FAIL",
+                     "NOT_ASSESSED": "N/A"}
+        for _name, _agg in aggregate_gate_groups(
+                check.results, args.phase).items():
+            _mark = _mark_map.get(_agg["status"], "FAIL")
+            _ref = (f"  refusals={",".join(_agg["refusals"])}"
+                    if _agg["refusals"] else "")
+            print(f"[{_mark}] GATE {_name}: {_agg["status"]}{_ref}")
+        for g in check.results:
+            mark = "PASS" if g.ok else "FAIL"
+            print(f"[{mark}] {g.guard}: {g.reasons or 'ok'}"
+                  f"{'  ' + g.detail if g.detail else ''}")
+        if check.ok:
+            # D3: explicit phase-specific verdict — pre_deploy READY is
+            # READY_FOR_STARTUP (never to be confused with a deploy READY);
+            # machine-readable phase= label for the deployment script
+            if args.phase == "pre_deploy":
+                print("phase=READY_FOR_STARTUP")
+            else:
+                print("phase=READY")
+        else:
+            print(f"phase=NOT_READY refusal_codes={list(check.refusal_codes)}")
+        # D6: stock-account rows stay warning/evidence (never block MTS
+        # futures flat unless global-risk policy)
+        flat = next((g for g in check.results if g.guard == "flat_snapshot"),
+                    None)
+        if flat is not None and "stock row" in flat.detail:
+            print(f"WARNING {flat.detail}")
+    return 0 if check.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

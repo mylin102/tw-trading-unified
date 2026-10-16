@@ -10,11 +10,28 @@ from __future__ import annotations
 import logging
 import os
 import json
+import tempfile
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, field
 
 from core.order_management.order import Order, OrderStatus, OrderType, OrderSide
+from core.order_lifecycle_reconciler import reconcile_order
+
+
+# Only stable, operator-safe codes produced by the live submission adapter may
+# cross this boundary.  Exception objects can originate in third-party code;
+# never surface arbitrary ``.code`` values in lifecycle events or dashboards.
+_SAFE_ADAPTER_SUBMISSION_REASONS = frozenset({
+    "ADAPTER_ORDER_OBJECT_INVALID",
+    "ADAPTER_ORDER_NO_TRADE",
+    "ADAPTER_ORDER_REJECTED",
+    "ADAPTER_ORDER_PLACE_FAILED",
+    "ORDER_PREMISE_MISSING",
+    "BROKER_QUERY_UNAVAILABLE",
+    "BROKER_PREMISE_MISMATCH",
+})
 
 
 # ── Live Order Hard Gate ───────────────────────────────────────────────────
@@ -38,8 +55,12 @@ def _get_live_gate():
     return _mode_transition_gate == "loaded"
 
 
-def _assert_live_allowed(execution_context) -> None:
-    """Thin wrapper: calls execution_context.assert_live_order_allowed()."""
+def _assert_live_allowed(execution_context, order=None) -> None:
+    """Second layer at the canonical OrderManager submission boundary."""
+    checker = getattr(execution_context, "assert_order_allowed", None)
+    if callable(checker):
+        checker(order, method="place_order")
+        return
     execution_context.assert_live_order_allowed()
 
 
@@ -102,6 +123,9 @@ class OrderManager:
             self._session_source = "wall_clock_fallback"
         self._next_id = 1
         self.broker_adapter = broker_adapter
+        # LIVE order channels are fail-closed until the monitor has published
+        # a successful update_status -> list_trades refresh generation.
+        self._broker_refresh_channel_state = "HEALTHY"
 
         # 2026-07-07 Hermes Agent: reindex from disk immediately after init
         # so the counter survives PM2 restart even before the first caller
@@ -134,12 +158,21 @@ class OrderManager:
 
     @staticmethod
     def _payload_to_dict(payload) -> Optional[Dict[str, Any]]:
+        # 2026-10-01 codex: SDK OrderEventDict is dict-like, not a Mapping.
+        # Use the same protocol check for the callback and nested event structs.
+        def is_mapping(value):
+            return isinstance(value, Mapping) or (
+                callable(getattr(value, "items", None))
+                and callable(getattr(value, "keys", None))
+                and callable(getattr(value, "__getitem__", None))
+            )
+
         def serialize(value):
             if value is None or isinstance(value, (str, int, float, bool)):
                 return value
             if isinstance(value, datetime):
                 return value.isoformat()
-            if isinstance(value, dict):
+            if is_mapping(value):
                 return {key: serialize(item) for key, item in value.items()}
             if isinstance(value, (list, tuple, set)):
                 return [serialize(item) for item in value]
@@ -155,7 +188,7 @@ class OrderManager:
 
         if payload is None:
             return None
-        if isinstance(payload, dict):
+        if is_mapping(payload):
             return serialize(payload)
         if hasattr(payload, "__dict__"):
             return serialize(payload)
@@ -188,6 +221,7 @@ class OrderManager:
         deal_id: Optional[str] = None,
         fill_price: Optional[float] = None,
         fill_qty: int = 0,
+        observation_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         entry = {
             "type": event_type,
@@ -204,6 +238,11 @@ class OrderManager:
             "fill_price": fill_price,
             "fill_qty": fill_qty,
         }
+        if observation_type:
+            entry["observation_type"] = observation_type
+            entry["observed_at"] = entry["timestamp"]
+            entry["normalization_result"] = "ACCEPTED"
+            entry["rejection_reason"] = None
         payload_dict = self._payload_to_dict(payload)
         if payload_dict is not None:
             entry["payload"] = payload_dict
@@ -246,22 +285,59 @@ class OrderManager:
         truth_source: str = "",
         combo_legs: Optional[List[Dict[str, Any]]] = None,
         combo_strategy: str = "",
+        reconciliation_id: Optional[str] = None,
     ) -> Order:
         """建立新委託單，狀態→ PENDING_SUBMIT"""
+        # A reconciled position may only create the two exact closing orders
+        # carried by its capability.  Refuse before creating local lifecycle
+        # state: entries, OCO brackets (which require cancel), and duplicate
+        # retries are not harmless bookkeeping in EXIT_ONLY.
+        _exit_ctx = getattr(self, "execution_context", None)
+        _exit_cap = getattr(_exit_ctx, "exit_only_capability", None)
+        _exit_only = (getattr(_exit_ctx, "effective_mode", None)
+                      == "reconciled_exit_only")
+        if _exit_only:
+            from core.mode_transition import LiveOrderBlocked
+            if strategy not in ("MTS_EXIT", "MTS_RELEASE"):
+                raise LiveOrderBlocked("EXIT_ONLY_STRATEGY_BLOCKED")
+            if not isinstance(_exit_cap, dict):
+                raise LiveOrderBlocked("EXIT_ONLY_CAPABILITY_MISSING")
+            _rid = _exit_cap.get("reconciliation_id")
+            _side = getattr(side, "value", side)
+            _allowed = any(
+                isinstance(item, dict)
+                and item.get("symbol") == symbol
+                and str(item.get("side", "")).lower() == str(_side).lower()
+                and item.get("remaining_qty") == quantity
+                for item in _exit_cap.get("allowed_orders", ()))
+            if not _allowed:
+                raise LiveOrderBlocked("EXIT_ONLY_ORDER_SCOPE_MISMATCH")
+            _issued = list(self.active_orders.values()) + list(self.completed)
+            if any(getattr(item, "reconciliation_id", None) == _rid
+                   and item.symbol == symbol and item.side == side
+                   for item in _issued):
+                raise LiveOrderBlocked("EXIT_ONLY_ORDER_ALREADY_ISSUED")
+        # 2026-08-03 Gemini CLI: Dynamically check and sync session date on order creation
+        try:
+            from core.date_utils import get_session_date_str
+            _cur_sess = get_session_date_str()
+            if _cur_sess and _cur_sess != self._session_date:
+                self._session_date = _cur_sess
+                self.reindex_orders()
+        except Exception:
+            pass
         # 2026-07-07 Hermes Agent: session_date-based order ID.
         # Format: ORD-{session_date}-{counter:06d}
         # Counter resets per trading session, persists across PM2 restarts
         # via reindex_orders() scanning existing orders for current session.
-        order_id = f"ORD-{self._session_date}-{self._next_id:06d}"
-        self._next_id += 1
-
-        # 2026-07-07 Hermes Agent: collision guard — skip IDs that already
-        # exist in active_orders or completed (counter may backtrack after
-        # PM2 restart if reindex_orders wasn't called yet).
+        # Reserve from a durable, session-independent sequence before creating
+        # the order.  The date remains useful for operators, but never defines
+        # uniqueness: a new trading session must not reuse yesterday's suffix.
         _existing_ids = set(self.active_orders.keys()) | {o.order_id for o in self.completed}
-        while order_id in _existing_ids:
-            order_id = f"ORD-{self._session_date}-{self._next_id:06d}"
-            self._next_id += 1
+        while True:
+            order_id = self._reserve_order_id()
+            if order_id not in _existing_ids:
+                break
 
         order = Order(
             symbol=symbol,
@@ -277,8 +353,15 @@ class OrderManager:
             truth_source=truth_source,
             combo_legs=combo_legs,
             combo_strategy=combo_strategy,
+            reconciliation_id=reconciliation_id,
         )
         self.active_orders[order_id] = order
+        # [RECONCILED_EXIT_ONLY] stamp exit-class orders with the active
+        # capability so the adapter gate can authorize them
+        # (default-deny otherwise).  Entry-class orders are never stamped.
+        if (_exit_only and isinstance(_exit_cap, dict)
+                and isinstance(_exit_cap.get("reconciliation_id"), str)):
+            order.reconciliation_id = _exit_cap["reconciliation_id"]
         return order
 
     def _resolve_order(
@@ -319,7 +402,7 @@ class OrderManager:
         if isinstance(value, OrderStatus):
             return value
 
-        normalized = str(value).strip().lower()
+        normalized = str(value).strip().split(".")[-1].lower()
         mapping = {
             "pendingsubmit": OrderStatus.PENDING_SUBMIT,
             "pending_submit": OrderStatus.PENDING_SUBMIT,
@@ -333,7 +416,11 @@ class OrderManager:
             "filled": OrderStatus.FILLED,
             "cancelled": OrderStatus.CANCELLED,
             "canceled": OrderStatus.CANCELLED,
-            "failed": OrderStatus.REJECTED,
+            # Failed/Inactive are broker evidence labels, not proof that a
+            # local order was rejected.  The canonical reconciler promotes
+            # them only after zero-deal + unchanged-baseline evidence.
+            "failed": OrderStatus.UNKNOWN,
+            "inactive": OrderStatus.UNKNOWN,
             "rejected": OrderStatus.REJECTED,
             "expired": OrderStatus.EXPIRED,
         }
@@ -350,6 +437,7 @@ class OrderManager:
         raw_status=None,
         source: str = "",
         reason: str = "",
+        observation_type: Optional[str] = None,
     ) -> Order:
         order = self._resolve_order(order_id)
         if order is None:
@@ -365,7 +453,12 @@ class OrderManager:
         ordno = ordno or getattr(broker_trade, "ordno", None) or broker_order_id
         seqno = seqno or getattr(broker_trade, "seqno", None)
         submit_status = self._normalize_raw_status(raw_status) or OrderStatus.SUBMITTED
-        exchange_id = ordno or broker_order_id or order.exchange_order_id or order.order_id
+        # ``seqno`` is a broker-issued submission receipt.  A seqno-only
+        # acknowledgement must stay traceable, but our local ``order_id`` is
+        # never a legitimate exchange identity and must not be fabricated.
+        exchange_id = ordno or broker_order_id or seqno or order.exchange_order_id
+        if exchange_id is None:
+            raise ValueError("broker submission receipt has no identity")
 
         if order.status == OrderStatus.PENDING_SUBMIT:
             order.submit(
@@ -395,6 +488,7 @@ class OrderManager:
             broker_order_id=broker_order_id,
             seqno=seqno,
             ordno=ordno,
+            observation_type=observation_type or "PLACE_RECEIPT",
         )
         self._emit("on_status_change", OrderEvent(
             order_id=order.order_id,
@@ -420,6 +514,7 @@ class OrderManager:
         seqno: Optional[str] = None,
         ordno: Optional[str] = None,
         source: str = "",
+        observation_type: Optional[str] = None,
     ) -> Optional[Order]:
         order = self._resolve_order(order_id, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
         if order is None:
@@ -427,6 +522,22 @@ class OrderManager:
 
         normalized = self._normalize_raw_status(raw_status)
         if normalized is None:
+            return order
+
+        # Broker position reconciliation is authoritative for a filled order.
+        # Shioaji may later replay an older PendingSubmit/Submitted receipt;
+        # never regress the local terminal state or its fill quantity.
+        if (order.status == OrderStatus.FILLED
+                and normalized != OrderStatus.FILLED):
+            self._record_audit(
+                order, "order_update_ignored", source=source or "order_update",
+                reason="STALE_RECEIPT_AFTER_BROKER_POSITION_FILL",
+                from_status=order.status, to_status=order.status,
+                raw_status=raw_status, payload=raw_payload,
+                broker_order_id=broker_order_id or order.broker_order_id,
+                seqno=seqno or order.seqno, ordno=ordno or order.ordno,
+                observation_type=observation_type,
+            )
             return order
 
         previous_status = order.status
@@ -445,6 +556,7 @@ class OrderManager:
             broker_order_id=order.broker_order_id,
             seqno=order.seqno,
             ordno=order.ordno,
+            observation_type=observation_type,
         )
 
         if normalized in (OrderStatus.PENDING_SUBMIT, OrderStatus.PRE_SUBMITTED, OrderStatus.SUBMITTED):
@@ -483,6 +595,21 @@ class OrderManager:
             ))
             return order
 
+        if normalized == OrderStatus.UNKNOWN:
+            # Failed/Inactive callback labels are retained as ambiguous until
+            # the canonical reconciler has zero-deal and baseline evidence.
+            order.status = OrderStatus.UNKNOWN
+            order.updated_at = datetime.now()
+            self._record_audit(
+                order, "order_pending", source=source or "order_update",
+                reason=reason or "BROKER_TERMINAL_EVIDENCE_INCOMPLETE",
+                from_status=previous_status, to_status=order.status,
+                raw_status=raw_status, payload=raw_payload,
+                broker_order_id=order.broker_order_id,
+                seqno=order.seqno, ordno=order.ordno,
+            )
+            return order
+
         if normalized == OrderStatus.CANCELLED:
             if order.order_id in self.active_orders:
                 self.cancel(order.order_id, reason=reason, source=source or "order_update")
@@ -500,7 +627,45 @@ class OrderManager:
 
         return order
 
+    def _mark_broker_terminal_without_details(
+        self, order: Order, *, filled_qty=None, raw_payload=None,
+        source="", reason="DETAILS_PENDING",
+    ) -> Optional[Order]:
+        """Commit broker Filled without inventing a price/PnL.
+
+        A refreshed Trade can be terminal while its deal detail is delayed.
+        The order lifecycle must stop retrying immediately, but accounting
+        remains explicitly incomplete until a deal observation arrives.
+        """
+        if order is None:
+            return None
+        try:
+            if filled_qty is not None and isinstance(filled_qty, int) \
+                    and not isinstance(filled_qty, bool) \
+                    and 0 <= filled_qty <= order.quantity:
+                order.filled_quantity = max(order.filled_quantity, filled_qty)
+        except (TypeError, ValueError):
+            pass
+        previous = order.status
+        order.status = OrderStatus.FILLED
+        order.fill_accounting_status = "DETAILS_PENDING"
+        order.updated_at = datetime.now()
+        self._record_audit(
+            order, "order_terminal", source=source or "reconcile",
+            reason=reason, from_status=previous, to_status=order.status,
+            raw_status="Filled", payload=raw_payload,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno, ordno=order.ordno)
+        if order.order_id in self.active_orders:
+            del self.active_orders[order.order_id]
+            self.completed.append(order)
+        return order
+
     # ── Submit ──
+
+    def set_broker_refresh_channel_state(self, state: str) -> None:
+        self._broker_refresh_channel_state = (
+            state if state in ("HEALTHY", "UNCERTAIN") else "UNCERTAIN")
 
     def submit(self, order: Order, exchange_ordno: Optional[str] = None) -> bool:
         """
@@ -509,17 +674,24 @@ class OrderManager:
         - Live: 透過 broker_adapter.place_order() 送單
         """
         # ── P0 Hard Gate: Second layer defense ──
+        if (self.mode == "live"
+                and getattr(self, "_broker_refresh_channel_state", "HEALTHY")
+                != "HEALTHY"):
+            self.reject(order.order_id, reason="BROKER_REFRESH_UNCERTAIN",
+                        source="refresh_channel_gate")
+            return False
         if self.mode == "live" and self.execution_context is not None:
             try:
-                _assert_live_allowed(self.execution_context)
+                _assert_live_allowed(self.execution_context, order)
             except Exception as exc:
-                order.status = OrderStatus.REJECTED
-                order.reject_reason = str(exc)
-                self._emit("on_reject", OrderEvent(
-                    order_id=order.order_id, status=OrderStatus.REJECTED,
-                    symbol=order.symbol, side=order.side,
-                    reason=str(exc),
-                ))
+                # Preserve an in-process capability refusal verbatim; it is
+                # a finite local code, unlike third-party exception text.
+                _reason = getattr(exc, "reason", None)
+                if not (isinstance(_reason, str)
+                        and _reason.startswith("EXIT_ONLY_")):
+                    _reason = "LIVE_ORDER_AUTHORIZATION_FAILED"
+                self.reject(order.order_id, reason=_reason,
+                            source="authorization_gate")
                 return False
 
         # ── Paper Drain Gate: Block any order during drain ──
@@ -542,9 +714,52 @@ class OrderManager:
             raise ValueError(f"Order {order.order_id} already submitted (status={order.status.value})")
 
         if self.mode == "live":
+            if getattr(order, "combo_legs", None):
+                return self._submit_live_combo(order)
             return self._submit_live(order)
         else:
             return self._submit_paper(order, exchange_ordno)
+
+    def _submit_live_combo(self, order: Order) -> bool:
+        """Submit a combo lifecycle order as one broker transaction."""
+        if self.broker_adapter is None:
+            raise RuntimeError("Live combo orders require broker_adapter")
+        submit_combo = getattr(self.broker_adapter,
+                               "place_combo_order_object", None)
+        if not callable(submit_combo):
+            self.reject(order.order_id, reason="COMBO_ADAPTER_UNAVAILABLE",
+                        source="broker_submit")
+            return False
+        try:
+            result = submit_combo(order)
+        except Exception as exc:
+            _code = getattr(exc, "code", None)
+            _reason = (_code if isinstance(_code, str)
+                       and (_code.startswith("ADAPTER_COMBO_")
+                            or _code in _SAFE_ADAPTER_SUBMISSION_REASONS)
+                       else "ADAPTER_COMBO_ORDER_FAILED")
+            self.reject(order.order_id, reason=_reason,
+                        source="broker_combo_submit")
+            return False
+        if result is None:
+            self.reject(order.order_id, reason="BROKER_COMBO_RECEIPT_MISSING",
+                        source="broker_combo_submit")
+            return False
+        _status = getattr(result, "status", None)
+        _broker_order_id = (getattr(result, "id", None)
+                            or getattr(_status, "id", None))
+        _seqno = getattr(result, "seqno", None) or getattr(_status, "seqno", None)
+        _ordno = getattr(result, "ordno", None) or getattr(_status, "ordno", None)
+        if not any((_broker_order_id, _seqno, _ordno)):
+            self.reject(order.order_id, reason="BROKER_COMBO_RECEIPT_MISSING",
+                        source="broker_combo_submit")
+            return False
+        self.attach_submission(
+            order.order_id, broker_trade=result,
+            broker_order_id=_broker_order_id, seqno=_seqno, ordno=_ordno,
+            raw_status="Submitted", source="broker_combo_submit",
+            reason="submit_live_combo")
+        return True
 
     def _submit_live(self, order: Order) -> bool:
         if self.broker_adapter is None:
@@ -560,28 +775,52 @@ class OrderManager:
         if order.order_type == OrderType.MKP:
             order.price = 0  # MKP ignores price; ShioajiClient detects price==0 → MKP
 
-        # [GSD] Compatibility bridge for ShioajiClient object-based placement
-        if hasattr(self.broker_adapter, "place_order_object"):
-            result = self.broker_adapter.place_order_object(order)
-        else:
-            result = self.broker_adapter.place_order(order)
-            
+        try:
+            # The Shioaji adapter exposes this explicit object bridge.  Other
+            # legacy adapters keep their documented object interface.
+            if hasattr(self.broker_adapter, "place_order_object"):
+                result = self.broker_adapter.place_order_object(order)
+            else:
+                result = self.broker_adapter.place_order(order)
+        except Exception as exc:
+            # No broker receipt means this is a local terminal rejection, not
+            # a submitted order that a watchdog may later cancel.  Preserve
+            # only a stable adapter code for operator diagnosis; never emit
+            # arbitrary exception text into the event/dashboard surface.
+            _code = getattr(exc, "code", None)
+            _blocked_reason = getattr(exc, "reason", None)
+            _reason = (
+                _code if isinstance(_code, str)
+                and _code in _SAFE_ADAPTER_SUBMISSION_REASONS
+                else _blocked_reason if isinstance(_blocked_reason, str)
+                and _blocked_reason.startswith("EXIT_ONLY_")
+                else "ADAPTER_SUBMIT_FAILED"
+            )
+            self.reject(order.order_id, reason=_reason,
+                        source="broker_submit")
+            return False
+
         if result is None:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = "broker_api_failed"
-            self._emit("on_reject", OrderEvent(
-                order_id=order.order_id, status=OrderStatus.REJECTED,
-                symbol=order.symbol, side=order.side,
-                reason="broker_api_failed",
-            ))
+            self.reject(order.order_id, reason="BROKER_RECEIPT_MISSING",
+                        source="broker_submit")
+            return False
+
+        _status = getattr(result, "status", None)
+        _broker_order_id = (getattr(result, "id", None)
+                            or getattr(_status, "id", None))
+        _seqno = getattr(result, "seqno", None) or getattr(_status, "seqno", None)
+        _ordno = getattr(result, "ordno", None) or getattr(_status, "ordno", None)
+        if not any((_broker_order_id, _seqno, _ordno)):
+            self.reject(order.order_id, reason="BROKER_RECEIPT_MISSING",
+                        source="broker_submit")
             return False
 
         self.attach_submission(
             order.order_id,
             broker_trade=result,
-            broker_order_id=getattr(result, "id", None),
-            seqno=getattr(result, "seqno", None),
-            ordno=getattr(result, "ordno", None),
+            broker_order_id=_broker_order_id,
+            seqno=_seqno,
+            ordno=_ordno,
             raw_status="Submitted",
             source="broker_submit",
             reason="submit_live",
@@ -616,13 +855,39 @@ class OrderManager:
         tax: float = 0.0,
         raw_payload: Optional[Dict[str, Any]] = None,
         broker_order_id: Optional[str] = None,
+        seqno: Optional[str] = None,
         ordno: Optional[str] = None,
         source: str = "",
         reason: str = "",
+        observation_type: Optional[str] = None,
     ) -> Optional[Order]:
-        order = self._resolve_order(order_id, broker_order_id=broker_order_id, ordno=ordno)
+        order = self._resolve_order(
+            order_id,
+            broker_order_id=broker_order_id,
+            seqno=seqno,
+            ordno=ordno,
+        )
         if order is None:
             return None
+
+        # A broker fill is authoritative only when it carries at least one
+        # broker-issued receipt identity.  Never mutate order state from a
+        # symbol/price/quantity-shaped observation, and make duplicate
+        # callbacks idempotent across restart-restored ``order.fills``.
+        if not any((deal_id, broker_trade_id, exchange_fill_id, exchange_seq)):
+            self._record_audit(
+                order, "deal_fill_rejected", source=source or "deal_fill",
+                reason="BROKER_RECEIPT_IDENTITY_MISSING", payload=raw_payload,
+                broker_order_id=broker_order_id, seqno=seqno, ordno=ordno,
+                fill_price=fill_price, fill_qty=fill_qty,
+                observation_type=observation_type,
+            )
+            return None
+        if self._has_fill_identity(
+            order, deal_id=deal_id, broker_trade_id=broker_trade_id,
+            exchange_fill_id=exchange_fill_id, exchange_seq=exchange_seq,
+        ):
+            return order
 
         remaining = order.quantity - order.filled_quantity
         if fill_qty > remaining:
@@ -651,11 +916,12 @@ class OrderManager:
             to_status=order.status,
             payload=raw_payload,
             broker_order_id=broker_order_id or order.broker_order_id,
-            seqno=order.seqno,
+            seqno=seqno or order.seqno,
             ordno=ordno or order.ordno,
             deal_id=deal_id or broker_trade_id or exchange_fill_id or exchange_seq,
             fill_price=fill_price,
             fill_qty=fill_qty,
+            observation_type=observation_type,
         )
 
         if order.status == OrderStatus.FILLED:
@@ -701,12 +967,24 @@ class OrderManager:
         if fill_qty <= 0:
             raise ValueError("Fill quantity must be positive")
 
+        # 2026-10-05 Codex: simulator callbacks have local PAPER identities,
+        # never broker-issued receipts. Persisted fill ordinals distinguish
+        # partial fills while retaining the existing lifecycle/dedupe path.
+        _paper_identity = {}
+        if self.mode == "paper":
+            _paper_identity = {
+                "deal_id": f"PAPER-{order.order_id}-{len(order.fills) + 1}",
+                "source": "paper_simulator",
+                "reason": "simulated_fill",
+                "observation_type": "PAPER_FILL",
+            }
         self.apply_deal_fill(
             order_id,
             fill_price=fill_price,
             fill_qty=fill_qty,
             commission=commission,
             tax=tax,
+            **_paper_identity,
         )
 
     # ── Release OCO Bracket (ADR-010) ──
@@ -877,6 +1155,115 @@ class OrderManager:
             symbol=order.symbol, side=order.side,
         ))
 
+    def finalize_session_orders(
+        self,
+        *,
+        source: str = "session_close",
+        reason: str = "BROKER_SESSION_CLOSED_UNFILLED",
+    ) -> int:
+        """Finalize local orders that the broker closed at session end.
+
+        This is a local lifecycle transition only: it never calls the broker
+        cancel API.  Fully unfilled active orders become ``EXPIRED``; orders
+        with a partial fill become ``CANCELLED`` so their fill history remains
+        intact while the unfilled remainder cannot leak into the next session.
+        Completed orders are deliberately retained for audit/dashboard history.
+        """
+        finalized = 0
+        for order_id in list(self.active_orders):
+            order = self.active_orders.get(order_id)
+            if order is None:
+                continue
+            previous_status = order.status
+            try:
+                if previous_status is OrderStatus.PARTIAL_FILLED:
+                    order.cancel(reason=reason)
+                    event_name = "cancel"
+                    callback = "on_cancel"
+                    status = OrderStatus.CANCELLED
+                elif previous_status in (
+                    OrderStatus.PENDING_SUBMIT,
+                    OrderStatus.PRE_SUBMITTED,
+                    OrderStatus.SUBMITTED,
+                ):
+                    order.expire()
+                    event_name = "expire"
+                    callback = "on_expire"
+                    status = OrderStatus.EXPIRED
+                else:
+                    continue
+            except ValueError:
+                # A concurrent callback may have made this order terminal;
+                # leave that authoritative terminal state untouched.
+                continue
+
+            self.completed.append(order)
+            del self.active_orders[order_id]
+            self._record_audit(
+                order,
+                event_name,
+                source=source,
+                reason=reason,
+                from_status=previous_status,
+                to_status=status,
+            )
+            self._emit(callback, OrderEvent(
+                order_id=order_id,
+                status=status,
+                symbol=order.symbol,
+                side=order.side,
+            ))
+            finalized += 1
+        return finalized
+
+    def restore_pending_from_broker_truth(
+        self, order_id: str, *, reason: str = "", source: str = ""
+    ) -> bool:
+        """Re-open a locally terminal order when broker truth is non-terminal.
+
+        This is deliberately a local-only reconciliation operation.  It is
+        permitted only for EXPIRED/CANCELLED orders, preserves all broker
+        identity fields, performs no submit/cancel call, and leaves the order
+        SUBMITTED until an explicit broker terminal receipt arrives.
+        """
+        order = next((candidate for candidate in self.completed
+                      if candidate.order_id == order_id), None)
+        if order is None or order.status not in (
+                OrderStatus.CANCELLED, OrderStatus.EXPIRED):
+            return False
+        previous = order.status
+        self.completed = [candidate for candidate in self.completed
+                          if candidate.order_id != order_id]
+        order.status = OrderStatus.SUBMITTED
+        order.cancelled_at = None
+        order.expired_at = None
+        order.cancel_reason = None
+        order.updated_at = datetime.now()
+        self.active_orders[order_id] = order
+        self._record_audit(
+            order,
+            "broker_truth_restore",
+            source=source or "broker_reconcile",
+            reason=reason or "BROKER_HAS_POSITION_OR_ORDER",
+            from_status=previous,
+            to_status=OrderStatus.SUBMITTED,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno,
+            ordno=order.ordno,
+        )
+        self._emit("on_status_change", OrderEvent(
+            order_id=order.order_id,
+            status=OrderStatus.SUBMITTED,
+            symbol=order.symbol,
+            side=order.side,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno,
+            ordno=order.ordno,
+            reason=reason or "BROKER_HAS_POSITION_OR_ORDER",
+            raw_status="broker_reconcile",
+        ))
+        return True
+
     # ── Recovery (重啟恢復) ──
 
     def restore_orders(self, serialized_orders: Optional[list]) -> Dict[str, int]:
@@ -904,13 +1291,14 @@ class OrderManager:
         return restored
 
     def reindex_orders(self) -> Dict[str, int]:
-        """Scan existing orders for current session_date, set _next_id to max+1.
+        """Recover a monotonic order sequence from all durable order history.
 
         2026-07-07 Hermes Agent: session_date-aware reindex.
         Supports both old format (ORD-XXXXXX) and new format (ORD-YYYYMMDD-XXXXXX).
         Scans in-memory orders AND the persisted orders JSON file so the counter
         survives PM2 restart (when in-memory state is empty but disk has history).
-        On session boundary, _session_date changes → finds no matching orders → resets to 1.
+        The session date is only a display component.  It must not reset the
+        numeric sequence, because daily exports can be compacted or replaced.
         """
         max_order_index = 0
 
@@ -921,7 +1309,7 @@ class OrderManager:
             parts = suffix.split("-", 1)
             if len(parts) == 2:
                 date_part, counter_part = parts
-                if date_part == self._session_date and counter_part.isdigit():
+                if date_part.isdigit() and counter_part.isdigit():
                     return int(counter_part)
             elif suffix.isdigit():
                 return int(suffix)
@@ -930,14 +1318,16 @@ class OrderManager:
         for order in list(self.active_orders.values()) + self.completed:
             max_order_index = max(max_order_index, _scan_id(order.order_id))
 
-        # 2026-07-07 Hermes Agent: also scan persisted orders file.
-        # After PM2 restart the in-memory collections are empty, but the
-        # orders file holds the full history for this session.
+        # Scan every daily export, not just today's file.  The separate
+        # sequence registry below is authoritative when an export was
+        # compacted/replaced and an old order is no longer in that JSON.
         try:
-            import json, os as _os
-            _orders_file = f"exports/trades/TMF_{self._session_date}_orders.json"
-            if _os.path.exists(_orders_file):
-                with open(_orders_file) as _of:
+            _trades_dir = "exports/trades"
+            for _orders_file in sorted(
+                _name for _name in os.listdir(_trades_dir)
+                if _name.startswith("TMF_") and _name.endswith("_orders.json")
+            ):
+                with open(os.path.join(_trades_dir, _orders_file)) as _of:
                     _orders_data = json.load(_of)
                 if isinstance(_orders_data, list):
                     for _entry in _orders_data:
@@ -949,22 +1339,95 @@ class OrderManager:
         except Exception:
             pass
 
+        try:
+            with open(self._order_id_registry_path()) as _rf:
+                _registry = json.load(_rf)
+            max_order_index = max(
+                max_order_index, int(_registry.get("next_id", 1)) - 1
+            )
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        try:
+            with open(self._order_id_audit_path(), encoding="utf-8") as _af:
+                for _line in _af:
+                    try:
+                        _entry = json.loads(_line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(_entry, dict):
+                        max_order_index = max(
+                            max_order_index, _scan_id(_entry.get("order_id", ""))
+                        )
+        except OSError:
+            pass
+
         self._next_id = max(self._next_id, max_order_index + 1)
+        self._persist_next_order_id()
         return {"active": len(self.active_orders), "completed": len(self.completed)}
 
+    @staticmethod
+    def _order_id_registry_path() -> str:
+        return os.path.join("exports", "trades", "order_id_sequence.json")
+
+    def _persist_next_order_id(self) -> None:
+        """Atomically persist the next global numeric suffix."""
+        path = self._order_id_registry_path()
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            return
+        fd, tmp_path = tempfile.mkstemp(prefix=".order_id_sequence.", dir=directory)
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump({"next_id": self._next_id}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    @staticmethod
+    def _order_id_audit_path() -> str:
+        return os.path.join("exports", "trades", "order_id_audit.jsonl")
+
+    def _append_order_id_audit(self, order_id: str) -> None:
+        """Keep append-only local identity history independent of daily exports."""
+        path = self._order_id_audit_path()
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            return
+        record = {
+            "order_id": order_id,
+            "session_date": self._session_date,
+            "created_at": datetime.now().isoformat(),
+            "source": "LOCAL_ORDER_ID_ALLOCATOR",
+        }
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _reserve_order_id(self) -> str:
+        next_id = self._next_id
+        self._next_id += 1
+        self._persist_next_order_id()
+        order_id = f"ORD-{self._session_date}-{next_id:06d}"
+        self._append_order_id_audit(order_id)
+        return order_id
+
     def clear_session_orders(self) -> None:
-        """Clear all active and completed orders for the current session and reset next ID.
+        """Clear in-memory session orders without resetting durable IDs.
 
         2026-07-07 Gemini CLI / Hermes Agent: Reset session-date-aware state and next_id.
         """
         self.active_orders.clear()
         self.completed = []
-        self._next_id = 1
         try:
             from core.date_utils import get_session_date_str
             self._session_date = get_session_date_str()
         except Exception:
             self._session_date = datetime.now().strftime("%Y%m%d")
+        self.reindex_orders()
 
     def reconcile_trade_snapshot(
         self,
@@ -976,7 +1439,8 @@ class OrderManager:
         source: str = "",
         reason: str = "",
     ) -> Dict[str, Any]:
-        broker_order_id = broker_order_id or self._extract_value(trade, "id", "broker_order_id", "exchange_order_id")
+        broker_order_id = broker_order_id or self._extract_value(
+            trade, "broker_order_id", "id", "status_id", "exchange_order_id")
         ordno = ordno or self._extract_value(trade, "ordno", "exchange_order_id")
         seqno = self._extract_value(trade, "seqno")
         order = self._resolve_order(order_id, broker_order_id=broker_order_id, seqno=seqno, ordno=ordno)
@@ -988,9 +1452,13 @@ class OrderManager:
                 "fills_added": 0,
             }
 
-        raw_status = self._extract_value(getattr(trade, "status", None), "status") or self._extract_value(trade, "status")
+        raw_status = (self._extract_value(trade, "broker_status")
+                      or self._extract_value(getattr(trade, "status", None), "status")
+                      or self._extract_value(trade, "status"))
         normalized_status = self._normalize_raw_status(raw_status)
-        deals = self._extract_value(getattr(trade, "status", None), "deals") or self._extract_value(trade, "deals") or []
+        deals = (self._extract_value(trade, "deals")
+                 or self._extract_value(getattr(trade, "status", None), "deals")
+                 or [])
         if broker_order_id or ordno or seqno:
             self.attach_submission(
                 order.order_id,
@@ -1003,7 +1471,12 @@ class OrderManager:
                 reason=reason,
             )
 
-        if raw_status is not None and not (normalized_status == OrderStatus.FILLED and deals):
+        _terminal_with_deals = normalized_status in (
+            OrderStatus.FILLED, OrderStatus.CANCELLED,
+            OrderStatus.REJECTED, OrderStatus.EXPIRED) and bool(deals)
+        if (raw_status is not None
+                and not (normalized_status == OrderStatus.FILLED and deals)
+                and not _terminal_with_deals):
             self.apply_order_update(
                 order.order_id,
                 raw_status=raw_status,
@@ -1016,11 +1489,82 @@ class OrderManager:
             )
 
         fills_added = 0
-        for deal in deals:
+        # Some Shioaji list_trades snapshots report a terminal Filled trade
+        # with a confirmed quantity but omit ``status.deals``.  The broker
+        # identity is sufficient to close the lifecycle, but accounting stays
+        # DETAILS_PENDING: never invent a price/PnL from aggregate fields.
+        if normalized_status == OrderStatus.FILLED and not deals:
+            # Shioaji may expose confirmed terminal quantity/price on status
+            # while deal detail arrives later. Use broker fields only; never
+            # synthesize a deal or BROKER_FILL ledger row here.
+            _status = getattr(trade, "status", None)
+            _filled_qty = self._extract_value(
+                _status, "filled_qty", "filled_quantity", "quantity")
+            if _filled_qty is None:
+                _filled_qty = self._extract_value(
+                    trade, "filled_qty", "filled_quantity", "quantity")
+            _aggregate_price = self._extract_value(
+                _status, "avg_price", "price")
+            if _aggregate_price is None:
+                _aggregate_price = self._extract_value(trade, "avg_price", "price")
+            if _filled_qty is not None:
+                try:
+                    _filled_qty = int(_filled_qty)
+                except (TypeError, ValueError):
+                    _filled_qty = None
+            self._mark_broker_terminal_without_details(
+                order, filled_qty=_filled_qty,
+                raw_payload=self._payload_to_dict(trade),
+                source=source or "reconcile", reason="DETAILS_PENDING")
+            if _aggregate_price is not None:
+                try:
+                    order.avg_fill_price = float(_aggregate_price)
+                except (TypeError, ValueError):
+                    pass
+        elif normalized_status == OrderStatus.PARTIAL_FILLED and not deals:
+            _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
+            try:
+                _filled_qty = int(_filled_qty) if _filled_qty is not None else None
+            except (TypeError, ValueError):
+                _filled_qty = None
+            if (_filled_qty is not None and not isinstance(_filled_qty, bool)
+                    and 0 < _filled_qty < order.quantity):
+                order.filled_quantity = max(order.filled_quantity, _filled_qty)
+                order.status = OrderStatus.PARTIAL_FILLED
+                order.fill_accounting_status = "DETAILS_PENDING"
+            # No deal identity means this observation is ambiguous.  Keep the
+            # raw refreshed Trade and its confirmed quantity, but do not
+            # manufacture a fill, price, or PnL from an order identity.
+        for _deal_index, deal in enumerate(deals):
             deal_id = self._extract_value(deal, "deal_id", "trade_id", "fill_id")
             broker_trade_id = self._extract_value(deal, "broker_trade_id", "trade_id")
             exchange_fill_id = self._extract_value(deal, "exchange_fill_id", "fill_id")
-            exchange_seq = self._extract_value(deal, "exchange_seq")
+            exchange_seq = self._extract_value(deal, "exchange_seq", "seq")
+
+            fill_price = float(self._extract_value(deal, "price", "avg_price") or 0)
+            fill_qty = int(self._extract_value(deal, "quantity", "qty") or 0)
+            if fill_qty <= 0:
+                continue
+
+            if not any((deal_id, broker_trade_id, exchange_fill_id, exchange_seq)):
+                # A synthesized identity must never turn a price-less deal into
+                # a booked fill: no broker price means no fill (fail-closed).
+                if fill_price <= 0:
+                    continue
+                # Single-leg futures trade snapshots can return deal detail with
+                # price/quantity only (no deal identity) - the fill is then
+                # refused as BROKER_RECEIPT_IDENTITY_MISSING and never booked
+                # (2026-09-29 combined exit: both legs Filled at the broker,
+                # ledger stayed 0).  Derive the identity from broker content
+                # only, mirroring broker-position:{...} / _build_combo_fill_identity:
+                # the same snapshot always yields the same key, so the fill is
+                # booked exactly once and nothing is guessed.
+                _anchor = broker_order_id or seqno or ordno
+                if not _anchor:
+                    continue
+                deal_id = broker_trade_id = exchange_fill_id = (
+                    f"broker-trade:{_anchor}:{_deal_index}:{fill_price}:{fill_qty}")
+
             if self._has_fill_identity(
                 order,
                 deal_id=deal_id,
@@ -1030,12 +1574,7 @@ class OrderManager:
             ):
                 continue
 
-            fill_price = float(self._extract_value(deal, "price", "avg_price") or 0)
-            fill_qty = int(self._extract_value(deal, "quantity", "qty") or 0)
-            if fill_qty <= 0:
-                continue
-
-            self.apply_deal_fill(
+            _applied = self.apply_deal_fill(
                 order.order_id,
                 deal_id=deal_id,
                 fill_price=fill_price,
@@ -1049,7 +1588,46 @@ class OrderManager:
                 source=source or "reconcile",
                 reason=reason,
             )
-            fills_added += 1
+            # A refused deal is not an applied fill (false fills_added made the
+            # MTS close-from-reconciled-fills path act on evidence it never had).
+            if _applied is not None:
+                fills_added += 1
+
+        # A terminal broker status remains terminal even if deal detail was
+        # partial or omitted.  For Cancelled/Rejected/Expired, apply the
+        # status *after* deals so confirmed partial fills are preserved.
+        if normalized_status == OrderStatus.FILLED and order.status != OrderStatus.FILLED:
+            _filled_qty = self._extract_value(trade, "filled_qty", "filled_quantity")
+            try:
+                _filled_qty = int(_filled_qty) if _filled_qty is not None else None
+            except (TypeError, ValueError):
+                _filled_qty = None
+            # A broker Filled label with deal details that only account for
+            # part of the requested quantity is contradictory.  Preserve the
+            # confirmed partial quantity and lock the intent; do not advance
+            # the lifecycle or hide the remaining quantity until a later
+            # refresh proves full completion.
+            if order.filled_quantity < order.quantity:
+                if order.filled_quantity > 0:
+                    order.status = OrderStatus.PARTIAL_FILLED
+                    order.fill_accounting_status = "DETAILS_PENDING"
+                    order.updated_at = datetime.now()
+            else:
+                self._mark_broker_terminal_without_details(
+                    order, filled_qty=_filled_qty,
+                    raw_payload=self._payload_to_dict(trade),
+                    source=source or "reconcile", reason="DETAILS_PENDING")
+        elif normalized_status in (OrderStatus.CANCELLED, OrderStatus.REJECTED,
+                                   OrderStatus.EXPIRED) and order.status not in (
+                                       OrderStatus.CANCELLED,
+                                       OrderStatus.REJECTED,
+                                       OrderStatus.EXPIRED,
+                                       OrderStatus.FILLED):
+            self.apply_order_update(
+                order.order_id, raw_status=raw_status, reason=reason,
+                raw_payload=self._payload_to_dict(trade),
+                broker_order_id=broker_order_id, seqno=seqno, ordno=ordno,
+                source=source or "reconcile")
 
         self._record_audit(
             order,
@@ -1062,6 +1640,7 @@ class OrderManager:
             broker_order_id=broker_order_id,
             seqno=seqno,
             ordno=ordno,
+            observation_type="REFRESHED_TRADE",
         )
         return {
             "matched": True,
@@ -1232,7 +1811,7 @@ class OrderManager:
                 broker_trade_id=fill_identity,
                 exchange_fill_id=fill_identity,
             ):
-                self.apply_deal_fill(
+                _applied = self.apply_deal_fill(
                     order.order_id,
                     deal_id=fill_identity,
                     fill_price=self._combo_fill_price(combo_trade, order),
@@ -1245,7 +1824,8 @@ class OrderManager:
                     source=source or "combo_reconcile",
                     reason=reason,
                 )
-                fills_added += 1
+                if _applied is not None:
+                    fills_added += 1
 
         self._record_audit(
             order,
@@ -1268,6 +1848,85 @@ class OrderManager:
             "status": order.status.value,
         }
 
+
+    def mark_broker_not_found(
+        self, order_id: str, *, source: str = "broker_reconcile",
+        reason: str = "BROKER_ORDER_NOT_FOUND",
+    ) -> Optional[Order]:
+        """Terminalize a locally submitted order absent from broker truth.
+
+        A successful broker read showing neither the order nor a covered
+        position is explicit phantom evidence.  Keep the order in completed
+        for audit, never resubmit it, and emit the same status-change event as
+        other terminal transitions.
+        """
+        order = self.active_orders.get(order_id)
+        if order is None:
+            return None
+        previous = order.status
+        order.status = OrderStatus.BROKER_NOT_FOUND
+        order.updated_at = datetime.now()
+        self._record_audit(
+            order, "order_terminal", source=source, reason=reason,
+            from_status=previous, to_status=order.status,
+            raw_status="BROKER_NOT_FOUND",
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno, ordno=order.ordno)
+        del self.active_orders[order_id]
+        self.completed.append(order)
+        self._emit("on_status_change", OrderEvent(
+            order_id=order.order_id, status=order.status,
+            symbol=order.symbol, side=order.side,
+            intent_id=order.intent_id,
+            broker_order_id=order.broker_order_id,
+            seqno=order.seqno, ordno=order.ordno, reason=reason,
+            raw_status="BROKER_NOT_FOUND"))
+        return order
+
+    def reconcile_pending_terminal(
+        self, snapshot: dict, *, source: str = "", reason: str = ""
+    ) -> List[Dict[str, Any]]:
+        """Apply broker terminal inference to local pending orders.
+
+        Wires core.order_lifecycle_reconciler.reconcile_order into the
+        periodic snapshot reconcile: an order the broker shows NEITHER as
+        an open order NOR backed by a position is a phantom pending —
+        mark BROKER_NOT_FOUND (terminal, audit kept, never resubmit).
+        APPLY_TERMINAL decisions (explicit broker terminal state) map
+        onto the OrderStatus terminal members.  RETAIN /
+        RECONCILE_REQUIRED are left untouched — fail-closed.  Only
+        PENDING_SUBMIT and SUBMITTED orders are considered (mirrors
+        scripts/reconcile_pending_orders.py)."""
+        changed: List[Dict[str, Any]] = []
+        for order in list(self.active_orders.values()):
+            if order.status not in (
+                    OrderStatus.PENDING_SUBMIT, OrderStatus.SUBMITTED):
+                continue
+            decision = reconcile_order(order, snapshot)
+            action = getattr(decision, "action", "")
+            if action == "MARK_TERMINAL":
+                order.status = OrderStatus.BROKER_NOT_FOUND
+                changed.append({"order_id": order.order_id,
+                                "action": "MARK_TERMINAL"})
+            elif action in ("APPLY_TERMINAL", "APPLY_ZERO_FILL_TERMINAL"):
+                terminal = {
+                    "FILLED": OrderStatus.FILLED,
+                    "CANCELLED": OrderStatus.CANCELLED,
+                    "REJECTED": OrderStatus.REJECTED,
+                    "EXPIRED": OrderStatus.EXPIRED,
+                    "RECEIVED_NOT_FILLED": OrderStatus.RECEIVED_NOT_FILLED,
+                }.get(getattr(decision, "state", ""))
+                if terminal is None:
+                    continue  # unknown terminal state — fail-closed
+                order.status = terminal
+                changed.append({"order_id": order.order_id,
+                                "action": action})
+            else:
+                continue  # RETAIN / RECONCILE_REQUIRED — fail-closed
+            del self.active_orders[order.order_id]
+            self.completed.append(order)
+        return changed
+
     def reconcile_broker_state(
         self,
         open_orders: Optional[list] = None,
@@ -1278,6 +1937,23 @@ class OrderManager:
         reconciled = []
         unmatched = []
         for trade in (open_orders or []) + (filled_trades or []):
+            # A refresh is an observation of an older broker generation.  It
+            # must never regress a locally newer terminal state by reattaching
+            # the receipt (attach_submission sets SUBMITTED).  Explicit new
+            # order/deal callbacks use apply_order_update/apply_deal_fill and
+            # are therefore not covered by this stale-refresh guard.
+            _pre = self._resolve_order(
+                None,
+                broker_order_id=self._extract_value(
+                    trade, "id", "broker_order_id", "exchange_order_id"),
+                seqno=self._extract_value(trade, "seqno"),
+                ordno=self._extract_value(trade, "ordno", "exchange_order_id"),
+            )
+            if _pre is not None and _pre.status in (
+                    OrderStatus.FILLED, OrderStatus.CANCELLED,
+                    OrderStatus.REJECTED, OrderStatus.EXPIRED,
+                    OrderStatus.BROKER_NOT_FOUND):
+                continue
             result = self.reconcile_trade_snapshot(
                 trade=trade,
                 source=source,
@@ -1288,6 +1964,115 @@ class OrderManager:
             else:
                 unmatched.append(result)
         return {"reconciled": reconciled, "unmatched": unmatched}
+
+    def reconcile_position_covered_orders(
+        self,
+        positions: Optional[list] = None,
+        *,
+        source: str = "broker_position_reconcile",
+        reason: str = "BROKER_POSITION_COVERED_PENDING",
+        captured_at: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Mark a local order filled only when broker position truth covers it.
+
+        Shioaji can retain a PendingSubmit receipt after the matching position
+        is already filled.  Matching is strict (futures code, side, and exact
+        quantity identify one local order); ambiguous data is left pending.
+        This is local reconciliation only: it never creates a broker order id
+        and never calls submit/cancel.
+        """
+        def _side(value):
+            text = str(value or "").lower().split(".")[-1]
+            if text in {"buy", "long"}:
+                return "buy"
+            if text in {"sell", "short"}:
+                return "sell"
+            return None
+
+        def _qty(value):
+            if isinstance(value, bool):
+                return None
+            try:
+                qty = int(value)
+            except (TypeError, ValueError):
+                return None
+            return qty if qty > 0 else None
+
+        candidates = list(self.active_orders.values()) + list(self.completed)
+        repaired = []
+        # Normalize durable rows that already contain a complete fill but
+        # were persisted with a stale non-terminal status.
+        for order in candidates:
+            if (order.quantity > 0
+                    and order.filled_quantity >= order.quantity
+                    and order.status != OrderStatus.FILLED):
+                previous = order.status
+                self.active_orders.pop(order.order_id, None)
+                if order not in self.completed:
+                    self.completed.append(order)
+                order.status = OrderStatus.FILLED
+                order.updated_at = datetime.now()
+                if order.filled_at is None:
+                    order.filled_at = order.updated_at
+                repaired.append({"order_id": order.order_id,
+                                 "code": str(order.symbol),
+                                 "filled_quantity": order.filled_quantity,
+                                 "avg_fill_price": order.avg_fill_price,
+                                 "previous_status": previous.value,
+                                 "action": "status_normalized"})
+        for row in positions or []:
+            if not isinstance(row, dict) or row.get("account") not in (None, "", "futures"):
+                continue
+            code = str(row.get("code") or "")
+            side = _side(row.get("direction") or row.get("action"))
+            qty = _qty(row.get("quantity", row.get("qty")))
+            try:
+                price = float(row.get("avg_cost"))
+            except (TypeError, ValueError):
+                price = 0.0
+            if not code or side is None or qty is None or price <= 0:
+                continue
+            matches = [order for order in candidates
+                       if str(order.symbol) == code
+                       and _side(getattr(order.side, "value", order.side)) == side
+                       and order.quantity == qty
+                       and order.status != OrderStatus.FILLED
+                       and order.filled_quantity == 0]
+            if len(matches) != 1:
+                continue
+            order = matches[0]
+            previous = order.status
+            if previous in (OrderStatus.CANCELLED, OrderStatus.EXPIRED):
+                self.completed = [item for item in self.completed
+                                  if item.order_id != order.order_id]
+                self.active_orders[order.order_id] = order
+                order.status = OrderStatus.SUBMITTED
+                order.cancelled_at = None
+                order.expired_at = None
+                order.cancel_reason = None
+            elif previous == OrderStatus.PENDING_SUBMIT:
+                broker_id = order.broker_order_id or order.exchange_order_id or order.order_id
+                order.submit(broker_id, broker_order_id=order.broker_order_id,
+                             seqno=order.seqno, ordno=order.ordno)
+            fill_time = None
+            if captured_at:
+                try:
+                    fill_time = datetime.fromtimestamp(float(captured_at) / 1000.0)
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pass
+            filled = self.apply_deal_fill(
+                order.order_id, fill_price=price, fill_qty=qty,
+                fill_time=fill_time, broker_order_id=order.broker_order_id,
+                deal_id=f"broker-position:{order.order_id}:{code}:{qty}:{price}",
+                seqno=order.seqno, ordno=order.ordno,
+                source=source, reason=reason,
+                raw_payload={"position": row, "authority": "broker_position"},
+            )
+            if filled is not None:
+                repaired.append({"order_id": order.order_id, "code": code,
+                                 "filled_quantity": qty, "avg_fill_price": price,
+                                 "previous_status": previous.value})
+        return {"reconciled": repaired, "ambiguous": []}
 
     def recover_from_api(
         self,

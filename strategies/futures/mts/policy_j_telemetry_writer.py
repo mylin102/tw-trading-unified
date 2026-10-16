@@ -2,6 +2,7 @@
 import logging
 from pathlib import Path
 from typing import Optional
+from core.runtime_paths import runtime_path
 
 from strategies.futures.mts.policy_j_telemetry_schema import PolicyJShadowSnapshot
 
@@ -17,7 +18,7 @@ class PolicyJTelemetryWriter:
     def __init__(self, export_dir: Optional[Path] = None):
         if export_dir is None:
             project_root = Path(__file__).parent.parent.parent.parent
-            export_dir = project_root / "exports" / "telemetry" / "policy_j"
+            export_dir = Path(runtime_path("exports", "telemetry", "policy_j"))
         self.export_dir = Path(export_dir)
         self.write_error_count = 0
         self.records_written = 0

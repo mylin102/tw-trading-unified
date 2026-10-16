@@ -14,6 +14,7 @@ Thread safety:
 """
 
 from __future__ import annotations
+from core.runtime_paths import runtime_logs
 
 import logging
 from dataclasses import dataclass, field
@@ -267,7 +268,7 @@ def build_mtx_runtime(
         if _exec_enabled:
             print("[DTI-001B] WARN: execution_enabled=True is BLOCKED. Forcing False.", flush=True)
             _exec_enabled = False
-        _capture_log_dir = dynamics_capture_config.get("log_dir", "logs/ticks/dynamics")
+        _capture_log_dir = dynamics_capture_config.get("log_dir", runtime_logs("ticks", "dynamics"))
         try:
             _capture_hook = DynamicsCaptureHook(log_dir=_capture_log_dir)
             _capture_hook.start()

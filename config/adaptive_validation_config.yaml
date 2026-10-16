@@ -1,0 +1,14 @@
+# 2026-10-16 Hermes Agent: frozen before v2 replay; offline research only.
+minimum_distance_fraction: 0.001
+minimum_alpha: 0.3
+confirmation_bars: 2
+volume_minimum_history: 30
+volume_history_limit: 120
+oi_intensity_assumed: 1.5
+oi_direction_assumed: 0.65
+maximum_hold_secs: 3600
+max_spread_loss_points: 200
+initial_equity_twd: 100000
+minimum_decision_difference_pct: 5
+# No measured tick/BBO history: closes are bar proxies, never fresh quote evidence.
+mode: OFFLINE_MTS_LIFECYCLE_BAR_PROXY_V2

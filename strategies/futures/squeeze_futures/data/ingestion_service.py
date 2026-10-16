@@ -17,12 +17,14 @@ Design:
 """
 
 import time
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
 import pandas as pd
 from rich.console import Console
 
 console = Console()
+logger = logging.getLogger("IngestionService")
 
 
 class IngestionService:
@@ -99,7 +101,13 @@ class IngestionService:
                 f"[cyan][Ingestion] Fetching kbars for {self._contract.code}, "
                 f"from {start_date} to {date_str}[/cyan]"
             )
+            fetch_started = time.perf_counter()
+            logger.info("[PERF] kbars_fetch_start contract=%s", self._contract.code)
             bars = self._api.kbars(self._contract, start=start_date, end=date_str)
+            logger.info(
+                "[PERF] kbars_fetch_done contract=%s duration_ms=%.1f",
+                self._contract.code, (time.perf_counter() - fetch_started) * 1000,
+            )
             self._last_kbars_fetch_at = now_ts
 
             if bars is None:
@@ -118,7 +126,12 @@ class IngestionService:
                 return None
 
             # [GSD Data Safety] Save raw API response to CSV FIRST
+            write_started = time.perf_counter()
             self._save_raw_kbars(bars)
+            logger.info(
+                "[PERF] kbars_csv_write_done contract=%s duration_ms=%.1f",
+                self._contract.code, (time.perf_counter() - write_started) * 1000,
+            )
 
             from core.broker.shioaji_compat import kbars_to_dataframe
             frame = kbars_to_dataframe(bars)

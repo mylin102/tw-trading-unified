@@ -22,6 +22,13 @@ class DataStorage:
         self.market_dir = Path("logs/market_data")
         self.trade_dir = Path("exports/trades")
         self.backtest_dir = Path("exports/backtests")
+        # 2026-10-02 Codex: PAPER confirmed deals cannot append into legacy LIVE exports.
+        # LIVE and offline legacy paths remain unchanged; this is not a global runtime-root switch.
+        from core.runtime_paths import mts_data_mode, mts_runtime_path
+        if mts_data_mode() == "paper":
+            self.market_dir = Path(mts_runtime_path("logs", "market_data"))
+            self.trade_dir = Path(mts_runtime_path("exports", "trades"))
+            self.backtest_dir = Path(mts_runtime_path("exports", "backtests"))
         
         # 建立目錄
         self.market_dir.mkdir(parents=True, exist_ok=True)
@@ -319,7 +326,11 @@ _storage = None
 def get_storage(ticker: str = "TMF") -> DataStorage:
     """獲取數據儲存實例"""
     global _storage
-    if _storage is None or _storage.ticker != ticker:
+    # 2026-10-02 Codex: never retain a buffer bound to the other execution namespace.
+    from core.runtime_paths import mts_data_mode, mts_runtime_path
+    _expected_trade_dir = (Path(mts_runtime_path("exports", "trades"))
+                           if mts_data_mode() == "paper" else Path("exports/trades"))
+    if _storage is None or _storage.ticker != ticker or _storage.trade_dir != _expected_trade_dir:
         _storage = DataStorage(ticker)
     return _storage
 
@@ -345,6 +356,10 @@ def save_signal_audit(signal_record: dict, ticker: str = "TMF"):
     """記錄信號審計軌跡（包含被拒絕的信號）— thread-safe"""
     from pathlib import Path
     log_dir = Path("logs/market_data")
+    # 2026-10-02 Codex: companion confirmed-deal audit stays with the PAPER trade CSV.
+    from core.runtime_paths import mts_data_mode, mts_runtime_path
+    if mts_data_mode() == "paper":
+        log_dir = Path(mts_runtime_path("logs", "market_data"))
     log_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime("%Y%m%d")
     audit_file = log_dir / f"{ticker}_{date_str}_signals_audit.csv"

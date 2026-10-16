@@ -147,7 +147,10 @@ class BackgroundSnapshotWriter:
         self._thread = threading.Thread(
             target=_loop,
             name=f"snapshot-writer-{id(self)}",
-            daemon=False,
+            # Explicit stop() remains the orderly shutdown path.  Daemon mode
+            # prevents a failed test or abrupt interpreter shutdown from being
+            # held open indefinitely by this background persistence worker.
+            daemon=True,
         )
         self._thread.start()
 

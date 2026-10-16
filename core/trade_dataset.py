@@ -294,6 +294,28 @@ def _correlate_events_to_trade(
 # ---------------------------------------------------------------------------
 
 
+# 2026-08-07 Hermes Agent (P1-A containment, codex exit-policy audit):
+# Known-corrupt realized_pnl entries in the fills ledger, excluded from
+# cumulative KPI sums. Source ledger rows are RETAINED unmodified as original
+# evidence; see overlays note + artifacts audit.
+#   mts-auto-222204-082 (2026-08-03): RELEASE FAR SELL @42765 recorded
+#   realized_pnl=-427,698.6; true value ~= +160 TWD (FAR LONG 42749->42765,
+#   +16 pts) — recorded value is price-scaled and wrong-signed.
+CORRUPT_REALIZED_PNL_TRADES = frozenset({"mts-auto-222204-082"})
+
+
+def _kpi_realized_pnl(fills) -> float:
+    """Sum realized_pnl across fills, excluding known-corrupt ledger rows.
+
+    The monitor recomputes PnL from prices; these sums trust the stored
+    realized_pnl field, so corrupted rows must be excluded here.
+    """
+    return sum(
+        f.get("realized_pnl") or 0.0 for f in fills
+        if f.get("trade_id") not in CORRUPT_REALIZED_PNL_TRADES
+    )
+
+
 def _build_trade_facts(
     trades: dict[str, list[dict]],
     build_id: str,
@@ -351,7 +373,7 @@ def _build_trade_facts(
         release_price = release.get("price") if release else None
 
         # PnL
-        pnl_total = sum(f.get("realized_pnl") or 0.0 for f in fills)
+        pnl_total = _kpi_realized_pnl(fills)
 
         row = {
             "trade_id": trade_id,
@@ -689,7 +711,7 @@ def _build_outcomes(
         mae_combined = min(mae_values) if mae_values else 0.0
 
         # Realized PnL total
-        realized_pnl_total = sum(f.get("realized_pnl") or 0.0 for f in fills)
+        realized_pnl_total = _kpi_realized_pnl(fills)
 
         # Release reason: from first RELEASE_SUBMITTED event
         release_submitted = [e for e in correlated

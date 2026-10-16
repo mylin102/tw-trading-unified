@@ -10,7 +10,7 @@ from strategies.stocks.monitor import StockMonitor
 
 class _DummyStocks(dict):
     def __getitem__(self, key):
-        return SimpleNamespace(code=key)
+        return SimpleNamespace(code=key, name="台積電")
 
 
 class _DummyApi:
@@ -73,3 +73,53 @@ def test_stock_monitor_live_orders_fall_back_to_ledger(tmp_path):
     assert orders[0]["ticker"] == "2330"
     assert orders[0]["status"] == "FILLED"
     assert orders[0]["mode"] == "LIVE"
+
+
+def test_stock_trade_ledger_writes_broker_contract_name(tmp_path):
+    monitor = StockMonitor.__new__(StockMonitor)
+    monitor.api = _DummyApi()
+    monitor.strat_name = "scout_strategy"
+    monitor.mode_tag = "PAPER"
+    monitor.ledger_path = tmp_path / "STOCK_20260421_PAPER_trades.csv"
+    monitor.orders_path = tmp_path / "STOCK_20260421_PAPER_orders.json"
+    monitor.pending_orders = {}
+    monitor.positions = {}
+    monitor.watchlist = ["2330"]
+    monitor._save_orders_file = lambda: None
+
+    monitor._log_trade("2330", "BUY", 880.0, 1, "TEST", 0.0, 880.0)
+
+    ledger = pd.read_csv(monitor.ledger_path)
+    assert ledger.loc[0, "ticker"] == 2330
+    assert ledger.loc[0, "name"] == "台積電"
+
+
+def test_stock_trade_ledger_migrates_legacy_header_before_append(tmp_path):
+    monitor = StockMonitor.__new__(StockMonitor)
+    monitor.api = _DummyApi()
+    monitor.strat_name = "scout_strategy"
+    monitor.mode_tag = "PAPER"
+    monitor.ledger_path = tmp_path / "STOCK_20260421_PAPER_trades.csv"
+    monitor.orders_path = tmp_path / "STOCK_20260421_PAPER_orders.json"
+    monitor._save_orders_file = lambda: None
+
+    pd.DataFrame([{
+        "timestamp": "2026-04-21 09:00:00",
+        "ticker": "2330",
+        "strategy": "scout_strategy",
+        "mode": "PAPER",
+        "action": "BUY",
+        "price": 879.0,
+        "entry_price": 879.0,
+        "qty": 1,
+        "reason": "LEGACY",
+        "pnl_gross": 0.0,
+        "fees": 0.0,
+        "pnl_cash": 0.0,
+    }]).to_csv(monitor.ledger_path, index=False)
+
+    monitor._log_trade("2330", "SELL", 880.0, 1, "TEST", 1.0, 879.0)
+
+    ledger = pd.read_csv(monitor.ledger_path)
+    assert list(ledger.columns)[2] == "name"
+    assert ledger["name"].tolist() == ["", "台積電"]

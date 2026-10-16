@@ -1,0 +1,489 @@
+"""RED tests: EXIT_ONLY position hydration + decision binding.
+
+Hydrate an attested broker pair into a managed exit-only position so the
+existing Policy J / combined / single-release evaluation produces ONLY
+capability-bound closing orders.  No synthetic PnL; missing/stale/
+ambiguous BBO -> N/A + zero order; paper unchanged.
+"""
+
+import time
+
+import pytest
+
+from core.mode_transition import (
+    ExecutionContext,
+    LiveOrderBlocked,
+    ModeTransitionState,
+)
+from core.order_management.order import OrderSide, OrderType
+from core.order_management.order_manager import OrderManager
+
+
+def _capability():
+    return {
+        "schema_version": 2,
+        "reconciliation_id": "recon-abc123",
+        "trade_id": "mts-20260811-085503",
+        "snapshot_hash": "s" * 64,
+        "attestation_hash": "a" * 64,
+        "snapshot_captured_at": 1754991000000,
+        "account_id_hash": "b" * 64,
+        "session_id": "c" * 32,
+        "config_hash": "d" * 64,
+        "release_sha": "e" * 40,
+        "allowed_orders": [
+            {"symbol": "TMFH6", "side": "buy", "remaining_qty": 1},
+            {"symbol": "TMFI6", "side": "sell", "remaining_qty": 1},
+        ],
+        "legs": [
+            {"symbol": "TMFH6", "side": "sell", "remaining_qty": 1,
+             "avg_cost": 44909.0},
+            {"symbol": "TMFI6", "side": "buy", "remaining_qty": 1,
+             "avg_cost": 45052.0},
+        ],
+    }
+
+
+_MISSING = object()
+
+
+def _exit_only_ctx(cap=_MISSING):
+    if cap is _MISSING:
+        cap = _capability()
+    return ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.RECONCILED_EXIT_ONLY.value,
+        live_order_allowed=False,
+        exit_only_capability=cap,
+    )
+
+
+def _live_ctx():
+    return ExecutionContext(
+        requested_mode="live",
+        effective_mode=ModeTransitionState.LIVE_READY.value,
+        live_order_allowed=True,
+    )
+
+
+def _bbo_slots(now=None):
+    ts_ms = int((now if now is not None else time.time()) * 1000)
+    return {
+        "TMF": {"code": "TMFH6", "bid": 44900.0, "ask": 44910.0,
+                "exchange_ts_ms": ts_ms, "received_at_ms": ts_ms,
+                "source": "shioaji_bidask"},
+        "TMF_FAR": {"code": "TMFI6", "bid": 45040.0, "ask": 45060.0,
+                    "exchange_ts_ms": ts_ms, "received_at_ms": ts_ms,
+                    "source": "shioaji_bidask"},
+    }
+
+
+_S2_IDENTITY = {
+    "reconciliation_id": "recon-abc123",
+    "snapshot_hash": "s" * 64,
+    "config_hash": "d" * 64,
+    "release_sha": "e" * 40,
+    "session_id": "c" * 32,
+}
+
+
+def _s2_kwargs(**over):
+    kw = {"near_code": "TMFH6", "far_code": "TMFI6",
+          "identity": dict(_S2_IDENTITY)}
+    kw.update(over)
+    return kw
+
+
+def _pure_bbo_slots(now=None):
+    slots = _bbo_slots(now)
+    return {"near": slots["TMF"], "far": slots["TMF_FAR"]}
+
+
+# ── pure hydration ────────────────────────────────────────────────────────
+
+def test_hydrate_requires_valid_capability():
+    from core.exit_only_position import hydrate_exit_only_position
+    from core.reconciled_exit import AttestationError
+
+    with pytest.raises(AttestationError) as exc:
+        hydrate_exit_only_position(None)
+    assert exc.value.code == "EXIT_ONLY_CAPABILITY_MISSING"
+
+    bad = _capability()
+    bad.pop("legs")
+    with pytest.raises(AttestationError) as exc:
+        hydrate_exit_only_position(bad)
+    assert exc.value.code == "EXIT_ONLY_CAPABILITY_INVALID"
+
+    bad = _capability()
+    bad["legs"][0]["avg_cost"] = 0.0
+    with pytest.raises(AttestationError) as exc:
+        hydrate_exit_only_position(bad)
+    assert exc.value.code == "EXIT_ONLY_CAPABILITY_INVALID"
+
+
+def test_hydrate_preserves_broker_costs_and_trade_id_no_pnl():
+    from core.exit_only_position import hydrate_exit_only_position
+
+    position = hydrate_exit_only_position(_capability())
+
+    assert position["trade_id"] == "mts-20260811-085503"
+    assert position["reconciliation_id"] == "recon-abc123"
+    assert position["snapshot_hash"] == "s" * 64
+    assert position["has_position"] is True
+    assert position["mode"] == "reconciled_exit_only"
+    assert position["legs"] == [
+        {"code": "TMFH6", "side": "sell", "quantity": 1, "avg_cost": 44909.0},
+        {"code": "TMFI6", "side": "buy", "quantity": 1, "avg_cost": 45052.0},
+    ]
+    # no synthetic PnL anywhere
+    joined = str(position).upper()
+    assert "PNL" not in joined and "UPL" not in joined
+
+
+# ── BBO binding ───────────────────────────────────────────────────────────
+
+def test_bbo_binding_optional_raw_fields_json_safe():
+    """[S2 audit] NaN/+Inf in optional raw fields (seq, received_at_ms)
+    must never crash the valid binding: sanitized to None, canonical
+    payload passes json.dumps(allow_nan=False); strict bid/ask/
+    exchange_ts/code/source validation is unchanged.  Non-string
+    identity values => BBO_IDENTITY_MISSING (never a hash crash)."""
+    import json as _json
+    from core.exit_only_position import build_bbo_binding
+
+    kw = _s2_kwargs()
+    for _field in ("seq", "received_at_ms"):
+        for _val in (float("nan"), float("inf"), float("-inf")):
+            slots = _pure_bbo_slots()
+            slots["near"][_field] = _val
+            binding, reason = build_bbo_binding(slots, **kw)
+            assert reason is None, (_field, _val, reason)
+            assert binding and binding["bbo_hash"]
+            _s = _json.dumps(binding["bbo_payload"], allow_nan=False)
+            assert "NaN" not in _s and "Infinity" not in _s, (_field, _val)
+            assert binding["bbo_payload"]["near"][_field] is None
+    # non-string identity value -> typed block, never a hash crash
+    bad_id = _s2_kwargs(identity={
+        "reconciliation_id": "x", "snapshot_hash": 12345,
+        "config_hash": "d", "release_sha": "e", "session_id": "c"})
+    assert build_bbo_binding(_pure_bbo_slots(), **bad_id)[1] \
+        == "BBO_IDENTITY_MISSING"
+
+
+def test_bbo_binding_rejects_float_or_seconds_timestamps():
+    """[S2 audit] exchange_ts_ms must be type(x) is int (not bool) and
+    >= 1e12 epoch-ms; float seconds / float epoch-ms / integer seconds /
+    bool are each rejected as BBO_STALE — the binding NEVER rescales."""
+    from core.exit_only_position import build_bbo_binding
+
+    kw = _s2_kwargs()
+    now = time.time()
+    # float current epoch seconds
+    fsec = _pure_bbo_slots(now=now)
+    fsec["near"]["exchange_ts_ms"] = float(now)
+    assert build_bbo_binding(fsec, **kw)[1] == "BBO_STALE"
+    # float epoch-ms
+    fms = _pure_bbo_slots(now=now)
+    fms["near"]["exchange_ts_ms"] = float(now * 1000)
+    assert build_bbo_binding(fms, **kw)[1] == "BBO_STALE"
+    # integer seconds
+    isec = _pure_bbo_slots(now=now)
+    isec["near"]["exchange_ts_ms"] = int(now)
+    assert build_bbo_binding(isec, **kw)[1] == "BBO_STALE"
+    # bool
+    bsec = _pure_bbo_slots(now=now)
+    bsec["near"]["exchange_ts_ms"] = True
+    assert build_bbo_binding(bsec, **kw)[1] == "BBO_STALE"
+    # missing
+    miss = _pure_bbo_slots(now=now)
+    miss["near"].pop("exchange_ts_ms")
+    assert build_bbo_binding(miss, **kw)[1] == "BBO_STALE"
+    # genuine int epoch-ms passes
+    ok, reason = build_bbo_binding(_pure_bbo_slots(now=now), **kw)
+    assert reason is None and ok and ok["bbo_hash"]
+
+
+def test_bbo_failure_evidence_json_safe_non_finite():
+    """[S2 audit] NaN / +Inf / -Inf in any evidence field must produce a
+    JSON-safe deterministic payload (allow_nan=False never raises),
+    reproducible evidence_hash, finite floats preserved, no secrets."""
+    import json as _json
+    from core.exit_only_position import build_bbo_failure_evidence
+
+    for _field in ("bid", "ask", "exchange_ts_ms", "received_at_ms",
+                   "seq"):
+        for _val in (float("nan"), float("inf"), float("-inf")):
+            slots = _pure_bbo_slots()
+            slots["near"][_field] = _val
+            ev = build_bbo_failure_evidence(slots, _S2_IDENTITY,
+                                            "BBO_STALE")
+            _s = _json.dumps(ev, allow_nan=False, sort_keys=True)
+            assert ev["evidence_hash"], (_field, _val)
+            assert "NaN" not in _s and "Infinity" not in _s, (_field, _val)
+            assert "password" not in _s and "token" not in _s
+    # finite floats preserved exactly
+    ev = build_bbo_failure_evidence(_pure_bbo_slots(), _S2_IDENTITY,
+                                    "BBO_STALE")
+    assert ev["near"]["bid"] == 44900.0 and ev["near"]["ask"] == 44910.0
+    _json.dumps(ev, allow_nan=False)
+
+
+def test_bbo_failure_evidence_canonical_payload():
+    """[S2 audit] blocked decisions carry a canonical bbo_input_v2 failure
+    payload: version, JSON-safe raw near/far, identity fields, reason and
+    a deterministic hash of that payload."""
+    from core.exit_only_position import build_bbo_failure_evidence
+
+    ev = build_bbo_failure_evidence(_pure_bbo_slots(), _S2_IDENTITY,
+                                    "BBO_STALE")
+    assert ev["version"] == "bbo_input_v2"
+    assert ev["near"]["code"] == "TMFH6"
+    assert ev["far"]["code"] == "TMFI6"
+    assert ev["near"]["bid"] == 44900.0 and ev["near"]["ask"] == 44910.0
+    assert ev["reconciliation_id"] == "recon-abc123"
+    assert ev["snapshot_hash"] == "s" * 64
+    assert ev["config_hash"] == "d" * 64
+    assert ev["release_sha"] == "e" * 40
+    assert ev["session_id"] == "c" * 32
+    assert ev["reason"] == "BBO_STALE"
+    assert ev["evidence_hash"]
+    import json as _json
+    import hashlib as _hl
+    _p = {k: ev[k] for k in ("version", "near", "far",
+                             "reconciliation_id", "snapshot_hash",
+                             "config_hash", "release_sha", "session_id",
+                             "reason")}
+    assert ev["evidence_hash"] == _hl.sha256(
+        _json.dumps(_p, sort_keys=True,
+                    separators=(",", ":")).encode()).hexdigest()
+    # JSON-safe: non-serializable values never break the payload
+    weird = _pure_bbo_slots()
+    weird["near"]["seq"] = object()
+    ev2 = build_bbo_failure_evidence(weird, _S2_IDENTITY, "BBO_SKEW")
+    assert ev2["reason"] == "BBO_SKEW" and ev2["evidence_hash"]
+
+
+def test_bbo_binding_missing_stale_ambiguous():
+    from core.exit_only_position import build_bbo_binding
+
+    assert build_bbo_binding(None, **_s2_kwargs())[0] is None
+    assert build_bbo_binding(
+        {"near": {}, "far": {}}, **_s2_kwargs())[1] == "BBO_MISSING"
+    assert build_bbo_binding({
+        "near": {"bid": 1, "ask": 2,
+                 "exchange_ts_ms": int(time.time() * 1000),
+                 "code": "TMFH6", "source": "shioaji_bidask"},
+        "far": {},
+    }, **_s2_kwargs())[1] == "BBO_MISSING"
+    assert build_bbo_binding(
+        _pure_bbo_slots(now=time.time() - 60), **_s2_kwargs())[1] \
+        == "BBO_STALE"
+    ambiguous = _pure_bbo_slots()
+    ambiguous["near"]["bid"] = 44920.0  # bid > ask
+    assert build_bbo_binding(ambiguous, **_s2_kwargs())[1] \
+        == "BBO_AMBIGUOUS"
+
+
+def test_bbo_binding_s2_hardening():
+    """[S2] future / skew / code / identity / non-finite ts are each
+    fail-closed with the typed reason; the valid version-2 hash binds the
+    raw quotes + identity."""
+    from core.exit_only_position import build_bbo_binding
+
+    kw = _s2_kwargs()
+    # future-stamped (beyond 1s)
+    fut = _pure_bbo_slots(now=time.time() + 5)
+    assert build_bbo_binding(fut, **kw)[1] == "BBO_FUTURE"
+    # cross-leg skew > 1s on EXCHANGE timestamps (far older by 2s)
+    skew = _pure_bbo_slots()
+    skew["far"]["exchange_ts_ms"] = int(time.time() * 1000) - 2000
+    assert build_bbo_binding(skew, **kw)[1] == "BBO_SKEW"
+    # exact contract code mismatch
+    wrong = _pure_bbo_slots()
+    wrong["near"]["code"] = "TMFZ6"
+    assert build_bbo_binding(wrong, **kw)[1] == "BBO_CODE_MISMATCH"
+    # source must be the validated bidask source
+    src = _pure_bbo_slots()
+    src["near"]["source"] = "tick"
+    assert build_bbo_binding(src, **kw)[1] == "BBO_SOURCE_MISMATCH"
+    # mixed identity: missing field
+    noid = _s2_kwargs(identity={"reconciliation_id": "x"})
+    assert build_bbo_binding(_pure_bbo_slots(), **noid)[1] \
+        == "BBO_IDENTITY_MISSING"
+    # non-finite exchange ts -> fail-closed BBO_STALE, never a crash
+    nan = _pure_bbo_slots()
+    nan["near"]["exchange_ts_ms"] = float("nan")
+    assert build_bbo_binding(nan, **kw)[1] == "BBO_STALE"
+    # valid: version-2 hash + raw payload bind quotes/source/identity
+    binding, reason = build_bbo_binding(_pure_bbo_slots(), **kw)
+    assert reason is None
+    assert binding["bbo_hash"] and binding["bbo_captured_at"] > 0
+    import json as _json
+    _ts = binding["bbo_captured_at"]
+    _payload = _json.dumps(
+        {"version": 2,
+         "near": {"symbol": "TMFH6", "bid": 44900.0, "ask": 44910.0,
+                  "exchange_ts": _ts, "received_at_ms": _ts,
+                  "source": "shioaji_bidask", "seq": None},
+         "far": {"symbol": "TMFI6", "bid": 45040.0, "ask": 45060.0,
+                 "exchange_ts": _ts, "received_at_ms": _ts,
+                 "source": "shioaji_bidask", "seq": None},
+         "reconciliation_id": "recon-abc123", "snapshot_hash": "s" * 64,
+         "config_hash": "d" * 64, "release_sha": "e" * 40,
+         "session_id": "c" * 32},
+        sort_keys=True, separators=(",", ":"))
+    import hashlib as _hl
+    assert binding["bbo_hash"] == _hl.sha256(
+        _payload.encode()).hexdigest()
+    # the raw payload is persisted with the binding (reproducible evidence)
+    assert binding["bbo_payload"] == _json.loads(_payload)
+
+
+def test_attach_decision_binding():
+    from core.exit_only_position import attach_decision_binding, build_bbo_binding
+
+    binding, _ = build_bbo_binding(_pure_bbo_slots(), **_s2_kwargs())
+    event = {"order_id": "ORD-1", "trade_id": "mts-20260811-085503"}
+    bound = attach_decision_binding(event, _capability(), binding)
+
+    assert bound["reconciliation_id"] == "recon-abc123"
+    assert bound["position_snapshot_hash"] == "s" * 64
+    assert bound["bbo_hash"] == binding["bbo_hash"]
+    assert bound["bbo_captured_at"] == binding["bbo_captured_at"]
+    assert bound["order_id"] == "ORD-1"
+    assert "bbo_hash" not in event  # original unchanged
+
+
+# ── monitor hydration ─────────────────────────────────────────────────────
+
+def _monitor(ctx, slots=None):
+    from strategies.futures.monitor import FuturesMonitor
+    from types import SimpleNamespace
+
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor._execution_context = ctx
+    monitor.market_data = dict(slots or {})
+    monitor._exit_only_bbo_cache = {
+        "near": dict((slots or {}).get("TMF") or {}),
+        "far": dict((slots or {}).get("TMF_FAR") or {}),
+    }
+    monitor.ticker = "TMF"
+    monitor.contract = SimpleNamespace(code="TMFH6")
+    monitor.far_contract = SimpleNamespace(code="TMFI6")
+    monitor._exit_only_position = None
+    monitor._exit_only_decision_binding = None
+    events = []
+    monitor._append_mts_event = lambda t, **k: events.append((t, k))
+    monitor._persist_execution_context = lambda: None
+    return monitor, events
+
+
+def _bound_strategy(rid="recon-abc123", trade_id="mts-20260811-085503"):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        _trade_id=trade_id, _reconciliation_id=rid,
+        _near_side="SHORT", _far_side="LONG",
+        _near_qty=1, _far_qty=1, _has_position=True)
+
+
+def test_monitor_hydrates_position_and_emits_event():
+    monitor, events = _monitor(_exit_only_ctx())
+
+    monitor._hydrate_exit_only_position()
+
+    assert monitor._exit_only_position is not None
+    assert monitor._exit_only_position["legs"][0]["avg_cost"] == 44909.0
+    assert events and events[0][0] == "EXIT_ONLY_POSITION_HYDRATED"
+    assert events[0][1]["trade_id"] == "mts-20260811-085503"
+
+
+def test_monitor_hydration_fails_without_capability():
+    monitor, events = _monitor(_exit_only_ctx(cap=None))
+
+    monitor._hydrate_exit_only_position()
+
+    assert monitor._exit_only_position is None
+    assert events and events[0][0] == "EXIT_ONLY_HYDRATION_FAILED"
+
+
+def test_paper_unchanged_hydration_noop():
+    monitor, events = _monitor(_live_ctx())
+
+    monitor._hydrate_exit_only_position()
+
+    assert monitor._exit_only_position is None
+    assert not events
+
+
+# ── decision guard ────────────────────────────────────────────────────────
+
+def test_exit_only_guard_blocks_entry():
+    monitor, events = _monitor(_exit_only_ctx())
+
+    ok, binding, reason = monitor._exit_only_decision_guard("BUY_NEAR_SELL_FAR")
+
+    assert ok is False and binding is None
+    assert reason == "EXIT_ONLY_ENTRY_BLOCKED"
+
+
+def test_exit_only_guard_missing_bbo_zero_order():
+    monitor, events = _monitor(_exit_only_ctx())
+    monitor._hydrate_exit_only_position()
+    events.clear()
+
+    ok, binding, reason = monitor._exit_only_decision_guard(
+        "COMBINED_EXIT", _bound_strategy())
+
+    assert ok is False and binding is None
+    assert reason == "BBO_MISSING"
+    assert not events  # no order attempt
+
+
+def test_exit_only_guard_eligible_with_valid_bbo():
+    monitor, events = _monitor(_exit_only_ctx(), _bbo_slots())
+    monitor._hydrate_exit_only_position()
+    events.clear()
+
+    ok, binding, reason = monitor._exit_only_decision_guard(
+        "COMBINED_EXIT", _bound_strategy())
+
+    assert ok is True and reason is None
+    assert binding["bbo_hash"]
+
+    ok, binding, reason = monitor._exit_only_decision_guard(
+        "RELEASE_NEAR", _bound_strategy())
+    assert ok is True and reason is None
+
+
+def test_paper_guard_passes_through_without_binding():
+    monitor, _ = _monitor(_live_ctx())
+
+    ok, binding, reason = monitor._exit_only_decision_guard("COMBINED_EXIT")
+
+    assert ok is True and binding is None and reason is None
+
+
+# ── order creation stays capability-bound ─────────────────────────────────
+
+def test_exit_only_eligible_creates_only_capability_bound_orders():
+    ctx = _exit_only_ctx()
+    manager = OrderManager(mode="live", execution_context=ctx)
+
+    near = manager.create_order(
+        symbol="TMFH6", side=OrderSide.BUY, order_type=OrderType.MKP,
+        quantity=1, strategy="MTS_EXIT")
+    assert near.reconciliation_id == "recon-abc123"
+    ctx.assert_order_allowed(near, method="place_order")
+
+    with pytest.raises(LiveOrderBlocked) as exc:
+        manager.create_order(
+            symbol="TMFI6", side=OrderSide.BUY, order_type=OrderType.MKP,
+            quantity=1, strategy="MTS_EXIT")  # off-scope symbol
+    assert "SCOPE_MISMATCH" in str(exc.value.reason)
+
+    with pytest.raises(LiveOrderBlocked) as exc:
+        manager.create_order(
+            symbol="TMFH6", side=OrderSide.SELL, order_type=OrderType.MKP,
+            quantity=1, strategy="MTS_ENTRY")  # entry remains blocked
+    assert "STRATEGY_BLOCKED" in str(exc.value.reason)

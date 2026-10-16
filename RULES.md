@@ -81,7 +81,31 @@ Enforce runtime capability gates (`assert_research_allowed()`, `assert_broker_ac
 ## CRITICAL: Read Before Any Code Change
 
 This is a live trading system (currently PAPER mode). Bugs cause real financial loss.
-Run `python3 -m pytest tests/ -v` before AND after every change.
+
+### Test Scope Policy
+
+<!-- 2026-10-14 Hermes Agent: replace mandatory full-suite runs with impact-based verification. -->
+Choose verification by the affected behavior, not by a blanket full-suite rule:
+
+- For one focused behavior changing at most 2 production code/config files,
+  run relevant tests before and after the change. A full-suite run is not required.
+  Include changed behavior, affected callers/integration paths, risk-exit precedence
+  where relevant, and any explicitly required regression contracts.
+- Count production code and configuration files toward the threshold; supporting
+  test and documentation files do not count. A small file count does not justify
+  narrow testing when the change has broad effects across modules.
+- Run the full suite for changes exceeding that threshold, broad cross-module
+  effects, unclear impact, or relevant failures indicating wider regression risk.
+  Do not rerun the full suite solely because unrelated baseline failures exist.
+- For documentation-only changes, check the diff and content consistency;
+  runtime tests are not required.
+- Record the selected scope, commands, results, skips, and baseline failures.
+  Relevant failures must be resolved or shown with evidence to predate the change
+  and be unrelated to it; never hide them or claim an unrun full suite passed.
+
+This policy applies both during development and before deployment. Existing
+host identity, release freeze, position/order reconciliation, mode isolation,
+restart authorization, and post-deployment runtime checks remain mandatory.
 
 ---
 
@@ -191,17 +215,24 @@ Every strategy function MUST:
 - `stop_loss` must be > 0
 - Return `None` for no signal (never return empty dict)
 
-## Rule 9: Config Changes Don't Require Restart
+## Rule 9: Config Changes Do Not Restart Trading
 
-- `active_strategy` is read every tick cycle
-- Dashboard writes YAML → monitor reads next cycle
-- Exception: Shioaji connection changes need full restart
+- `active_strategy` is read every tick cycle.
+- Dashboard creates a configuration revision; trading-system applies a validated revision only at a safe point.
+- Dashboard, YAML updates, and sync scripts MUST NOT create `.restart`, invoke `pm2`, or cause `trading-system` to exit.
+- A Shioaji connection change is a maintenance deployment, not a dashboard action; it requires Rule 17.
 
 ## Rule 10: Test Before Deploy
 
+<!-- 2026-10-14 Hermes Agent: deployment follows the same impact-based test scope. -->
+Before deployment, apply the Test Scope Policy above. Small focused changes need
+the relevant tests, not an automatic full-suite run. Report all selected test
+results and separately classify evidenced unrelated baseline failures; do not
+deploy with new or unexplained failures in the affected behavior.
+
 ```bash
-# Mandatory before any deployment:
-python3 -m pytest tests/ -v          # All tests pass
+# Select relevant test paths per Test Scope Policy; for a required full run, use tests/.
+taskpolicy -c background python3 -m pytest <relevant-test-paths> -v
 python3 -c "import py_compile; ..."  # No syntax errors
 python3 main.py --dry-run            # Starts without crash
 ```
@@ -245,3 +276,12 @@ config/
 3. Night session (15:00~05:00) dates: use previous calendar day before 05:00
 4. `api.kbars()` has 5-min rate limit — tick bars are primary data source
 5. Options `position` field is overwritten (not accumulated) on entry — guard prevents double entry
+
+## Rule 17: PM2 Supervision and Dashboard Isolation (2026-08-05)
+
+1. PM2 is a process supervisor, not a dashboard configuration-apply mechanism. Dashboard UI/YAML/watchlist changes MUST NOT call PM2, touch `.restart`, or restart `trading-system`.
+2. Never use `pm2 restart all`, `pm2 reload`, or ad-hoc `pm2 start main.py` for trading. Use the canonical `ecosystem.config.js`; the CJS entry is compatibility-only.
+3. A trading-system restart/stop/start needs explicit user approval and may occur only after target preflight, broker position and working-order reconciliation, and `VERIFIED_FLAT`. Logs or stale local state alone are insufficient proof.
+4. During broker uncertainty with a possible open position: block new entries, preserve state, alert, and reconcile. Autonomous stop/restart is forbidden.
+5. Deployments use single-instance stop-then-start, never reload. Validate process identity, intended commit/cwd/interpreter/args, near/far Tick+BidAsk subscriptions, and 120 seconds stable observe-only operation.
+6. Only after validation may an agent run `pm2 save`; it must then verify `dump.pm2` contains `trading-system` with the intended settings and that launchd uses the same `PM2_HOME`.

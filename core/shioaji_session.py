@@ -7,9 +7,12 @@ import threading
 import time
 import logging
 import os
+import ast
+import json
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +33,212 @@ _fetch_lock = threading.Lock()
 _is_fetching = False
 _system_status = SystemReadiness.BOOTING
 
+_session_generation = 0
+_session_records: dict[int, int] = {}
+_last_successful_login_generation: int | None = None
+_instrument_lock = threading.Lock()
+
+
+def _safe_session_account(api):
+    """Read account identity without touching auth-gated SDK properties unsafely."""
+    try:
+        account_obj = getattr(api, "futopt_account", None)
+    except Exception:
+        # A freshly constructed Shioaji object can raise Not authenticated when
+        # its account property is inspected.  Instrumentation must never run
+        # ahead of login or change the login path's outcome.
+        return None
+    return (getattr(account_obj, "account_id", None)
+            or getattr(account_obj, "person_id", None)
+            or getattr(account_obj, "account", None)
+            or account_obj)
+
+
+def _session_event_path() -> Path:
+    return Path(os.getenv("MTS_SESSION_EVENT_LOG_PATH") or
+                os.getenv("MTS_EVENT_LOG_PATH") or
+                str(_PROJECT_ROOT / "logs" / "mts_spread_events.jsonl"))
+
+
+def _session_event(event: str, *, api=None, source: str = "", account=None,
+                   **fields) -> dict:
+    api_id = id(api) if api is not None else None
+    if account is None and api is not None:
+        account = _safe_session_account(api)
+    record = {
+        "event": event,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "thread": threading.get_ident(),
+        "thread_name": threading.current_thread().name,
+        "api_object_id": api_id,
+        "account": account,
+        "source": source or "core.shioaji_session",
+        "session_generation": _session_records.get(api_id) if api_id else None,
+        "last_successful_login_generation": _last_successful_login_generation,
+        **fields,
+    }
+    path = _session_event_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _instrument_lock:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        logger.warning("[SESSION_INSTRUMENTATION_WRITE_FAILED] %s", exc)
+    return record
+
+
+def observe_api_created(api, *, source: str = "", account=None) -> dict:
+    """Record one Shioaji object creation and assign a process-local generation."""
+    global _session_generation
+    with _instrument_lock:
+        _session_generation += 1
+        generation = _session_generation
+        _session_records[id(api)] = generation
+    return _session_event("SESSION_API_CREATED", api=api, source=source,
+                          account=account)
+
+
+def observe_login(api, *, source: str = "", account=None, success: bool,
+                  error: BaseException | None = None) -> dict:
+    """Record login result without changing authentication or readiness semantics."""
+    global _last_successful_login_generation
+    generation = _session_records.get(id(api))
+    if success:
+        _last_successful_login_generation = generation
+    event = _session_event(
+        "SESSION_LOGIN", api=api, source=source, account=account,
+        success=bool(success), error_type=type(error).__name__ if error else None,
+        error_text=str(error)[:240] if error else None)
+    if success:
+        event["last_successful_login_generation"] = _last_successful_login_generation
+    return event
+
+
+def observe_logout(api, *, source: str = "", account=None) -> dict:
+    """Record logout before the object is discarded."""
+    return _session_event("SESSION_LOGOUT", api=api, source=source,
+                          account=account)
+
+
+def observe_broker_call(api, operation: str, phase: str, *, source: str = "",
+                        error: BaseException | None = None) -> dict:
+    """Record read/order API boundaries; this helper never invokes the broker."""
+    return _session_event(
+        "BROKER_CALL", api=api, source=source, operation=operation,
+        phase=phase, error_type=type(error).__name__ if error else None,
+        error_text=str(error)[:240] if error else None)
+
+
+def audit_resident_shioaji_constructors(repo_root: str | Path,
+                                        resident_paths: list[str]) -> list[dict]:
+    """AST audit: resident code may not construct/login Shioaji directly."""
+    root = Path(repo_root).resolve()
+    violations: list[dict] = []
+    files: list[Path] = []
+    for relative in resident_paths:
+        target = root / relative
+        if target.is_file() and target.suffix == ".py":
+            files.append(target)
+        elif target.is_dir():
+            files.extend(sorted(target.rglob("*.py")))
+    for path in files:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            direct_ctor = (isinstance(node.func, ast.Attribute)
+                           and node.func.attr == "Shioaji")
+            direct_login = (isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "login")
+            if direct_ctor or direct_login:
+                violations.append({
+                    "path": str(path.relative_to(root)),
+                    "line": node.lineno,
+                    "kind": "constructor" if direct_ctor else "login",
+                })
+    return violations
+
+
+def is_session_death_error(exc: BaseException) -> bool:
+    """Return True only for errors that prove the broker session is dead.
+
+    Generic timeouts and provider 5xx responses remain degraded reads; they
+    must not create a login storm.  Shioaji exposes the terminal condition
+    either through its exception type or the SolClient sub-code text.
+    """
+    _name = type(exc).__name__.lower()
+    _text = str(exc).lower()
+    return (
+        "sessionnotestablished" in _text
+        or "session not established" in _text
+        or "shioajiconnectionerror" in _name
+        or "shioajiconnectionerror" in _text
+    )
+
+
+class SessionReconnectController:
+    """Single-flight, bounded replacement-session recovery.
+
+    The controller never submits, cancels, or mutates an order.  Callers
+    provide only login, callback/subscription restoration and a read-only
+    verification probe.  Exhaustion is sticky until process restart or an
+    explicit successful recovery, preventing repeated call sites from
+    turning one outage into an unbounded login loop.
+    """
+
+    def __init__(self, *, max_attempts: int = 3,
+                 backoff_seconds=(1.0, 2.0), sleep=time.sleep):
+        self.max_attempts = max(1, int(max_attempts))
+        self.backoff_seconds = tuple(float(v) for v in backoff_seconds)
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._attempts = 0
+        self._exhausted = False
+
+    def reconnect(self, exc: BaseException, *, api_factory: Callable,
+                  login: Callable, restore: Callable, verify: Callable,
+                  emit: Callable):
+        if not is_session_death_error(exc) or self._exhausted:
+            return None
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            while self._attempts < self.max_attempts:
+                self._attempts += 1
+                _attempt = self._attempts
+                emit("SESSION_RECONNECT_ATTEMPT", attempt=_attempt,
+                     max_attempts=self.max_attempts)
+                try:
+                    candidate = api_factory()
+                    observe_api_created(candidate,
+                                        source="SessionReconnectController.reconnect")
+                    login(candidate)
+                    restore(candidate)
+                    if not verify(candidate):
+                        raise RuntimeError("replacement session verification failed")
+                    emit("SESSION_RECONNECT_OK", attempt=_attempt)
+                    self._attempts = 0
+                    self._exhausted = False
+                    return candidate
+                except Exception as reconnect_exc:
+                    emit("SESSION_RECONNECT_FAILED", attempt=_attempt,
+                         max_attempts=self.max_attempts,
+                         error_type=type(reconnect_exc).__name__)
+                    if self._attempts < self.max_attempts:
+                        _idx = min(self._attempts - 1,
+                                   len(self.backoff_seconds) - 1)
+                        if self.backoff_seconds:
+                            self._sleep(self.backoff_seconds[_idx])
+            self._exhausted = True
+            return None
+        finally:
+            self._lock.release()
+
 # IPC: Shared state file to communicate between trading-system and dashboard processes
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _STATUS_FILE = _PROJECT_ROOT / "logs" / "system_status.tmp"
@@ -37,6 +246,34 @@ _STATUS_FILE = _PROJECT_ROOT / "logs" / "system_status.tmp"
 def _system_status_path() -> Path:
     """Helper for tests to mock the status file path."""
     return _STATUS_FILE
+
+
+def _require_ca_material(ca_path: str | None,
+                         ca_passwd: str | None) -> tuple[str, str]:
+    """Return usable signing material or refuse a live-session startup.
+
+    A successful login alone is not sufficient for a production order path.
+    Never silently continue without a readable certificate: that produces a
+    misleading LIVE_READY state followed by local order rejection.
+    """
+    if (not isinstance(ca_path, str) or not ca_path
+            or not isinstance(ca_passwd, str) or not ca_passwd):
+        raise RuntimeError("CA configuration unavailable")
+    if not os.path.isfile(ca_path):
+        raise RuntimeError("CA certificate file unavailable")
+    return ca_path, ca_passwd
+
+
+def _activate_futopt_ca(api: sj.Shioaji, ca_path: str,
+                        ca_passwd: str) -> None:
+    """Activate order signing for the futures/options account."""
+    account = getattr(api, "futopt_account", None)
+    person_id = getattr(account, "person_id", None)
+    if not isinstance(person_id, str) or not person_id:
+        raise RuntimeError("Cannot activate CA: futures account identity unavailable")
+    api.activate_ca(ca_path=ca_path, ca_passwd=ca_passwd,
+                    person_id=person_id)
+
 
 def get_api() -> sj.Shioaji:
     """Get or create the singleton Shioaji API instance."""
@@ -46,14 +283,49 @@ def get_api() -> sj.Shioaji:
     global _api
     with _lock:
         if _api is None:
-            _api = sj.Shioaji()
-            _login(_api)
+            candidate = sj.Shioaji()
+            observe_api_created(candidate, source="core.shioaji_session.get_api")
+            try:
+                _login(candidate)
+            except Exception:
+                # Do not let a failed login leave an unauthenticated
+                # singleton that startup retries would silently reuse.
+                _api = None
+                raise
+            _api = candidate
         return _api
+
+
+def install_replacement_api(expected, replacement) -> bool:
+    """Atomically replace the dead singleton after verified reconstruction."""
+    global _api
+    with _lock:
+        if _api is not expected:
+            return False
+        observe_api_created(replacement,
+                            source="core.shioaji_session.install_replacement_api")
+        _api = replacement
+        return True
+
+def _load_env_credentials():
+    """載入 Shioaji 憑證與環境變數，支援多重路徑 Fallback (包含隔離 worktree 與 runtime 目錄)
+    2026-08-18 Gemini CLI: 解決 PM2 / isolated worktree 環境下遺漏 .env 的問題
+    """
+    from dotenv import load_dotenv
+    env_candidates = [
+        os.getenv("TRADING_ENV_FILE"),
+        str(Path.cwd() / ".env"),
+        str(_PROJECT_ROOT / ".env"),
+        str(Path.home() / "Documents/mylin102/tw-trading-unified-runtime/credentials/.env"),
+    ]
+    for env_path in env_candidates:
+        if env_path and Path(env_path).is_file():
+            load_dotenv(dotenv_path=env_path, override=False)
+    load_dotenv(override=False)
 
 def _login(api: sj.Shioaji):
     """Internal login logic."""
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
+    _load_env_credentials()
     
     api_key = os.getenv("SHIOAJI_API_KEY")
     secret_key = os.getenv("SHIOAJI_SECRET_KEY")
@@ -63,14 +335,43 @@ def _login(api: sj.Shioaji):
     if not api_key or not secret_key:
         raise ValueError("Missing Shioaji credentials in .env")
 
+    # Production order signing is fail-closed: login success is not live
+    # readiness unless the CA material and futures-account identity are valid.
+    ca_path, ca_passwd = _require_ca_material(ca_path, ca_passwd)
+
     # Login
     from core.broker.shioaji_compat import safe_login
-    res = safe_login(api, api_key, secret_key, contracts_timeout=10000)
+    try:
+        login_result = safe_login(api, api_key, secret_key, contracts_timeout=10000)
+        if not login_result:
+            raise RuntimeError("Shioaji login returned unsuccessful result")
+        _activate_futopt_ca(api, ca_path, ca_passwd)
+        _verify_request_readiness(api)
+    except Exception as exc:
+        observe_login(api, source="core.shioaji_session._login", success=False,
+                      error=exc)
+        raise
+    observe_login(api, source="core.shioaji_session._login", success=True)
     logger.info(f"[session] Logged in (attempt 1)")
-    
-    if ca_path and os.path.exists(ca_path):
-        api.activate_ca(ca_path, ca_passwd, os.path.dirname(ca_path))
-        logger.info(f"[session] CA activated: {ca_path}")
+    logger.info("[session] CA activated for futures account")
+
+
+def _verify_request_readiness(api: sj.Shioaji) -> None:
+    """Prove the authenticated object can service a read-only account request."""
+    list_positions = getattr(api, "list_positions", None)
+    if not callable(list_positions):
+        raise RuntimeError("request readiness failed: list_positions unavailable")
+    account = _safe_session_account(api)
+    try:
+        try:
+            result = list_positions(account=account)
+        except TypeError:
+            result = list_positions()
+    except Exception as exc:
+        raise RuntimeError(
+            f"request readiness failed: {type(exc).__name__}: {exc}") from exc
+    if result is None:
+        raise RuntimeError("request readiness failed: list_positions returned None")
 
 def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q):
     """Child process worker: logs in and fetches contracts to populate the local disk cache.
@@ -83,11 +384,13 @@ def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q)
         api = sj.Shioaji()
         api.login(api_key, secret_key)
         if ca_path and os.path.exists(ca_path):
-            api.activate_ca(ca_path, ca_passwd, os.path.dirname(ca_path))
+            _activate_futopt_ca(api, ca_path, ca_passwd)
         api.fetch_contracts()
         q.put(True)
-    except Exception as e:
-        q.put(str(e))
+    except Exception:
+        # Do not send certificate paths, account identity, or provider error
+        # text over the IPC queue.
+        q.put(False)
 
 
 def _fetch_contracts_subprocess(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, timeout: int = 120) -> bool:
@@ -214,6 +517,20 @@ def logout():
     global _api
     with _lock:
         if _api:
+            # Live Route Certification (round-9 #1): invalidate the session
+            # registration so no certificate remains generation-valid after
+            # broker logout. Function-level import avoids import cycles.
+            # round-10 P0-2: invalidation is MANDATORY and must NOT be
+            # swallowed — if it fails we force global revocation and
+            # re-raise (broker logout must not proceed with a valid
+            # generation).
+            from core.live_route_certificate import session_registry
+            try:
+                session_registry.unregister(_api)
+            except Exception:
+                session_registry.invalidate_all()   # force global revocation
+                raise
+            observe_logout(_api, source="core.shioaji_session.logout")
             try:
                 _api.logout()
                 logger.info("[session] Logged out cleanly")

@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np  # 2026-05-31 Gemini CLI: Added for ATR calculation
 from strategies.futures.squeeze_futures.engine.indicators import calculate_futures_squeeze
-from strategies.stocks.pattern_engine import detect_cup_with_handle
+from strategies.stocks.pattern_engine import detect_cup_with_handle, detect_vcp
+
 
 class StockScanner:
     def __init__(self, api):
@@ -34,10 +35,12 @@ class StockScanner:
                 }).dropna()
                 df_5m = calculate_futures_squeeze(df_5m)
                 
-                # 3. 抓取整股 1分K 數據 (優化：抓取最近 28 天以確保有足夠的交易日算 ATR(10))
-                # 💡 GSD: Fetching 365 days of 1min data is too heavy for Shioaji API.
-                # 2026-06-26 Gemini CLI: Decreased to 28 days to prevent Shioaji API range limit error
-                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=28)).strftime("%Y-%m-%d")
+                # 3. 抓取整股日線資料
+                # 2026-09-21 Antigravity: VCP 需要 60+ 個交易日（約 90 日曆天）；
+                # daily_lookback_days 可透過 stocks.canslim.daily_lookback_days 覆蓋。
+                # 原本 28 天只夠 ATR(10)，不夠 VCP 或 Cup with Handle 偵測。
+                lookback_days = canslim_cfg.get("daily_lookback_days", 90)
+                start_date_1d = (pd.Timestamp.now() - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
                 kbars_raw = self._kbars_with_timeout(contract, start=start_date_1d)
                 df_raw = pd.DataFrame({**kbars_raw})
                 
@@ -67,7 +70,7 @@ class StockScanner:
                         atr_10_series = pd.Series(tr).rolling(window=10).mean()
                         atr_10 = float(atr_10_series.iloc[-1])
 
-                    # 執行幾何型態偵測
+                    # 執行幾何型態偵測：Cup with Handle 優先，VCP 作為 fallback
                     base_info = detect_cup_with_handle(df_1d, 
                         cup_depth_min=canslim_cfg.get("cup_depth_min", 0.12),
                         cup_depth_max=canslim_cfg.get("cup_depth_max", 0.35)
@@ -75,6 +78,17 @@ class StockScanner:
                     if base_info["status"]:
                         pattern_status = base_info["type"].upper()
                         pivot_price = base_info["pivot_price"]
+                    else:
+                        # 2026-09-21 Antigravity: VCP fallback — requires 60+ daily bars.
+                        # min_pivots=3 (Minervini standard), check_volume=True (flow signal).
+                        vcp_info = detect_vcp(
+                            df_1d,
+                            min_pivots=canslim_cfg.get("vcp_min_pivots", 3),
+                            check_volume=canslim_cfg.get("vcp_volume_check", True),
+                        )
+                        if vcp_info["status"]:
+                            pattern_status = "VCP"
+                            pivot_price    = vcp_info["pivot_price"]
 
                 # 4. 投信作帳指標 (MA20/MA60)
                 df_5m['ma20'] = df_5m['Close'].rolling(20).mean()

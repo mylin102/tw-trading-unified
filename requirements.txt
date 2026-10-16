@@ -8,6 +8,7 @@ fastparquet
 numba
 python-dotenv
 pyyaml
+ruamel.yaml
 rich
 pandas_market_calendars
 pydantic

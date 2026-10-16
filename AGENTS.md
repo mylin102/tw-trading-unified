@@ -1,7 +1,16 @@
 You are working on a Taiwan futures + options trading system (Shioaji broker). Bugs cause real financial loss.
 
 Read RULES.md in project root before any code change.
-Run `python3 -m pytest tests/ -v` before and after every change.
+<!-- 2026-10-14 Hermes Agent: use impact-based verification for small changes. -->
+Choose tests by change impact, following RULES.md's "Test Scope Policy":
+- For one focused behavior changing at most 2 production code/config files,
+  run relevant tests before and after the change; a full suite is not required.
+  Cover affected callers, integration paths, and existing regression contracts.
+- Tests and documentation files do not count toward the 2-file threshold.
+  Documentation-only changes need diff/content checks, not runtime tests.
+- Use the full suite for broader changes or unclear impact, or when relevant
+  failures indicate wider regression risk. Record baseline failures separately.
+- Deployment uses the same test scope; it does not automatically require a full suite.
 
 # Project Context
 
@@ -74,3 +83,29 @@ Whenever generating Python code, execution steps, or terminal commands for runni
 - Do not mention `cpulimit` or typical Linux-based throttling utilities, as they are inefficient on Apple Silicon schedulers.
 - Remind the user that this policy applies to all spawned child processes automatically, maintaining a cool device with zero fan noise.
 
+
+## P0: PM2 and Dashboard Configuration Safety (2026-08-05)
+- Dashboard, YAML updates, watchlist sync, and UI mode changes MUST NOT create `.restart`, invoke `pm2`, or cause `trading-system` to exit.
+- Never use `pm2 restart all`, `pm2 reload`, or a dashboard-triggered restart for trading configuration. A dashboard-only code update may target `dashboard` only.
+
+## Production Release Immutability and Agent Handoff
+
+The deployed release worktree is immutable while `trading-system` is running.
+
+1. Do not edit or commit to a deployed release worktree during a live session.
+2. After any release commit, re-record the freeze manifest before deployment.
+3. Before every restart, require `git rev-parse HEAD` to equal PM2's
+   `LRC_RELEASE_SHA` exactly.
+4. Before bootstrap or restart, collect one fresh canonical broker preflight;
+   futures positions must be flat (or explicitly reconciled) and open orders
+   must be empty.
+5. Until freeze, preflight, and SHA alignment all pass, do not deploy or
+   restart. Never edit `execution_context.json` or bypass a refusal code.
+6. Runtime artifacts (logs, telemetry, snapshots, credentials, and context
+   files) must never be committed to the release tree.
+7. One slice has one implementer. Other agents hold the same files and only
+   perform read-only review until the implementer hands off a clean commit.
+- A trading-system stop/start/restart is a maintenance deployment: require explicit user approval, target preflight, broker position + working-order reconciliation, and `VERIFIED_FLAT`. Ledger or stale state files alone do not prove flat.
+- Start trading-system only from the canonical `ecosystem.config.js`; `ecosystem.config.cjs` is compatibility-only. Do not use ad-hoc `pm2 start main.py` commands.
+- After a deployment, verify exactly one trading process, the intended commit/cwd/interpreter/args, near/far Tick+BidAsk subscriptions, and 120 seconds of stable observe-only operation before `pm2 save`. Confirm `dump.pm2` contains `trading-system` and uses the same `PM2_HOME` as launchd.
+- If broker health is unknown while a position may be open: block new entries, preserve strategy state, alarm, and reconcile. Do not autonomously stop/restart the process.

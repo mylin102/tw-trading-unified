@@ -15,6 +15,8 @@ def _make_bar(near_close=45500, far_close=45800, atr=10.0, near_age=5000.0, far_
         "near_close": near_close,
         "far_close": far_close,
         "atr": atr,
+        "near_bid": near_close - 1, "near_ask": near_close + 1,
+        "far_bid": far_close - 1, "far_ask": far_close + 1,
         "near_high": near_close,
         "near_low": near_close,
         "far_high": far_close,
@@ -148,6 +150,7 @@ def test_trail_stop_bypasses_quote_guard_when_exceeds_threshold(tmp_path):
     strategy._entry_ts = datetime.now()
     strategy._single_leg_started_at = datetime.now()
     strategy._peak = 45600.0  # Peak is 45600
+    strategy._single_leg_peak = 45600.0
 
     # ADR-011 Phase 4: simulate warmup expiry (entered 1s ago, 2 ticks received)
     import time as _time

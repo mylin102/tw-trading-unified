@@ -117,7 +117,10 @@ class TestMTSStateRestore:
 
             strategy = TMFSpread()
             strategy.init(ctx)
-            assert strategy._has_position is None  # fresh instance
+            # 2026-07-31 Hermes Agent: ADR-025 STARTUP_RECOVERY — init() performs
+            # immediate position recovery (zero-wait before first bar), so a
+            # fresh instance with an open state file is ALREADY restored here.
+            assert strategy._has_position is True
 
             result = strategy.on_bar(ctx)
 
@@ -263,8 +266,22 @@ class TestMTSStateRestore:
             assert strategy._has_position is False
             assert result is None
 
-    def test_stale_state_does_not_block_new_entry(self):
+    def test_stale_state_does_not_block_new_entry(self, monkeypatch, tmp_path):
         """Stale state file → position not restored, but normal entry still works."""
+        # 2026-07-31 Hermes Agent: isolate fills log — the Secondary
+        # fills-reconstruction path reads the real production fills log, which
+        # would resurrect an unrelated open trade and block fresh entry.
+        monkeypatch.setenv("MTS_FILL_LOG_PATH", str(tmp_path / "fills.jsonl"))
+        monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(tmp_path / "events.jsonl"))
+
+        # channel_safety singleton starts RECONCILIATION_PENDING in a fresh
+        # process (correct prod behavior after restart) — mock it as reconciled
+        # so the entry gate passes.
+        class _Safe:
+            entry_blocked_reason = None
+            def entry_allowed(self, ticker=""):
+                return True
+        monkeypatch.setattr("core.channel_safety.get_safety_state", lambda: _Safe())
         _write_test_state(
             _updated=(datetime.now() - timedelta(hours=2)).isoformat()
         )
@@ -272,6 +289,7 @@ class TestMTSStateRestore:
             "near_close": 42000.0,
             "far_close": 41600.0,
             "spread_z": 3.0,   # triggers entry
+            "atr": 50.0,
             "timestamp": pd.Timestamp("2026-05-15 10:00:00"),
         })
 

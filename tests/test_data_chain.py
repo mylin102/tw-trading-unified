@@ -341,6 +341,7 @@ class TestDashboardFileResolution:
                 {
                     "timestamp": "2026-04-21 09:15:00",
                     "ticker": 3017.0,
+                    "name": "奇鋐",
                     "action": "BUY",
                     "price": 2490.0,
                     "qty": 2,
@@ -361,6 +362,7 @@ class TestDashboardFileResolution:
 
         assert len(orders) == 2
         assert orders[0]["ticker"] == "3017"
+        assert orders[0]["name"] == "奇鋐"
         assert orders[0]["status"] == "FILLED"
         assert orders[1]["side"] == "SELL"
 

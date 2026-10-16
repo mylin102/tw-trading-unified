@@ -46,12 +46,15 @@ class TestGhostExitBlockedWhenAuthorityFlat:
         object.__setattr__(m, "order_mgr", om)
         object.__setattr__(m, "paper_fill_sim", sim)
         object.__setattr__(m, "ticker", "TMF")
+        object.__setattr__(m, "dry_run", False)
+        object.__setattr__(m, "live_trading", True)
         object.__setattr__(m, "contract", SimpleNamespace(code="TMFG6"))
         object.__setattr__(m, "far_contract", SimpleNamespace(code="TMFH6"))
         object.__setattr__(m, "_registry", {"tmf_spread": None})
         object.__setattr__(m, "cfg", {"mts": {"strategy": "tmf_spread"}})
         object.__setattr__(m, "trader", SimpleNamespace(position=0, entry_price=0.0))
         object.__setattr__(m, "market_data", {})
+        object.__setattr__(m, "_pending_lifecycle_orders", {})
 
         exports_dir = tmp_path / "exports" / "trades"
         exports_dir.mkdir(parents=True, exist_ok=True)

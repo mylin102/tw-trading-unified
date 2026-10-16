@@ -156,7 +156,7 @@ class TestOrderManagerGate:
         result = om.submit(order)
         assert result is False
         assert order.status == OrderStatus.REJECTED
-        assert "EFFECTIVE_MODE_NOT_LIVE_READY" in (order.reject_reason or "")
+        assert "LIVE_ORDER_AUTHORIZATION_FAILED" in (order.reject_reason or "")
 
     def test_paper_mode_bypasses_gate(self):
         """Paper mode without execution context works normally."""
@@ -214,7 +214,7 @@ class TestOrderManagerGate:
         )
         result = om.submit(order)
         assert result is False
-        assert "LIVE_ORDER_FLAG_FALSE" in (order.reject_reason or "")
+        assert "LIVE_ORDER_AUTHORIZATION_FAILED" in (order.reject_reason or "")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -781,4 +781,4 @@ class TestReadyForCommitState:
         result = om.submit(order)
         assert result is False
         assert order.status == OrderStatus.REJECTED
-        assert "EFFECTIVE_MODE_NOT_LIVE_READY" in (order.reject_reason or "")
+        assert "LIVE_ORDER_AUTHORIZATION_FAILED" in (order.reject_reason or "")

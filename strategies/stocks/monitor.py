@@ -20,10 +20,17 @@ from strategies.stocks.position_state import (
     save_position_state,
     merge_recovery,
 )
+from strategies.stocks.order_chokepoint import StockOrderChokepoint
 
-ROOT = Path(__file__).parent.parent.parent
-MKT_LOGS = ROOT / "logs" / "market_data"
-TRADE_LOGS = ROOT / "exports" / "trades"
+# 2026-08-18 Gemini CLI: 統一對齊 TRADING_RUNTIME_DIR 數據總線 (runtime_paths SSOT)
+try:
+    from core.runtime_paths import runtime_path, runtime_logs
+    MKT_LOGS = Path(runtime_logs("market_data"))
+    TRADE_LOGS = Path(runtime_path("exports", "trades"))
+except ImportError:
+    ROOT = Path(__file__).parent.parent.parent
+    MKT_LOGS = ROOT / "logs" / "market_data"
+    TRADE_LOGS = ROOT / "exports" / "trades"
 MKT_LOGS.mkdir(parents=True, exist_ok=True)
 TRADE_LOGS.mkdir(parents=True, exist_ok=True)
 
@@ -33,14 +40,16 @@ class StockMonitor:
     def __init__(self, api, config_path, dry_run=False):
         self.api = api
         self.dry_run = dry_run
+        self.config_path = Path(config_path)
         
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(self.config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
+        self._config_mtime = self.config_path.stat().st_mtime
             
         stk_cfg = self.cfg.get("stocks", {})
         self.watchlist = stk_cfg.get("watchlist", ["2330"])
         self.total_budget = stk_cfg.get("total_portfolio_budget", 100000)
-        self.capital_per_trade = stk_cfg.get("capital_per_trade", 20000)
+        self.capital_per_trade = stk_cfg.get("capital_per_trade", 150000)
         self.strat_name = stk_cfg.get("strategy", "scout_strategy")
         self.live_trading = self.cfg.get("live_trading", False)
         
@@ -52,6 +61,7 @@ class StockMonitor:
         
         self.positions = {} 
         self.pending_orders = {} # {ticker: {"order_id": str, "time": datetime}}
+        self._stock_order_gateway_instance = None
         self.running = False
         
         # 空頭防禦
@@ -61,7 +71,7 @@ class StockMonitor:
         self.max_daily_loss = bear_cfg.get("max_daily_loss", 3000)
         self.max_consecutive_losses = bear_cfg.get("max_consecutive_losses", 3)
         self.bear_max_positions = bear_cfg.get("bear_max_positions", 1)
-        self.normal_max_positions = bear_cfg.get("normal_max_positions", 3)
+        self.normal_max_positions = bear_cfg.get("normal_max_positions", 2)
         self.daily_pnl = 0.0
         self.consecutive_losses = 0
         self.is_bear_market = False
@@ -72,6 +82,76 @@ class StockMonitor:
         
         # 數據儲存管理器
         self.data_storages = {}  # {ticker: StockDataStorage}
+
+    def _stock_order_gateway(self):
+        if self._stock_order_gateway_instance is None:
+            self._stock_order_gateway_instance = StockOrderChokepoint(
+                self.api,
+                intent_path=TRADE_LOGS / f"STOCK_{self.date_str}_intents.jsonl",
+                config=self.cfg,
+                mode=self.mode_tag,
+            )
+        return self._stock_order_gateway_instance
+
+    def _stock_order_intent(self, ticker, action, price, qty, reason):
+        now = datetime.now()
+        return {
+            "decision_id": f"{ticker}:{action}:{reason}",
+            "bar_id": now.strftime("%Y%m%d%H%M"),
+            "symbol": ticker,
+            "side": action,
+            "qty": qty,
+            "price": price,
+            "strategy_version": self.strat_name,
+            "reason": reason,
+            "metadata": {"mode": self.mode_tag},
+            "current_exposure": self.get_current_exposure(),
+            "open_positions": list(self.positions),
+            "daily_pnl": self.daily_pnl,
+            "is_bear_market": self.is_bear_market,
+            "pending_order": ticker in self.pending_orders,
+            "position_snapshot_ok": getattr(self, "_broker_position_snapshot_verified", False),
+            "price_limit_ok": getattr(self, "_price_limit_verified", False),
+            "now": now,
+        }
+
+    def _reload_config_if_changed(self):
+        """Reload stock config after an mtime change, preserving old state on error."""
+        if not self.config_path.exists():
+            return
+
+        mtime = self.config_path.stat().st_mtime
+        if mtime <= self._config_mtime:
+            return
+
+        try:
+            with self.config_path.open("r", encoding="utf-8") as f:
+                new_cfg = yaml.safe_load(f)
+            if not isinstance(new_cfg, dict):
+                raise ValueError("stock config must be a mapping")
+
+            stocks_cfg = new_cfg.get("stocks", {}) or {}
+            if not isinstance(stocks_cfg, dict):
+                raise ValueError("stocks config must be a mapping")
+
+            self.cfg = new_cfg
+            self.watchlist = stocks_cfg.get("watchlist", ["2330"])
+            self.total_budget = stocks_cfg.get("total_portfolio_budget", 100000)
+            self.capital_per_trade = stocks_cfg.get("capital_per_trade", 150000)
+            self.strat_name = stocks_cfg.get("strategy", "scout_strategy")
+            bear_cfg = stocks_cfg.get("bear_defense", {}) or {}
+            self.bear_defense = bear_cfg.get("enabled", False)
+            self.market_ema_length = bear_cfg.get("market_ema_length", 60)
+            self.max_daily_loss = bear_cfg.get("max_daily_loss", 3000)
+            self.max_consecutive_losses = bear_cfg.get("max_consecutive_losses", 3)
+            self.bear_max_positions = bear_cfg.get("bear_max_positions", 1)
+            self.normal_max_positions = bear_cfg.get("normal_max_positions", 2)
+            if hasattr(self, "_loop_state"):
+                self._loop_state["active_watchlist"] = None
+            self._config_mtime = mtime
+            console.print(f"[cyan]🔄 Stock config hot-reloaded from {self.config_path}[/cyan]")
+        except Exception as e:
+            console.print(f"[red]❌ Failed to reload stock config: {e}[/red]")
 
     def _run_daily_scan(self):
         """執行日線級別型態掃描，更新 Pivot 點"""
@@ -260,7 +340,8 @@ class StockMonitor:
                         console.print(f"[yellow]⚠️ 訂單時間解析錯誤: {e}, 使用當前時間[/yellow]")
                 if trade.status.status == sj.constant.Status.Submitted and (now - order_time).total_seconds() > 300:
                     console.print(f"[yellow]⏳ Order Timeout: Cancelling {trade.contract.code}...[/yellow]")
-                    self.api.cancel_order(trade)
+                    self._stock_order_gateway().cancel_stock_order(
+                        trade, reason="STALE_ORDER_TIMEOUT")
 
     def cancel_all_pending_orders(self):
         """BUG FIX 2026-04-13: Cancel ALL pending orders immediately.
@@ -289,7 +370,8 @@ class StockMonitor:
                 if trade.status.status == sj.constant.Status.Submitted:
                     console.print(f"[yellow]🚨 EOD Cancel: {trade.contract.code} (status={trade.status.status})[/yellow]")
                     try:
-                        self.api.cancel_order(trade)
+                        self._stock_order_gateway().cancel_stock_order(
+                            trade, reason="END_OF_DAY_CLEANUP")
                         cancelled += 1
                     except Exception as e:
                         console.print(f"[red]❌ Failed to cancel {trade.contract.code}: {e}[/red]")
@@ -319,41 +401,108 @@ class StockMonitor:
         return False
 
     def _update_market_regime(self):
-        """用加權指數 EMA 判斷大盤多空"""
+        """用加權指數 (IX0001) 或台指期 EMA 判斷大盤多空
+        2026-08-18 Gemini CLI: 修正加權指數合約代碼為 IX0001 (發行量加權股價指數)，並加入台指期 Fallback
+        """
         if not self.bear_defense:
             return
         try:
-            taiex = self.api.Contracts.Indexs.TSE["001"]
+            taiex = None
+            if hasattr(self.api.Contracts, "Indexs") and hasattr(self.api.Contracts.Indexs, "TSE"):
+                for code in ["IX0001", "001", "TSE001"]:
+                    try:
+                        taiex = self.api.Contracts.Indexs.TSE[code]
+                        if taiex:
+                            break
+                    except (KeyError, IndexError):
+                        continue
+            
+            if taiex is None:
+                # Fallback: 嘗試透過 ContractResolver 取得台指期連續月合約作為大盤參考
+                try:
+                    from core.contract_resolver import ContractResolver
+                    cr = ContractResolver(self.api)
+                    taiex = cr.resolve_futures("TXF")
+                except Exception:
+                    pass
+
+            if taiex is None:
+                console.print("[yellow]⚠️ 無法解析大盤指標合約 (IX0001/TXF)，維持既有市場狀態[/yellow]")
+                return
+
             start = (datetime.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
             kbars = self.api.kbars(taiex, start=start)
             df = pd.DataFrame({**kbars})
             if len(df) < self.market_ema_length:
                 return
             df["ema"] = df["Close"].ewm(span=self.market_ema_length, adjust=False).mean()
-            self.is_bear_market = df["Close"].iloc[-1] < df["ema"].iloc[-1]
+            self.is_bear_market = bool(df["Close"].iloc[-1] < df["ema"].iloc[-1])
             tag = "🐻 空頭" if self.is_bear_market else "🐂 多頭"
             console.print(f"[dim]📊 大盤 regime: {tag} (Close={df['Close'].iloc[-1]:.0f}, EMA{self.market_ema_length}={df['ema'].iloc[-1]:.0f})[/dim]")
         except Exception as e:
             console.print(f"[yellow]⚠️ Market regime check failed: {e}[/yellow]")
 
     def _filter_watchlist_by_strength(self):
-        """第二招：只留成交量大 + 開盤強勢的標的"""
+        """只留達最低流動性門檻 + 開盤強勢的標的。
+
+        Gate 1（硬性絕對門檻）: snap.total_amount >= min_daily_amount
+            — 確保可執行整股市價單不影響盤
+            — 預設 5000 萬台幣；可由 stocks.canslim.min_daily_amount 覆蓋
+            — 非盤中（api=None）直接回傳完整 watchlist，不打 API
+        Gate 2（相對排名）: 按成交金額降序，取前半（現有邏輯不變）
+
+        已持倉股票（position_tickers）由 run_iteration 的獨立路徑保護，
+        不受此過濾影響（check_risk 永遠執行）。
+
+        2026-09-20 Antigravity: added Gate 1 absolute volume threshold.
+        """
         if self.api is None:
-            return self.watchlist
+            return self.watchlist  # 非盤中 fallback：跳過過濾，不打 API
+
+        # 讀取門檻（可 YAML 覆蓋；預設 5000 萬台幣日成交金額）
+        # 在 stocks.yaml 加入 stocks.canslim.min_daily_amount: 50000000 可覆蓋
+        canslim_cfg = self.cfg.get("stocks", {}).get("canslim", {})
+        min_daily_amount = canslim_cfg.get("min_daily_amount", 50_000_000)
+
         scored = []
+        filtered_out = []
         for ticker in self.watchlist:
             try:
                 contract = self.api.Contracts.Stocks[ticker]
                 snap = self.api.snapshots([contract])[0]
-                if snap.total_amount > 0 and snap.close > snap.open:
+
+                # Gate 1: 硬性日成交金額門檻（絕對值）
+                if snap.total_amount < min_daily_amount:
+                    filtered_out.append(ticker)
+                    continue
+
+                # Gate 2: 開盤強勢（現有條件）
+                if snap.close > snap.open:
                     scored.append((ticker, snap.total_amount))
-            except Exception:
-                pass
-        # 按成交金額排序，取前半
+            except Exception as e:
+                self._record_analysis_failure(ticker, e)
+
+        if filtered_out:
+            console.print(
+                f"[yellow]⚠️ Volume filter: excluded {len(filtered_out)} tickers "
+                f"(daily amount < {min_daily_amount:,} TWD): {filtered_out}[/yellow]"
+            )
+
+        # Gate 2: 相對排名，取前半（現有邏輯不變）
         scored.sort(key=lambda x: -x[1])
         max_tickers = max(3, len(self.watchlist) // 2)
         result = [t for t, _ in scored[:max_tickers]]
-        return result if result else self.watchlist
+
+        # Fallback：若全部被過濾（門檻設太高或盤前量不足），
+        # 回傳原始 watchlist + 告警，避免系統空轉。
+        if not result:
+            console.print(
+                "[bold yellow]⚠️ Volume filter removed ALL tickers — "
+                "falling back to full watchlist. Check min_daily_amount setting.[/bold yellow]"
+            )
+            return self.watchlist
+
+        return result
 
     def _check_date_reset(self):
         """Check if date has changed and reset daily stats."""
@@ -435,7 +584,8 @@ class StockMonitor:
                     
                     console.print("[bold red]🛑 Cancelling ALL pending orders to prevent post-market execution[/bold red]")
                     self.cancel_all_pending_orders()
-                    Path(ROOT / ".restart").touch()
+                    # 2026-08-05 Antigravity AI: Disabled .restart touch for Commit 224cab05 P0 compliance
+                    pass
                 elif not self.live_trading and disk_live:
                     # PAPER → LIVE: promote to live mode, cancel any stale paper positions
                     console.print("[bold yellow]⚠️ Config changed to LIVE on disk! Switching to LIVE mode.[/bold yellow]")
@@ -447,16 +597,37 @@ class StockMonitor:
                     
                     console.print("[bold yellow]🛑 Cancelling ALL paper orders before going LIVE[/bold yellow]")
                     self.cancel_all_pending_orders()
-                    Path(ROOT / ".restart").touch()
+                    # 2026-08-05 Antigravity AI: Disabled .restart touch for Commit 224cab05 P0 compliance
+                    pass
                 return disk_live
         except Exception as e:
             console.print(f"[yellow]⚠️ Could not re-verify live flag: {e}[/yellow]")
             return self.live_trading
 
+    def _record_analysis_failure(self, ticker, error):
+        failures = getattr(self, "_analysis_failures", None)
+        if failures is None:
+            failures = self._analysis_failures = []
+        failures.append(str(ticker))
+        first_line = str(error).splitlines()[0] if str(error) else type(error).__name__
+        console.print(f"[yellow][WARN] Stock analysis failed ticker={ticker} "
+                      f"error={type(error).__name__}: {first_line}[/yellow]")
+
+    def _finish_analysis_round(self):
+        failures = getattr(self, "_analysis_failures", [])
+        total = int(getattr(self, "_analysis_total", 0) or 0)
+        if not failures:
+            return
+        level = "ERROR" if total and len(failures) >= total else "WARN"
+        console.print(f"[{'red' if level == 'ERROR' else 'yellow'}][{level}] "
+                      f"Stock analysis failures this round: {len(failures)}/{total} "
+                      f"tickers={failures}[/{'red' if level == 'ERROR' else 'yellow'}]")
+
     def run_iteration(self):
         """Run a single iteration of the scanning and execution logic."""
         # [GSD Fix] Daily reset for long-running process
         self._check_date_reset()
+        self._reload_config_if_changed()
         
         if not hasattr(self, '_loop_state'):
             from strategies.stocks.entry_strategies import STOCK_STRATEGIES
@@ -480,6 +651,18 @@ class StockMonitor:
         # BUG FIX 2026-04-13: Cancel pending orders when trading window closes
         if now.hour < 9 or (now.hour == 13 and now.minute > 30) or now.hour >= 14:
             console.print(f"[dim]⏸️ Outside trading hours, skipping iteration[/dim]")
+            # EOD/time exits remain active even when the normal scan is closed.
+            if 13 <= now.hour <= 14:
+                for ticker in list(self.positions):
+                    try:
+                        contract = self.api.Contracts.Stocks[ticker]
+                        snapshot = self.api.snapshots([contract])[0]
+                        price = snapshot.close
+                    except Exception:
+                        price = self.positions[ticker].get("entry_price", 0.0)
+                    self.check_risk(ticker, price, context={"regime": "NORMAL",
+                                                             "last_bar": {},
+                                                             "now": now})
             # Only cancel once per session end (track with flag)
             if not getattr(self, '_eod_cancelled_today', False):
                 self.cancel_all_pending_orders()
@@ -504,6 +687,8 @@ class StockMonitor:
 
         self.clean_unfilled_orders()
         scan_list = self._loop_state["active_watchlist"] if self._loop_state["active_watchlist"] else self.watchlist
+        self._analysis_failures = []
+        self._analysis_total = len(scan_list)
         # Also scan open positions (may include overnight holdings not in watchlist)
         position_tickers = [t for t in self.positions.keys() if t not in scan_list]
         if position_tickers:
@@ -543,6 +728,18 @@ class StockMonitor:
                     else:
                         console.print(f"[yellow]⚠️ API returned empty data for {ticker}[/yellow]")
                 except Exception as e:
+                    # 2026-09-18 Antigravity session-health RCA (Layer-1 fix):
+                    # Session death (SessionNotEstablished / SDK_SESSION_CLOSED)
+                    # MUST NOT be silenced into a cache fallback.  Swallowing it
+                    # here causes run_iteration() to return normally, which then
+                    # triggers record_success() on a dead session — the root cause
+                    # of the 1327-iteration silent loop bug.
+                    # Re-raise so the outer ticker handler and ultimately the
+                    # runner's health tracker can classify and block entry.
+                    # MUTATION GATE: removing this block makes the test RED.
+                    from core.broker_health import classify_broker_error, BrokerErrorClass
+                    if classify_broker_error(e) == BrokerErrorClass.SDK_SESSION_CLOSED:
+                        raise  # propagate — do NOT fall through to cache
                     console.print(f"[dim]📋 API kbars failed: {e}[/dim]")
                 finally:
                     _sk1.setdefaulttimeout(_orig_to1)
@@ -615,9 +812,6 @@ class StockMonitor:
 
                 df.columns = [c.capitalize() if c.lower() in ["open", "high", "low", "close", "volume"] else c for c in df.columns]
                 
-                # 調試：檢查傳遞給 calculate_stock_squeeze 的 DataFrame
-                console.print(f"[dim]📊 DEBUG: Before calculate_stock_squeeze for {ticker}[/dim]")
-                
                 df = self._loop_state["calculate_stock_squeeze"](df)
                 
                 # Indicator logic
@@ -670,9 +864,21 @@ class StockMonitor:
                     except Exception as e:
                         console.print(f"[yellow]⚠️ Failed to save indicators for {ticker}: {e}[/yellow]")
 
-                # 檢查數據來源，如果是緩存數據則跳過交易
+                # Exits are evaluated before entry gates; cached prices are exit-only.
+                try:
+                    snapshot = self.api.snapshots([contract])[0]
+                    current_price = snapshot.close
+                except Exception:
+                    current_price = float(df.iloc[-1]["Close"])
+                last_bar = df.iloc[-1].to_dict()
+                regime = tf_analysis.get("regime", "NORMAL")
+                last_bar["regime"] = regime
+                if ticker in self.positions:
+                    self.check_risk(ticker, current_price, context={
+                        "regime": regime, "last_bar": last_bar, "now": now})
+
+                # Cache is exit-only: it cannot enable a new entry.
                 if data_source == "cache":
-                    console.print(f"[yellow]⚠️ Skipping trade for {ticker} - using cached data (trading disabled)[/yellow]")
                     continue
                 
                 should_trade, tf_details = self._loop_state["should_trade_based_on_tf"](df)
@@ -693,28 +899,16 @@ class StockMonitor:
                 
                 res = self._loop_state["STOCK_STRATEGIES"][self.strat_name]["func"](state, self.cfg)
                 
-                # 3. Execution & Risk with Decision Intelligence
-                snapshot = self.api.snapshots([contract])[0]
-                last_bar = df.iloc[-1].to_dict()
-                regime = tf_analysis.get("regime", "NORMAL")
-                last_bar["regime"] = regime
-                
-                # --- A. Risk Check (Consolidated Exit Engine) ---
-                if ticker in self.positions:
-                    self.check_risk(ticker, snapshot.close, context={
-                        "regime": regime,
-                        "last_bar": last_bar,
-                        "now": now
-                    })
-
-                # --- B. Entry Filter (Market Gate + Edge Model) ---
+                # --- Entry Filter (Market Gate + Edge Model) ---
+                # 2026-08-18 Gemini CLI: 傳入 StockMonitor 由加權指數 (IX0001) / 台指期判斷之大盤多空作為 Fallback
                 if res and res["action"] == "BUY" and not self._check_bear_defense():
                     from strategies.stocks.market_gate import get_gate_result, strategy_allowed
-                    gate_res = get_gate_result()
+                    current_regime = "BEAR" if self.is_bear_market else "BULL"
+                    gate_res = get_gate_result(fallback_regime=current_regime)
                     if not gate_res.allowed:
                         console.print(f"[dim]🚫 Market gate {gate_res.gate} — skip {ticker} ({gate_res.reason})[/dim]")
                         continue
-                    if not strategy_allowed(self.strat_name):
+                    if not strategy_allowed(self.strat_name, regime=gate_res.regime):
                         console.print(f"[dim]🚫 Strategy {self.strat_name} not allowed in current regime — skip {ticker}[/dim]")
                         continue
                     
@@ -757,7 +951,17 @@ class StockMonitor:
                             console.print(f"[dim]🛡️ Entry blocked: {ticker} {edge_res['reason']}[/dim]")
                         
             except Exception as e:
-                console.print(f"[red]Error {ticker}: {e}[/red]")
+                # 2026-09-22 Hermes takeover: Layer-2 session-death guard.  agy's Layer-2
+                # block was lost when the slice was re-derived on the true base; without
+                # it the outer per-ticker handler swallows session death, run_iteration()
+                # returns normally, and the runner never records SESSION_INVALID.
+                # MUTATION GATE: removing this block makes the propagation tests RED.
+                from core.broker_health import classify_broker_error, BrokerErrorClass
+                if classify_broker_error(e) == BrokerErrorClass.SDK_SESSION_CLOSED:
+                    raise  # propagate to the run_iteration caller
+                pass
+
+        self._finish_analysis_round()
 
     def run(self):
         """Legacy run method for backward compatibility."""
@@ -878,12 +1082,34 @@ class StockMonitor:
             console.print(f"[yellow]⚠️ [STOCK_STOP_PENDING] {ticker} stop triggered at {curr_price:.2f}, exit pending EOD[/yellow]")
             return
 
+    def _is_same_trade_date(self, pos):
+        stamp = pos.get("entry_ts")
+        if not stamp:
+            return False
+        try:
+            return datetime.fromisoformat(str(stamp)).date() == datetime.now().date()
+        except (TypeError, ValueError):
+            return False
+
+    def _is_day_strategy(self):
+        return str(self.strat_name).lower() in {
+            "mean_reversion", "intraday", "day_trading", "day_strategy"
+        }
+
+    def _stock_order_lot(self, quantity, overnight=False):
+        if quantity >= 1000:
+            return sj.constant.StockOrderLot.Common
+        return (sj.constant.StockOrderLot.Odd if overnight
+                else sj.constant.StockOrderLot.IntradayOdd)
+
     def execute_trade(self, ticker, action, price, qty_mode, reason):
         if action == "BUY":
             # GSD Fix: Prevent duplicate entry for same ticker
             if ticker in self.positions and qty_mode == "SCOUT":
                 return
 
+            if ticker not in self.positions and len(self.positions) >= 2:
+                return
             current_exposure = self.get_current_exposure()
             remaining = self.total_budget - current_exposure
             if remaining <= 5000: return
@@ -900,6 +1126,8 @@ class StockMonitor:
                 total_target = min(self.total_budget - (current_exposure - pos_cost), self.capital_per_trade)
                 qty = int(total_target // (price * 1.002)) - pos_qty
             
+            if self._is_day_strategy():
+                qty = (qty // 1000) * 1000
             if qty <= 0: return
 
             # --- LIVE: 下單後等確認，才更新 position ---
@@ -911,9 +1139,15 @@ class StockMonitor:
                     price=price, quantity=qty, action=sj.constant.Action.Buy,
                     price_type=sj.constant.StockPriceType.LMT,
                     order_type=sj.constant.OrderType.ROD,
-                    order_lot=sj.constant.StockOrderLot.IntradayOdd
+                    order_lot=self._stock_order_lot(qty)
                 )
-                trade = self.api.place_order(contract, order)
+                result = self._stock_order_gateway().submit_stock_order(
+                    intent=self._stock_order_intent(ticker, "BUY", price, qty, reason),
+                    contract=contract, order=order)
+                if not result.accepted:
+                    console.print(f"[red]❌ BUY {ticker} blocked: {result.reason}[/red]")
+                    return
+                trade = result.trade
                 # 等待委託回報確認 (最多 10 秒)
                 self.api.update_status()
                 if trade.status.status != sj.constant.Status.Submitted and trade.status.status != sj.constant.Status.Filled:
@@ -932,37 +1166,14 @@ class StockMonitor:
             if ticker not in self.positions: return
             pos = self.positions[ticker]
             
-            # GSD Fix: 零股禁止當沖檢查
+            # Same-day odd-lot positions are not sellable; defer silently
+            # until the next session (no retry/log storm).
             # 台灣股市規則：零股（<1000股）禁止當天賣出
             qty = pos.get("qty", 0)
+            if qty < 1000 and self._is_same_trade_date(pos):
+                return
             if qty < 1000:
-                # 檢查是否為當天買入的零股
-                is_today_buy = False
-                try:
-                    # 從交易紀錄中查找這個ticker的最近買入時間
-                    if self.ledger_path.exists():
-                        trades_df = pd.read_csv(self.ledger_path)
-                        # 將ticker轉換為整數進行比較（交易紀錄中的ticker是整數）
-                        ticker_int = int(ticker)
-                        ticker_trades = trades_df[trades_df["ticker"] == ticker_int]
-                        buy_trades = ticker_trades[ticker_trades["action"] == "BUY"]
-                        if not buy_trades.empty:
-                            # 獲取最近一筆買入交易的時間
-                            latest_buy = buy_trades.iloc[-1]
-                            buy_timestamp = pd.to_datetime(latest_buy["timestamp"])
-                            buy_date = buy_timestamp.date()
-                            today = datetime.now().date()
-                            is_today_buy = (buy_date == today)
-                except Exception as e:
-                    console.print(f"[yellow]⚠️ Failed to check odd-lot day-trade: {e}[/yellow]")
-                
-                # 如果零股是今天買入的，則禁止賣出（當沖）
-                if is_today_buy:
-                    console.print(f"[yellow]⚠️ 零股禁止當沖: {ticker} ({qty}股) 今天買入，禁止當天賣出[/yellow]")
-                    return
-                else:
-                    # 零股但不是今天買入的（可能是隔夜持倉），允許賣出
-                    console.print(f"[cyan]ℹ️ 零股賣出允許: {ticker} ({qty}股) 非今天買入[/cyan]")
+                console.print(f"[cyan]ℹ️ 零股賣出允許: {ticker} ({qty}股) 非今天買入[/cyan]")
             
             # --- LIVE: 下單後等確認，才更新 position ---
             if self.mode_tag == "LIVE":
@@ -972,9 +1183,15 @@ class StockMonitor:
                     price=price, quantity=pos["qty"], action=sj.constant.Action.Sell,
                     price_type=sj.constant.StockPriceType.LMT,
                     order_type=sj.constant.OrderType.ROD,
-                    order_lot=sj.constant.StockOrderLot.IntradayOdd
+                    order_lot=self._stock_order_lot(pos["qty"], overnight=qty < 1000)
                 )
-                trade = self.api.place_order(contract, order)
+                result = self._stock_order_gateway().submit_stock_order(
+                    intent=self._stock_order_intent(ticker, "SELL", price, pos["qty"], reason),
+                    contract=contract, order=order)
+                if not result.accepted:
+                    console.print(f"[red]❌ SELL {ticker} blocked: {result.reason}[/red]")
+                    return
+                trade = result.trade
                 self.api.update_status()
                 if trade.status.status != sj.constant.Status.Submitted and trade.status.status != sj.constant.Status.Filled:
                     console.print(f"[red]❌ SELL {ticker} order rejected: {trade.status.status}[/red]")
@@ -1001,10 +1218,69 @@ class StockMonitor:
             self._log_trade(ticker, "SELL", price, qty, reason, pnl, pos["entry_price"], fees, net_pnl)
             self._save_position_state_to_disk()
 
+    def _stock_name(self, ticker):
+        """Return the broker contract name for ledger/dashboard consumers."""
+        try:
+            contract = self.api.Contracts.Stocks[str(ticker)]
+            for attr in ("name", "local_name"):
+                value = getattr(contract, attr, "")
+                if value and str(value).strip():
+                    return str(value).strip()
+        except Exception:
+            pass
+        # Historical ledgers may be migrated after the broker session is gone.
+        # Use the latest indicator snapshot as a read-only name source rather
+        # than leaving the newly-added column blank.
+        try:
+            pattern = f"STOCK_{str(ticker)}_*_indicators.csv"
+            candidates = list(MKT_LOGS.glob(pattern))
+            for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+                frame = pd.read_csv(path, nrows=1)
+                if "name" not in frame.columns or frame.empty:
+                    continue
+                value = frame.iloc[0].get("name", "")
+                if pd.notna(value) and str(value).strip():
+                    return str(value).strip()
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError):
+            pass
+        return ""
+
+    def _ensure_trade_ledger_schema(self):
+        """Add columns required by new rows before appending to legacy ledgers."""
+        if not self.ledger_path.exists():
+            return
+        try:
+            legacy = pd.read_csv(self.ledger_path)
+            columns = legacy.columns.tolist()
+            changed = False
+            if "name" not in columns:
+                insert_at = columns.index("ticker") + 1 if "ticker" in columns else len(columns)
+                legacy.insert(insert_at, "name", "")
+                changed = True
+
+            # Backfill blank names as well as adding the column. This repairs
+            # old rows without overwriting a broker-provided name.
+            if "ticker" in legacy.columns:
+                for idx, ticker in legacy.loc[
+                    legacy["name"].isna() | legacy["name"].astype(str).str.strip().eq(""),
+                    "ticker",
+                ].items():
+                    name = self._stock_name(ticker)
+                    if name:
+                        legacy.at[idx, "name"] = name
+                        changed = True
+            if changed:
+                legacy.to_csv(self.ledger_path, index=False)
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError, ValueError):
+            # A malformed/empty legacy file must not prevent the next trade from
+            # being recorded; the append below will preserve the normal path.
+            return
+
     def _log_trade(self, ticker, action, price, qty, reason, pnl, entry_price=0.0, fees=0.0, net_pnl=0.0):
         row = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "ticker": ticker,
+            "name": self._stock_name(ticker),
             "strategy": self.strat_name,
             "mode": self.mode_tag,
             "action": action,
@@ -1016,6 +1292,7 @@ class StockMonitor:
             "fees": round(fees, 0),
             "pnl_cash": round(net_pnl if action == "SELL" else 0, 0),
         }
+        self._ensure_trade_ledger_schema()
         trade_df = pd.DataFrame([row])
         trade_df.to_csv(self.ledger_path, mode='a', header=not self.ledger_path.exists(), index=False)
         

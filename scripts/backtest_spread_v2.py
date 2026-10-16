@@ -28,7 +28,7 @@ from core.strategy_context import StrategyContext, MarketData, PositionView
 from core.signal import Signal
 
 # ==================== Configuration ====================
-DATA_PATTERN = "data/mxf_calendar_spread_*.csv"
+DATA_PATTERN = "data/tmf_calendar_spread_*.csv"
 INITIAL_CAPITAL = 100_000
 MULTIPLIER = 10.0  # TMF (Micro)
 FEE_PER_SIDE = 10.0 # Estimate for micro

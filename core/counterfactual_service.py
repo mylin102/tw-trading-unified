@@ -1,3 +1,9 @@
+
+def _format_df_markdown(df) -> str:
+    try:
+        return df.to_markdown(index=False)
+    except Exception:
+        return f"```\n{df.to_string(index=False)}\n```"
 # 2026-07-17 Gemini CLI: CounterfactualService implementation with fail-fast schema/hash contract verification.
 
 from dataclasses import dataclass, field
@@ -127,6 +133,7 @@ class ParameterSweepResult:
     provenance: "ProvenanceBundle"
     baseline_value: float = 0.0
 
+@dataclass(frozen=True)
 class MismatchDetail:
     """Detailed info for a mismatched decision case."""
     trade_id: str
@@ -586,7 +593,7 @@ class CounterfactualService:
 * **Generated At**: `{result.provenance.generated_time}`
 
 ### Summary Metrics Table
-{metrics_df.to_markdown(index=False)}
+{_format_df_markdown(metrics_df)}
 
 ### Conclusion
 This decision-point sensitivity analysis identifies the stability threshold boundaries of the trading decision engine under varying parameters.

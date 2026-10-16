@@ -39,6 +39,28 @@ class MultiTimeframeAnalyzer:
             'volatility_regime': 'NORMAL' # 波動率狀態
         }
         
+    @staticmethod
+    def _normalize_ohlcv_columns(df_5m: pd.DataFrame) -> pd.DataFrame:
+        """Normalize producer columns to the OHLCV consumer contract.
+
+        The stock monitor may receive API or cache frames with lower-case
+        names.  This is the single analysis choke point; missing required
+        fields raise an explicit error instead of becoming ``should_trade``
+        false through an outer per-ticker exception handler.
+        """
+        required = ("Open", "High", "Low", "Close", "Volume")
+        by_lower = {}
+        for column in df_5m.columns:
+            key = str(column).lower()
+            if key in by_lower and by_lower[key] != column:
+                raise ValueError(f"STOCK_OHLCV_SCHEMA_DUPLICATE: {column}")
+            by_lower[key] = column
+        missing = [name for name in required if name.lower() not in by_lower]
+        if missing:
+            raise ValueError("STOCK_OHLCV_SCHEMA_MISSING: " + ",".join(missing))
+        rename = {by_lower[name.lower()]: name for name in required}
+        return df_5m.rename(columns=rename).copy()
+
     def resample_data(self, df_5m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         """將5分鐘數據重採樣到其他時間框架"""
         if timeframe == '5m':
@@ -118,6 +140,7 @@ class MultiTimeframeAnalyzer:
     
     def analyze_multi_timeframe(self, df_5m: pd.DataFrame) -> Dict:
         """多時間框架綜合分析"""
+        df_5m = self._normalize_ohlcv_columns(df_5m)
         results = {}
         
         # 分析各時間框架

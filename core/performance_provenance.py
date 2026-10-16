@@ -1,0 +1,551 @@
+"""MTS Paper/Live performance provenance — canonical presentation contract.
+
+Every MTS performance metric (UPL, realized PnL, closed-loop count / win
+rate / profit factor) must be SCOPED by:
+  - mode (paper / live)
+  - run_id
+  - config_hash
+  - session/source provenance
+
+Rules (fail-closed presentation — NEVER 0 or merged PnL on uncertainty):
+  - the Live view may use ONLY live broker-reconciled execution evidence;
+    the Paper view ONLY paper evidence
+  - legacy (no per-record provenance) / mixed / unknown evidence renders
+    N/A with an explicit source-mismatch reason
+  - a live verified-flat UPL renders 0 ONLY together with a fresh
+    snapshot timestamp; missing/stale evidence renders N/A
+  - Go-Live Preconditions stay visibly separate (research/observation),
+    never presented as performance
+
+The classifier is dashboard-side and pure (no streamlit import): the
+ledger records may or may not carry explicit mode/run_id/config_hash —
+records without them are legacy (attributable to a paper runtime, never
+to a live runtime).
+"""
+
+import json
+import math
+import os
+import time
+
+# freshness window for a "verified now" snapshot (same as the gate SLO)
+SNAPSHOT_MAX_AGE_S = 600.0
+
+_EVIDENCE_FIELDS = ("mode", "run_id", "config_hash")
+# the ONLY accepted live source marker (documented canonical equivalent)
+LIVE_SOURCE = "live_broker_reconciled"
+_SESSION_KEYS = ("session_id", "generation", "session_generation")
+
+
+def _iter_records(path):
+    if not path or not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(rec, dict) and rec:
+                yield rec
+
+
+_TD_CACHE: dict = {}
+
+
+def _record_trading_day(rec: dict) -> str | None:
+    """Return the exchange trading day for a ledger record."""
+    if not isinstance(rec, dict):
+        return None
+    ts = next((rec.get(k) for k in
+               ("timestamp", "event_ts", "ts", "fill_timestamp", "created_at")
+               if rec.get(k) not in (None, "")), None)
+    if ts is None:
+        return None
+    session = rec.get("session") or rec.get("session_label") or "UNKNOWN"
+    # [PERF] get_trading_day is ~0.5ms/record; the MTS events ledger has
+    # ~90K records, so the dashboard evidence classification took ~105s per
+    # rerun.  The trading day only changes at the 15:00 night-session
+    # boundary, so an hour-precision key is a pure function of (ts, session)
+    # with identical output — memoizing drops the scan to well under a
+    # second (2026-08-28 Hermes Agent).
+    _key = (str(ts)[:13], session)
+    _cached = _TD_CACHE.get(_key)
+    if _cached is not None:
+        return _cached
+    try:
+        from scripts.generate_daily_report import get_trading_day
+        day = get_trading_day(ts, session)
+        _result = day.strftime("%Y-%m-%d") if hasattr(day, "strftime") else str(day)
+    except Exception:
+        value = str(ts)
+        _result = value[:10] if len(value) >= 10 else None
+    if _result is not None:
+        _TD_CACHE[_key] = _result
+    return _result
+
+
+def select_mts_reporting_day(fills_path, events_path,
+                             current_trading_day: str) -> str:
+    """Choose current day when it has records, otherwise latest prior day.
+
+    This is deliberately a date selector, not a performance aggregation:
+    provenance classification still receives exactly one trading day.
+    """
+    days = set()
+    for path in (fills_path, events_path):
+        for rec in _iter_records(path):
+            day = _record_trading_day(rec)
+            if day:
+                days.add(day)
+    if current_trading_day in days:
+        return current_trading_day
+    prior = [day for day in days if day < current_trading_day]
+    return max(prior) if prior else current_trading_day
+
+
+def classify_mts_evidence(fills_path, events_path,
+                          target_trading_day: str | None = None) -> dict:
+    """Scan the MTS ledger and classify the execution evidence.
+
+    Returns:
+      evidence_mode: "live" | "paper" | "legacy" | "mixed" | "missing"
+      run_ids / config_hashes / session_ids / sources: distinct values
+      record_count: scanned records
+      reason: None or an explicit source-attribution explanation
+
+    LIVE is STRICT (fail-closed): evidence is classified "live" ONLY when
+    EVERY record carries mode="live" AND exactly one non-empty run_id AND
+    exactly one non-empty config_hash AND exactly one non-empty
+    session/generation AND every source == "live_broker_reconciled".
+    Any missing/mixed/unknown value degrades to "mixed" (N/A downstream).
+
+    Execution evidence = the FILLS ledger only (2026-09-02). The events file
+    holds diagnostics; HVWAP_RELEASE_INTENT writes its gate state into a
+    'mode' field, which previously collided with the provenance contract and
+    degraded clean paper ledgers to 'mixed'.
+    """
+    modes, run_ids, hashes, sessions, sources = set(), set(), set(), set(), set()
+    n = 0
+    for path in (fills_path,):
+        for rec in _iter_records(path):
+            if target_trading_day is not None and _record_trading_day(rec) != target_trading_day:
+                continue
+            n += 1
+            m = rec.get("mode")
+            if isinstance(m, str) and m:
+                modes.add(m)
+            r = rec.get("run_id")
+            if isinstance(r, str) and r:
+                run_ids.add(r)
+            c = rec.get("config_hash")
+            if isinstance(c, str) and c:
+                hashes.add(c)
+            s = next((rec.get(k) for k in _SESSION_KEYS
+                      if isinstance(rec.get(k), str) and rec.get(k)), None)
+            if s:
+                sessions.add(s)
+            src = rec.get("source")
+            if isinstance(src, str) and src:
+                sources.add(src)
+    if n == 0:
+        return {"evidence_mode": "missing", "record_count": 0,
+                "run_ids": [], "config_hashes": [], "session_ids": [],
+                "sources": [], "reason": None}
+    if modes:
+        known = modes & {"paper", "live"}
+        if known and len(known) > 1:
+            return {"evidence_mode": "mixed", "record_count": n,
+                    "run_ids": sorted(run_ids),
+                    "config_hashes": sorted(hashes),
+                    "session_ids": sorted(sessions),
+                    "sources": sorted(sources),
+                    "reason": "ledger mixes paper and live execution "
+                              "evidence — cannot attribute"}
+        if known:
+            mode = next(iter(known))
+            unknown = modes - {"paper", "live"}
+            if unknown:
+                return {"evidence_mode": "mixed", "record_count": n,
+                        "run_ids": sorted(run_ids),
+                        "config_hashes": sorted(hashes),
+                        "session_ids": sorted(sessions),
+                        "sources": sorted(sources),
+                        "reason": f"ledger carries unknown modes "
+                                  f"{sorted(unknown)} — cannot attribute"}
+            if mode == "live":
+                # STRICT live: the full provenance must be present and
+                # single-valued on EVERY record (audit correction — an
+                # unproven live ledger must NEVER pass)
+                missing = []
+                if not run_ids:
+                    missing.append("run_id")
+                elif len(run_ids) > 1:
+                    missing.append(f"multiple run_ids {sorted(run_ids)}")
+                if not hashes:
+                    missing.append("config_hash")
+                elif len(hashes) > 1:
+                    missing.append(f"multiple config_hashes "
+                                   f"{sorted(hashes)}")
+                if not sessions:
+                    missing.append("session/generation")
+                elif len(sessions) > 1:
+                    missing.append(f"multiple sessions {sorted(sessions)}")
+                if not sources:
+                    missing.append("source")
+                elif sources != {LIVE_SOURCE}:
+                    missing.append(f"source {sorted(sources)} != "
+                                   f"{LIVE_SOURCE}")
+                if missing:
+                    return {"evidence_mode": "mixed", "record_count": n,
+                            "run_ids": sorted(run_ids),
+                            "config_hashes": sorted(hashes),
+                            "session_ids": sorted(sessions),
+                            "sources": sorted(sources),
+                            "reason": "live ledger incomplete/unproven: "
+                                      + "; ".join(missing)}
+                return {"evidence_mode": "live", "record_count": n,
+                        "run_ids": sorted(run_ids),
+                        "config_hashes": sorted(hashes),
+                        "session_ids": sorted(sessions),
+                        "sources": sorted(sources), "reason": None}
+            # paper mode (explicit)
+            return {"evidence_mode": mode, "record_count": n,
+                    "run_ids": sorted(run_ids),
+                    "config_hashes": sorted(hashes),
+                    "session_ids": sorted(sessions),
+                    "sources": sorted(sources), "reason": None}
+        # only unknown mode strings
+        return {"evidence_mode": "mixed", "record_count": n,
+                "run_ids": sorted(run_ids),
+                "config_hashes": sorted(hashes),
+                "session_ids": sorted(sessions),
+                "sources": sorted(sources),
+                "reason": "ledger carries no recognizable paper/live mode "
+                          "provenance — cannot attribute"}
+    # no per-record mode: legacy evidence
+    return {"evidence_mode": "legacy", "record_count": n,
+            "run_ids": sorted(run_ids), "config_hashes": sorted(hashes),
+            "session_ids": sorted(sessions), "sources": sorted(sources),
+            "reason": "legacy ledger without per-record mode/run_id/"
+                      "config_hash provenance"}
+
+
+def _read_live_session_upl(rt: dict) -> dict | None:
+    """The trading-system session's live UPL artifact (read-only for the
+    dashboard — the dashboard NEVER opens a second Shioaji session and
+    NEVER falls back to local state UPL).  Fresh (<60s) + session match +
+    both legs with quantity/pnl -> payload; else None (N/A)."""
+    try:
+        from pathlib import Path
+        from core.runtime_paths import runtime_path
+        if not rt.get("is_live_runtime"):
+            return None
+        _f = Path(runtime_path("exports", "trades", "live", "diagnostics",
+                               "live_session_upl.json"))
+        if not _f.exists():
+            return None
+        _d = json.loads(_f.read_text(encoding="utf-8"))
+        if rt.get("session_id") \
+                and _d.get("session_id") != rt.get("session_id"):
+            return None
+        _age = time.time() - (int(_d.get("captured_at") or 0) / 1000.0)
+        if _age > 60:
+            return None
+        _legs = _d.get("legs") or {}
+        # any rolled contract pair (not a literal month pair); 2 legs means
+        # the spread is complete -- 2026-09-24 TMFJ6/TMFK6 was rejected here
+        if len(_legs) != 2:
+            return None
+        for _leg in _legs.values():
+            _pnl = _leg.get("pnl")
+            if int(_leg.get("quantity") or 0) <= 0 \
+                    or _pnl is None \
+                    or not isinstance(_pnl, (int, float)) \
+                    or not math.isfinite(float(_pnl)):
+                return None
+        return _d
+    except Exception:
+        return None
+
+
+def _load_broker_canonical() -> dict | None:
+    """The CURRENT session's live-broker canonical snapshot, or None."""
+    try:
+        from pathlib import Path
+        from core.runtime_paths import runtime_path
+        _f = Path(runtime_path("exports", "trades", "live", "diagnostics",
+                               "broker_snapshot_canonical.json"))
+        if not _f.exists():
+            return None
+        _d = json.loads(_f.read_text(encoding="utf-8"))
+        return _d if isinstance(_d, dict) else None
+    except Exception:
+        return None
+
+
+def _broker_canonical_complete(canon: dict, rt: dict) -> bool:
+    """Strict completeness for the BROKER_CANONICAL_RUNTIME fallback:
+    LIVE runtime only, CURRENT session only, both legs fully specified
+    (direction / quantity / cost / PnL), fresh, capture OK.  The legacy
+    ledger is history only and is never mixed into the UPL."""
+    try:
+        if not rt.get("is_live_runtime"):
+            return False
+        if not canon.get("account_identity_hash") \
+                or not canon.get("canonical_input_hash"):
+            return False
+        if not canon.get("session_id"):
+            return False
+        if rt.get("session_id") \
+                and canon.get("session_id") != rt.get("session_id"):
+            return False
+        _age = time.time() - (int(canon.get("captured_at") or 0) / 1000.0)
+        if _age > 60:
+            return False
+        if (canon.get("fetch_status") or {}).get("capture") != "OK":
+            return False
+        _legs = {p.get("code"): p for p in (canon.get("positions") or [])
+                 if p.get("account") == "futures"
+                 and str(p.get("code") or "").startswith("TMF")}
+        # any rolled contract pair (not a literal month pair); 2 legs means
+        # the spread is complete -- 2026-09-24 TMFJ6/TMFK6 was rejected here
+        if len(_legs) != 2:
+            return False
+        for _leg in _legs.values():
+            if not (_leg.get("direction")
+                    and int(_leg.get("quantity") or 0) > 0
+                    and _leg.get("avg_cost") is not None
+                    and _leg.get("pnl") is not None):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def scope_mts_performance(runtime_truth: dict, evidence: dict) -> dict:
+    """The canonical presentation scope for MTS performance data.
+
+    runtime_truth: the dashboard's summarize_execution_context() result
+      (is_live_runtime / is_paper_runtime / profile_identity /
+      config_hash / runtime_status)
+    evidence: classify_mts_evidence() result
+
+    Returns {"ok": bool, "reason": None|str, "mode": ..., "run_id": ...,
+             "config_hash": ...} — ok=False means the metrics must render
+    N/A with `reason` (NEVER 0, NEVER merged PnL).
+    """
+    rt = runtime_truth if isinstance(runtime_truth, dict) else {}
+    ev = evidence if isinstance(evidence, dict) else {}
+    em = ev.get("evidence_mode")
+    if rt.get("is_live_runtime"):
+        mode = "live"
+        if em == "live":
+            # STRICT live (audit correction): the classifier already
+            # guarantees every record has mode=live + one run_id + one
+            # config_hash + one session + source=live_broker_reconciled.
+            # The scope additionally requires config_hash == the ACTIVE
+            # sealed profile hash AND the session == the ACTIVE runtime
+            # session/generation.
+            if ev.get("config_hashes") != [rt.get("config_hash")]:
+                return {"ok": False, "mode": mode, "reason":
+                        "live view: ledger config_hash does not match the "
+                        "active sealed profile — source mismatch",
+                        "run_id": None, "config_hash": rt.get("config_hash")}
+            if rt.get("session_id") and \
+                    ev.get("session_ids") != [rt.get("session_id")]:
+                return {"ok": False, "mode": mode, "reason":
+                        "live view: ledger session/generation does not "
+                        "match the active runtime session — source "
+                        "mismatch", "run_id": None,
+                        "config_hash": rt.get("config_hash")}
+            run_id = ev["run_ids"][0] if len(ev.get("run_ids") or []) == 1 \
+                else None
+            return {"ok": True, "mode": mode, "reason": None,
+                    "run_id": run_id, "config_hash": rt.get("config_hash")}
+        if em in ("paper", "legacy"):
+            # [B] BROKER_CANONICAL_RUNTIME fallback (v3): the trading-system
+            # session's live UPL artifact (monitor writes list_positions()
+            # .pnl) is the ONLY live UPL authority.  The dashboard never
+            # opens its own session; the legacy ledger and local state are
+            # never mixed in.  Stale/missing/session-mismatch -> N/A.
+            if _read_live_session_upl(rt) is not None:
+                return {"ok": True, "mode": mode,
+                        "provenance": "BROKER_CANONICAL_RUNTIME",
+                        "reason": None, "run_id": None,
+                        "config_hash": rt.get("config_hash")}
+            return {"ok": False, "mode": mode, "reason":
+                    f"live view with {em} execution evidence — source "
+                    "mismatch (live view requires live broker-reconciled "
+                    "evidence)", "run_id": None,
+                    "config_hash": rt.get("config_hash")}
+        return {"ok": False, "mode": mode, "reason":
+                f"live view: {em or 'missing'} execution evidence — "
+                "cannot attribute", "run_id": None,
+                "config_hash": rt.get("config_hash")}
+    if rt.get("is_paper_runtime"):
+        mode = "paper"
+        if em in ("paper", "legacy"):
+            # legacy records ARE the paper evidence (paper compatibility)
+            return {"ok": True, "mode": mode, "reason": None,
+                    "run_id": None, "config_hash": rt.get("config_hash")}
+        if em == "live":
+            return {"ok": False, "mode": mode, "reason":
+                    "paper view with live execution evidence — source "
+                    "mismatch (paper view requires paper evidence)",
+                    "run_id": None, "config_hash": rt.get("config_hash")}
+        return {"ok": False, "mode": mode, "reason":
+                f"paper view: {em or 'missing'} execution evidence — "
+                "cannot attribute", "run_id": None,
+                "config_hash": rt.get("config_hash")}
+    return {"ok": False, "mode": "unknown", "reason":
+            f"runtime not an authorized live/paper state "
+            f"({rt.get('runtime_status')}) — fail-closed",
+            "run_id": None, "config_hash": rt.get("config_hash")}
+
+
+def _current_runtime_session_id() -> str:
+    """The current runtime execution-context session id, or ''."""
+    try:
+        from core.runtime_paths import runtime_path
+        from pathlib import Path
+        _f = Path(runtime_path("execution_context.json"))
+        if _f.exists():
+            _ctx = json.loads(_f.read_text(encoding="utf-8"))
+            _s = _ctx.get("session_id")
+            if _s:
+                return str(_s)
+    except Exception:
+        pass
+    return ""
+
+
+def broker_snapshot_live_upl(snapshot_path, session_id=None) -> tuple:
+    """Live UPL from the CURRENT broker-reconciled preflight snapshot,
+    fail-closed on canonical live-broker provenance:
+
+    - source == "live_broker" and mode == "live"
+    - account_identity_hash and canonical_input_hash present
+    - session_id matches the explicit caller or the current runtime
+      execution context (mismatch => N/A)
+    - captured_at fresh
+    - the exact expected MTS legs (TMFH6/TMFI6) each carrying
+      direction / qty / avg_cost
+
+    Missing / malformed / mismatched => (None, reason) so the UI
+    renders N/A — the live UPL is NEVER fabricated from local state."""
+    try:
+        from pathlib import Path
+        _p = Path(str(snapshot_path))
+        if not _p.exists():
+            return None, "no broker snapshot"
+        _resp = json.loads(_p.read_text(encoding="utf-8"))
+        _snap = _resp.get("snapshot") or {}
+        _src = _resp.get("source") or _snap.get("source")
+        _mode = _resp.get("mode") or _snap.get("mode")
+        _acc = (_resp.get("account_identity_hash")
+                or _snap.get("account_identity_hash")
+                or _snap.get("account_id_hash"))
+        _sess = str(_resp.get("session_id") or _snap.get("session_id") or "")
+        _chash = (_resp.get("canonical_input_hash")
+                  or _snap.get("canonical_input_hash"))
+        _positions = _snap.get("positions") or _resp.get("positions") or []
+        _cap_raw = _resp.get("captured_at") or _snap.get("captured_at")
+        if _src != "live_broker":
+            return None, "provenance: source is not live_broker"
+        if _mode != "live":
+            return None, "provenance: mode is not live"
+        if not _acc:
+            return None, "provenance: missing account_identity_hash"
+        if not _chash:
+            return None, "provenance: missing canonical_input_hash"
+        if session_id is None:
+            session_id = _current_runtime_session_id()
+        if not _sess or (session_id and _sess != str(session_id)):
+            return None, "snapshot session does not match current runtime"
+        if not _positions:
+            return None, "broker snapshot has no positions"
+        _cap_ms = None
+        if isinstance(_cap_raw, (int, float)) and not isinstance(_cap_raw, bool):
+            _cap_ms = int(_cap_raw)
+        elif isinstance(_cap_raw, str):
+            try:
+                from datetime import datetime
+                _dt = datetime.fromisoformat(_cap_raw.replace("Z", "+00:00"))
+                _cap_ms = int(_dt.timestamp() * 1000)
+            except Exception:
+                _cap_ms = None
+        if _cap_ms is None or time.time() - _cap_ms / 1000.0 > SNAPSHOT_MAX_AGE_S:
+            return None, "broker snapshot stale/missing timestamp"
+        _upl = {}
+        for _pos in _positions:
+            _code = str(_pos.get("code") or "")
+            _pnl = _pos.get("pnl")
+            _dir = _pos.get("direction")
+            _qty = _pos.get("qty")
+            if _qty is None:
+                _qty = _pos.get("quantity")
+            _cost = _pos.get("avg_cost")
+            if _code in ("TMFH6", "TMFI6") and _dir and _qty and \
+                    _cost is not None and isinstance(_pnl, (int, float)):
+                _upl[_code] = _pnl
+        if set(_upl) != {"TMFH6", "TMFI6"}:
+            return None, "expected MTS legs (TMFH6/TMFI6) missing/mismatched"
+        return _upl, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def live_upl_presented_reason(reason, audit_reasons):
+    """Presentation-only mapping for the live UPL N/A reason: a typed
+    quarantine/renewal audit reason takes precedence (the real cause is
+    a renewal/session mismatch, not a missing timestamp); a session
+    mismatch maps to the typed SESSION_MISMATCH; only a genuinely
+    missing/stale snapshot keeps the generic stale message.  N/A and
+    no-order behavior are unchanged."""
+    _audit = [str(r) for r in (audit_reasons or [])]
+    _renewal = next((r for r in _audit
+                     if "EXIT_ONLY_RENEWAL" in r), None)
+    if _renewal:
+        return _renewal
+    _r = str(reason or "")
+    _low = _r.lower()
+    if "session" in _low and "match" in _low:
+        return "SESSION_MISMATCH"
+    return _r or "broker snapshot stale/missing timestamp"
+
+
+def upl_presentation(scope: dict, is_flat: bool, snapshot_ts) -> dict:
+    """Canonical UPL presentation.
+
+    - scope not ok -> N/A + the scope reason
+    - live verified-flat: 0 ONLY with a fresh snapshot timestamp
+      (now - snapshot_ts <= SNAPSHOT_MAX_AGE_S); stale/missing timestamp
+      -> N/A (cannot verify the flat claim NOW)
+    - paper flat -> 0 (paper evidence is the ledger's own)
+    - non-flat -> None (the caller renders the scoped computed value)
+    """
+    if not scope.get("ok"):
+        return {"kind": "NA", "value": None,
+                "reason": scope.get("reason") or "no authorized scope"}
+    if not is_flat:
+        return {"kind": "COMPUTED", "value": None, "reason": None}
+    if scope.get("mode") == "live":
+        if snapshot_ts is None:
+            return {"kind": "NA", "value": None,
+                    "reason": "live flat UPL requires a fresh verified "
+                              "snapshot timestamp (missing)"}
+        try:
+            age = time.time() - float(snapshot_ts)
+        except (TypeError, ValueError):
+            return {"kind": "NA", "value": None,
+                    "reason": "live flat UPL snapshot timestamp invalid"}
+        if age > SNAPSHOT_MAX_AGE_S:
+            return {"kind": "NA", "value": None,
+                    "reason": f"live flat UPL snapshot stale "
+                              f"({age:.0f}s > {SNAPSHOT_MAX_AGE_S:.0f}s)"}
+        return {"kind": "ZERO", "value": 0.0, "reason": None}
+    return {"kind": "ZERO", "value": 0.0, "reason": None}

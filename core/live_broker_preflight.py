@@ -1,0 +1,651 @@
+"""One-shot, read-only broker preflight for a future paper-to-live transition.
+
+This module deliberately does not import the strategy, OrderManager, or any
+order-routing code.  It is evidence collection only; a successful result does
+not change ``live_trading`` or grant live-order authority.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+import uuid
+from datetime import date, datetime, time as clock_time, timezone
+from pathlib import Path
+from typing import Any
+
+from core.deployment_role_gate import assert_broker_access_allowed
+from core.runtime_paths import runtime_path
+
+
+REQUEST_ENV = "LIVE_PREFLIGHT_NO_ORDERS"
+LOCK_NAME = "live_preflight.lock"
+
+
+class PreflightBlocked(RuntimeError):
+    """Raised before a broker session is created when the safety contract fails."""
+
+
+def diagnostics_dir() -> Path:
+    return Path(runtime_path("exports", "trades", "live", "diagnostics"))
+
+
+def _json_safe(value: Any) -> Any:
+    """JSON-safe serializer default.  Enum-like values — including
+    Shioaji C-extension enums whose .name is NOT exposed as a usable
+    str (getattr can itself raise TypeError) — normalize via the FIXED
+    TYPE NAME; getattr(.name) is only used when it yields a str.
+    str()/repr() are never called on non-JSON objects (the C enum str()
+    raises 'first argument must be a string, not builtins.Action').
+    No secrets: non-JSON objects degrade to the type name."""
+    if type(value) in (str, int, float, bool) or value is None:
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    _tname = type(value).__name__
+    try:
+        _name = getattr(value, "name", None)
+        if isinstance(_name, str) and _name:
+            return _name
+    except Exception:
+        pass
+    return _tname
+
+
+def _json_safe_key(key: Any) -> Any:
+    """JSON-safe dict KEY: a Shioaji C-extension enum used as a key
+    (the encoder's default= covers values only) normalizes to its NAME;
+    datetime/date -> isoformat; anything else keeps str/int/float/bool/
+    None or degrades to the type name — never str/repr (no secrets)."""
+    try:
+        _name = getattr(key, "name", None)
+        if isinstance(_name, str):
+            return _name
+    except Exception:
+        pass
+    if isinstance(key, (datetime, date)):
+        return key.isoformat()
+    if type(key) in (str, int, float, bool) or key is None:
+        return key
+    return type(key).__name__
+
+
+def _json_safe_normalize(payload: Any) -> Any:
+    """Recursive JSON-safe normalization applied BEFORE json.dump so a
+    Shioaji C-extension enum can never appear as a value OR a dict key
+    (the encoder's default= only covers values)."""
+    if isinstance(payload, dict):
+        return {_json_safe_key(k): _json_safe_normalize(v)
+                for k, v in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return [_json_safe_normalize(v) for v in payload]
+    if isinstance(payload, (set, frozenset)):
+        return [_json_safe_normalize(v) for v in payload]
+    try:
+        from collections.abc import Mapping
+        if isinstance(payload, Mapping):
+            return {_json_safe_key(k): _json_safe_normalize(v)
+                    for k, v in payload.items()}
+    except Exception:
+        pass
+    return _json_safe(payload)
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(_json_safe_normalize(payload), handle,
+                  ensure_ascii=False, indent=2, default=_json_safe)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _account_hash(account: Any) -> str:
+    raw = ":".join(str(getattr(account, attr, "")) for attr in ("person_id", "broker_id", "account_id"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _account_is_bound(account: Any) -> bool:
+    """Require a resolved futures account identity before querying it."""
+    if account is None:
+        return False
+    return any(
+        bool(getattr(account, attr, None))
+        for attr in ("person_id", "broker_id", "account_id", "account_no")
+    )
+
+
+def _contract_summary(contract: Any) -> dict[str, Any]:
+    return {
+        "code": getattr(contract, "code", None),
+        "delivery_date": str(getattr(contract, "delivery_date", "")),
+        "category": getattr(contract, "category", None),
+    }
+
+
+def _delivery_date(contract: Any) -> date | None:
+    value = getattr(contract, "delivery_date", None)
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value.replace("-", "/"), "%Y/%m/%d").date()
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_near_far_contracts(api: Any, product: str) -> tuple[Any, Any]:
+    """Resolve with the monitor's rshioaji-safe contract-list adapter.
+
+    The native ``Futures[product]`` indexing is not portable on the installed
+    rshioaji binding.  Do not use it in this diagnostic path.
+    """
+    from core.broker.shioaji_compat import get_contracts_list
+
+    product = str(product).upper()
+    query_symbol = "MXF" if product == "MTX" else product
+    now = datetime.now()
+    today = now.date()
+    valid = []
+    for contract in get_contracts_list(api, "Futures", query_symbol):
+        delivery = _delivery_date(contract)
+        if delivery is None:
+            continue
+        if delivery > today or (delivery == today and now.time() < clock_time(13, 30)):
+            valid.append((delivery, contract))
+    valid.sort(key=lambda item: item[0])
+    if len(valid) < 2:
+        raise PreflightBlocked("NEAR_FAR_CONTRACT_RESOLUTION_FAILED")
+    near_date, near = valid[0]
+    far = next((contract for delivery, contract in valid[1:] if delivery != near_date), None)
+    if far is None:
+        raise PreflightBlocked("NEAR_FAR_CONTRACT_RESOLUTION_FAILED")
+    return near, far
+
+
+def _canonical_direction(raw: Any) -> str | None:
+    """Canonical broker position direction: a Shioaji Action enum maps
+    to 'buy'/'sell' via SAFE enum member identity — name/value
+    attribute access only; NEVER str()/repr() on the C-extension
+    (which raises TypeError), never the generic type name.  Unknown
+    values => None (fail-closed: the dashboard and the attestation
+    reject a missing/invalid direction)."""
+    if raw is None:
+        return None
+    _candidates: list[str] = []
+    if isinstance(raw, str) and raw:
+        _candidates.append(raw)
+    try:
+        _n = getattr(raw, "name", None)
+        if isinstance(_n, str) and _n:
+            _candidates.append(_n)
+    except Exception:
+        pass
+    try:
+        _v = getattr(raw, "value", None)
+        if isinstance(_v, str) and _v:
+            _candidates.append(_v)
+    except Exception:
+        pass
+    for _c in _candidates:
+        _low = _c.strip().lower()
+        if _low in ("buy", "sell"):
+            return _low
+        if _low in ("b", "s"):
+            return "buy" if _low == "b" else "sell"
+    return None
+
+
+def _update_status(api: Any, account: Any) -> Any:
+    """Refresh the broker's account/position view before reading it.
+
+    A freshly logged-in session exposes an EMPTY position/order view until the
+    broker is asked for the account status; reading before this returned [] for
+    a real two-leg spread (2026-09-24 23:52) and the capture recorded that
+    empty read as a live_broker success.  Keyword-first to match the documented
+    Shioaji call convention, with the positional fallback other adapters use.
+    """
+    try:
+        return api.update_status(account=account)
+    except TypeError:
+        # the installed SDK exposes `account` as POSITIONAL-ONLY
+        # (update_status(self, /, account=None, ...)) and returns None on
+        # success — a None return is NOT a failure.
+        return api.update_status(account)
+
+
+def _safe_positions(api: Any, account: Any) -> list[dict[str, Any]]:
+    """Preserve broker position identity: code / qty / direction
+    (canonical buy/sell) / avg_cost (Shioaji's Position.price is the
+    average cost) / pnl so a later consumer can render live UPL and
+    the leg identity without fabricating cost."""
+    try:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_positions", "before",
+                            source="core.live_broker_preflight._safe_positions")
+        raw_positions = api.list_positions(account=account)
+    except TypeError:
+        # Compatibility with the installed SDK/test doubles whose bound
+        # account parameter is positional-only.  The account object is still
+        # resolved and passed; this does not permit an unbound query.
+        raw_positions = api.list_positions(account)
+    except Exception as exc:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_positions", "error",
+                            source="core.live_broker_preflight._safe_positions",
+                            error=exc)
+        raise
+    from core.shioaji_session import observe_broker_call
+    observe_broker_call(api, "list_positions", "after",
+                        source="core.live_broker_preflight._safe_positions")
+    return [
+        {
+            # `account`/`quantity` are the deployment gate's canonical row shape;
+            # `qty` is the recorder's.  Emitting both keeps one artifact usable
+            # by every consumer instead of each one re-deriving identity.
+            "account": "futures",
+            "code": getattr(p, "code", None),
+            "quantity": getattr(p, "quantity", None),
+            "qty": getattr(p, "quantity", None),
+            "direction": _canonical_direction(
+                getattr(p, "direction", None)),
+            "avg_cost": getattr(p, "price", None),
+            "pnl": getattr(p, "pnl", None),
+        }
+        for p in list(raw_positions)
+    ]
+
+
+def _safe_open_orders(api: Any, account: Any) -> list[dict[str, Any]]:
+    try:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_trades", "before",
+                            source="core.live_broker_preflight._safe_open_orders")
+        trades = list(api.list_trades())
+    except TypeError:
+        trades = list(api.list_trades(account=account))
+    except Exception as exc:
+        from core.shioaji_session import observe_broker_call
+        observe_broker_call(api, "list_trades", "error",
+                            source="core.live_broker_preflight._safe_open_orders",
+                            error=exc)
+        raise
+    from core.shioaji_session import observe_broker_call
+    observe_broker_call(api, "list_trades", "after",
+                        source="core.live_broker_preflight._safe_open_orders")
+    terminal = {"Filled", "Cancelled", "Expired", "Done"}
+    return [
+        {
+            "code": (getattr(t, "code", None)
+                     or getattr(getattr(getattr(t, "order", None),
+                                         "contract", None), "code", None)),
+            "qty": getattr(t, "quantity", None),
+            "direction": _canonical_direction(
+                getattr(t, "action", None)
+                or getattr(getattr(t, "order", None), "action", None)),
+            "broker_order_id": getattr(t, "id", None)
+                               or getattr(t, "broker_order_id", None)
+                               or getattr(getattr(t, "order", None), "id", None),
+            "ordno": getattr(t, "ordno", None)
+                     or getattr(getattr(t, "order", None), "ordno", None),
+            "seqno": getattr(t, "seqno", None)
+                     or getattr(getattr(t, "order", None), "seqno", None),
+            "status": getattr(getattr(t, "status", None), "status", None),
+        }
+        for t in trades
+        if getattr(getattr(t, "status", None), "status", "") not in terminal
+    ]
+
+
+def _position_covered_orders(positions: list[dict[str, Any]],
+                             open_orders: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Remove only one-to-one stale pending receipts covered by positions.
+
+    ``list_trades`` can retain PendingSubmit after a fill.  We accept this
+    only when every non-zero futures position has exactly one matching order
+    by code, canonical direction, and quantity; missing/ambiguous fields
+    remain open and fail closed.  Raw rows are returned as audit evidence.
+    """
+    def _positive_qty(value):
+        try:
+            if isinstance(value, bool):
+                return None
+            qty = int(value)
+            return qty if qty > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    active_positions = [p for p in positions or []
+                        if isinstance(p, dict)
+                        and str(p.get("code") or "")
+                        and _positive_qty(p.get("qty")) is not None]
+    candidates = [o for o in open_orders or []
+                  if isinstance(o, dict)
+                  and o.get("code")
+                  and o.get("direction") in {"buy", "sell"}
+                  and _positive_qty(o.get("qty")) is not None]
+    if not active_positions or len(candidates) != len(active_positions):
+        return list(open_orders or []), []
+    remaining = list(active_positions)
+    covered = []
+    for order in candidates:
+        match = next((p for p in remaining
+                      if str(p.get("code")) == str(order.get("code"))
+                      and p.get("direction") == order.get("direction")
+                      and _positive_qty(p.get("qty")) == _positive_qty(order.get("qty"))),
+                     None)
+        if match is None:
+            return list(open_orders or []), []
+        remaining.remove(match)
+        covered.append(order)
+    if remaining:
+        return list(open_orders or []), []
+    covered_ids = {id(item) for item in covered}
+    filtered = [item for item in open_orders or [] if id(item) not in covered_ids]
+    return filtered, covered
+
+
+def _unsubscribe_bidask(api: Any, contract: Any) -> None:
+    """Use the matching Shioaji unsubscribe surface for the installed SDK."""
+    from core.broker.shioaji_compat import is_rust_version
+    if is_rust_version():
+        import shioaji as sj
+        api.unsubscribe(contract, quote_type=sj.QuoteType.BidAsk, version=sj.QuoteVersion.v1)
+    else:
+        import shioaji as sj
+        api.quote.unsubscribe(contract, quote_type=sj.constant.QuoteType.BidAsk)
+
+
+def collect_read_only_preflight(api: Any, product: str = "TMF") -> dict[str, Any]:
+    """Collect only account, contract, query, snapshot and quote-capability evidence.
+
+    There is intentionally no order/cancel/modify method in this adapter.
+    """
+    account = getattr(api, "futopt_account", None)
+    if not _account_is_bound(account):
+        raise PreflightBlocked("FUTOPT_ACCOUNT_UNAVAILABLE")
+
+    near, far = resolve_near_far_contracts(api, product)
+
+    query_failures: list[str] = []
+    warnings: list[str] = []
+
+    def query(name: str, fn: Callable[[], Any], fallback: Any, *, required: bool = True) -> Any:
+        try:
+            return fn()
+        except Exception as exc:
+            message = f"{name}_QUERY_FAILED: {type(exc).__name__}: {exc}"
+            (query_failures if required else warnings).append(message)
+            return fallback
+
+    # Keep successfully completed evidence when one broker endpoint is down.
+    # A failed check remains a failed preflight; it must not erase the useful
+    # evidence needed to distinguish an account mapping issue from login loss.
+    # The account status MUST be refreshed first: a fresh session's view is
+    # empty until then, and an empty read is not evidence of a flat account.
+    try:
+        _update_status(api, account)
+    except Exception as _exc:
+        # Fail closed: without a refreshed account view the position list is
+        # not evidence (an empty read must never be recorded as a flat account).
+        query_failures.append(
+            f"ACCOUNT_STATUS_UNAVAILABLE: {type(_exc).__name__}: {_exc}")
+    positions = query("POSITIONS", lambda: _safe_positions(api, account), None)
+    open_orders = query("OPEN_ORDERS", lambda: _safe_open_orders(api, account), None)
+    if positions is None:
+        query_failures.append("POSITIONS_UNAVAILABLE")
+    if open_orders is None:
+        query_failures.append("OPEN_ORDERS_UNAVAILABLE")
+    if not isinstance(positions, list):
+        query_failures.append("POSITIONS_INVALID_RESPONSE")
+    if not isinstance(open_orders, list):
+        query_failures.append("OPEN_ORDERS_INVALID_RESPONSE")
+    open_orders, position_covered_orders = _position_covered_orders(
+        positions or [], open_orders or [])
+    def _margin_query() -> Any:
+        try:
+            return api.margin(account=account)
+        except TypeError:
+            return api.margin(account)
+
+    margin = query("MARGIN", _margin_query, None)
+    available_margin = getattr(margin, "available_margin", None) if margin else None
+    if available_margin is None:
+        query_failures.append("MARGIN_UNAVAILABLE")
+    # The broker's trading_limits endpoint is known to be unavailable for some
+    # branch mappings.  Available margin remains the required capacity check
+    # for this one-lot-per-leg preflight; preserve this endpoint failure as an
+    # auditable warning instead of hiding every successful broker check.
+    def _limits_query() -> Any:
+        try:
+            return api.trading_limits(account=account)
+        except TypeError:
+            return api.trading_limits(account)
+
+    limits = query("TRADING_LIMITS", _limits_query, None, required=False)
+    snapshots = query("MARKET_SNAPSHOT", lambda: list(api.snapshots([near, far])), [])
+
+    # Subscription proves the broker accepts the request.  It is immediately
+    # removed and does not wait for market data (closed-market safe).
+    from core.broker.shioaji_compat import safe_subscribe
+    quote_checks: list[dict[str, Any]] = []
+    for contract in (near, far):
+        try:
+            safe_subscribe(api, contract, quote_type="bidask")
+            try:
+                _unsubscribe_bidask(api, contract)
+            except Exception:
+                # A successful subscription is the capability proof; an
+                # unsubscribe failure is still reported and fails the check.
+                raise
+            quote_checks.append({"code": contract.code, "passed": True})
+        except Exception as exc:
+            quote_checks.append({"code": contract.code, "passed": False, "error": str(exc)})
+
+    return {
+        "connected": True,
+        "authenticated": True,
+        "account_id_hash": _account_hash(account),
+        "position_snapshot_time": datetime.now(timezone.utc).isoformat(),
+        "order_snapshot_time": datetime.now(timezone.utc).isoformat(),
+        "positions": positions,
+        "open_orders": open_orders,
+        "position_covered_orders": position_covered_orders,
+        "margin": {
+            "available_margin": available_margin,
+            "equity_amount": getattr(margin, "equity_amount", None) if margin else None,
+            "risk_indicator": getattr(margin, "risk_indicator", None) if margin else None,
+        },
+        "trading_limits": str(limits) if limits is not None else None,
+        "contracts": {"near": _contract_summary(near), "far": _contract_summary(far)},
+        "snapshot_codes": [getattr(s, "code", None) for s in snapshots],
+        "quote_subscription": quote_checks,
+        "query_failures": query_failures,
+        "warnings": warnings,
+    }
+
+
+def _to_epoch_ms(value: Any) -> int:
+    """Canonical epoch-ms INTEGER from the preflight's ISO captured_at.
+    A malformed value degrades to 0 (the gate's freshness check then
+    fails closed — never a manual timestamp)."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        _dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return int(_dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def derive_canonical_gate_artifact(response: dict[str, Any]) -> dict[str, Any]:
+    """Derive the FLAT canonical gate artifact from the SAME read-only
+    preflight response (no manual values): source=live_broker, mode=live,
+    positions/open_orders, account_identity_hash, scope=futopt,
+    captured_at (epoch-ms int), available_margin and the content-
+    addressed canonical_input_hash (sha256 of the sorted JSON of the
+    account hash + futures positions + open_orders + available_margin +
+    captured_at).  The deployment gate and the --margin-evidence CLI
+    consume this flat shape unchanged; the paper path is untouched."""
+    snapshot = response.get("snapshot") or {}
+    _acct = snapshot.get("account_id_hash")
+    _positions = snapshot.get("positions")
+    _open_orders = snapshot.get("open_orders")
+    _margin = ((snapshot.get("margin") or {}).get("available_margin"))
+    _cap_ms = _to_epoch_ms(response.get("captured_at"))
+    _failed = list((response.get("preflight") or {}).get("failed_checks") or ())
+    _error = snapshot.get("capture_error") or response.get("capture_error")
+    if _failed or _error or _positions is None or _open_orders is None or _margin is None:
+        _reason = "; ".join(str(x) for x in _failed if x)
+        _reason = _reason or str(_error or "BROKER_CAPTURE_UNAVAILABLE")
+        return {
+            "source": "unavailable",
+            "mode": "unavailable",
+            "capture_error": True,
+            "fetch_status": {"capture": "FAIL", "reasons": [_reason]},
+            "error": _reason,
+            "positions": None,
+            "open_orders": None,
+            "account_identity_hash": _acct,
+            "scope": "futopt",
+            "captured_at": _cap_ms,
+            "available_margin": None,
+            "session_id": str(response.get("request_id") or ""),
+            "session_scope": "read_only_capture",
+        }
+    _canonical_input = {
+        "account_identity_hash": _acct,
+        "positions": _positions,
+        "open_orders": _open_orders,
+        "available_margin": _margin,
+        "captured_at": _cap_ms,
+    }
+    _capture_ok = {"capture": "OK"}
+    artifact = {
+        "source": "live_broker",
+        "mode": "live",
+        "positions": _positions,
+        "open_orders": _open_orders,
+        "account_identity_hash": _acct,
+        "scope": "futopt",
+        "captured_at": _cap_ms,
+        "available_margin": _margin,
+        "session_id": str(response.get("request_id") or ""),
+        "session_scope": "read_only_capture",
+        "fetch_status": _capture_ok,
+    }
+    # The content address must cover every key that is persisted, because the
+    # consumer that adopts a held position (record_reconciled_holding) re-hashes
+    # the whole file: a digest over an earlier, smaller payload can never match
+    # (session_id/session_scope/fetch_status were outside it), so a live capture
+    # was structurally un-adoptable.
+    artifact["canonical_input_hash"] = hashlib.sha256(
+        json.dumps(dict(artifact, canonical_input_hash=None), sort_keys=True,
+                   ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+    return artifact
+
+
+def run_once(api_factory: Any, *, request_id: str | None = None, product: str = "TMF") -> dict[str, Any]:
+    """Run a guarded preflight and persist its success or failure snapshot."""
+    if os.environ.get(REQUEST_ENV) != "1":
+        raise PreflightBlocked(f"{REQUEST_ENV}=1 is required")
+    assert_broker_access_allowed()
+    request_id = request_id or f"LIVE-PREFLIGHT-{uuid.uuid4().hex[:12]}"
+    diag = diagnostics_dir()
+    diag.mkdir(parents=True, exist_ok=True)
+    lock = diag / LOCK_NAME
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise PreflightBlocked("PREFLIGHT_ALREADY_RUNNING") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"request_id": request_id, "pid": os.getpid(), "started_at": datetime.now(timezone.utc).isoformat()}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        api = None
+        try:
+            api = api_factory()
+            snapshot = collect_read_only_preflight(api, product=product)
+            quote_ok = all(c.get("passed") for c in snapshot["quote_subscription"])
+            failed_checks = list(snapshot["query_failures"])
+            if not quote_ok:
+                failed_checks.append("QUOTE_SUBSCRIPTION_FAILED")
+            response: dict[str, Any] = {
+                "schema_version": 1,
+                "request_id": request_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "read_only": True,
+                "live_order_allowed": False,
+                "snapshot": snapshot,
+                "preflight": {"passed": not failed_checks, "failed_checks": failed_checks},
+            }
+            # An empty response after a previously successful holding capture
+            # is ambiguous (account/session drift), never proof of flatness.
+            try:
+                _prior_path = diag / "broker_snapshot_canonical.json"
+                if (not failed_checks and snapshot.get("positions") == []
+                        and _prior_path.exists()):
+                    _prior = json.loads(_prior_path.read_text(encoding="utf-8"))
+                    _same_scope = (
+                        # `scope` is optional: the RUNNING app's canonical
+                        # artifact carries the account hash but no scope, and
+                        # requiring it let the first false-flat overwrite real
+                        # evidence (2026-09-24 23:52).
+                        _prior.get("scope", "futopt") == "futopt"
+                        and bool(_prior.get("account_identity_hash"))
+                        and _prior.get("account_identity_hash")
+                        == snapshot.get("account_id_hash")
+                    )
+                    _prior_positions = _prior.get("positions") or []
+                    _prior_holding = any(
+                        isinstance(row, dict)
+                        and int(row.get("qty", row.get("quantity", 0)) or 0) > 0
+                        for row in _prior_positions
+                    )
+                    if (_same_scope and _prior.get("source") == "live_broker"
+                            and _prior_holding):
+                        failed_checks.append("POSITIONS_EMPTY_AFTER_PRIOR_HOLDING")
+            except (OSError, ValueError, TypeError):
+                pass
+            if failed_checks:
+                snapshot["capture_error"] = True
+                snapshot["error"] = "; ".join(failed_checks)
+                response["preflight"] = {"passed": False, "failed_checks": failed_checks}
+        except Exception as exc:
+            response = {
+                "schema_version": 1,
+                "request_id": request_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "read_only": True,
+                "live_order_allowed": False,
+                "snapshot": None,
+                "preflight": {"passed": False, "failed_checks": [f"{type(exc).__name__}: {exc}"]},
+            }
+        finally:
+            if api is not None:
+                try:
+                    api.logout()
+                except Exception:
+                    pass
+        _atomic_json(diag / f"broker_snapshot_{request_id}.json", response)
+        _atomic_json(diag / "broker_snapshot_latest.json", response)
+        # Always replace the canonical artifact, including top-level query
+        # failures.  A failed capture must leave explicit UNAVAILABLE evidence;
+        # retaining an older live/flat artifact would be unsafe.
+        _atomic_json(diag / "broker_snapshot_canonical.json",
+                     derive_canonical_gate_artifact(response))
+        return response
+    finally:
+        try:
+            os.unlink(lock)
+        except FileNotFoundError:
+            pass

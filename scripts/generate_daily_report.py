@@ -8,12 +8,19 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 def get_trading_day(timestamp_str: str, session: str) -> str:
-    """Resolve the trading day based on calendar timestamp and trading session."""
+    """Resolve the trading day based on calendar timestamp and trading session.
+
+    2026-07-31 Hermes Agent: delegate to core/date_utils.get_trading_day so the
+    night-session rule is IDENTICAL to the dashboard's (night 15:00+ -> next
+    TRADING day, skipping weekends/holidays). Previously this local simplified
+    version used dt+1 (no holiday skip), which mis-bucketed Friday-night trades
+    to Saturday and made the dashboard's performance review appear stale.
+    """
     try:
+        from core.date_utils import get_trading_day as _core_get_trading_day
         dt = datetime.fromisoformat(timestamp_str)
-        if session == "night" and dt.hour >= 15:
-            return (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-        return dt.strftime("%Y-%m-%d")
+        _d = _core_get_trading_day(dt)
+        return _d.strftime("%Y-%m-%d") if hasattr(_d, "strftime") else str(_d)
     except Exception:
         return timestamp_str.split("T")[0]
 
@@ -31,6 +38,13 @@ def format_triplet(val1, val2, val3, decimals=0) -> str:
                 parts.append(str(val))
     return "/".join(parts)
 
+def _format_exit_reason_label(reason_str: str) -> str:
+    if not reason_str or reason_str == "UNKNOWN":
+        return "UNKNOWN"
+    if "COMBINED_EXIT" in reason_str.upper() or "POLICY_J" in reason_str.upper():
+        return "Policy J (COMBINED_EXIT)"
+    return reason_str
+
 def resolve_exit_reason(data: dict, events: list) -> tuple[str, str]:
     """Resolve final exit reason using 5-level evidence hierarchy.
     Returns (exit_reason, reason_source).
@@ -42,20 +56,30 @@ def resolve_exit_reason(data: dict, events: list) -> tuple[str, str]:
         if ev.get("event") in ("EXIT_REMAINING", "EXIT_LOG", "EMERGENCY_FLATTEN", "MANUAL_CLOSE"):
             r = ev.get("reason") or ev.get("exit_reason")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "EXPLICIT_EVENT"
+                return _format_exit_reason_label(str(r)), "EXPLICIT_EVENT"
+    # Level 1b: Policy J combined exit (2026-08-04 review item 4) — the
+    # trigger/submit events are explicit evidence (peak/current/giveback);
+    # previously fell to Level 5 INSUFFICIENT_EVIDENCE. Prefer the event's
+    # own exit_reason when carried, else the canonical Policy J label.
+    for ev in events_list:
+        if ev.get("event") in ("POLICY_J_TRIGGERED", "COMBINED_EXIT_SUBMITTED"):
+            r = ev.get("exit_reason") or ev.get("reason")
+            if r and r not in ("UNKNOWN", ""):
+                return _format_exit_reason_label(str(r)), "EXPLICIT_EVENT"
+            return "Policy J (COMBINED_EXIT)", "EXPLICIT_EVENT"
     
     # Level 2: Order metadata
     for ev in events_list:
         if ev.get("event") == "ORDER_SUBMITTED" and ev.get("strategy") in ("MTS_EXIT", "EXIT"):
             r = ev.get("exit_reason") or ev.get("reason")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "ORDER_METADATA"
+                return _format_exit_reason_label(str(r)), "ORDER_METADATA"
 
     # Level 3: Lifecycle state / shadow summary
     for ev in events_list:
         r = ev.get("actual_exit_reason") or ev.get("lifecycle_exit_type")
         if r and r not in ("UNKNOWN", ""):
-            return str(r), "LIFECYCLE_STATE"
+            return _format_exit_reason_label(str(r)), "LIFECYCLE_STATE"
 
     # Level 4: Narrowly constrained trail inference
     for ev in events_list:
@@ -76,15 +100,182 @@ def resolve_release_reason(data: dict, events: list) -> tuple[str, str]:
         if ev.get("event") in ("RELEASE_NEAR_SUBMITTED", "RELEASE_FAR_SUBMITTED"):
             r = ev.get("release_reason") or ev.get("reason") or ev.get("risk_mode")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "EXPLICIT_EVENT"
+                return _format_exit_reason_label(str(r)), "EXPLICIT_EVENT"
     for ev in events_list:
         if ev.get("event") == "ORDER_SUBMITTED" and ev.get("strategy") in ("MTS_RELEASE", "RELEASE"):
             r = ev.get("release_reason") or ev.get("reason")
             if r and r not in ("UNKNOWN", ""):
-                return str(r), "ORDER_METADATA"
+                return _format_exit_reason_label(str(r)), "ORDER_METADATA"
     if data.get("release"):
         return "RELEASE_STOP", "DEFAULT_FALLBACK"
     return "UNKNOWN", "INSUFFICIENT_EVIDENCE"
+
+
+# 2026-08-03 P0: side resolution — canonical priority, never guessed.
+# ENTRY BUY -> position LONG ; ENTRY SELL -> position SHORT
+# EXIT SELL -> closes LONG   ; EXIT BUY  -> closes SHORT
+def _fill_pnl_components(fill, entry, point_value=10.0):
+    """Canonical per-leg realized PnL from a fill + its entry (side-aware).
+
+    Side resolution priority (locked):
+      1. fill.position_side_before_exit (canonical Phase A)
+      2. entry.side -> position mapping (BUY->LONG / SELL->SHORT)
+      3. unresolved -> None (caller marks UNAUDITABLE)
+    Returns (pnl, entry_px, exit_px, qty, side_resolution_method).
+    """
+    try:
+        entry_px = float((entry or {}).get("price") or 0.0)
+        exit_px = float(fill.get("price") or 0.0)
+        qty = int(fill.get("qty") or 0)
+        pside = str(fill.get("position_side_before_exit") or "").upper()
+        if pside in ("LONG", "SHORT"):
+            method = "canonical-position_side_before_exit"
+        else:
+            eside = str((entry or {}).get("side") or "").upper()
+            if eside == "BUY":
+                pside = "LONG"; method = "entry-fill-side"
+            elif eside == "SELL":
+                pside = "SHORT"; method = "entry-fill-side"
+            elif eside == "LONG":
+                pside = "LONG"; method = "entry-fill-side"
+            elif eside == "SHORT":
+                pside = "SHORT"; method = "entry-fill-side"
+            else:
+                return None, entry_px, exit_px, qty, "UNRESOLVED"
+        if pside == "LONG":
+            return (exit_px - entry_px) * qty * point_value, entry_px, exit_px, qty, method
+        return (entry_px - exit_px) * qty * point_value, entry_px, exit_px, qty, method
+    except Exception:
+        return None, 0.0, 0.0, 0, "ERROR"
+
+
+def _compute_trade_pnl(data: dict, fills_path: str = None) -> dict:
+    """2026-08-03 P0 fix: canonical realized PnL per trade.
+
+    Priority:
+      1. COMBINED_EXIT_SETTLED net (then gross)
+      2. leg fills realized_pnl sum (Phase A canonical fills)
+      3. fills price backfill (legacy fills w/ price + entry — DERIVED)
+      4. unavailable -> null, never event theoretical PnL
+    Returns dict with net_pnl, gross, pnl_source, audit_status, confidence,
+    price_confidence, theoretical_pnl (EXPLICIT_EVENT, not realized).
+    """
+    from strategies.plugins.futures.active.tmf_spread import _MTS_FILL_LOG
+    point_value = 10.0
+
+    # 0. theoretical (EXPLICIT_EVENT) — never realized
+    theoretical = 0.0
+    for ev in data.get("events", []):
+        if ev.get("event") in ("COMBINED_EXIT_SUBMITTED", "EXIT_LOG"):
+            pts = ev.get("gross_points") if ev.get("gross_points") is not None else ev.get("pnl")
+            if pts is not None:
+                theoretical += float(pts) * point_value
+
+    # 1. COMBINED_EXIT_SETTLED event (canonical settlement)
+    settled = None
+    for ev in data.get("events", []):
+        if ev.get("event") == "COMBINED_EXIT_SETTLED":
+            settled = ev
+            break
+    if settled is None and fills_path and os.path.exists(fills_path):
+        with open(fills_path) as _f:
+            for _ln in _f:
+                try:
+                    _r = json.loads(_ln.strip())
+                except Exception:
+                    continue
+                if _r.get("event_type") == "COMBINED_EXIT_SETTLED" and _r.get("trade_id") == data.get("trade_id"):
+                    settled = _r
+                    break
+    if settled:
+        net = settled.get("combined_realized_pnl_net")
+        gross = settled.get("combined_realized_pnl_gross")
+        if net is not None:
+            return {"net_pnl": float(net), "gross_pnl": float(gross or net),
+                    "pnl_source": "SETTLEMENT", "settlement_origin": settled.get("settlement_origin", "LIVE"),
+                    "price_confidence": settled.get("price_confidence", "EXACT"),
+                    "audit_status": "AUDITABLE", "theoretical_pnl": theoretical,
+                    "pnl_status": "NET" if net is not None else "GROSS_ONLY"}
+        if gross is not None:
+            return {"net_pnl": None, "gross_pnl": float(gross),
+                    "pnl_source": "SETTLEMENT", "settlement_origin": settled.get("settlement_origin", "LIVE"),
+                    "price_confidence": settled.get("price_confidence", "EXACT"),
+                    "audit_status": "AUDITABLE", "theoretical_pnl": theoretical,
+                    "pnl_status": "GROSS_ONLY"}
+
+    # 2+3. leg fills: canonical realized sum, else price backfill
+    entries = {e.get("leg"): e for e in data.get("entries", [])}
+    # A released leg is a realized close just like the remaining-leg EXIT.
+    # Excluding it made KPI aggregation count only the profitable remaining
+    # leg and classify losing spreads as wins.
+    exit_fills = [f for f in data.get("exit_fills", []) if int(f.get("qty") or 0) > 0]
+    release_fill = data.get("release")
+    if release_fill and int(release_fill.get("qty") or 0) > 0:
+        exit_fills.append(release_fill)
+    if not exit_fills:
+        return {"net_pnl": None, "gross_pnl": None, "pnl_source": "UNAVAILABLE",
+                "audit_status": "PRE_FIX_UNAUDITABLE", "theoretical_pnl": theoretical,
+                "pnl_status": "GROSS_ONLY", "price_confidence": None}
+
+    total = 0.0
+    computed = 0
+    canonical_all = True
+    confidence = "EXACT"
+    side_methods = set()
+    for f in exit_fills:
+        leg = f.get("leg")
+        entry = entries.get(leg)
+        # canonical fill (Phase A): realized_pnl present + provenance fields
+        rp = f.get("realized_pnl")
+        if rp is not None and (f.get("position_effect") == "CLOSE" or f.get("fill_type") == "RELEASE"):
+            total += float(rp)
+            computed += 1
+            continue
+        # legacy: backfill from prices (DERIVED)
+        if entry and f.get("price") is not None:
+            pnl, _, _, _, _method = _fill_pnl_components(f, entry, point_value)
+            if pnl is not None:
+                total += pnl
+                computed += 1
+                canonical_all = False
+                confidence = "DERIVED"
+                side_methods.add(_method)
+                continue
+        # unavailable
+        canonical_all = False
+        confidence = None
+
+    if computed == 0:
+        return {"net_pnl": None, "gross_pnl": None, "pnl_source": "UNAVAILABLE",
+                "audit_status": "PRE_FIX_UNAUDITABLE", "theoretical_pnl": theoretical,
+                "pnl_status": "GROSS_ONLY", "price_confidence": None}
+
+    return {"net_pnl": None, "gross_pnl": round(total, 1), "pnl_source": "FILLS" if canonical_all else "FILLS_BACKFILL",
+            "settlement_origin": "LIVE" if canonical_all else "BACKFILL",
+            "price_confidence": confidence, "audit_status": "AUDITABLE" if confidence else "DERIVED_AUDITABLE" if confidence == "DERIVED" else "PRE_FIX_UNAUDITABLE",
+            "theoretical_pnl": theoretical, "pnl_status": "GROSS_ONLY",
+            "calculation_version": "pnl-backfill-v2",
+            "side_resolution_method": ",".join(sorted(side_methods)) if side_methods else None,
+            "generated_at": None}
+
+
+# 2026-08-03 P0: data-governance cutover buckets.
+# PRE_GUARD: before 7/31 19:08 far->near pollution guard.
+# POST_GUARD_PRE_PHASE_A: guarded, legacy fill schema (realized_pnl missing).
+# POST_PHASE_A_CANONICAL: Phase A fill schema (canonical per-leg realized).
+_PRE_GUARD_CUT = "2026-07-31T19:08"
+_PHASE_A_CUT = "2026-08-03T12:00"
+
+
+def _guard_period_of(ts_str):
+    ts = str(ts_str or "")
+    if not ts:
+        return "UNKNOWN"
+    if ts < _PRE_GUARD_CUT:
+        return "PRE_GUARD"
+    if ts < _PHASE_A_CUT:
+        return "POST_GUARD_PRE_PHASE_A"
+    return "POST_PHASE_A_CANONICAL"
 
 
 def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> dict:
@@ -93,6 +284,7 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
         "entries": [],
         "release": None,
         "exit": None,
+        "exit_fills": [],   # 2026-08-03 P0 fix: ALL exit/combined_exit fills
         "entry_ts": None,
         "exit_ts": None,
         "session": "UNKNOWN",
@@ -128,8 +320,9 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                         trades[trade_id]["session"] = session
                     elif fill_type == "RELEASE":
                         trades[trade_id]["release"] = fill
-                    elif fill_type == "EXIT":
+                    elif fill_type in ("EXIT", "COMBINED_EXIT"):
                         trades[trade_id]["exit"] = fill
+                        trades[trade_id]["exit_fills"].append(fill)
                         trades[trade_id]["exit_ts"] = ts_str
                 except Exception as e:
                     print(f"Warning: Failed to parse fill line: {e}", file=sys.stderr)
@@ -234,6 +427,19 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
         if len(data["entries"]) > 0 and not data["exit"]:
             near_entry = next((e for e in data["entries"] if e["leg"] == "NEAR"), None)
             far_entry = next((e for e in data["entries"] if e["leg"] == "FAR"), None)
+
+            # Active trades can have ENTRY/RELEASE evidence without a final
+            # EXIT fill.  Keep the report renderable and expose any realized
+            # release leg without assuming an exit exists.
+            _near_gross = 0.0
+            _far_gross = 0.0
+            _active_release = data.get("release")
+            if isinstance(_active_release, dict):
+                _release_pnl = float(_active_release.get("realized_pnl") or 0.0)
+                if str(_active_release.get("leg", "")).upper() == "NEAR":
+                    _near_gross = _release_pnl
+                elif str(_active_release.get("leg", "")).upper() == "FAR":
+                    _far_gross = _release_pnl
             
             entry_ts = data["entry_ts"]
             session = data["session"]
@@ -255,6 +461,8 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "release_leg": data["release"].get("leg") if data["release"] else "NONE",
                 "release_price": data["release"].get("price") if data["release"] else 0.0,
                 "release_pnl": data["release"].get("realized_pnl") if data["release"] else 0.0,
+                "near_pnl_gross": _near_gross,
+                "far_pnl_gross": _far_gross,
                 "release_reason": rel_r,
                 "release_reason_source": rel_src,
                 "risk_mode": data["risk_mode"],
@@ -277,7 +485,32 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             
             release_pnl = float(release_fill.get("realized_pnl") or 0.0) if release_fill else 0.0
             exit_pnl = float(exit_fill.get("realized_pnl") or 0.0) if exit_fill else 0.0
-            net_pnl = release_pnl + exit_pnl
+            # 2026-08-03: near/far leg realized gross — complete per-leg fill
+            _near_gross = 0.0
+            _far_gross = 0.0
+            # 2026-10-05 Codex: exit is only the final fill; keep both legs and partial closes.
+            for _lf in ([release_fill] if release_fill else []) + data["exit_fills"]:
+                _lr = float(_lf.get("realized_pnl") or 0.0)
+                if str(_lf.get("leg", "")).upper() == "NEAR":
+                    _near_gross += _lr
+                elif str(_lf.get("leg", "")).upper() == "FAR":
+                    _far_gross += _lr
+            if not (_near_gross or _far_gross):
+                # legacy: derive from release_leg when only leg-tagged fills exist
+                pass
+            # 2026-08-03 P0 fix: canonical realized PnL. EXPLICIT_EVENT
+            # theoretical PnL is NEVER used as realized.
+            _pnl = _compute_trade_pnl(data, fills_path)
+            net_pnl = _pnl.get("gross_pnl") if _pnl.get("net_pnl") is None else _pnl.get("net_pnl")
+            gross_pnl = _pnl.get("gross_pnl")
+            theoretical_pnl = _pnl.get("theoretical_pnl", 0.0)
+            pnl_source = _pnl.get("pnl_source", "UNAVAILABLE")
+            audit_status = _pnl.get("audit_status", "PRE_FIX_UNAUDITABLE")
+            price_confidence = _pnl.get("price_confidence")
+            pnl_status = _pnl.get("pnl_status", "GROSS_ONLY")
+            if release_fill:
+                # single-leg path: release + remaining-leg exit realized
+                net_pnl = (release_pnl + exit_pnl) or net_pnl
             report_data["completed"].append({
                 "trade_id": trade_id,
                 "entry_time": data["entry_ts"],
@@ -297,9 +530,19 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "release_reason_source": rel_src,
                 "exit_price": exit_fill.get("price") if exit_fill else 0.0,
                 "exit_pnl": exit_pnl,
+                "near_pnl_gross": _near_gross,
+                "far_pnl_gross": _far_gross,
                 "exit_reason": exit_r,
                 "exit_reason_source": exit_src,
                 "net_pnl": net_pnl,
+                "gross_pnl": gross_pnl,
+                "theoretical_pnl": theoretical_pnl,
+                "pnl_source": pnl_source,
+                "audit_status": audit_status,
+                "price_confidence": price_confidence,
+                "pnl_status": pnl_status,
+                "is_realized": pnl_source in ("SETTLEMENT", "FILLS", "FILLS_BACKFILL"),
+                "guard_period": _guard_period_of(exit_ts),
                 "risk_mode": data["risk_mode"],
                 "mtf_score": data.get("mtf_score"),
                 "entry_mtf": data.get("entry_mtf_score"),
@@ -310,6 +553,29 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "exit_vwap": data.get("exit_vwap"),
             })
                 
+    # 2026-08-03 P0: trading-day session breakdown (canonical realized only)
+    _comp = report_data.get("completed", [])
+    _real = [t for t in _comp if t.get("is_realized") and t.get("gross_pnl") is not None]
+    _summ = {"calendar_dates": sorted({str(t.get("exit_time", ""))[:10] for t in _real if t.get("exit_time")}),
+             "sessions": {"night": {"count": 0, "gross": 0.0},
+                          "day": {"count": 0, "gross": 0.0}},
+             "pnl_source_dist": {}, "audit_dist": {}, "theoretical_total": 0.0}
+    from collections import Counter as _C
+    _summ["pnl_source_dist"] = dict(_C(t.get("pnl_source") for t in _real))
+    _summ["audit_dist"] = dict(_C(t.get("audit_status") for t in _real))
+    _summ["theoretical_total"] = sum((t.get("theoretical_pnl") or 0.0) for t in _comp)
+    from collections import defaultdict as _DD
+    _guard = _DD(lambda: [0, 0.0])
+    for t in _real:
+        _g = t.get("guard_period", "UNKNOWN")
+        _guard[_g][0] += 1
+        _guard[_g][1] += (t.get("gross_pnl") or 0.0)
+    _summ["guard_buckets"] = {k: {"count": v[0], "gross": round(v[1], 1)} for k, v in _guard.items()}
+    for t in _real:
+        _s = "night" if str(t.get("session", "")).upper() == "NIGHT" else "day"
+        _summ["sessions"][_s]["count"] += 1
+        _summ["sessions"][_s]["gross"] += (t.get("gross_pnl") or 0.0)
+    report_data["trading_day_summary"] = _summ
     return report_data
 
 

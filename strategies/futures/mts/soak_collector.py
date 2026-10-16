@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from core.runtime_paths import runtime_logs
 
 from .soak_manifest import BaselineProvenance, CoverageMetrics, PerformanceMetrics, ShadowSoakManifest
 from .telemetry import EvaluationAccountingSummary, ProcessSafeTelemetryLogger, TelemetryDeliveryAccountingSummary
@@ -46,7 +47,7 @@ class ShadowSoakCollector:
     def __init__(
         self,
         generation_id: str | None = None,
-        base_dir: Path | str = "data/telemetry/shadow-soak",
+        base_dir: Path | str = runtime_logs("telemetry", "shadow-soak"),
         deployment_id: str = "default-deploy",
         authority: str = "legacy",
         override_git_clean: bool | None = None,

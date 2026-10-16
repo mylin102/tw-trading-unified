@@ -5,7 +5,7 @@ Instrumentation only — zero impact on trading decisions.
 Non-blocking bounded queue in callback → dedicated writer thread → per-generation JSONL.
 
 Usage:
-    capture = DynamicsCaptureHook(log_dir="logs/ticks/dynamics")
+    capture = DynamicsCaptureHook(log_dir=runtime_logs("ticks", "dynamics"))
     capture.start()
 
     # In callback:
@@ -16,6 +16,7 @@ Usage:
 """
 
 from __future__ import annotations
+from core.runtime_paths import runtime_logs
 
 import json
 import logging
@@ -30,12 +31,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue, Full
 from typing import Any
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("dynamics_capture")
 
 # ─── Schema ──────────────────────────────────────────────────────────
 
 CAPTURE_SCHEMA_VERSION = "1.0.0"
+CALLBACK_TRACE_SCHEMA_VERSION = "1.1.0"
 
 
 def _get_git_commit_short() -> str:
@@ -92,6 +95,9 @@ class TickCaptureEvent:
     bid_size: int | None = None
     ask_size: int | None = None
     tick_age_ms: float | None = None  # event_time → received_at delta
+    clock_valid: bool = True
+    clock_domain: str = "EXCHANGE_ASIA_TAIPEI"
+    clock_error: str = ""
 
     # Pair snapshot (state of the OTHER leg at observation time)
     pair_code: str = ""
@@ -114,6 +120,42 @@ class TickCaptureEvent:
     thread_id: int = field(default_factory=threading.get_ident)
 
 
+@dataclass
+class CallbackTraceEvent:
+    """Raw callback/dispatch evidence; telemetry only, never a gate input."""
+
+    schema_version: str = CALLBACK_TRACE_SCHEMA_VERSION
+    generation_id: str = ""
+    event_id: str = ""
+    callback_id: str = ""
+    callback_seq: int = 0
+    callback_type: str = ""
+    stage: str = ""  # ENTRY, ROUTE, CONSUME
+    exchange: str = ""
+    raw_contract_code: str = ""
+    canonical_contract_code: str = ""
+    expected_role: str = "unknown"
+    session_id: str = ""
+    exchange_event_time_raw: str = ""
+    exchange_event_time_normalized_utc: str = ""
+    callback_receive_wall_utc: str = ""
+    callback_receive_monotonic_ns: int = 0
+    route_enter_monotonic_ns: int | None = None
+    route_exit_monotonic_ns: int | None = None
+    strategy_consume_monotonic_ns: int | None = None
+    validation_result: str = ""
+    drop_reason: str = ""
+    bid1: float | None = None
+    ask1: float | None = None
+    bid_qty1: int | None = None
+    ask_qty1: int | None = None
+    last: float | None = None
+    volume: int | None = None
+    queue_depth: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    thread_id: int = field(default_factory=threading.get_ident)
+
+
 # ─── Capture Hook ────────────────────────────────────────────────────
 
 _EMPTY_CAPTURE = TickCaptureEvent()
@@ -131,14 +173,14 @@ class DynamicsCaptureHook:
 
     def __init__(
         self,
-        log_dir: str | Path = "logs/ticks/dynamics",
+        log_dir: str | Path = runtime_logs("ticks", "dynamics"),
         queue_maxsize: int = 10_000,
         flush_interval_ms: int = 500,
         flush_batch_size: int = 100,
         max_stale_age_ms: float = 5000.0,  # 5 seconds = stale
     ):
         self._log_dir = Path(log_dir)
-        self._queue: Queue[TickCaptureEvent | None] = Queue(maxsize=queue_maxsize)
+        self._queue: Queue[Any | None] = Queue(maxsize=queue_maxsize)
         self._queue_maxsize = queue_maxsize
         self._flush_interval_ms = flush_interval_ms
         self._flush_batch_size = flush_batch_size
@@ -229,6 +271,38 @@ class DynamicsCaptureHook:
         except Exception:
             logger.exception("DynamicsCaptureHook._observe_impl failed — capture skipped")
 
+    def observe_callback(self, **fields: Any) -> None:
+        """Best-effort raw callback trace using the same bounded queue.
+
+        This deliberately uses ``put_nowait``: telemetry must never delay a
+        broker callback or strategy execution.  The caller supplies monotonic
+        timestamps so freshness evidence cannot be reconstructed from a
+        wall-clock or exchange timestamp by accident.
+        """
+        try:
+            self._seq += 1
+            _fields = dict(fields)
+            _callback_seq = _fields.pop("callback_seq", None)
+            _generation_id = _fields.pop("generation_id", None)
+            _event_id = _fields.pop("event_id", None)
+            _callback_id = _fields.pop("callback_id", "")
+            _known = {f.name for f in __import__("dataclasses").fields(CallbackTraceEvent)}
+            _metadata = {k: _fields.pop(k) for k in list(_fields) if k not in _known}
+            event = CallbackTraceEvent(
+                generation_id=_generation_id or self._active_generation_id,
+                event_id=_event_id or f"{self._active_generation_id}-cb{self._seq:08d}",
+                callback_id=_callback_id,
+                callback_seq=_callback_seq if _callback_seq is not None else self._seq,
+                metadata=_metadata,
+                **_fields,
+            )
+            self._queue.put_nowait(event)
+            self.captured_count += 1
+        except Full:
+            self.dropped_count += 1
+        except Exception:
+            logger.exception("DynamicsCaptureHook.observe_callback failed")
+
     def _observe_impl(
         self,
         exchange: str,
@@ -252,7 +326,7 @@ class DynamicsCaptureHook:
         ask_size = _safe_int(getattr(tick, "ask_volume", None))
 
         # Parse event_time
-        event_dt = _parse_ts(event_time_str)
+        event_dt, clock_error = parse_exchange_datetime_taipei(event_time_str)
         event_time_iso = event_dt.isoformat() if event_dt else ""
         received_at_iso = now.isoformat()
 
@@ -321,6 +395,9 @@ class DynamicsCaptureHook:
             bid_size=bid_size,
             ask_size=ask_size,
             tick_age_ms=round(tick_age_ms, 2) if tick_age_ms is not None else None,
+            clock_valid=event_dt is not None,
+            clock_domain="EXCHANGE_ASIA_TAIPEI" if event_dt is not None else "INVALID_CLOCK_DOMAIN",
+            clock_error=clock_error or "",
             pair_code=pair_code,
             pair_bid=pair_bid,
             pair_ask=pair_ask,
@@ -424,10 +501,14 @@ def _safe_int(v: Any) -> int | None:
         return None
 
 
-def _parse_ts(ts_str: str) -> datetime | None:
-    """Parse Shioaji timestamp string -> datetime."""
+def parse_exchange_datetime_taipei(ts_str: str) -> tuple[datetime | None, str | None]:
+    """Parse Shioaji's naive exchange time as Asia/Taipei, then convert UTC."""
     if not ts_str:
-        return None
+        return None, "INVALID_CLOCK_DOMAIN:missing_exchange_datetime"
+    if isinstance(ts_str, datetime):
+        parsed = ts_str
+    else:
+        parsed = None
     for fmt in [
         "%Y-%m-%d %H:%M:%S.%f",
         "%Y-%m-%d %H:%M:%S",
@@ -437,7 +518,35 @@ def _parse_ts(ts_str: str) -> datetime | None:
         "%Y-%m-%dT%H:%M:%S",
     ]:
         try:
-            return datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
+            parsed = parsed or datetime.strptime(str(ts_str), fmt)
+            break
         except ValueError:
             continue
-    return None
+    if parsed is None:
+        return None, "INVALID_CLOCK_DOMAIN:unparseable_exchange_datetime"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    return parsed.astimezone(timezone.utc), None
+
+
+def parse_received_at_utc(value: str | datetime) -> tuple[datetime | None, str | None]:
+    """Parse system receive time; naive values are rejected, never guessed."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None, "INVALID_CLOCK_DOMAIN:unparseable_received_at"
+    else:
+        return None, "INVALID_CLOCK_DOMAIN:missing_received_at"
+    if parsed.tzinfo is None:
+        return None, "INVALID_CLOCK_DOMAIN:received_at_naive"
+    return parsed.astimezone(timezone.utc), None
+
+
+# Compatibility shim for external imports: source-unaware parsing is no longer
+# used internally and deliberately refuses naive input rather than guessing.
+def _parse_ts(ts_str: str) -> datetime | None:
+    parsed, _error = parse_received_at_utc(ts_str)
+    return parsed

@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from typing import Callable, Dict
+from typing import Any, Callable, Dict
 from collections import deque
 
 try:
@@ -23,10 +23,36 @@ INTERVAL_MAP = {
     "1h": "1h",
 }
 
+
+class AdapterOrderError(Exception):
+    """Structured, stable-code adapter failure (P0 2026-08-08).
+
+    Raised on order build/API failures so callers can write a durable,
+    order-manager-visible failure reason — never an ambiguous None.
+    """
+
+    def __init__(self, code: str, context: dict):
+        super().__init__(f"{code}: {context}")
+        self.code = code
+        self.context = context
+
+
+def wire_price_type_for(order) -> "sj.FuturesPriceType":
+    """Map the order's requested wire price type to the SDK enum.
+
+    Fail-safe: anything unknown or missing falls back to LMT (the historical behaviour).
+    """
+    name = str(getattr(order, "wire_price_type", "LMT") or "LMT").upper()
+    return getattr(sj.FuturesPriceType, name, sj.FuturesPriceType.LMT)
+
+
 class ShioajiClient:
     def __init__(self):
         self.api = None
         self.is_logged_in = False
+        # [Step 8] execution-context gate reference — set by the monitor
+        # on every mode transition (None = no certification -> fail-closed)
+        self._execution_context = None
         self._tick_callbacks = {}  # 儲存 tick 回呼函數
         self._kbar_callbacks = {}  # 儲存 K 棒回呼函數
         self._latest_kbars: Dict[str, deque] = {}  # 儲存最新 K 棒數據
@@ -34,11 +60,107 @@ class ShioajiClient:
             return
         self.api = sj.Shioaji()
 
+    def _gate_or_raise(self, method: str, order=None):
+        # [S0] gateway authorization: direct adapter calls (no live
+        # submission authorization) are rejected.
+        _gw_registry = getattr(self, "_gateway_registry", None)
+        if (_gw_registry is not None
+                and method in ("place_order", "place_order_object")
+                and not _gw_registry.verify_pending_submission(order)):
+            raise AdapterOrderError(
+                code="ADAPTER_GATEWAY_AUTHORIZATION_MISSING",
+                context={"method": method})
+        """[Step 8] execution-context gate: non-LIVE_READY or ctx=None
+        makes ZERO broker calls and raises the canonical structured gate
+        exception LiveOrderBlocked (typed reason); LIVE_READY permits the
+        intended call. Fail-closed by default (None context = no live
+        certification)."""
+        from core.mode_transition import LiveOrderBlocked
+        ctx = getattr(self, "_execution_context", None)
+        if ctx is None:
+            raise LiveOrderBlocked(
+                f"{method}: NO_LIVE_CERTIFICATION")
+        checker = getattr(ctx, "assert_order_allowed", None)
+        if callable(checker):
+            try:
+                checker(order, method=method)
+                return
+            except LiveOrderBlocked as exc:
+                raise LiveOrderBlocked(f"{method}: {exc.reason}") from exc
+        if not ctx.is_live_ready():
+            raise LiveOrderBlocked(
+                f"{method}: LIVE_QUARANTINED "
+                f"audit_reasons="
+                f"{list(getattr(ctx, 'audit_reasons', ()) or ())}")
+
+    def _broker_truth_snapshot(self) -> dict[str, Any]:
+        """Return a fail-closed, normalized snapshot for the order boundary."""
+        provider = getattr(self, "_broker_snapshot_provider", None)
+        if callable(provider):
+            snapshot = provider()
+            if not isinstance(snapshot, dict):
+                raise RuntimeError("broker snapshot provider returned invalid data")
+            return snapshot
+        api = getattr(self, "api", None)
+        if api is None or not hasattr(api, "list_positions"):
+            raise RuntimeError("broker position query unavailable")
+        account = getattr(api, "futopt_account", None)
+        rows = api.list_positions(account=account) if account is not None else api.list_positions()
+        positions = []
+        for row in rows or []:
+            code = getattr(row, "code", None) or getattr(row, "symbol", None)
+            direction = getattr(row, "direction", None) or getattr(row, "side", None)
+            direction = str(getattr(direction, "value", direction) or "").upper()
+            direction = ("LONG" if "BUY" in direction or "LONG" in direction
+                         else "SHORT" if "SELL" in direction or "SHORT" in direction
+                         else direction)
+            qty = getattr(row, "quantity", None)
+            if qty is None:
+                qty = getattr(row, "qty", None)
+            positions.append({"code": str(code), "side": direction,
+                              "direction": direction, "qty": qty,
+                              "quantity": qty})
+        return {"source": "live_broker", "positions": positions,
+                "fetch_status": {"capture": "OK"}}
+
+    def _authorize_broker_premise(self, contract, action, quantity,
+                                  premise, intent_action=None, snapshot=None):
+        """Lowest live send boundary: broker truth must satisfy the premise."""
+        if not isinstance(premise, dict):
+            raise AdapterOrderError(
+                code="ORDER_PREMISE_MISSING",
+                context={"method": "place_order", "action": intent_action})
+        from core.futures_release_guard import ReleaseIntent, evaluate_release_precondition
+        symbol = getattr(contract, "code", None) or getattr(contract, "symbol", None)
+        intent = ReleaseIntent(
+            action=str(intent_action or "ORDER"), symbol=str(symbol),
+            side=str(action), qty=int(quantity), premise=premise)
+        if snapshot is None:
+            try:
+                snapshot = self._broker_truth_snapshot()
+            except Exception as exc:
+                raise AdapterOrderError(
+                    code="BROKER_QUERY_UNAVAILABLE",
+                    context={"method": "place_order", "symbol": symbol,
+                             "error": f"{type(exc).__name__}: {exc}"}) from exc
+        decision = evaluate_release_precondition(intent, snapshot)
+        if not decision.allowed:
+            logger.warning("[ORDER_INTENT_BLOCKED] reason=%s audit=%s",
+                           decision.reason, decision.audit)
+            raise AdapterOrderError(
+                code=decision.reason,
+                context={"method": "place_order", "symbol": symbol,
+                         "action": intent_action, "premise": premise,
+                         "audit": decision.audit})
+        return snapshot
+
     def login(self, retries: int = 3, retry_delay: int = 10):
         api_key = os.getenv("SHIOAJI_API_KEY")
         secret_key = os.getenv("SHIOAJI_SECRET_KEY")
-        cert_path = os.getenv("SHIOAJI_CERT_PATH")
-        cert_password = os.getenv("SHIOAJI_CERT_PASSWORD")
+        cert_path = (os.getenv("SHIOAJI_CA_PATH")
+                     or os.getenv("SHIOAJI_CERT_PATH"))
+        cert_password = (os.getenv("SHIOAJI_CA_PASSWD")
+                         or os.getenv("SHIOAJI_CERT_PASSWORD"))
         if not all([api_key, secret_key]):
             return False
         
@@ -47,11 +169,16 @@ class ShioajiClient:
             try:
                 safe_login(self.api, api_key=api_key, secret_key=secret_key, contracts_timeout=10000)
                 if cert_path and os.path.exists(cert_path):
-                    self.api.activate_ca(ca_path=cert_path, ca_passwd=cert_password, person_id=api_key)
+                    from core.shioaji_session import _activate_futopt_ca
+                    _activate_futopt_ca(self.api, cert_path, cert_password)
                 self.is_logged_in = True
                 return True
-            except Exception as e:
-                logger.error(f"Shioaji login failed (attempt {attempt}/{retries}): {e}")
+            except Exception:
+                # SDK failures can contain certificate/account details.  The
+                # caller receives only the fail-closed False result.
+                logger.error(
+                    "Shioaji login failed (attempt %s/%s): "
+                    "SHIOAJI_LOGIN_FAILED", attempt, retries)
                 if attempt < retries:
                     import time
                     time.sleep(retry_delay)
@@ -193,39 +320,351 @@ class ShioajiClient:
             logger.error(f"[shioaji_client] Get contract {ticker} error: {e}")
             return None
 
-    def place_order(self, contract, action: str, quantity: int, price: float = 0):
-        if not self.is_logged_in: return None
+    def place_order(self, contract, action: str, quantity: int, price: float = 0,
+                    *, premise=None, intent_action=None, octype=None,
+                    _verified_order=None):
+        # P0 fix 2026-08-08 (verified on Mini shioaji 1.7.0):
+        # OrderType=[FOK,IOC,ROD] — MTL does not exist; FuturesPriceType=
+        # [LMT,MKP,MKT]; Order has NO market_type field.
+        # TAIFEX order rules: Market-With-Protection (MKP) requires IOC or
+        # FOK — ROD is for LIMIT orders only. MTS intent for a market order
+        # is immediate execution with protection → MKP + IOC (default;
+        # FOK is the explicit all-or-none alternative). price>0 (limit) →
+        # LMT + ROD. octype is set EXPLICITLY to Auto (broker determines
+        # New/Cover from position) — never rely on SDK defaults.
+        # Non-deprecated sj.OrderType/sj.FuturesPriceType/sj.Action used.
+        # Terminal failure/rejection semantics (fix-forward): a None API
+        # return is ADAPTER_ORDER_NO_TRADE; a trade with terminal status
+        # Failed/Rejected is ADAPTER_ORDER_REJECTED — zero silent failures.
+        # Nested calls (place_order_object -> place_order) must verify against
+        # the SAME order object the gateway authorized.  Passing no order here
+        # made verify_pending_submission(None) always False, so every
+        # object-bridge submission was refused as
+        # ADAPTER_GATEWAY_AUTHORIZATION_MISSING.  Direct callers keep the old
+        # fail-closed behaviour (no order => registry check fails).
+        self._gate_or_raise("place_order", _verified_order)
+        self._authorize_broker_premise(
+            contract, action, quantity, premise, intent_action)
+        return self._place_order_unchecked(contract, action, quantity, price, octype)
+
+    def _place_order_unchecked(self, contract, action: str, quantity: int,
+                               price: float = 0, octype=None):
+        """Broker call after an already-authorized route-specific gate."""
+        if not self.is_logged_in:
+            return None
         try:
-            action_value = sj.constant.Action.Buy if action.upper() in ("BUY", "LONG") else sj.constant.Action.Sell
+            action_value = sj.Action.Buy if action.upper() in ("BUY", "LONG") \
+                else sj.Action.Sell
+            # shioaji's C-extension enum members are str-like, so
+            # isinstance(_octype, str) is True for a real member; passing that
+            # member to getattr(sj.FuturesOCType, ...) raises
+            # "attribute name must be string".  Resolve by NAME only for a
+            # plain string; a member already carries .value — use it as-is.
+            _octype = octype if octype is not None else sj.FuturesOCType.Auto
+            if not hasattr(_octype, "value"):
+                _octype = getattr(sj.FuturesOCType, str(_octype),
+                                  sj.FuturesOCType.Auto)
             order = self.api.Order(
                 action=action_value, price=price, quantity=quantity,
-                order_type=sj.constant.OrderType.MTL,
-                price_type=sj.constant.FuturesPriceType.MKP if price == 0 else sj.constant.FuturesPriceType.LMT,
-                market_type=sj.constant.FuturesMarketType.Night if datetime.now().hour >= 15 or datetime.now().hour < 5 else sj.constant.FuturesMarketType.Common,
+                order_type=sj.OrderType.IOC if price == 0 else sj.OrderType.ROD,
+                price_type=sj.FuturesPriceType.MKP if price == 0
+                else sj.FuturesPriceType.LMT,
+                octype=_octype,
                 account=self.api.futopt_account,
             )
-            return self.api.place_order(contract, order)
+            from core.shioaji_session import observe_broker_call
+            observe_broker_call(self.api, "place_order", "before",
+                                source="squeeze_futures.data.shioaji_client._place_order_unchecked")
+            try:
+                trade = self.api.place_order(contract, order)
+            except Exception as exc:
+                observe_broker_call(self.api, "place_order", "error",
+                                    source="squeeze_futures.data.shioaji_client._place_order_unchecked",
+                                    error=exc)
+                raise
+            observe_broker_call(self.api, "place_order", "after",
+                                source="squeeze_futures.data.shioaji_client._place_order_unchecked")
+            if trade is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_NO_TRADE",
+                    context={"method": "place_order",
+                             "contract": getattr(contract, "code", None),
+                             "action": action, "quantity": quantity,
+                             "price": price,
+                             "reason": "api returned no trade"})
+            # never return a rejected/failed trade as success
+            _status = getattr(getattr(trade, "status", None), "status", None)
+            if _status is not None and str(_status) in ("Failed", "Rejected"):
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_REJECTED",
+                    context={"method": "place_order",
+                             "contract": getattr(contract, "code", None),
+                             "action": action, "quantity": quantity,
+                             "price": price, "status": str(_status)})
+            return trade
+        except AdapterOrderError:
+            raise                    # typed failures pass through unwrapped
         except Exception as e:
             logger.error(f"Order placement failed: {e}")
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_PLACE_FAILED",
+                context={"method": "place_order",
+                         "contract": getattr(contract, "code", None),
+                         "action": action, "quantity": quantity,
+                         "price": price, "error": str(e)}) from e
+
+    def place_order_object(self, order):
+        """Bridge the canonical OrderManager order object to Shioaji.
+
+        OrderManager submits domain ``Order`` objects, while this adapter's
+        broker boundary deliberately accepts contract/action/quantity.  Keep
+        that conversion here so a live MTS path cannot accidentally call
+        ``place_order(order)`` and fail after local intent creation.
+        """
+        self._gate_or_raise("place_order", order)
+        symbol = getattr(order, "symbol", None)
+        contract = self.get_contract(symbol) if isinstance(symbol, str) else None
+        side = getattr(getattr(order, "side", None), "value",
+                       getattr(order, "side", None))
+        quantity = getattr(order, "quantity", None)
+        if contract is None or not isinstance(side, str) or not isinstance(quantity, int) \
+                or isinstance(quantity, bool) or quantity <= 0:
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_OBJECT_INVALID",
+                context={"method": "place_order_object", "symbol": symbol,
+                         "side": side, "quantity": quantity})
+        strategy = str(getattr(order, "strategy", "") or "").upper()
+        premise = getattr(order, "premise", None)
+        if premise is None and strategy == "MTS_ENTRY":
+            premise = {"kind": "NOT_HOLD"}
+        elif premise is None and strategy in {"MTS_RELEASE", "MTS_EXIT"}:
+            side_name = "BUY" if str(side).upper() == "BUY" else "SELL"
+            premise = {"kind": "HOLD_LEG", "leg": "target",
+                       "side": "SHORT" if side_name == "BUY" else "LONG",
+                       "qty": quantity}
+        return self.place_order(
+            contract, action=side, quantity=quantity,
+            price=getattr(order, "price", 0) or 0,
+            premise=premise, intent_action=strategy or "ORDER",
+            _verified_order=order,
+        )
+
+    def place_combo_order_object(self, order):
+        """Submit one futures calendar-spread order from a lifecycle Order.
+
+        The combo is deliberately a separate adapter method so MTS cannot
+        silently fall back to two independent leg orders.  Authorization is
+        still performed by the same execution-context gate as single orders.
+        """
+        self._gate_or_raise("place_order", order)
+        legs = getattr(order, "combo_legs", None)
+        if not isinstance(legs, list) or len(legs) != 2:
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_LEGS_INVALID",
+                context={"method": "place_combo_order_object"})
+        if self.api is None or not self.is_logged_in:
+            raise AdapterOrderError(
+                code="ADAPTER_NOT_LOGGED_IN",
+                context={"method": "place_combo_order_object"})
+
+        combo_bases = []
+        contracts = []
+        for leg in legs:
+            if not isinstance(leg, dict):
+                raise AdapterOrderError(
+                    code="ADAPTER_COMBO_LEG_INVALID",
+                    context={"method": "place_combo_order_object"})
+            symbol = leg.get("symbol") or leg.get("code")
+            side = str(leg.get("side") or "").lower()
+            quantity = leg.get("quantity")
+            if (not isinstance(symbol, str) or not symbol or side not in ("buy", "sell")
+                    or not isinstance(quantity, int) or isinstance(quantity, bool)
+                    or quantity <= 0):
+                raise AdapterOrderError(
+                    code="ADAPTER_COMBO_LEG_INVALID",
+                    context={"method": "place_combo_order_object"})
+            contract = self.get_contract(symbol)
+            if contract is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_COMBO_CONTRACT_UNRESOLVED",
+                    context={"method": "place_combo_order_object"})
+            contracts.append((contract, side, quantity))
+            action = sj.Action.Buy if side == "buy" else sj.Action.Sell
+            combo_base_cls = getattr(getattr(sj, "contracts", sj), "ComboBase")
+            try:
+                combo_base = combo_base_cls.from_contract(contract, action=action)
+            except AttributeError:
+                combo_base = combo_base_cls(
+                    security_type=getattr(contract, "security_type"),
+                    exchange=getattr(contract, "exchange"),
+                    code=getattr(contract, "code"),
+                    symbol=getattr(contract, "symbol", symbol),
+                    category=getattr(contract, "category", ""),
+                    delivery_month=getattr(contract, "delivery_month", ""),
+                    action=action,
+                )
+            combo_bases.append(combo_base)
+
+        strategy = str(getattr(order, "strategy", "") or "").upper()
+        premise = getattr(order, "premise", None)
+        if premise is None and strategy == "MTS_ENTRY":
+            premise = {"kind": "NOT_HOLD"}
+        try:
+            snapshot = self._broker_truth_snapshot()
+        except Exception as exc:
+            raise AdapterOrderError(
+                code="BROKER_QUERY_UNAVAILABLE",
+                context={"method": "place_combo_order_object",
+                         "error": f"{type(exc).__name__}: {exc}"}) from exc
+        # One broker snapshot authorizes every leg.  For an entry premise,
+        # either held leg blocks the atomic combo before SDK construction.
+        for contract, side, quantity in contracts:
+            self._authorize_broker_premise(
+                contract, side, quantity, premise,
+                intent_action=strategy or "COMBO_ORDER", snapshot=snapshot)
+
+        combo_contract_cls = getattr(getattr(sj, "contracts", sj), "ComboContract")
+        combo_contract = combo_contract_cls(legs=combo_bases)
+        combo_order_cls = getattr(
+            sj, "ComboOrder",
+            getattr(getattr(sj, "order", sj), "ComboOrder", None))
+        if combo_order_cls is None:
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_SDK_UNAVAILABLE",
+                context={"method": "place_combo_order_object"})
+        combo_order = combo_order_cls(
+            action=sj.Action.Sell,
+            price=float(getattr(order, "price", 0) or 0),
+            quantity=int(getattr(order, "quantity", 1)),
+            price_type=wire_price_type_for(order),
+            order_type=sj.OrderType.IOC,
+            octype=sj.FuturesOCType.Auto,
+            account=self.api.futopt_account,
+        )
+        try:
+            from core.shioaji_session import observe_broker_call
+            observe_broker_call(self.api, "place_comboorder", "before",
+                                source="squeeze_futures.data.shioaji_client.place_combo_order_object")
+            trade = self.api.place_comboorder(combo_contract, combo_order)
+            observe_broker_call(self.api, "place_comboorder", "after",
+                                source="squeeze_futures.data.shioaji_client.place_combo_order_object")
+        except Exception as exc:
+            try:
+                observe_broker_call(self.api, "place_comboorder", "error",
+                                    source="squeeze_futures.data.shioaji_client.place_combo_order_object",
+                                    error=exc)
+            except Exception:
+                pass
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_ORDER_FAILED",
+                context={"method": "place_combo_order_object"}) from exc
+        if trade is None:
+            raise AdapterOrderError(
+                code="ADAPTER_COMBO_RECEIPT_MISSING",
+                context={"method": "place_combo_order_object"})
+        return trade
+
+    def update_combostatus(self, account=None):
+        """Refresh broker combo status using the explicit account keyword."""
+        if self.api is None or not hasattr(self.api, "update_combostatus"):
+            return None
+        if account is None:
+            account = getattr(self.api, "futopt_account", None)
+        if account is None:
+            return None
+        return self.api.update_combostatus(account=account)
+
+    def list_combotrades(self):
+        """Read the SDK combo trades projection after an explicit refresh."""
+        if self.api is None or not self.is_logged_in:
+            return []
+        try:
+            return list(self.api.list_combotrades() or [])
+        except Exception:
+            logger.warning("[shioaji_client] combo status refresh failed")
+            return []
+
+    def list_combo_status_trades(self, account=None, refresh=True):
+        """Refresh then read combo trades for futures MTS reconciliation."""
+        if refresh:
+            self.update_combostatus(account=account)
+        return self.list_combotrades()
+
+    def get_contract(self, symbol: str):
+        """Resolve one exact futures code without guessing a near/far alias.
+
+        ``get_futures_contract`` intentionally accepts product aliases such as
+        ``TMF``.  The live order bridge instead receives broker codes (for
+        example ``TMFH6``), so it must fail closed on a missing or ambiguous
+        exact match, especially around a contract roll.
+        """
+        if self.api is None or not self.is_logged_in or not isinstance(symbol, str) or not symbol:
+            return None
+        try:
+            from core.broker.shioaji_compat import get_contracts_list
+
+            matches = [
+                contract for contract in get_contracts_list(self.api, "Futures", symbol[:3])
+                if str(getattr(contract, "code", "")) == symbol
+            ]
+            return matches[0] if len(matches) == 1 else None
+        except Exception as exc:
+            logger.error("[shioaji_client] exact contract resolve %s failed: %s", symbol, exc)
             return None
 
     def update_order(self, trade, price: float, quantity: int = 1):
-        if not self.is_logged_in: return False
+        self._gate_or_raise("update_order")         # [Step 8] fail-closed
+        if not self.is_logged_in:
+            return False
         try:
-            self.api.update_order(trade, price=price, qty=quantity)
-            return True
+            result = self.api.update_order(trade, price=price, qty=quantity)
+            if result is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_NO_TRADE",
+                    context={"method": "update_order", "price": price,
+                             "quantity": quantity,
+                             "reason": "api returned no result"})
+            if result is False:
+                # official API returns Trade — False is a silent failure
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_UPDATE_FAILED",
+                    context={"method": "update_order", "price": price,
+                             "quantity": quantity,
+                             "reason": "api returned False (not a Trade)"})
+            return result
+        except AdapterOrderError:
+            raise
         except Exception as e:
             logger.error(f"Update order failed: {e}")
-            return False
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_UPDATE_FAILED",
+                context={"method": "update_order", "price": price,
+                         "quantity": quantity, "error": str(e)}) from e
 
     def cancel_order(self, trade):
-        if not self.is_logged_in: return False
+        self._gate_or_raise("cancel_order")        # [Step 8] fail-closed
+        if not self.is_logged_in:
+            return False
         try:
-            self.api.cancel_order(trade)
-            return True
+            result = self.api.cancel_order(trade)
+            if result is None:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_NO_TRADE",
+                    context={"method": "cancel_order",
+                             "reason": "api returned no result"})
+            if result is False:
+                raise AdapterOrderError(
+                    code="ADAPTER_ORDER_CANCEL_FAILED",
+                    context={"method": "cancel_order",
+                             "reason": "api returned False (not a Trade)"})
+            return result
+        except AdapterOrderError:
+            raise
         except Exception as e:
             logger.error(f"Cancel order failed: {e}")
-            return False
+            raise AdapterOrderError(
+                code="ADAPTER_ORDER_CANCEL_FAILED",
+                context={"method": "cancel_order", "error": str(e)}) from e
 
     def refresh_status(self, account=None, trade=None):
         if not self.is_logged_in: return None

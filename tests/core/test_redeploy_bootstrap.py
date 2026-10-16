@@ -1,0 +1,452 @@
+"""RED: auditable redeploy bootstrap/reset for a stale execution_context.
+
+The release5 pre_deploy was blocked by a stale runtime ctx
+(SESSION_LOGOUT + a timestamp session_id from the STOPPED process).
+The fix is a CONTROLLED reset flow (scripts/deployment/
+redeploy_bootstrap.py):
+
+- DRY-RUN by default; the actual reset requires --apply AND all guards
+  PASS: no active process/pid, fresh live_broker futures-flat/no-orders
+  snapshot, sealed live config profile, no pending safety reconcile,
+  readable ctx in an acceptable stale state (SESSION_LOGOUT /
+  RESTART_MAINTAIN_QUARANTINE). Anything else (corrupt ctx, reconcile
+  pending, nonflat/pending, active pid, profile/snapshot mismatch)
+  REFUSES and never touches the file.
+- Apply archives the old ctx (full content + sha256 + timestamp) under
+  <runtime>/logs/context_history/ then atomically rewrites the ctx as
+  LIVE_QUARANTINED with audit_reasons=(REDEPLOY_BOOTSTRAP,) — NEVER
+  LIVE_READY, never a session generation.
+- pre_deploy accepts the bootstrap ctx (no standalone snapshot session
+  comparison — the ctx session_id is None); post_startup STILL requires
+  the registry generation/session match.
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+_REPO = Path(__file__).resolve().parents[2]
+_SCRIPT = _REPO / "scripts" / "deployment" / "redeploy_bootstrap.py"
+
+_STALE_CTX = {
+    "account_id_hash": None,
+    "audit_reasons": ["SESSION_LOGOUT"],
+    "config_hash": None,
+    "effective_mode": "live_quarantined",
+    "live_order_allowed": False,
+    "process_start_id": "0e3367936f2dcfe9",
+    "requested_mode": "paper",
+    "revision": 1,
+    "session_id": "20260810_070039",
+    "state_namespace": "paper",
+    "updated_at": "2026-08-09T23:02:25.294+00:00",
+}
+
+
+def _write_ctx(runtime_dir: Path, data: dict):
+    p = runtime_dir / "execution_context.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _write_snapshot(tmp_path, **over):
+    data = {"source": "live_broker", "mode": "live",
+            "positions": [], "open_orders": [],
+            "captured_at": int(time.time() * 1000),
+            "canonical_input_hash": "b" * 64, "session_id": "1d9889aa",
+            "account_identity_hash": "a" * 64}
+    data.update(over)
+    p = tmp_path / "preflight.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return p
+
+
+def _write_profile(tmp_path):
+    import hashlib
+    p = tmp_path / "config" / "futures_live.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("live_trading: true\nconfig_profile: futures_live\n",
+                 encoding="utf-8")
+    return str(p), hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _run(repo: Path, *args, env_extra=None):
+    env = dict(os.environ)
+    for k in ("TRADING_RUNTIME_DIR", "LRC_RELEASE_SHA"):
+        env.pop(k, None)
+    env.update(env_extra or {})
+    return subprocess.run(
+        [sys.executable, "-B", str(_SCRIPT), *map(str, args)],
+        capture_output=True, text=True, env=env, timeout=60)
+
+
+@pytest.fixture()
+def env(tmp_path, monkeypatch):
+    rt = tmp_path / "runtime"
+    (rt / "logs").mkdir(parents=True)
+    _write_ctx(rt, _STALE_CTX)
+    pf = _write_snapshot(tmp_path)
+    prof, prof_hash = _write_profile(tmp_path)
+    pid = tmp_path / "nope.pid"          # absent => no active process
+    return {"rt": rt, "pf": pf, "prof": prof, "prof_hash": prof_hash,
+            "pid": pid, "tmp": tmp_path}
+
+
+def _base_args(e):
+    return ["--runtime-dir", str(e["rt"]), "--pid-file", str(e["pid"]),
+            "--position-state", str(e["pf"]), "--margin-evidence",
+            str(e["pf"]), "--config-profile", str(e["prof"]),
+            "--config-hash", e["prof_hash"]]
+
+
+def test_dry_run_default_does_not_modify_ctx(env):
+    r = _run(env["tmp"], *_base_args(env))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "DRY_RUN" in r.stdout
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur == _STALE_CTX, "dry-run must never modify the ctx"
+
+
+def test_apply_requires_all_guards_pid_active(env):
+    (env["pid"]).write_text(str(os.getpid()) + "\n")  # an ACTIVE pid
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode != 0
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur == _STALE_CTX, "refused apply must not modify the ctx"
+
+
+def test_apply_refuses_nonflat_snapshot(env):
+    pf = _write_snapshot(env["tmp"], positions=[
+        {"account": "futures", "code": "TMFH6", "quantity": 1,
+         "direction": "Action.Sell"}])
+    r = _run(env["tmp"], "--runtime-dir", str(env["rt"]),
+             "--pid-file", str(env["pid"]), "--position-state", str(pf),
+             "--margin-evidence", str(pf), "--config-profile",
+             str(env["prof"]), "--config-hash", env["prof_hash"], "--apply")
+    assert r.returncode != 0
+    assert "flat" in (r.stdout + r.stderr).lower()
+    assert json.loads((env["rt"] / "execution_context.json").read_text()) \
+        == _STALE_CTX
+
+
+def test_apply_refuses_reconcile_pending(env):
+    _write_ctx(env["rt"], {**_STALE_CTX,
+                           "audit_reasons": ["SAFETY_STOP_RECONCILE_PENDING"]})
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode != 0
+    assert "reconcile" in (r.stdout + r.stderr).lower()
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert "SAFETY_STOP_RECONCILE_PENDING" in cur["audit_reasons"]
+
+
+def test_apply_refuses_corrupt_ctx(env):
+    (env["rt"] / "execution_context.json").write_text("{not json",
+                                                      encoding="utf-8")
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode != 0
+    assert (env["rt"] / "execution_context.json").read_text() == "{not json"
+
+
+def test_apply_refuses_profile_mismatch(env):
+    r = _run(env["tmp"], "--runtime-dir", str(env["rt"]),
+             "--pid-file", str(env["pid"]), "--position-state",
+             str(env["pf"]), "--margin-evidence", str(env["pf"]),
+             "--config-profile", str(env["prof"]),
+             "--config-hash", "cd" * 32, "--apply")
+    assert r.returncode != 0
+    assert json.loads((env["rt"] / "execution_context.json").read_text()) \
+        == _STALE_CTX
+
+
+def test_apply_archives_and_resets(env):
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    # archive: full content + sha256 + timestamp under logs/context_history
+    hist = env["rt"] / "logs" / "context_history"
+    files = sorted(hist.glob("*.json"))
+    assert len(files) == 1, f"expected one archive, got {[f.name for f in files]}"
+    archived = json.loads(files[0].read_text())
+    assert archived["ctx"] == _STALE_CTX
+    assert archived["sha256"] == hashlib.sha256(
+        json.dumps(_STALE_CTX).encode()).hexdigest()
+    assert archived["timestamp"]
+    # ctx: LIVE_QUARANTINED + REDEPLOY_BOOTSTRAP + no session
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["live_order_allowed"] is False
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert not cur.get("session_id")
+    assert cur.get("config_hash") == env["prof_hash"]
+
+
+def test_apply_archives_and_resets_stale_auth_unavailable_ctx(env):
+    """A stopped process's failed-auth startup is retryable only via quarantine.
+
+    The reset still requires every normal bootstrap guard; it archives the
+    failure and never promotes the execution context to LIVE_READY.
+    """
+    stale = {**_STALE_CTX, "audit_reasons": ["AUTH_SESSION_UNAVAILABLE"]}
+    _write_ctx(env["rt"], stale)
+
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    archived = json.loads(next((env["rt"] / "logs" / "context_history").glob("*.json")).read_text())
+    assert archived["ctx"] == stale
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["live_order_allowed"] is False
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert cur["session_id"] is None
+
+
+def test_predeploy_accepts_redeploy_bootstrap_ctx(env, monkeypatch):
+    # after the reset, the pre_deploy gate accepts the bootstrap ctx: the
+    # flat guard must NOT compare the standalone snapshot session (ctx
+    # session_id is None) and ctx_atomic_health accepts REDEPLOY_BOOTSTRAP
+    from core.deployment_safety_gate import guard_flat_no_pending, \
+        guard_ctx_atomic_health
+    ctx = {"requested_mode": "live", "effective_mode": "live_quarantined",
+           "live_order_allowed": False, "audit_reasons": ["REDEPLOY_BOOTSTRAP"],
+           "revision": 1, "session_id": None, "config_hash": None}
+    _write_ctx(env["rt"], ctx)
+    r1 = guard_flat_no_pending(str(env["pf"]), ctx)
+    assert r1.ok, r1.reasons
+    r2 = guard_ctx_atomic_health(str(env["rt"]))
+    assert r2.ok, r2.reasons
+
+
+def test_post_startup_still_requires_generation(env, monkeypatch):
+    # the bootstrap ctx does NOT weaken post_startup: the registry-bound
+    # session generation is still mandatory
+    from core.deployment_safety_gate import guard_session_generation
+    r = guard_session_generation(None, False)
+    assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons
+
+
+_FAILED_GATE_CTX = {
+    "account_id_hash": None,
+    "audit_reasons": ["SESSION_LOGOUT", "POST_STARTUP_GATE_FAILED",
+                      "GUARD_CAPTURE_MISMATCH", "GUARD_MANIFEST_MISSING",
+                      "GUARD_MARGIN_UNAVAILABLE"],
+    "config_hash": "e798167389a5c1f42e6697da4e95138434478042eb5087155b826d57320a1c79",
+    "effective_mode": "live_quarantined",
+    "live_order_allowed": False,
+    "requested_mode": "live",
+    "revision": 2,
+    "session_id": "337ae6215a7f497df9da235be61f58a8",
+    "updated_at": "2026-08-10T13:07:53+08:00",
+}
+
+
+def _base_args_retry(e):
+    return _base_args(e) + ["--retry-post-startup-gate"]
+
+
+def _new_failed_gate_env(tmp_path, monkeypatch):
+    """A runtime whose ctx carries the previous POST_STARTUP_GATE_FAILED
+    audit (the real release8 blocker)."""
+    rt = tmp_path / "runtime"
+    (rt / "logs").mkdir(parents=True)
+    _write_ctx(rt, _FAILED_GATE_CTX)
+    pf = _write_snapshot(tmp_path)
+    prof, prof_hash = _write_profile(tmp_path)
+    pid = tmp_path / "nope.pid"
+    return {"rt": rt, "pf": pf, "prof": prof, "prof_hash": prof_hash,
+            "pid": pid, "tmp": tmp_path}
+
+
+def test_retry_apply_alone_refuses_failed_gate_ctx(tmp_path, monkeypatch):
+    """[P0 retry] --apply WITHOUT --retry-post-startup-gate must REFUSE a
+    ctx carrying POST_STARTUP_GATE_FAILED (no silent re-bootstrap)."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], *_base_args(e), "--apply")
+    assert r.returncode != 0
+    assert "refuse" in (r.stdout + r.stderr).lower()
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
+
+
+def test_retry_dry_run_refuses_failed_gate_ctx(tmp_path, monkeypatch):
+    """[P0 retry] --retry-post-startup-gate WITHOUT --apply must refuse
+    (dry-run default; the reset requires the explicit apply)."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], *_base_args_retry(e))
+    assert r.returncode != 0
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
+
+
+def test_retry_succeeds_after_all_guards(tmp_path, monkeypatch):
+    """[P0 retry] --retry-post-startup-gate + --apply with ALL guards
+    (pid inactive, flat + margin evidence, sealed profile, no reconcile)
+    archives the ENTIRE old ctx and atomically resets to
+    LIVE_QUARANTINED + REDEPLOY_BOOTSTRAP, session None."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], *_base_args_retry(e), "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    hist = e["rt"] / "logs" / "context_history"
+    files = sorted(hist.glob("*.json"))
+    assert len(files) == 1, f"expected one archive, got {[f.name for f in files]}"
+    archived = json.loads(files[0].read_text())
+    assert archived["ctx"] == _FAILED_GATE_CTX
+    assert archived["sha256"] == hashlib.sha256(
+        json.dumps(_FAILED_GATE_CTX).encode()).hexdigest()
+    cur = json.loads((e["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert not cur.get("session_id")
+    assert cur["live_order_allowed"] is False
+
+
+def test_retry_refuses_unknown_failure_reason(tmp_path, monkeypatch):
+    """[P0 retry] ANY other/unknown failure reason (e.g. an emergency
+    block) must refuse WITHOUT modifying the file."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    _write_ctx(e["rt"], {**_FAILED_GATE_CTX,
+                         "audit_reasons": ["EMERGENCY_BLOCKED_QUARANTINED",
+                                           "POST_STARTUP_GATE_FAILED"]})
+    r = _run(e["tmp"], *_base_args_retry(e), "--apply")
+    assert r.returncode != 0
+    cur = json.loads((e["rt"] / "execution_context.json").read_text())
+    assert "EMERGENCY_BLOCKED_QUARANTINED" in cur["audit_reasons"]
+    assert not (e["rt"] / "logs" / "context_history").exists() \
+        or not list((e["rt"] / "logs" / "context_history").glob("*.json"))
+
+
+def test_retry_refuses_nonflat_snapshot(tmp_path, monkeypatch):
+    """[P0 retry] the guards still apply: a non-flat snapshot refuses
+    and never touches the ctx."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    pf = _write_snapshot(e["tmp"], positions=[
+        {"account": "futures", "code": "TMFH6", "quantity": 1,
+         "direction": "Action.Sell"}])
+    r = _run(e["tmp"], "--runtime-dir", str(e["rt"]), "--pid-file",
+             str(e["pid"]), "--position-state", str(pf),
+             "--margin-evidence", str(pf), "--config-profile",
+             str(e["prof"]), "--config-hash", e["prof_hash"],
+             "--retry-post-startup-gate", "--apply")
+    assert r.returncode != 0
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
+
+
+def test_retry_refuses_profile_mismatch(tmp_path, monkeypatch):
+    """[P0 retry] a profile/hash mismatch refuses and never modifies."""
+    e = _new_failed_gate_env(tmp_path, monkeypatch)
+    r = _run(e["tmp"], "--runtime-dir", str(e["rt"]), "--pid-file",
+             str(e["pid"]), "--position-state", str(e["pf"]),
+             "--margin-evidence", str(e["pf"]), "--config-profile",
+             str(e["prof"]), "--config-hash", "cd" * 32,
+             "--retry-post-startup-gate", "--apply")
+    assert r.returncode != 0
+    assert json.loads((e["rt"] / "execution_context.json").read_text()) \
+        == _FAILED_GATE_CTX
+
+def test_apply_archives_and_resets_stale_exit_only_quarantine_ctx(env):
+    """A stale EXIT_ONLY quarantine (broker-not-flat / position-mismatch
+    recorded before the broker went flat) is retryable: the fresh
+    canonical flat evidence supersedes it.  The reset still archives the
+    old ctx and only ever rewrites LIVE_QUARANTINED +
+    REDEPLOY_BOOTSTRAP (never LIVE_READY, never a session)."""
+    stale = {**_STALE_CTX,
+             "audit_reasons": ["BROKER_NOT_FLAT",
+                               "EXIT_ONLY_RENEWAL:EXIT_ONLY_POSITION_MISMATCH"]}
+    _write_ctx(env["rt"], stale)
+
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode == 0, r.stdout + r.stderr
+    archived = json.loads(next(
+        (env["rt"] / "logs" / "context_history").glob("*.json")).read_text())
+    assert archived["ctx"] == stale
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["live_order_allowed"] is False
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert cur["session_id"] is None
+
+
+def test_apply_still_refuses_unknown_audit(env):
+    """The acceptable set stays CLOSED: an unknown audit reason still
+    refuses the reset (no silent re-bootstrap)."""
+    stale = {**_STALE_CTX, "audit_reasons": ["SOME_UNKNOWN_REASON"]}
+    _write_ctx(env["rt"], stale)
+
+    r = _run(env["tmp"], *_base_args(env), "--apply")
+    assert r.returncode != 0
+    assert "unacceptable ctx audit state" in r.stderr or \
+        "unacceptable ctx audit state" in r.stdout
+
+
+
+_RECONCILED_HOLDING = {
+    "canonical_legs": [
+        {"code": "TMFH6", "side": "SHORT", "qty": 1, "avg_cost": 48176.0},
+        {"code": "TMFI6", "side": "LONG", "qty": 1, "avg_cost": 48320.0},
+    ],
+    "source": "broker_reconciled_record",
+    "captured_at": 1790253493941,
+    "canonical_input_hash": "c" * 64,
+}
+_TWO_LEGS = [
+    {"account": "futures", "code": "TMFH6", "quantity": 1,
+     "direction": "Action.Sell", "avg_cost": 48176.0},
+    {"account": "futures", "code": "TMFI6", "quantity": 1,
+     "direction": "Action.Buy", "avg_cost": 48320.0},
+]
+
+
+def _reconciled_env(env, **over):
+    pf = _write_snapshot(env["tmp"], positions=_TWO_LEGS)
+    _write_ctx(env["rt"], {
+        **_STALE_CTX, "requested_mode": "live",
+        "canonical_holding": _RECONCILED_HOLDING,
+        "audit_reasons": ["SESSION_LOGOUT", "SESSION_RECONNECT_PENDING",
+                          "POST_STARTUP_GATE_FAILED", "GUARD_POSITION_NOT_FLAT"],
+        **over})
+    return ["--runtime-dir", str(env["rt"]), "--pid-file", str(env["pid"]),
+            "--position-state", str(pf), "--margin-evidence", str(pf),
+            "--config-profile", str(env["prof"]),
+            "--config-hash", env["prof_hash"]]
+
+
+def test_reconciled_position_with_reconnect_pending_is_resettable(env):
+    """Live 2026-09-24 deadlock: the app held a broker-reconciled spread AND a
+    SESSION_RECONNECT_PENDING audit (written by the process we stopped).
+    pre_deploy refused the stale ctx; the only tool that clears a stale ctx
+    (this bootstrap) refused the reconnect flag — so the deploy could never run
+    with a real position, and the position had no managing path."""
+    args = _reconciled_env(env) + ["--allow-existing-mts-position",
+                                   "--retry-post-startup-gate"]
+    # a failed startup gate is never retried by a bare dry-run: the operator
+    # must be explicit (--retry-post-startup-gate AND --apply)
+    dry = _run(env["tmp"], *args)
+    assert dry.returncode != 0, dry.stdout + dry.stderr
+    assert "ctx NOT modified" in dry.stdout
+    assert json.loads((env["rt"] / "execution_context.json").read_text()) \
+        ["audit_reasons"] == ["SESSION_LOGOUT", "SESSION_RECONNECT_PENDING",
+                              "POST_STARTUP_GATE_FAILED", "GUARD_POSITION_NOT_FLAT"]
+
+    applied = _run(env["tmp"], *args, "--apply")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert cur["effective_mode"] == "live_quarantined"
+    assert cur["live_order_allowed"] is False
+    assert cur["session_id"] is None
+    assert cur["audit_reasons"] == ["REDEPLOY_BOOTSTRAP"]
+    assert cur["canonical_holding"] == _RECONCILED_HOLDING, (
+        "broker truth must survive the reset: pre_deploy and the startup gate "
+        "accept a non-flat account only against these legs")
+
+
+def test_reconciled_position_without_the_allowance_still_refuses(env):
+    args = _reconciled_env(env) + ["--retry-post-startup-gate", "--apply"]
+    r = _run(env["tmp"], *args)
+    assert r.returncode != 0
+    assert "flat" in (r.stdout + r.stderr).lower()
+    cur = json.loads((env["rt"] / "execution_context.json").read_text())
+    assert "GUARD_POSITION_NOT_FLAT" in cur["audit_reasons"]

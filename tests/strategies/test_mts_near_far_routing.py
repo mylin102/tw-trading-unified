@@ -124,3 +124,145 @@ def test_case_6_no_early_return_loss(mock_monitor):
     # Accumulate far tick must be invoked
     mock_monitor._accumulate_far_tick.assert_called_once_with(far_tick)
     assert mock_monitor.market_data["TMF_FAR"]["close"] == 44050.0
+
+
+def _tick_without_bbo(code: str, close: float):
+    tick = create_mock_tick(code, close)
+    tick.buy_price = None
+    tick.sell_price = None
+    return tick
+
+
+def test_near_tick_without_bbo_preserves_cached_bidask(mock_monitor):
+    cached = {"bid": 44299.0, "ask": 44301.0, "bidask_at": 123.0}
+    mock_monitor.market_data["TMF"] = dict(cached)
+    mock_monitor.market_data["TMF_NEAR"] = dict(cached)
+
+    mock_monitor.on_tick("TFE", _tick_without_bbo("TMFH6", 44300.0))
+
+    for key in ("TMF", "TMF_NEAR"):
+        assert mock_monitor.market_data[key]["bid"] == 44299.0
+        assert mock_monitor.market_data[key]["ask"] == 44301.0
+        assert mock_monitor.market_data[key]["bidask_at"] == 123.0
+        assert "tick_bbo_at" not in mock_monitor.market_data[key]
+        assert mock_monitor.market_data[key]["close"] == 44300.0
+
+
+def test_far_tick_without_bbo_preserves_cached_bidask(mock_monitor):
+    mock_monitor.market_data["TMF_FAR"] = {
+        "bid": 44049.0, "ask": 44051.0, "bidask_at": 456.0,
+    }
+
+    mock_monitor.on_tick("TFE", _tick_without_bbo("TMFI6", 44050.0))
+
+    slot = mock_monitor.market_data["TMF_FAR"]
+    assert slot["bid"] == 44049.0
+    assert slot["ask"] == 44051.0
+    assert slot["bidask_at"] == 456.0
+    assert "tick_bbo_at" not in slot
+    assert slot["close"] == 44050.0
+
+
+def test_far_tick_bar_keeps_cached_near_and_far_bidask(mock_monitor):
+    mock_monitor.dry_run = False
+    mock_monitor.cfg["mts"]["enabled"] = True
+    mock_monitor._mts_tick = MagicMock()
+    mock_monitor.market_data["TMF"] = {
+        "bid": 44299.0, "ask": 44301.0, "bidask_at": 123.0,
+        "local_arrival_at": time.time(),
+    }
+    mock_monitor.market_data["TMF_FAR"] = {
+        "bid": 44049.0, "ask": 44051.0, "bidask_at": 456.0,
+        "local_arrival_at": time.time(),
+    }
+
+    mock_monitor.on_tick("TFE", _tick_without_bbo("TMFI6", 44050.0))
+
+    bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
+    assert (bar["bbo_near_bid"], bar["bbo_near_ask"]) == (44299.0, 44301.0)
+    assert (bar["bbo_far_bid"], bar["bbo_far_ask"]) == (44049.0, 44051.0)
+
+
+def test_bar_without_bidask_never_uses_close_and_gate_reports_missing(
+        mock_monitor, monkeypatch):
+    mock_monitor.dry_run = False
+    mock_monitor.cfg["mts"]["enabled"] = True
+    mock_monitor._mts_tick = MagicMock()
+    mock_monitor.market_data.clear()
+
+    mock_monitor.on_tick("TFE", _tick_without_bbo("TMFI6", 44050.0))
+
+    bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
+    assert bar["far_close_rt"] == 44050.0
+    assert all(bar.get(key) is None for key in (
+        "bbo_near_bid", "bbo_near_ask", "bbo_far_bid", "bbo_far_ask"))
+    assert 44050.0 not in tuple(bar.get(key) for key in (
+        "bbo_near_bid", "bbo_near_ask", "bbo_far_bid", "bbo_far_ask"))
+
+    captured = []
+    import core.entry_research_store as store
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    bar.update({"spread_z": 2.0, "entry_z": 1.0})
+    strategy = type("Strategy", (), {"_entry_z": 1.0, "_trade_id": None})()
+    mock_monitor._record_mts_entry_research_candidate(
+        strategy, bar, pd.Timestamp("2026-09-21 10:00:00"))
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "BBO_MISSING"
+
+
+def test_entry_research_view_rejects_stale_cached_bidask(mock_monitor, monkeypatch):
+    mock_monitor.dry_run = False
+    mock_monitor.cfg["mts"]["enabled"] = True
+    mock_monitor._mts_tick = MagicMock()
+    stale_at = time.time() - 31.0
+    mock_monitor.market_data["TMF"] = {
+        "bid": 44299.0, "ask": 44301.0, "bidask_at": stale_at,
+        "local_arrival_at": time.time(),
+    }
+    mock_monitor.market_data["TMF_FAR"] = {
+        "bid": 44049.0, "ask": 44051.0, "bidask_at": stale_at,
+        "local_arrival_at": time.time(),
+    }
+    mock_monitor.on_tick("TFE", _tick_without_bbo("TMFI6", 44050.0))
+    bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
+    assert bar["bbo_near_age_ms"] >= 30000
+    assert bar["bbo_far_age_ms"] >= 30000
+
+    captured = []
+    import core.entry_research_store as store
+    monkeypatch.setattr(store, "record_entry_observation",
+                        lambda audit, **kw: captured.append(audit) or True)
+    bar.update({"spread_z": 2.0, "entry_z": 1.0})
+    strategy = type("Strategy", (), {
+        "_entry_z": 1.0, "_trade_id": None, "_max_quote_age_ms": 30000,
+    })()
+    mock_monitor._record_mts_entry_research_candidate(
+        strategy, bar, pd.Timestamp("2026-09-21 10:00:00"))
+    assert captured[-1]["decision"] == "REJECT"
+    assert captured[-1]["rejection_reason"] == "STALE_QUOTE"
+
+
+def test_entry_view_never_uses_a_tick_bbo_as_entry_evidence(mock_monitor):
+    """UPDATED 2026-09-23 (docs/specs/quote-store-view-refactor.md): the tick-ordering
+    rule was replaced by SOURCE SEPARATION — the tick path writes tick_* keys and can no
+    longer contaminate the BidAsk slot.  Preserved intent: a tick-borne BBO never becomes
+    entry evidence; freshness is judged by the consumers' thresholds.
+    """
+    mock_monitor.dry_run = False
+    mock_monitor.cfg["mts"]["enabled"] = True
+    mock_monitor._mts_tick = MagicMock()
+    now = time.time()
+    mock_monitor.market_data["TMF"] = {
+        "bid": 44299.0, "ask": 44301.0, "bidask_at": now, "local_arrival_at": now,
+    }
+    mock_monitor.market_data["TMF_FAR"] = {
+        "bid": 44049.0, "ask": 44051.0, "bidask_at": now - 0.5, "local_arrival_at": now,
+    }
+
+    mock_monitor.on_tick("TFE", create_mock_tick("TMFI6", 44050.0))
+
+    bar = mock_monitor._mts_tick.call_args.kwargs["enriched_bar"]
+    assert bar["bbo_far_bid"] == 44049.0
+    assert bar["bbo_far_ask"] == 44051.0
+    assert 400 <= bar["bbo_far_age_ms"] < 30000

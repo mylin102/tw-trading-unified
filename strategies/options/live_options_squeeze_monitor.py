@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from rich.console import Console
+from core.runtime_paths import runtime_logs
 
 # ── Contract date normalization helper ──────────────────────────────
 # Shioaji may return delivery_date as str, datetime.date, or datetime.datetime.
@@ -169,6 +170,12 @@ class MockBrokerAdapter:
 
     def cancel_order(self, trade):
         return None
+
+
+def _ensure_central_dispatcher_ownership(api):
+    """No-op ownership guard: the central order dispatcher registered by
+    main.py is the single Shioaji order callback.  Options never re-register
+    (that would replace the futures fills bridge)."""
 
 
 class ShioajiOptionsSmartMonitor:
@@ -328,19 +335,15 @@ class ShioajiOptionsSmartMonitor:
 
         # 設定日誌路徑
         self._update_log_paths()
-        if self.api is not None and hasattr(self.api, "set_order_callback"):
-            try:
-                self.api.set_order_callback(self.on_order_event)
-            except RuntimeError as e:
-                if "Already borrowed" in str(e):
-                    console.print("[dim]🔗 Options order callback already managed by parent session[/dim]")
-                else:
-                    raise
+        # Central order dispatcher (main.py) is the sole Shioaji callback owner;
+        # options events are routed through it.  Never re-register here: a
+        # direct set_order_callback would steal the futures fills bridge.
+        _ensure_central_dispatcher_ownership(self.api)
 
     def _update_log_paths(self):
         log_sub_dir = "live_trading" if self.live_trading else "paper_trading"
         # Use cwd-based path (main.py runs from tw-trading-unified root)
-        log_base = Path(os.getcwd()) / "strategies" / "options" / "logs" / log_sub_dir
+        log_base = Path(runtime_logs("options")) / log_sub_dir
         try:
             if log_base.exists() and not log_base.is_dir():
                 log_base.unlink()
@@ -993,7 +996,7 @@ class ShioajiOptionsSmartMonitor:
 
             now = _dt.datetime.now()
             date_str = get_session_date_str(now)
-            log_base = Path("logs/market_data")
+            log_base = Path(runtime_logs("market_data"))
             log_base.mkdir(parents=True, exist_ok=True)
             csv_path = log_base / f"OPTIONS_{date_str}_indicators.csv"
 
@@ -1286,13 +1289,7 @@ class ShioajiOptionsSmartMonitor:
             print(f"⚠️ Failed to save options orders: {e}")
 
     def _options_orders_file_path(self, now=None):
-        # 2026-07-08 Gemini CLI: Support test isolation to prevent test leakage
-        import sys
-        orders_dir = "exports/trades"
-        if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
-            current_cwd = Path.cwd().resolve()
-            if (current_cwd / "RULES.md").exists() and (current_cwd / "exports").exists():
-                orders_dir = "tests/temp_exports_trades"
+        orders_dir = os.environ.get("TRADING_TEST_EXPORT_DIR", "exports/trades")
         current_time = now or datetime.datetime.now()
         date_str = current_time.strftime("%Y%m%d")
         return Path(orders_dir) / f"OPTIONS_{date_str}_orders.json"
@@ -2030,7 +2027,7 @@ class ShioajiOptionsSmartMonitor:
     def _resolve_futures_squeeze_state(self, bar_ts):
         bar_time = pd.Timestamp(bar_ts)
         date_str = get_session_date_str(bar_time.to_pydatetime())
-        market_dir = Path("logs/market_data")
+        market_dir = Path(runtime_logs("market_data"))
         patterns = [
             f"TMF_{date_str}_*_indicators.csv",
             "TMF_*_indicators.csv",
@@ -3425,7 +3422,7 @@ class ShioajiOptionsSmartMonitor:
     def _audit_signal(self, signal_type, side, signal_data, rejection_reason):
         """記錄信號審計軌跡到 CSV（與期貨系統共用格式）"""
         from pathlib import Path
-        log_dir = Path("logs/market_data")
+        log_dir = Path(runtime_logs("market_data"))
         log_dir.mkdir(parents=True, exist_ok=True)
         date_str = datetime.datetime.now().strftime("%Y%m%d")
         audit_file = log_dir / f"MTX_{date_str}_signals_audit.csv"
@@ -4514,7 +4511,7 @@ class ShioajiOptionsSmartMonitor:
             "watchdog_state": self._watchdog_state,
         }
         event.update(kwargs)
-        log_dir = Path("logs/options_watchdog")
+        log_dir = Path(runtime_logs("options_watchdog"))
         log_dir.mkdir(parents=True, exist_ok=True)
         with open(log_dir / "watchdog_events.jsonl", "a") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -4858,6 +4855,7 @@ class ShioajiOptionsSmartMonitor:
 
                 # ── [Vertical Spread v1] Spread position management ──
                 if self._enable_vertical_spread and self._current_spread is not None:
+                    option_chain = getattr(self, '_all_month_contracts', None) or []
                     if self.live_trading:
                         exited = self.manage_spread_live_position(signal, option_chain=option_chain)
                     else:
@@ -5144,14 +5142,10 @@ class ShioajiOptionsSmartMonitor:
                     self.broker = ShioajiBrokerAdapter(self.api, self.execution_cfg)
 
             # 3. Wire API callbacks
-            if self.api is not None and hasattr(self.api, "set_order_callback"):
-                try:
-                    self.api.set_order_callback(self.on_order_event)
-                except RuntimeError as e:
-                    if "Already borrowed" in str(e):
-                        console.print("[dim]🔗 Options order callback already managed by parent session[/dim]")
-                    else:
-                        raise
+            # Central order dispatcher (main.py) is the sole Shioaji callback owner;
+            # options events are routed through it.  Never re-register here: a
+            # direct set_order_callback would steal the futures fills bridge.
+            _ensure_central_dispatcher_ownership(self.api)
 
             # 4. Initialize OrderManager (SSOT for all orders)
             if self.order_mgr is None:
@@ -5202,7 +5196,6 @@ class ShioajiOptionsSmartMonitor:
 
         try:
             while self._running:
-                if os.path.exists(".restart"): break
                 try:
                     self.run_strategy_logic()
                     self._diag_counter += 1

@@ -29,12 +29,23 @@ Re-entry:
 """
 
 from __future__ import annotations
+from core.runtime_paths import (
+    runtime_logs,
+    mts_position_state_path,
+    stamp_runtime_state,
+)
+
+# A caller may explicitly clear an immutable field; omitted arguments retain
+# the legacy field-level protection behavior.
+_UNSET_SENTINEL = object()
 
 import logging
 import os
 import json
 import math
 import time
+from pathlib import Path
+from collections import deque
 import pandas as pd
 from datetime import datetime
 from typing import Any, TypeVar
@@ -48,6 +59,114 @@ from core.strategy_context import StrategyContext, MarketData, PositionView
 from strategies.futures.squeeze_futures.engine.constants import get_point_value
 
 logger = logging.getLogger(__name__)
+
+# ── Policy J entry peak guard config (2026-08-04 contract alignment) ──
+# Canonical key: entry_peak_guard_ms — the quarantine window AFTER both legs
+# settle, during which Policy J durable peaks are suppressed (opening-spike
+# isolation). NOT a warmup knob; do not confuse with strategy/data warmup.
+_ENTRY_PEAK_GUARD_DEFAULT_MS = 15000.0
+_ENTRY_PEAK_GUARD_LEGACY_KEY = "policy_j_entry_warmup_ms"
+
+
+def resolve_entry_peak_guard_ms(params) -> tuple[float, str, str]:
+    """Resolve the effective entry-peak guard window from strategy params.
+
+    Returns (value_ms, source, config_key) with source in
+    CONFIG | LEGACY_CONFIG | DEFAULT.
+
+    Migration precedence (2026-08-04):
+      entry_peak_guard_ms present            -> new canonical key
+      only policy_j_entry_warmup_ms present  -> legacy, deprecation warning
+      both present, different values         -> ValueError (never silent pick)
+      neither present                        -> documented default, source=DEFAULT
+    """
+    params = params or {}
+    new_key = "entry_peak_guard_ms"
+    legacy_key = _ENTRY_PEAK_GUARD_LEGACY_KEY
+    has_new = new_key in params and params.get(new_key) is not None
+    has_legacy = legacy_key in params and params.get(legacy_key) is not None
+    if has_new and has_legacy:
+        _nv = float(params[new_key])
+        _lv = float(params[legacy_key])
+        if _nv != _lv:
+            raise ValueError(
+                f"Policy J guard config conflict: {new_key}={_nv} vs "
+                f"{legacy_key}={_lv} — remove the legacy key; refusing to "
+                f"silently pick one."
+            )
+        return (_nv, "CONFIG", new_key)
+    if has_new:
+        return (float(params[new_key]), "CONFIG", new_key)
+    if has_legacy:
+        _lv = float(params[legacy_key])
+        logger.warning(
+            "[POLICY_J_GUARD] deprecated key %s=%s used — migrate to %s",
+            legacy_key, _lv, new_key,
+        )
+        return (_lv, "LEGACY_CONFIG", legacy_key)
+    return (_ENTRY_PEAK_GUARD_DEFAULT_MS, "DEFAULT", new_key)
+
+
+# ── Canonical Policy J guard clock (2026-08-04 P0) ──
+# The 8h skew root cause: bar/tick timestamps carry UTC-epoch semantics while
+# the entry state ISO is naive Asia/Taipei wall-clock; mixing .timestamp()
+# yields phantom elapsed and an instantly-expired guard. Contract:
+#   epoch integer ms = decision source of truth
+#   timezone-aware ISO = display/audit only
+#   guard starts at entry-settled receive epoch (same clock as lifecycle)
+_ENTRY_GUARD_REASON_MISSING = "ENTRY_TIME_MISSING"
+_ENTRY_GUARD_REASON_PARSE = "ENTRY_TIME_PARSE_ERROR"
+_ENTRY_GUARD_REASON_FUTURE = "ENTRY_TIME_FUTURE"
+_ENTRY_GUARD_REASON_IMPLAUSIBLE = "ENTRY_TIME_IMPLAUSIBLE"
+_ENTRY_GUARD_REASON_SCHEMA = "ENTRY_TIME_SCHEMA_UNKNOWN"
+_ENTRY_GUARD_REASON_ACTIVE = "ENTRY_GUARD_ACTIVE"
+
+
+def iso_to_epoch_ms(iso: str) -> float:
+    """Convert an ISO timestamp to epoch milliseconds.
+
+    timezone-aware -> UTC epoch ms (correct).
+    naive -> Asia/Taipei wall-clock per the documented legacy contract
+    (LEGACY_NAIVE_LOCAL_MIGRATED); NEVER guessed as UTC.
+    Raises ValueError on unparseable / far-future values.
+    """
+    if not iso:
+        raise ValueError(_ENTRY_GUARD_REASON_MISSING)
+    s = str(iso).strip()
+    if not s:
+        raise ValueError(_ENTRY_GUARD_REASON_MISSING)
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        raise ValueError(_ENTRY_GUARD_REASON_PARSE)
+    if dt.tzinfo is None:
+        # naive legacy contract: Asia/Taipei wall-clock
+        from zoneinfo import ZoneInfo
+        dt = dt.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    epoch_ms = dt.timestamp() * 1000.0
+    _now_ms = time.time() * 1000.0
+    if epoch_ms > _now_ms + 24 * 3600 * 1000:
+        raise ValueError(_ENTRY_GUARD_REASON_FUTURE)
+    return epoch_ms
+
+
+def migrate_entry_time(iso, entry_ts_ms=None):
+    """Resolve a trusted entry-time epoch for the guard clock.
+
+    Returns (epoch_ms, source) with source in
+      CANONICAL_EPOCH | TZ_AWARE | LEGACY_NAIVE_LOCAL_MIGRATED
+    Raises ValueError with an _ENTRY_GUARD_REASON_* code on untrusted input
+    (missing / unparseable / future).
+    """
+    if entry_ts_ms is not None and entry_ts_ms > 0:
+        _now_ms = time.time() * 1000.0
+        if entry_ts_ms > _now_ms + 24 * 3600 * 1000:
+            raise ValueError(_ENTRY_GUARD_REASON_FUTURE)
+        return float(entry_ts_ms), "CANONICAL_EPOCH"
+    ms = iso_to_epoch_ms(iso)
+    if "+" in str(iso) or "Z" in str(iso).upper():
+        return ms, "TZ_AWARE"
+    return ms, "LEGACY_NAIVE_LOCAL_MIGRATED"
 
 # 2026-07-14 Gemini CLI: Import decoupled risk engines under ADR-009 Phase 2
 from strategies.plugins.futures.active.risk_engine import (
@@ -75,12 +194,6 @@ from strategies.plugins.futures.active.mts_lifecycle_adapter import (
     ReleaseGroup,
     TrailGroup,
     PositionLifecycle,
-)
-
-# 2026-07-28 Gemini CLI: Phase 1B Combined Exit Experiment instrumentation
-from strategies.futures.mts.experiment_telemetry.experiment_hook import (
-    observe_release_decision,
-    initialize_experiment,
 )
 
 class ReleaseMode(Enum):
@@ -296,23 +409,87 @@ _ENTRY_Z = 2.5            # entry z-score threshold
 _RELEASE_STOP_PTS = 20    # losing leg release threshold (pt)
 _TRAIL_DISTANCE_PTS = 30  # remaining leg trailing stop distance (pt)
 # 2026-05-27 Gemini CLI: Environmental isolation for state file
-# 2026-07-08 Gemini CLI: Default to test path if running under pytest to prevent state file leakage
-import sys
-_default_state_path = "/tmp/test_mts_position_state.json" if ("pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ) else "/tmp/mts_position_state.json"
-_MTS_STATE_FILE = os.getenv("MTS_STATE_PATH", _default_state_path)
+# State isolation is an explicit runtime injection, never inferred from the
+# test runner.  Production therefore always resolves through runtime_paths.
+_MTS_STATE_FILE = os.getenv("MTS_STATE_PATH") or mts_position_state_path()
 
 # 💡 Gemini CLI: Dynamic state file path supporting thread-local overrides for multi-instance monitors
 def _get_state_file_path() -> Path:
-    from pathlib import Path
-    if "pytest" in sys.modules and _MTS_STATE_FILE != _default_state_path and _MTS_STATE_FILE != os.getenv("MTS_STATE_PATH"):
-        return Path(_MTS_STATE_FILE)
+    # 2026-10-02 Codex: module import can precede the engine's startup mode binding.
+    if os.environ.get("NODE_ENV") == "production":
+        return Path(mts_position_state_path())
+    return Path(_MTS_STATE_FILE)
+# One canonical append-only ledger for strategy and dashboard.  A relative
+# default follows PM2 cwd, which can be the release worktree while the
+# dashboard reads the shared runtime directory; that split silently hides all
+# HVWAP telemetry (and makes the panel report DATA_PIPELINE_MISSING).  Allow
+# an explicit override for tests, otherwise always use the runtime SSOT.
+_MTS_EVENT_LOG = os.getenv(
+    "MTS_EVENT_LOG_PATH",
+    os.path.join(runtime_logs(), "mts_spread_events.jsonl"),
+)
+def _fills_ledger_path() -> str:
+    """Resolve the durable fills ledger path.
+
+    Authority: TRADING_RUNTIME_DIR/logs/mts_trade_fills.jsonl (runtime_paths);
+    MTS_FILL_LOG_PATH env override wins.  Without TRADING_RUNTIME_DIR (dev,
+    paper, tests) the legacy cwd-relative default is preserved so fixtures and
+    relative writes keep resolving to the same file.  Legacy schema untouched.
+    """
+    # 2026-10-02 Codex: production overrides cannot alias PAPER back into the LIVE ledger.
+    if os.environ.get("NODE_ENV") == "production":
+        from core.runtime_paths import mts_runtime_path
+        return mts_runtime_path("logs", "mts_trade_fills.jsonl")
+    _env = os.getenv("MTS_FILL_LOG_PATH")
+    if _env:
+        return _env
+    if os.getenv("TRADING_RUNTIME_DIR"):
+        from core.runtime_paths import runtime_logs
+        return runtime_logs("mts_trade_fills.jsonl")
+    return "logs/mts_trade_fills.jsonl"
+
+
+_MTS_FILL_LOG = _fills_ledger_path()
+_MTS_RECOVERY_AUDIT_LOG = os.getenv(
+    "MTS_RECOVERY_AUDIT_LOG_PATH",
+    os.path.join(runtime_logs(), "mts_recovery_audit.jsonl"),
+)
+
+
+# 2026-10-02 Codex: rebind all related durable artifacts together before any restore.
+def configure_mts_data_paths() -> None:
+    global _MTS_STATE_FILE, _MTS_FILL_LOG, _MTS_EVENT_LOG, _MTS_RECOVERY_AUDIT_LOG
+    global _SETTLEMENT_FAILURE_LATCH, _CRITICAL_FAILURE_SENTINEL
+    from core.runtime_paths import mts_runtime_path
+    _MTS_STATE_FILE = mts_position_state_path()
+    _MTS_FILL_LOG = _fills_ledger_path()
+    _MTS_EVENT_LOG = mts_runtime_path("logs", "mts_spread_events.jsonl")
+    _MTS_RECOVERY_AUDIT_LOG = mts_runtime_path("logs", "mts_recovery_audit.jsonl")
+    _SETTLEMENT_FAILURE_LATCH = mts_runtime_path("logs", "runtime", "settlement_failure_latch.json")
+    _CRITICAL_FAILURE_SENTINEL = mts_runtime_path("logs", "runtime", "critical.sentinel")
+
+
+def _abandoned_trade_ids(log_path: str | None = None) -> set[str]:
+    """Return trade IDs explicitly abandoned by an audited recovery decision."""
+    _path = log_path or _MTS_RECOVERY_AUDIT_LOG
+    if not os.path.exists(_path):
+        return set()
+    _ids: set[str] = set()
     try:
-        from strategies.futures.monitor import _mts_position_state_path
-        return _mts_position_state_path()
-    except Exception:
-        return Path(os.getenv("MTS_STATE_PATH", _default_state_path))
-_MTS_EVENT_LOG = os.getenv("MTS_EVENT_LOG_PATH", "logs/mts_spread_events.jsonl")
-_MTS_FILL_LOG = os.getenv("MTS_FILL_LOG_PATH", "logs/mts_trade_fills.jsonl")
+        with open(_path, encoding="utf-8") as _f:
+            for _line in _f:
+                try:
+                    _rec = json.loads(_line.strip())
+                except (TypeError, ValueError):
+                    continue
+                if _rec.get("event_type") != "MTS_RECOVERY_ABANDON":
+                    continue
+                _tid = str(_rec.get("abandoned_trade_id") or "").strip()
+                if _tid:
+                    _ids.add(_tid)
+    except OSError:
+        return set()
+    return _ids
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -375,7 +552,7 @@ class QuoteFreshnessPolicy:
     def __init__(
         self,
         near_max_ms: float = 3000.0,
-        near_hard_stale_ms: float = 10000.0,
+        near_hard_stale_ms: float = 12000.0,
         far_max_ms: float = 8000.0,
         far_hard_stale_ms: float = 15000.0,
         emergency_stale_ms: float = 30000.0,
@@ -464,15 +641,35 @@ from strategies.plugins.futures.active.mts_lifecycle_adapter import (
 
 
 def _commit_action(lifecycle: PositionLifecycle, decision: LifecycleDecision) -> None:
-    """Apply lifecycle state transition. No side effects — no filesystem, no Shioaji.
-
-    ADR-009 Task 9: TRAIL decision no longer pushes trail_group to SUBMITTED.
-    SUBMITTED is now set only after broker order submit succeeds (with exit_order_id).
-    This prevents the orphan SUBMITTED + exit_order_id=null deadlock.
-    """
-    if decision.action == LifecycleAction.RELEASE:
+    """Apply lifecycle state transition. No side effects — no filesystem, no Shioaji."""
+    if decision.action in (LifecycleAction.RELEASE, LifecycleAction.COMBINED_EXIT):
         lifecycle.release_group.status = ReleaseGroupStatus.TRIGGERED
-    # TRAIL: status stays ARMED/ACTIVE until monitor confirms order submit
+        if decision.action == LifecycleAction.COMBINED_EXIT:
+            lifecycle.exit_owner = "POLICY_J"
+        elif decision.action == LifecycleAction.RELEASE:
+            lifecycle.exit_owner = "RELEASE"
+
+
+# ── Maintenance entry lock (2026-08-05) ──
+# data/maintenance_entry_lock.flag blocks NEW ENTRIES during controlled
+# deployment. Existing positions keep full monitoring/risk/exit. The flag is
+# read by the trading system itself (audited); Dashboard displays only.
+_MAINT_LOCK_FLAG = None  # resolved lazily (repo root unknown at import)
+
+
+def _maintenance_entry_lock_active() -> bool:
+    global _MAINT_LOCK_FLAG
+    try:
+        if _MAINT_LOCK_FLAG is None:
+            # tmf_spread.py sits at strategies/plugins/futures/active/ —
+            # 4 subdirs under repo root; 5 dirname calls reach the root.
+            _repo = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+            _MAINT_LOCK_FLAG = os.path.join(_repo, "data",
+                                            "maintenance_entry_lock.flag")
+        return os.path.exists(_MAINT_LOCK_FLAG)
+    except Exception:
+        return False
 
 
 def _append_event(event_type: str, **kwargs) -> None:
@@ -492,6 +689,121 @@ def _append_event(event_type: str, **kwargs) -> None:
         pass
 
 
+def _p1b_exit_submitted(_ilog, trade_id: str, legs) -> bool:
+    """P1-B: True if any of the given legs of the trade's active intent is
+    already in a submitted state (SUBMIT_ATTEMPTED/SUBMITTED/UNKNOWN/FILLED).
+
+    The release creates the exit-intent for the REMAINING leg while it is
+    still NOT_SUBMITTED — a later remaining-leg exit must submit THROUGH that
+    same intent (not be suppressed, not re-create).  Only an already-submitted
+    leg suppresses re-emission (duplicate exit = the P1-2 double-submit)."""
+    try:
+        for _iid in _ilog.list_active():
+            _rec = _ilog.get(_iid)
+            if _rec.get("trade_id") != trade_id:
+                continue
+            for _leg in legs:
+                if _rec["legs"].get(_leg, {}).get("status") in (
+                    "SUBMIT_ATTEMPTED", "SUBMITTED", "UNKNOWN", "FILLED",
+                ):
+                    return True
+        return False
+    except Exception:
+        return False  # intent unavailable → legacy behavior (no gate)
+
+
+def _exit_intent_log():
+    """P1-B: durable COMBINED_EXIT intent log at the shared runtime dir.
+
+    The runtime directory is injected through TRADING_RUNTIME_DIR in tests
+    and supplied by the process supervisor in production."""
+    from core.exit_intent import IntentLog
+    # 2026-10-02 Codex: share the monitor's isolated PAPER intent directory.
+    if os.environ.get("NODE_ENV") == "production":
+        from core.runtime_paths import mts_runtime_path
+        return IntentLog(mts_runtime_path("logs"))
+    _rt = os.environ.get("TRADING_RUNTIME_DIR")
+    if _rt:
+        return IntentLog(os.path.join(_rt, "logs"))
+    from core.runtime_paths import runtime_root
+    return IntentLog(os.path.join(runtime_root(), "logs"))
+
+
+def _restart_baseline_quote(
+    bar: dict,
+    *,
+    rem_leg: Leg,
+    position_session_type: str | None,
+    max_quote_age_ms: float,
+) -> tuple[float | None, str | None]:
+    """RESTART_BASELINE quote resolution — (anchor_price, None) on success,
+    (None, fail_reason) on fail-closed.
+
+    Contract (bounded slice 2026-08-18):
+      1. single-leg remaining-leg BBO only — the other leg is never read
+      2. fresh — remaining-leg quote age (leg tick age -> leg age ->
+         bar quote_age_ms) must be present and <= max_quote_age_ms;
+         an unprovable age fails closed (QUOTE_AGE_UNKNOWN)
+      3. session match — bar session_type must equal the position's session
+         (unknown position session / unknown bar session -> fail-closed)
+      4. fail-closed — any missing / stale / session-mismatch input returns
+         (None, reason); the caller keeps PENDING_REANCHOR
+      5. metadata-only by construction — returns a price; the caller only
+         writes trail extrema / anchor fields (never avg_cost / UPL /
+         Policy-J / two-leg entry time)
+    """
+    _b = bar or {}
+    if position_session_type is None:
+        return None, "TRAIL_REANCHOR_SESSION_UNKNOWN"
+    _bar_sess = _b.get("session_type")
+    if _bar_sess is None:
+        return None, "TRAIL_REANCHOR_SESSION_UNKNOWN"
+    if str(_bar_sess) != str(position_session_type):
+        return None, "TRAIL_REANCHOR_SESSION_MISMATCH"
+
+    _leg_key = "near" if rem_leg == Leg.NEAR else "far"
+    _bid = _b.get(f"{_leg_key}_bid")
+    _ask = _b.get(f"{_leg_key}_ask")
+    if _bid is None or _ask is None:
+        return None, "TRAIL_REANCHOR_BBO_MISSING"
+    # type-safety BEFORE arithmetic (2026-08-13 width-gate lesson):
+    # bool is an int subclass; str / unparseable values must never anchor
+    if isinstance(_bid, bool) or isinstance(_ask, bool):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    if isinstance(_bid, str) or isinstance(_ask, str):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    try:
+        _bid_f = float(_bid)
+        _ask_f = float(_ask)
+    except (TypeError, ValueError):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    if (not math.isfinite(_bid_f) or not math.isfinite(_ask_f)
+            or _bid_f <= 0 or _ask_f <= 0):
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+    if _ask_f < _bid_f:
+        return None, "TRAIL_REANCHOR_BBO_INVALID"
+
+    _age = _b.get(f"{_leg_key}_tick_age_ms")
+    if _age is None:
+        _age = _b.get(f"{_leg_key}_age_ms")
+    if _age is None:
+        _age = _b.get("quote_age_ms")
+    if _age is None:
+        return None, "TRAIL_REANCHOR_QUOTE_AGE_UNKNOWN"
+    try:
+        _age_f = float(_age)
+    except (TypeError, ValueError):
+        return None, "TRAIL_REANCHOR_QUOTE_INVALID"
+    if (isinstance(_age, bool) or not math.isfinite(_age_f) or _age_f < 0):
+        # NaN / ±Inf / 負值 / bool 都不是可證明的 freshness — fail-closed;
+        # 負值不得 clamp 成 0 (0 = "just received" 是假的 freshness 證據)
+        return None, "TRAIL_REANCHOR_QUOTE_INVALID"
+    if max_quote_age_ms > 0 and _age_f > max_quote_age_ms:
+        return None, "TRAIL_REANCHOR_QUOTE_STALE"
+
+    return (_bid_f + _ask_f) / 2.0, None
+
+
 def _session_label() -> str:
     """Return 'night' if current time is in night session, else 'day'."""
     _h = datetime.now().hour
@@ -503,109 +815,44 @@ _LIVE_TICK = "LIVE_TICK"
 _MISSING = "MISSING"
 _UNSET = "UNSET"
 
-# ADR-024E.1: Durable JSONL append with flush + fsync
-_SETTLEMENT_FAILURE_LATCH = os.getenv(
-    "MTS_SETTLEMENT_FAILURE_LATCH",
-    "data/runtime/mts_settlement_failure.json",
-)
-_CRITICAL_FAILURE_SENTINEL = os.getenv(
-    "MTS_CRITICAL_FAILURE_SENTINEL",
-    "data/runtime/mts_critical_failure.sentinel",
-)
+
+def _authorized_fill_mode() -> str:
+    """Authorized execution mode for fill provenance from the canonical
+    runtime execution context (codex spec §3, v2).  paper_active ->
+    "paper"; live_ready / live_quarantined / reconciled_exit_only ->
+    "live"; anything else -> "unknown" (fail-closed: reconstruction will
+    never classify an unknown-mode fill as VERIFIED_PAPER).  NEVER reads
+    an arbitrary env override.
+    """
+    try:
+        from core.execution_context_state import read_execution_context
+        _ctx = read_execution_context() or {}
+        _mode = str(_ctx.get("effective_mode") or "").lower()
+        if _mode == "paper_active":
+            return "paper"
+        if _mode.startswith("live") or _mode == "reconciled_exit_only":
+            return "live"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
-def _append_jsonl_durable(path: str, record: dict) -> None:
-    """Append JSONL record with flush + fsync for durability."""
-    _dir = os.path.dirname(path)
-    if _dir and not os.path.exists(_dir):
-        os.makedirs(_dir, exist_ok=True)
-    payload = json.dumps(record, default=str, ensure_ascii=False) + "\n"
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(payload)
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def _write_settlement_failure_latch(
-    trade_id: str,
-    execution_id: str,
-    *,
-    near_filled_qty: int = 0,
-    near_expected_qty: int = 0,
-    far_filled_qty: int = 0,
-    far_expected_qty: int = 0,
-    failure_reason: str = "COMBINED_EXIT_LEDGER_APPEND_FAILED",
-) -> None:
-    """Atomically write a persistent settlement failure latch."""
-    state = {
-        "schema_version": 1,
-        "active": True,
-        "phase": "SETTLEMENT_PERSISTENCE_FAILED",
-        "trade_id": trade_id,
-        "execution_id": execution_id,
-        "failure_reason": failure_reason,
-        "failed_at": datetime.now().isoformat(),
-        "near_filled_qty": near_filled_qty,
-        "near_expected_qty": near_expected_qty,
-        "far_filled_qty": far_filled_qty,
-        "far_expected_qty": far_expected_qty,
-        "entry_enabled": False,
-        "combined_exit_resubmit_enabled": False,
-        "reconciliation_required": True,
+def _fill_provenance_defaults(trade_id: str, fill_type: str) -> dict:
+    """Complete fill provenance at the single writer boundary."""
+    try:
+        from core.execution_context_state import read_execution_context
+        _ctx = read_execution_context() or {}
+    except Exception:
+        _ctx = {}
+    _tid = str(trade_id or "")
+    return {
+        "mode": _authorized_fill_mode(),
+        "session_id": _ctx.get("session_id"),
+        "generation_id": _ctx.get("process_start_id"),
+        "parent_combo_order_id": (
+            f"PAPER-COMBO-{_tid}" if _tid and _authorized_fill_mode() != "live" else None),
+        "release_group_id": f"MTS-RG-{_tid}" if _tid else None,
     }
-    _tmp = _SETTLEMENT_FAILURE_LATCH + ".tmp"
-    try:
-        with open(_tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(state, default=str, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(_tmp, _SETTLEMENT_FAILURE_LATCH)
-        # Directory fsync for atomic rename
-        _dir_fd = os.open(os.path.dirname(_SETTLEMENT_FAILURE_LATCH), os.O_RDONLY)
-        try:
-            os.fsync(_dir_fd)
-        finally:
-            os.close(_dir_fd)
-    except Exception:
-        # Failure latch itself failed to persist — this is a critical durability failure.
-        # Remove the partial temp file, then hard-terminate.
-        try:
-            if os.path.exists(_tmp):
-                os.remove(_tmp)
-        except Exception:
-            pass
-        logger.critical(
-            "[CRITICAL_DURABILITY_FAILURE] Cannot persist settlement failure latch for "
-            "trade_id=%s execution_id=%s. Terminating process.",
-            trade_id, execution_id,
-        )
-        os._exit(1)
-
-
-def _clear_settlement_failure_latch() -> bool:
-    """Remove the failure latch if it exists. Returns True if latch was present."""
-    if os.path.exists(_SETTLEMENT_FAILURE_LATCH):
-        try:
-            os.remove(_SETTLEMENT_FAILURE_LATCH)
-            return True
-        except Exception:
-            logger.error("[FAILURE_LATCH] Failed to remove latch: %s", _SETTLEMENT_FAILURE_LATCH)
-            return False
-    return False
-
-
-def _load_settlement_failure_latch() -> dict | None:
-    """Load the persistent failure latch, returning None if absent or invalid."""
-    if not os.path.exists(_SETTLEMENT_FAILURE_LATCH):
-        return None
-    try:
-        with open(_SETTLEMENT_FAILURE_LATCH) as f:
-            state = json.loads(f.read())
-        if state.get("active") is True:
-            return state
-    except Exception:
-        pass
-    return None
 
 
 def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
@@ -627,7 +874,16 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  slippage_far: float | None = None,
                  # 2026-07-24 Hermes Agent: settlement tracking
                  settlement_status: str | None = None,
-                 settled_from: str | None = None) -> None:
+                 settled_from: str | None = None,
+                 # 2026-08-03 COMBINED_EXIT fills audit fix
+                 position_side_before_exit: str | None = None,
+                 position_effect: str | None = None,
+                 # 2026-07-31 Hermes Agent: ADR-024E — durable (fsync) writes
+                 # propagate failures instead of swallowing them. Used by the
+                 # COMBINED_EXIT settlement path so a lost fill cannot be
+                 # silently marked complete (fail-closed).
+                 durable: bool = False,
+                 **extra_fields) -> None:
     """Append a trade fill record (append-only JSONL)."""
     # 2026-06-25 Gemini CLI: Skip fill logging during backtesting
     if os.getenv("MTS_BACKTEST") == "1":
@@ -643,6 +899,7 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             logger.warning("[MTS_FILL_FALLBACK] Missing trade_id, using fallback=%s", _fallback)
             trade_id = _fallback
 
+        _prov = _fill_provenance_defaults(trade_id, fill_type)
         fill = {
             "timestamp": datetime.now().isoformat(),
             "ticker": ticker,
@@ -653,6 +910,43 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             "price": price,
             "fill_type": fill_type.upper(),
             "trade_id": trade_id,
+            # ── 2026-08-27 (codex-approved spec §3): future paper-fill
+            # provenance contract.  Every paper fill carries explicit
+            # provenance so downstream reconstruction can classify
+            # VERIFIED_PAPER without guessing.  Never uses
+            # settlement_origin=LIVE / BROKER_FILL for paper fills.
+            #
+            # mode is decided by the AUTHORIZED runtime execution context
+            # (canonical execution_context.json effective_mode), never by
+            # an arbitrary env override.  paper_active -> paper; any
+            # live_* / reconciled_exit_only -> live; unknown -> "unknown"
+            # (reconstruction fails closed on unknown mode).  An env
+            # override is NOT accepted — a paper runtime cannot be
+            # mislabeled live and vice versa.
+            "mode": _prov["mode"],
+            "execution_source": (
+                "UNVERIFIED_LIVE_FILL" if _prov["mode"] == "live" else
+                "PAPER_EXIT_FILL"
+                if str(fill_type).upper() in ("EXIT", "RELEASE",
+                                              "COMBINED_EXIT",
+                                              "COMBINED_EXIT_SETTLED")
+                else "PAPER_COMBO_FILL"),
+            "paper_fill_id": (None if _prov["mode"] == "live" else
+                extra_fields.pop("paper_fill_id", None)
+                or f"PF-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{leg.upper()}"),
+            "parent_combo_order_id": extra_fields.pop(
+                "parent_combo_order_id", None) or _prov["parent_combo_order_id"],
+            "leg_role": str(leg).upper(),
+            "expected_qty": extra_fields.pop("expected_qty", None) or qty,
+            "filled_qty": extra_fields.pop("filled_qty", None) or qty,
+            "fill_status": "FILLED",
+            "fill_price": price,
+            "fill_timestamp": datetime.now().isoformat(),
+            "attribution_key": extra_fields.pop("attribution_key", None)
+            or f"{trade_id}:{str(leg).upper()}:{str(fill_type).upper()}",
+            "session_id": extra_fields.pop("session_id", None) or _prov["session_id"],
+            "generation_id": extra_fields.pop("generation_id", None) or _prov["generation_id"],
+            "release_group_id": extra_fields.pop("release_group_id", None) or _prov["release_group_id"],
             "session": _session_label(),
             "spread_z": round(spread_z, 2) if spread_z is not None else None,
             "realized_pnl": round(realized_pnl, 1) if realized_pnl is not None else None,
@@ -673,14 +967,147 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
             # 2026-07-24 Hermes Agent: settlement tracking
             'settlement_status': settlement_status,
             'settled_from': settled_from,
+            # 2026-08-03 COMBINED_EXIT fills audit fix
+            'position_side_before_exit': position_side_before_exit,
+            'position_effect': position_effect,
         }
+        if extra_fields:
+            fill.update(extra_fields)
         # 💡 [Fixed 2026-05-27] Big warning for missing trade_id to catch leaks
         if trade_id == "?":
             logger.error("[MTS_FILL_ERROR] Missing trade_id in fill record! type=%s ticker=%s", fill_type, ticker)
         
-        _append_jsonl_durable(_MTS_FILL_LOG, fill)
-    except Exception as _ae:
-        logger.error("[MTS_FILL_APPEND_FAILED] trade_id=%s fill_type=%s error=%s", trade_id, fill_type, _ae); raise
+        if durable:
+            _append_jsonl_durable(_MTS_FILL_LOG, fill)
+        else:
+            with open(_MTS_FILL_LOG, "a") as f:
+                f.write(json.dumps(fill, default=str) + "\n")
+    except Exception:
+        if durable:
+            raise  # settlement-path writes must not be silently lost
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADR-024E: Settlement persistence failure latch / sentinel
+# 2026-07-31 Hermes Agent: implemented to match monitor.py call sites
+# (_enter_settlement_persistence_failed / _check_settlement_failure_latch
+# / _reconcile_combined_exit). Previously referenced but never defined,
+# so failures were silently swallowed -> fail-OPEN (restart forgot the
+# failed settlement, risking phantom positions / double settlement).
+# ═══════════════════════════════════════════════════════════════
+_SETTLEMENT_FAILURE_LATCH = os.path.join(
+    os.path.dirname(_MTS_FILL_LOG), "runtime", "settlement_failure_latch.json"
+)
+_CRITICAL_FAILURE_SENTINEL = os.path.join(
+    os.path.dirname(_SETTLEMENT_FAILURE_LATCH), "critical.sentinel"
+)
+
+
+def _append_jsonl_durable(path: str, record: dict) -> None:
+    """Append one JSONL record with fsync. Raises OSError on failure."""
+    _dir = os.path.dirname(path)
+    if _dir and not os.path.exists(_dir):
+        os.makedirs(_dir, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as _f:
+        _f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        _f.flush()
+        os.fsync(_f.fileno())
+
+
+def _write_critical_sentinel() -> None:
+    """Write the CRITICAL sentinel via os.open so it survives open() failures
+    (and builtins.open mocks). This is the last-resort marker."""
+    _dir = os.path.dirname(_CRITICAL_FAILURE_SENTINEL)
+    if _dir and not os.path.exists(_dir):
+        os.makedirs(_dir, exist_ok=True)
+    _fd = os.open(_CRITICAL_FAILURE_SENTINEL, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(_fd, b"CRITICAL_DURABILITY_FAILURE\n")
+        os.fsync(_fd)
+    finally:
+        os.close(_fd)
+
+
+def _write_settlement_failure_latch(
+    *,
+    trade_id: str,
+    execution_id: str,
+    near_filled_qty: int = 0,
+    near_expected_qty: int = 0,
+    far_filled_qty: int = 0,
+    far_expected_qty: int = 0,
+) -> None:
+    """ADR-024E.1: persist the failure latch durably. On secondary (latch
+    write) failure, write the CRITICAL sentinel and hard-exit (SystemExit —
+    uncaught in production terminates the process; tests may catch it)."""
+    _latch = {
+        "type": "SETTLEMENT_FAILURE_LATCH",
+        "trade_id": trade_id,
+        "execution_id": execution_id,
+        "near_filled_qty": near_filled_qty,
+        "near_expected_qty": near_expected_qty,
+        "far_filled_qty": far_filled_qty,
+        "far_expected_qty": far_expected_qty,
+        "entry_enabled": False,
+        "combined_exit_resubmit_enabled": False,
+        "reconciliation_required": True,
+        "timestamp": datetime.now().isoformat(),
+    }
+    try:
+        _append_jsonl_durable(_SETTLEMENT_FAILURE_LATCH, _latch)
+    except Exception as _le:  # noqa: BLE001 — secondary failure path
+        logger.critical(
+            "[CRITICAL_DURABILITY_FAILURE] latch write failed: %r — writing sentinel", _le,
+        )
+        try:
+            _write_critical_sentinel()
+        except Exception:  # noqa: BLE001
+            pass
+        raise SystemExit(1)
+
+
+def _load_settlement_failure_latch() -> dict | None:
+    """Load the latest latch record. If the CRITICAL sentinel exists without
+    a readable latch, synthesize a HALT latch (fail-closed)."""
+    # sentinel lives alongside the latch file — derive dynamically so tests
+    # that override only _SETTLEMENT_FAILURE_LATCH still find it.
+    _sentinel = os.path.join(os.path.dirname(_SETTLEMENT_FAILURE_LATCH), "critical.sentinel")
+    if os.path.exists(_sentinel):
+        return {
+            "type": "SYNTHETIC_HALT",
+            "entry_enabled": False,
+            "combined_exit_resubmit_enabled": False,
+            "reconciliation_required": True,
+            "sentinel": _sentinel,
+        }
+    if os.path.exists(_SETTLEMENT_FAILURE_LATCH):
+        try:
+            with open(_SETTLEMENT_FAILURE_LATCH, encoding="utf-8") as _f:
+                _last = None
+                for _line in _f:
+                    if not _line.strip():
+                        continue
+                    try:
+                        _last = json.loads(_line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                if _last:
+                    return _last
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _clear_settlement_failure_latch() -> None:
+    """Remove latch + sentinel after verified reconciliation."""
+    _sentinel = os.path.join(os.path.dirname(_SETTLEMENT_FAILURE_LATCH), "critical.sentinel")
+    for _p in (_SETTLEMENT_FAILURE_LATCH, _sentinel):
+        try:
+            if os.path.exists(_p):
+                os.remove(_p)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -901,6 +1328,43 @@ def settle_mts_trade(
     }
 
 
+# 2026-07-31 Hermes Agent: Projection integrity — when a CAS reject occurs, the
+# projection (disk state) is stale but execution state (RAM) is already correct.
+# Enqueue a rewrite here; the next telemetry heartbeat replays the snapshot with
+# the CURRENT disk revision. Projection failure must never roll back RAM.
+_PENDING_STATE_REWRITE = None  # dict | None: snapshot awaiting replay
+
+
+def _renko_status_payload(self_or_none=None):
+    """Build renko_status for canonical state write. Returns None when:
+    - no tracker exists, or
+    - tracker trade_id does not match the active trade (stale episode), or
+    - tracker is in FLAT/None state (post-reset).
+    """
+    try:
+        tracker = getattr(self_or_none, "_renko_tracker", None)
+        if tracker is None:
+            return None
+        active_trade = getattr(self_or_none, "_trade_id", None)
+        if active_trade and tracker.trade_id and tracker.trade_id != active_trade:
+            return None  # stale episode tracker — never persist
+        payload = tracker.to_dict()
+        payload["_bound_trade_id"] = active_trade
+        payload["_bound_episode_id"] = getattr(tracker, "episode_id", None)
+        return payload
+    except Exception:
+        return None
+
+
+# 2026-10-08 Codex: zero is a value; non-finite/blank Z is unknown everywhere.
+def _finite_spread_z_or_none(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _write_mts_state(
     has_position: bool,
     action: str,
@@ -909,9 +1373,9 @@ def _write_mts_state(
     far_entry: float = 0,
     near_last: float = 0,
     far_last: float = 0,
-    near_side: str | None = None,
-    far_side: str | None = None,
-    spread_z: float = 0,
+    near_side: str | None | object = _UNSET_SENTINEL,
+    far_side: str | None | object = _UNSET_SENTINEL,
+    spread_z: float | None = None,
     released_leg: str | None = None,
     release_price: float = 0,
     trail_pts: int = 0,
@@ -919,9 +1383,11 @@ def _write_mts_state(
     trail_nadir: float = 0,
     release_stop_points: int = 0,
     trail_distance_points: int = 0,
-    trade_id: str | None = None,
+    trade_id: str | None | object = _UNSET_SENTINEL,
     ticker: str = "TMF",
     atr: float = 0.0,
+    policy_j_meta: dict | None = None,
+    entry_ts: str | None | object = _UNSET_SENTINEL,
     **kwargs,
 ) -> None:
     """
@@ -936,6 +1402,8 @@ def _write_mts_state(
     try:
         # 💡 Gemini CLI: Dynamic state file resolution for multi-instance monitors (TMF vs MTX)
         _target_state_file = _get_state_file_path()
+        # 2026-10-02 Codex: first PAPER state write cannot rely on a legacy directory.
+        Path(_target_state_file).parent.mkdir(parents=True, exist_ok=True)
         # 1. Load existing state to preserve immutable fields if they exist
         existing = {}
         if os.path.exists(_target_state_file):
@@ -945,9 +1413,13 @@ def _write_mts_state(
             except:
                 pass
 
-        # ── Per-leg status: OPEN or RELEASED ──
-        near_status = "RELEASED" if released_leg == "near" else "OPEN"
-        far_status = "RELEASED" if released_leg == "far" else "OPEN"
+        # ── Per-leg status: OPEN, RELEASED, or CLOSED ──
+        if not has_position:
+            near_status = "CLOSED"
+            far_status = "CLOSED"
+        else:
+            near_status = "RELEASED" if released_leg == "near" else "OPEN"
+            far_status = "RELEASED" if released_leg == "far" else "OPEN"
 
         # Remaining leg labels for dashboard
         remaining_leg = None
@@ -961,12 +1433,32 @@ def _write_mts_state(
         # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
         _f_near_entry = near_entry if near_entry > 0 else float(existing.get("near_entry") or 0.0)
         _f_far_entry = far_entry if far_entry > 0 else float(existing.get("far_entry") or 0.0)
-        _f_near_side = near_side or existing.get("near_side")
-        _f_far_side = far_side or existing.get("far_side")
-        _f_trade_id = trade_id or existing.get("trade_id")
-        _f_entry_ts = existing.get("entry_ts")
+        _f_near_side = (existing.get("near_side")
+                        if near_side is _UNSET_SENTINEL else near_side)
+        _f_far_side = (existing.get("far_side")
+                       if far_side is _UNSET_SENTINEL else far_side)
+        _f_trade_id = (existing.get("trade_id")
+                       if trade_id is _UNSET_SENTINEL else trade_id)
+        _f_entry_ts = (existing.get("entry_ts")
+                      if entry_ts is _UNSET_SENTINEL else entry_ts)
         if not _f_entry_ts and has_position:
             _f_entry_ts = datetime.now().isoformat()
+
+        # 2026-10-08 Codex: freeze the confirmed entry for this trade only.
+        _current_z = _finite_spread_z_or_none(kwargs.pop("current_spread_z", spread_z))
+        _entry_z_arg = kwargs.pop("entry_spread_z", _UNSET_SENTINEL)
+        _same_trade = (has_position and existing.get("has_position")
+                       and bool(_f_trade_id) and existing.get("trade_id") == _f_trade_id)
+        if not has_position:
+            _entry_z = None
+        elif _same_trade:
+            _entry_z = _finite_spread_z_or_none(existing.get("entry_spread_z"))
+        elif _entry_z_arg is not _UNSET_SENTINEL:
+            _entry_z = _finite_spread_z_or_none(_entry_z_arg)
+        elif reason == "MANUAL_ENTRY_CONFIRMED":
+            _entry_z = _finite_spread_z_or_none(spread_z)
+        else:
+            _entry_z = None
 
         # ── UPL Calculation ──
         # 2026-05-27 Gemini CLI: Use dynamic point value from engine constants
@@ -1022,10 +1514,29 @@ def _write_mts_state(
             )
 
         # ── Release state label ──
-        if released_leg is None:
+        if not has_position:
+            release_state = "FLAT"
+        elif released_leg is None:
             release_state = "BOTH_HELD"
         else:
             release_state = f"{released_leg.upper()}_RELEASED"
+
+        # P2 canonical holding projection.  Legacy fields remain during the
+        # migration window, but every state write now also carries one
+        # normalized legs[] table; FLAT is represented only by [] there.
+        if not has_position:
+            legs = []
+        else:
+            _near_qty = int(kwargs.get("near_qty", existing.get("near_qty", 1)) or 1)
+            _far_qty = int(kwargs.get("far_qty", existing.get("far_qty", 1)) or 1)
+            legs = [
+                {"leg": "near", "status": near_status,
+                 "side": _f_near_side, "qty": _near_qty,
+                 "entry": round(_f_near_entry, 1)},
+                {"leg": "far", "status": far_status,
+                 "side": _f_far_side, "qty": _far_qty,
+                 "entry": round(_f_far_entry, 1)},
+            ]
 
         # Trail stop price + distance
         _rem_side = _f_far_side if released_leg == "near" else _f_near_side
@@ -1051,9 +1562,10 @@ def _write_mts_state(
             "ticker": ticker,
             "monitor_id": f"futures_{ticker.lower()}",
             "manual_trade_status": existing.get("manual_trade_status"),
-            "entry_spread_z": round(spread_z, 2) if (spread_z is not None and spread_z != 0) else existing.get("entry_spread_z"),
-            "current_spread_z": existing.get("current_spread_z"),
+            "entry_spread_z": round(_entry_z, 2) if _entry_z is not None else None,
+            "current_spread_z": round(_current_z, 2) if _current_z is not None else None,
             "release_state": release_state,
+            "legs": legs,
             "released_leg": released_leg,
             "remaining_leg": remaining_leg,
             "remaining_side": _trail_side,
@@ -1075,7 +1587,7 @@ def _write_mts_state(
             "cumulative_realized_pnl": round(_cumulative, 1),
             # Preserve initial_balance from existing (set via dashboard)
             "initial_balance": existing.get("initial_balance", 100000),
-            "spread_z": round(spread_z, 2) if spread_z is not None else None,
+            "spread_z": round(_current_z, 2) if _current_z is not None else None,
             "trail_side": _trail_side,
             "trail_mode": _trail_mode,
             "trail_peak": round(trail_peak, 1),
@@ -1084,8 +1596,6 @@ def _write_mts_state(
             "distance_to_stop": round(max(0, _dist_stop), 1),
             "release_stop_points": release_stop_points or existing.get("release_stop_points"),
             "trail_distance_points": trail_distance_points or existing.get("trail_distance_points"),
-            # 2026-07-27 Gemini CLI: P0 Peak Persistence — Persist Policy J peak UPL across restarts
-            "peak_net_exit_pnl_twd": round(float(kwargs.get("peak_net_exit_pnl_twd", getattr(kwargs.get("strategy"), "_peak_net_exit_pnl_twd", 0.0)) or existing.get("peak_net_exit_pnl_twd", 0.0)), 1),
             "trade_id": _f_trade_id,
             "entry_ts": _f_entry_ts,
             # 2026-07-24 Hermes Agent: settlement tracking
@@ -1100,6 +1610,24 @@ def _write_mts_state(
         _expected_revision_val = kwargs.pop("expected_revision", None)
         # 2026-06-26 Gemini CLI: merge extra risk metrics / kwargs
         state.update(kwargs)
+        # Identity metadata is part of the canonical state contract.  It is
+        # stamped immediately before the existing CAS + atomic replace path;
+        # no lifecycle semantics are changed.
+        stamp_runtime_state(state, existing)
+        # ── Policy J effective guard metadata (2026-08-04 config observability) ──
+        # Merged into the OUTPUT state (not just `existing`); only refresh
+        # guard CONFIG metadata, never touch per-trade peak/durable state.
+        _pj_meta = policy_j_meta or {}
+        _pj_out = dict(existing.get("policy_j") or {})
+        for _mk, _mv in (
+            ("entry_peak_guard_ms", _pj_meta.get("entry_peak_guard_ms")),
+            ("entry_peak_guard_source", _pj_meta.get("entry_peak_guard_source")),
+            ("entry_peak_guard_config_key", _pj_meta.get("entry_peak_guard_config_key")),
+        ):
+            if _mv is not None:
+                _pj_out[_mk] = _mv
+        if _pj_out:
+            state["policy_j"] = _pj_out
         # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
         # ── P0: CAS revision guard ──
         # 防止舊 process 或延遲的 heartbeat 覆寫較新的 lifecycle state。
@@ -1118,8 +1646,6 @@ def _write_mts_state(
         try:
             with open(_tmp_file, "w") as f:
                 json.dump(state, f, default=str)
-                f.flush()
-                os.fsync(f.fileno())
             # 💡 Gemini CLI: CAS check against dynamic target state file
             if os.path.exists(_target_state_file):
                 try:
@@ -1129,22 +1655,21 @@ def _write_mts_state(
                     if _disk_revision != _expected_revision:
                         if os.path.exists(_tmp_file): os.remove(_tmp_file)
                         logger.warning(
-                            "[MTS_CAS_REJECT] revision mismatch: expected=%d disk=%d reason=%s",
+                            "[MTS_CAS_REJECT] revision mismatch: expected=%d disk=%d reason=%s "
+                            "-> STATE_WRITE_RETRY enqueued (RAM untouched)",
                             _expected_revision, _disk_revision, reason,
                         )
+                        # Layer 2: enqueue projection repair. Execution state (RAM)
+                        # is authoritative and must NOT be rolled back; the disk
+                        # projection is replayed by the next heartbeat instead.
+                        global _PENDING_STATE_REWRITE
+                        _PENDING_STATE_REWRITE = dict(state)
                         return
                 except Exception:
                     pass  # if we can't read disk, proceed with replace
             os.replace(_tmp_file, _target_state_file)
-            # 2026-07-27 Gemini CLI: Directory fsync for POSIX entry durability
-            try:
-                _dir_fd = os.open(os.path.dirname(_target_state_file), os.O_RDONLY)
-                try:
-                    os.fsync(_dir_fd)
-                finally:
-                    os.close(_dir_fd)
-            except Exception:
-                pass
+            # Projection converged — clear any pending rewrite
+            _PENDING_STATE_REWRITE = None
         except Exception as e:
             if os.path.exists(_tmp_file): os.remove(_tmp_file)
             raise e
@@ -1162,9 +1687,14 @@ def _write_mts_telemetry(
     total_upl: float = 0.0,
     atr: float = 0.0,
     quote_age_ms: float = 0.0,
+    spread_z: float | None = None,
     **kwargs,
 ) -> None:
     """P0: Heartbeat-only telemetry update — NEVER writes lifecycle fields.
+
+    Layer 2 (projection repair): if a previous lifecycle write was CAS-rejected,
+    replay the enqueued snapshot here using the CURRENT disk revision, so the
+    projection converges without touching execution state.
 
     ───── 設計原則 ─────
     Heartbeat 只能更新：
@@ -1185,7 +1715,32 @@ def _write_mts_telemetry(
     所有 lifecycle 欄位從 existing state 原封不動繼承。
     即使記憶體中 init() 設了錯誤的預設值，
     heartbeat 也沒有能力把持倉洗掉。
-    ─────────────────────"""
+    """
+    global _PENDING_STATE_REWRITE
+    if _PENDING_STATE_REWRITE is not None:
+        try:
+            from pathlib import Path as _Path
+            _pp = _Path(_get_state_file_path())
+            _disk = {}
+            if _pp.exists():
+                import json as _json
+                _disk = _json.loads(_pp.read_text())
+            _disk_rev = _disk.get("state_revision", 0)
+            _snap = dict(_PENDING_STATE_REWRITE)
+            _snap["state_revision"] = _disk_rev + 1
+            _snap["_updated"] = datetime.now().isoformat()
+            _tmpf = f"{_pp}.tmp.retry.{os.getpid()}"
+            with open(_tmpf, "w") as _f:
+                _json.dump(_snap, _f, default=str)
+            os.replace(_tmpf, _pp)
+            _PENDING_STATE_REWRITE = None
+            logger.warning(
+                "[STATE_WRITE_RETRY] projection replayed (rev=%d) state=%s reason=%s",
+                _disk_rev + 1, _snap.get("state"), _snap.get("reason"),
+            )
+        except Exception as _e:
+            logger.warning("[STATE_WRITE_RETRY] replay failed: %s (retained)", _e)
+
     if os.getenv("MTS_BACKTEST") == "1":
         return
     try:
@@ -1200,7 +1755,17 @@ def _write_mts_telemetry(
                 pass
 
         # Only touch telemetry fields — preserve ALL lifecycle fields
+        # 2026-07-31 Hermes Agent: if the authoritative disk state is FLAT, the
+        # in-memory position is stale (e.g. after emergency close / clear_records
+        # where strategy memory was not reset). Never write phantom UPL into a
+        # FLAT state file — the dashboard would render it as open-position PnL.
+        if not existing.get("has_position", False):
+            near_upl = 0.0
+            far_upl = 0.0
+            total_upl = 0.0
         _mult = float(get_point_value(ticker))
+        # 2026-10-08 Codex: normalize the current mark before serialization.
+        _current_z = _finite_spread_z_or_none(spread_z)
         telemetry = {
             "has_position": existing.get("has_position", False),
             "state": existing.get("state", "HEARTBEAT"),
@@ -1220,16 +1785,28 @@ def _write_mts_telemetry(
             "schema_version": existing.get("schema_version", 3),
             "position_epoch": existing.get("position_epoch"),
         }
+        # Keep the legacy heartbeat shape when no spread-Z was ever supplied,
+        # while clearing previously persisted marks when a later update is unknown.
+        if (
+            _current_z is not None
+            or "spread_z" in existing
+            or "current_spread_z" in existing
+        ):
+            telemetry["spread_z"] = round(_current_z, 2) if _current_z is not None else None
+            telemetry["current_spread_z"] = (
+                round(_current_z, 2) if _current_z is not None else None
+            )
         # Preserve all lifecycle fields from existing state
         for _key in ["state", "reason", "has_position", "near_entry", "far_entry",
                       "near_side", "far_side", "near_status", "far_status",
                       "released_leg", "remaining_leg", "remaining_side",
+                      "last_known_legs",
                       "near_realized_pnl", "far_realized_pnl", "total_realized_pnl",
                       "cumulative_realized_pnl", "initial_balance", "trade_id", "entry_ts",
                       "trail_side", "trail_mode", "trail_peak", "trail_nadir",
                       "trail_stop_price", "distance_to_stop", "release_stop_points",
                       "trail_distance_points", "lifecycle", "manual_trade_status",
-                      "entry_spread_z", "current_spread_z", "release_state",
+                      "entry_spread_z", "release_state",
                       "release_price", "risk_mode", "session", "stop_mult", "trail_mult",
                       "final_release_stop", "final_trail_dist", "release_stop",
                       "release_stop_floor", "trail_dist", "trail_dist_floor",
@@ -1239,6 +1816,7 @@ def _write_mts_telemetry(
             if _key in existing:
                 telemetry[_key] = existing[_key]
 
+        stamp_runtime_state(telemetry, existing)
         import random
         _tmp = f"{_target_state_file}.tmp.{os.getpid()}.{random.randint(1000, 9999)}"
         with open(_tmp, "w") as f:
@@ -1288,6 +1866,15 @@ class TMFSpread(StrategyBase):
         self._release_stop_fixed = float(_params.get("release_stop_points", _RELEASE_STOP_PTS))
         self._trail_dist_fixed = float(_params.get("trail_distance_points", _TRAIL_DISTANCE_PTS))
         self._min_atr = float(_params.get("min_atr", 0.0))
+        # Policy J Peak Spike Validation (2026-08-03) — config-driven
+        self._peak_confirmation_samples = int(_params.get("peak_confirmation_samples", 3))
+        self._peak_confirmation_ms = float(_params.get("peak_confirmation_ms", 1000.0))
+        self._peak_confirmation_tolerance_twd = float(_params.get("peak_confirmation_tolerance_twd", 100.0))
+        self._entry_peak_guard_ms, _pjg_src, _pjg_key = resolve_entry_peak_guard_ms(_params)
+        self._pj_guard_source = _pjg_src          # CONFIG | LEGACY_CONFIG | DEFAULT
+        self._pj_guard_config_key = _pjg_key      # entry_peak_guard_ms | policy_j_entry_warmup_ms
+        self._pj_guard_effective_ms = float(self._entry_peak_guard_ms)
+        self._max_single_update_jump_twd = float(_params.get("max_single_update_jump_twd", 200.0))
 
         # Release mode (Phase 1: triggered_market only)
         _rel_mode_str = _params.get("release_mode", "triggered_market")
@@ -1316,10 +1903,8 @@ class TMFSpread(StrategyBase):
         self._far_entry: float = 0.0
         self._near_side: str | None = None  # "LONG" or "SHORT" at entry
         self._far_side: str | None = None   # "LONG" or "SHORT" at entry
-        self._entry_spread_z: float = 0.0   # snapshot at entry, not hot-reloaded
+        self._entry_spread_z: float | None = None  # 2026-10-08 Codex: unknown until confirmed.
         self._released_leg: str | None = None  # "near" or "far"
-        # 2026-07-28 Gemini CLI: Phase 1B experiment dedup guard
-        self._release_event_id_observed: str | None = None
         self._release_ts: datetime | None = None
         self._release_mono: float = 0.0
         self._peak: float = 0.0  # for long trailing (highest)
@@ -1413,15 +1998,73 @@ class TMFSpread(StrategyBase):
         # ── P0: Trail anchor status (default READY for normal flow) ──
         self._trail_anchor_status: TrailAnchorStatus = TrailAnchorStatus.READY
         self._trail_warmup_tick_count: int = 0
-        self._entry_established_at: float | None = None  # P0: Policy J warmup timestamp
         self._trail_started_at: float | None = None
         self._trail_anchor_source: str | None = None
+        # ── RESTART_BASELINE: 持倉的 trading session (day/night), 由
+        # release-fill 路徑或 fill-log restore 記錄; baseline gate 用它
+        # 比對報價 session, mismatch / unknown 一律 fail-closed ──
+        self._position_session_type: str | None = None
+        # ── broker-reconciled single-leg recovery identity (2026-08-18)
+        self._broker_recovery_source: str | None = None
+        self._broker_recovery_order_id: str | None = None
+        self._broker_recovery_broker_order_id: str | None = None
+        self._broker_recovery_snapshot_hash: str | None = None
 
         # ── P1: Single-leg extrema (decision authority in SINGLE_LEG) ──
+        # (_single_leg_peak/nadir initialized before _restore_position_state;
+        #  kept here only for anchor fields)
         self._single_leg_peak: float = 0.0
         self._single_leg_nadir: float = 0.0
+        self._single_leg_post_fill_ticks: int = 0
+        self._single_leg_peak: float = 0.0
+        self._single_leg_nadir: float = 0.0
+        self._single_leg_post_fill_ticks: int = 0
         self._single_leg_anchor_price: float = 0.0
         self._single_leg_anchor_event_time_ns: float = 0.0
+        self._renko_tracker = None
+        self._emitted_renko_event_keys = set()  # 2026-08-02 Antigravity: RenkoTracker instance
+        self._emitted_renko_event_keys = set()
+
+        # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0)
+        # TELEMETRY-ONLY bookkeeping: completed 5m bar ring (close-time ts)
+        # fed from the bar stream. Consumed solely by _hvwap_candidate_tick;
+        # never read by any baseline/lifecycle/order path.
+        # 2026-10-15 Hermes Agent: use the same mode-scoped event ledger as writer.
+        from strategies.plugins.futures.active.mts_oi_estimator import OIEstimator
+        self._oi_estimator = OIEstimator(_MTS_EVENT_LOG)
+        self._oi_snapshot_key = None
+        self._oi_snapshot = None
+        # 2026-10-15 Hermes Agent: cache the exact OI window for VolQuality.
+        self._oi_event_sequence = None
+        # 2026-10-15 Hermes Agent: load shadow calibration once, fail closed on config errors.
+        self._adaptive_vwap_config = None
+        try:
+            from strategies.plugins.futures.active.mts_adaptive_vwap import AdaptiveVWAPConfig
+            _adaptive_path = context.config.get("adaptive_vwap_config_path", os.path.join(
+                os.path.dirname(__file__), "..", "..", "..", "..", "config", "adaptive_vwap_config.yaml"))
+            self._adaptive_vwap_config = AdaptiveVWAPConfig.load(_adaptive_path)
+        except Exception:
+            logger.warning("[HVWAP_ADAPTIVE_AB] invalid configuration; shadow disabled", exc_info=True)
+        self._hvwap_5m_bars: deque = deque(maxlen=320)
+        self._hvwap_last_bucket: int | None = None
+        self._hvwap_pending_snapshot: dict | None = None
+        self._hvwap_last_emit_bucket: int | None = None
+        # 2026-08-23 Hermes Agent: paper-only direct VWAP release wiring state
+        # (see _hvwap_maybe_paper_release). All telemetry/release state is
+        # observation-only for the baseline Renko+ADL+Micro-VWAP arm.
+        self._hvwap_last_verdict = None          # freshest pure candidate verdict
+        self._hvwap_armed = False                # first completed bar committed after wiring start
+        self._hvwap_release_sent_trade_id = None # idempotency: one candidate release per trade
+        self._hvwap_baseline_clear_tick = False  # baseline produced NO exit decision this tick
+        self._hvwap_execution_mode = None        # injected by monitor each tick (effective_mode)
+        self._hvwap_live_order_allowed = False   # injected by monitor each tick
+        # 2026-08-24 Hermes Agent: fail-closed diagnostics — the candidate
+        # pipeline must never fail SILENTLY. Every no-evaluate path emits an
+        # explicit HVWAP_DATA_UNAVAILABLE event (rate-limited once per 5m
+        # bucket via _hvwap_diag_last_bucket) so the dashboard can
+        # distinguish NOT_EVALUATED / DATA_PIPELINE_MISSING from a real
+        # UNKNOWN/BLOCK verdict. Telemetry-only; baseline/risk untouched.
+        self._hvwap_diag_last_bucket: int | None = None
 
         # P1: Spread-level excursions (telemetry only)
         self._spread_near_high: float = 0.0
@@ -1440,7 +2083,7 @@ class TMFSpread(StrategyBase):
         try:
             from strategies.futures.mts.soak_collector import ShadowSoakCollector
             self._soak_collector = ShadowSoakCollector(
-                base_dir="data/telemetry/shadow-soak",
+                base_dir=runtime_logs("telemetry", "shadow-soak"),
                 deployment_id=f"tmf-spread-{self._ticker.lower()}",
                 authority="legacy",
                 override_git_clean=True,
@@ -1472,6 +2115,669 @@ class TMFSpread(StrategyBase):
         self._last_applied_event_time = None
         self._single_leg_started_at = None
         self._ensure_lifecycle_adapter_initialized("INIT")
+
+    def _build_trend_release_input(self) -> tuple[bool, dict | None]:
+        """MTS 2.0 trend-release wiring seam (2026-08-22).
+
+        Returns (enabled, snapshot_or_None). Fail-closed by design:
+          * enabled only when env MTS_TREND_RELEASE_ENABLED == "1"
+          * snapshot only when a precomputed immutable TrendDecision-shaped
+            dict is present on the strategy (self._trend_confirmed_snapshot)
+            with required decision/asof/freshness metadata; anything missing
+            -> (False, None), never a synthesized guess.
+          * entry sides must map to a counter-trend leg (near LONG/far SHORT
+            -> release FAR; near SHORT/far LONG -> release NEAR); same-side or
+            unknown sides -> (False, None). Never inferred from current PNL.
+
+        INTEGRATION TODO (documented): the LIVE TrendDecision producer does
+        not exist yet. Production currently has no ADL-SNR / 15m / 60m
+        completed-bar producer wired to the tick path (only the pure replay
+        modules and _renko_tracker exist). This seam consumes a precomputed
+        immutable snapshot and refuses to synthesize one from incomplete
+        bars. To enable live, implement a producer that builds the snapshot
+        strictly from completed 5m/15m/60m bars as-of decision_ts with
+        freshness metadata, then assign it to self._trend_confirmed_snapshot.
+        """
+        try:
+            if os.getenv("MTS_TREND_RELEASE_ENABLED") != "1":
+                return False, None
+            snap = getattr(self, "_trend_confirmed_snapshot", None)
+            if not isinstance(snap, dict):
+                return False, None
+            _required = ("decision_ts", "pass_release", "direction", "confidence",
+                         "asof_ts", "decision_max_quote_age_ms", "window_max_quote_age_ms")
+            if not all(_k in snap for _k in _required):
+                return False, None
+            # ── Phase 1 (2026-08-22): freshness VALUE gate + session gate ──
+            # Presence alone is not enough: stale / non-finite / negative ages
+            # must fail closed (never release from a stale snapshot).
+            try:
+                _d_age = float(snap.get("decision_max_quote_age_ms"))
+                _w_age = float(snap.get("window_max_quote_age_ms"))
+                _max_age = float(getattr(self, "_max_quote_age_ms", 1000.0))
+            except (TypeError, ValueError):
+                return False, None
+            if not (0.0 <= _d_age <= _max_age) or not (0.0 <= _w_age <= _max_age):
+                return False, None
+            # session gate: snapshot session must match the position session
+            _snap_sess = snap.get("session") or snap.get("session_type")
+            _pos_sess = getattr(self, "_position_session_type", None)
+            if _pos_sess is not None and _snap_sess is not None:
+                if str(_snap_sess) != str(_pos_sess):
+                    return False, None
+            # entry-side -> counter-trend leg (pure; never PNL)
+            from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+                counter_trend_leg_from_sides,
+            )
+            _retained, _rel_leg = counter_trend_leg_from_sides(
+                getattr(self, "_near_side", None), getattr(self, "_far_side", None))
+            if _retained is None or _rel_leg is None:
+                return False, None
+            snap = dict(snap)
+            snap["release_leg"] = _rel_leg
+            snap["retained_direction"] = _retained.value if hasattr(_retained, "value") else str(_retained)
+            return True, snap
+        except Exception:
+            logger.warning("[MTS_TREND_RELEASE] seam fail-closed (exception)", exc_info=True)
+            return False, None
+
+    def _hvwap_candidate_tick(self, bar: dict, now) -> None:
+        """2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0).
+
+        PARALLEL, TELEMETRY-ONLY seam. It:
+          * accumulates COMPLETED 5m bars (close-time ts) into a ring buffer
+            from the bar stream (bucket-roll detection) — warms VWAP/slope
+            history even while FLAT;
+          * evaluates the pure Hierarchical VWAP candidate
+            (strategies.plugins.futures.active.mts_hvwap_candidate) and
+            appends one `HVWAP_CANDIDATE` telemetry record per completed 5m
+            bar while a position is held;
+          * NEVER gates the baseline Renko+ADL+Micro-VWAP 2-of-3 decision
+            arm, NEVER emits orders, NEVER touches lifecycle/position/order
+            state, and NEVER raises (any failure fails closed for the
+            candidate only).
+
+        VWAP contract (spec docs/mts/mts_vwap_filter_spec.md section 1.4):
+          per-leg session VWAP from each leg's OWN volume, trading day
+          resetting at 15:00 and carrying through the next-day session; no
+          prior-trading-day data. The NEAR leg accumulates its own volume
+          from the bar stream; the FAR leg carries its own tick volume via
+          the `far_volume` bar field (monitor exposes `_far_current_bar`
+          volume). When far volume is absent/zero the far leg fails closed
+          (MISSING_VWAP) — the monitor's deque-wide `far_vwap` is recorded
+          as `far_vwap_bar_ref` for reference only and is NEVER used as a
+          gate input or volume substitute.
+
+        Timestamp rule: `bar["ts"]` in this pipeline is a 5m bucket-START
+        (proven floor(epoch/300)*300); bar_close_time() shifts to the close
+        time ONLY for bucket-aligned timestamps and never double-shifts a
+        non-aligned (already point/close) timestamp.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                evaluate_hvwap_candidate,
+                compute_counterfactual_outcomes,
+                bar_close_time,
+            )
+            _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
+            if _close is None:
+                # 2026-08-24: explicit fail-closed diagnostic (previously a
+                # SILENT return -> production data gap with zero visibility).
+                self._hvwap_emit_data_unavailable(
+                    bar, reason="NO_BAR_TIMESTAMP",
+                    detail=f"ts_type={type(bar.get('ts')).__name__} "
+                           f"timestamp_type={type(bar.get('timestamp')).__name__} "
+                           f"keys={sorted(bar.keys())}")
+                return
+            _bucket = int(_close // 300.0)
+
+            # bucket-roll: the previous bucket is now COMPLETE -> commit it
+            _last_bucket = getattr(self, "_hvwap_last_bucket", None)
+            if _last_bucket is not None and _bucket > _last_bucket:
+                _snap = getattr(self, "_hvwap_pending_snapshot", None)
+                if _snap is not None:
+                    self._hvwap_5m_bars.append(_snap)
+                    # 2026-08-23 Hermes Agent: fresh completed bar after wiring
+                    # start — required before any candidate paper release (no
+                    # retroactive release on startup/recovery from an old
+                    # verdict; the first bar committed AFTER construction arms
+                    # the release path).
+                    self._hvwap_armed = True
+            self._hvwap_last_bucket = _bucket
+
+            _n_raw = bar.get("near_close")
+            if _n_raw is None:
+                _n_raw = bar.get("near_close_rt")
+            if _n_raw is None:
+                _n_raw = bar.get("close")
+            if _n_raw is None:
+                _n_raw = bar.get("Close")
+            _f_raw = bar.get("far_close")
+            if _f_raw is None:
+                _f_raw = bar.get("far_close_rt")
+            try:
+                _n_f = float(_n_raw) if _n_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _n_f = 0.0
+            try:
+                _f_f = float(_f_raw) if _f_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _f_f = 0.0
+            # Monitor 5m DataFrame bars may preserve OHLCV capitalization.
+            _vol_raw = bar.get("volume")
+            if _vol_raw is None:
+                _vol_raw = bar.get("Volume")
+            try:
+                _n_vol = float(_vol_raw) if _vol_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _n_vol = 0.0
+            _far_vol_raw = bar.get("far_volume") or bar.get("far_volume_rt")
+            try:
+                _far_vol = float(_far_vol_raw) if _far_vol_raw is not None else 0.0
+            except (TypeError, ValueError):
+                _far_vol = 0.0
+            self._hvwap_pending_snapshot = {
+                "ts": _close,
+                "close": _n_f,
+                "volume": _n_vol,
+                "far_close": _f_f,
+                "far_volume": _far_vol,
+                "far_vwap_ref": bar.get("far_vwap"),
+            }
+
+            # ── fresh candidate verdict: computed EVERY tick while a position
+            # is held (the paper-release gate needs the CURRENT bar's verdict).
+            # Telemetry EMISSION stays rate-limited to one record per completed
+            # 5m bar; the verdict itself is refreshed per tick.
+            # Ledger authority is read-only input from FuturesMonitor.  It is
+            # needed during PAPER recovery because _has_position may still be
+            # None before the normal strategy hydration pass completes.
+            _authority_has_position = (
+                bar.get("_mts_authority_has_position") is True
+            )
+            _hvwap_has_position = self._has_position is True or _authority_has_position
+            if _hvwap_has_position:
+                # 2026-08-24: make the pre-first-emission warmup VISIBLE —
+                # when a position is held but no candidate event has ever been
+                # emitted, record an explicit WARMUP_PENDING diagnostic once
+                # per bucket instead of failing silently.
+                if (getattr(self, "_hvwap_last_verdict", None) is None
+                        and getattr(self, "_hvwap_last_emit_bucket", None) is not None):
+                    self._hvwap_emit_data_unavailable(
+                        bar, reason="WARMUP_PENDING",
+                        detail="position held, awaiting first completed-bar "
+                               "evaluation (emit cadence = 1 per 5m bar)")
+                _phase = "SPREAD"
+                try:
+                    _ph = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+                    if _ph is not None:
+                        _phase = _ph.value if hasattr(_ph, "value") else str(_ph)
+                except Exception:
+                    _phase = "SPREAD"
+                _atr_raw = bar.get("atr")
+                try:
+                    _atr_f = float(_atr_raw) if _atr_raw is not None else None
+                except (TypeError, ValueError):
+                    _atr_f = None
+                _n_age = bar.get("near_tick_age_ms")
+                _f_age = bar.get("far_tick_age_ms")
+
+                near_bars = list(self._hvwap_5m_bars)
+                _prewarm_bars = bar.get("regime_prewarm_bars") or []
+                far_bars = [
+                    {"ts": _b["ts"], "close": _b["far_close"],
+                     "volume": _b.get("far_volume", 0.0)}
+                    for _b in near_bars if _b.get("far_close", 0.0) > 0
+                ]
+                # 2026-10-15 Hermes Agent: estimate once per candidate boundary,
+                # isolating optional OI failures from existing HVWAP arbitration.
+                _oi_path = _MTS_EVENT_LOG
+                _oi_ts = max((_b["ts"] for _b in near_bars), default=None)
+                _oi_key = (_oi_path, _oi_ts)
+                if getattr(self, "_oi_snapshot_key", None) != _oi_key:
+                    self._oi_snapshot = None
+                    # 2026-10-15 Hermes Agent: unavailable is distinct from an empty window.
+                    self._oi_event_sequence = None
+                    try:
+                        from strategies.plugins.futures.active.mts_oi_estimator import OIEstimator
+                        if (getattr(self, "_oi_estimator", None) is None
+                                or self._oi_estimator.log_path != _oi_path):
+                            self._oi_estimator = OIEstimator(_oi_path)
+                        if _oi_ts is not None:
+                            self._oi_snapshot = self._oi_estimator.estimate_oi(_oi_ts)
+                            # 2026-10-15 Hermes Agent: reuse the estimator's already
+                            # loaded events, preserving (close - 300, close] semantics.
+                            _events = self._oi_estimator._event_cache
+                            if _events is not None:
+                                self._oi_event_sequence = []
+                                for _event in _events:
+                                    _event_ts = self._oi_estimator._parse_ts(_event.get("ts", ""))
+                                    if _event_ts is not None and _oi_ts - 300 < _event_ts <= _oi_ts:
+                                        self._oi_event_sequence.append(_event)
+                    except Exception:
+                        logger.warning("[HVWAP_CANDIDATE] OI estimate unavailable", exc_info=True)
+                    self._oi_snapshot_key = _oi_key
+                # 2026-10-15 Hermes Agent: share identical immutable inputs between shadow arms.
+                _candidate_inputs = dict(
+                    oi_snapshot=self._oi_snapshot,
+                    event_sequence=getattr(self, "_oi_event_sequence", None),
+                    decision_ts=_close,
+                    near_bars=near_bars,
+                    far_bars=far_bars,
+                    regime_prewarm_bars=_prewarm_bars,
+                    near_price=_n_f if _n_f > 0 else None,
+                    far_price=_f_f if _f_f > 0 else None,
+                    near_side=getattr(self, "_near_side", None),
+                    far_side=getattr(self, "_far_side", None),
+                    atr_15m=_atr_f,
+                    near_quote_age_ms=_n_age,
+                    far_quote_age_ms=_f_age,
+                    position_phase=_phase,
+                )
+                verdict = evaluate_hvwap_candidate(**_candidate_inputs)
+                self._hvwap_last_verdict = verdict
+                if getattr(self, "_hvwap_last_emit_bucket", None) == _bucket:
+                    return
+                self._hvwap_last_emit_bucket = _bucket
+            else:
+                # 2026-08-24: defensive diagnostic — a truthy-but-not-True
+                # _has_position (e.g. serialization artifact) would silently
+                # starve the in-position emit branch (production data gap).
+                if self._has_position:
+                    self._hvwap_emit_data_unavailable(
+                        bar, reason="HAS_POSITION_NON_BOOL",
+                        detail=f"type={type(self._has_position).__name__} "
+                               f"value={self._has_position!r}")
+                # flat: advance the cadence bucket so the first in-position
+                # bar emits on its completion (existing cadence contract)
+                self._hvwap_last_emit_bucket = _bucket
+                return
+
+            # baseline parity reference (read-only, idempotent)
+            _base_enabled, _base_snap = self._build_trend_release_input()
+            _base_pass = bool(_base_snap and _base_snap.get("pass_release")) if _base_enabled else False
+            _base_rel = (_base_snap or {}).get("release_leg") if _base_enabled else None
+
+            # paired counterfactual (hypothetical release, PURE & isolated)
+            _cf = None
+            _rel_leg = verdict.hypothetical_release_leg
+            if (_phase == "SPREAD" and _rel_leg and _n_f > 0 and _f_f > 0
+                    and getattr(self, "_near_entry", 0) and getattr(self, "_far_entry", 0)):
+                try:
+                    _mult = float(get_point_value(self._ticker))
+                except Exception:
+                    _mult = 10.0
+                _rel_price = _n_f if _rel_leg == "NEAR" else _f_f
+                _entry = self._near_entry if _rel_leg == "NEAR" else self._far_entry
+                _friction = 40.0 + (_rel_price + _entry) * _mult * 2e-5
+                _cf = compute_counterfactual_outcomes(
+                    near_side=getattr(self, "_near_side", None),
+                    far_side=getattr(self, "_far_side", None),
+                    near_entry=self._near_entry, far_entry=self._far_entry,
+                    release_leg=_rel_leg, release_price=_rel_price,
+                    near_now=_n_f, far_now=_f_f,
+                    point_value=_mult, release_friction_twd=_friction,
+                )
+
+            _payload = verdict.to_dict()
+            _payload.update({
+                "timestamp": now.isoformat() if hasattr(now, "isoformat") else str(now),
+                "trade_id": getattr(self, "_trade_id", None),
+                "position_phase": _phase,
+                "near_vwap_bar_ref": bar.get("near_vwap"),
+                "far_vwap_bar_ref": bar.get("far_vwap"),
+                "baseline_enabled": _base_enabled,
+                "baseline_pass_release": _base_pass,
+                "baseline_release_leg": _base_rel,
+                "release_action_emitted": False,
+                "release_outcome": "PENDING",
+                "counterfactual": _cf.to_dict() if _cf else None,
+            })
+            _append_event("HVWAP_CANDIDATE", **_payload)
+            # 2026-10-15 Hermes Agent: paired shadow record at the existing 5m
+            # emission cadence; never replaces the baseline release verdict.
+            _adaptive_cfg = getattr(self, "_adaptive_vwap_config", None)
+            if _adaptive_cfg is not None and _adaptive_cfg.shadow_enabled:
+                try:
+                    from strategies.plugins.futures.active.mts_adaptive_ab import evaluate_hvwap_ab, paired_record, log_ab_pair
+                    _arms = evaluate_hvwap_ab(baseline=verdict, config=_adaptive_cfg, **_candidate_inputs)
+                    _pair_id = f"{getattr(self, '_trade_id', None)}:{verdict.decision_ts}"
+                    _pair = paired_record(_pair_id, _arms, _adaptive_cfg)
+                    self._adaptive_last_pair = _pair
+                    _append_event("HVWAP_ADAPTIVE_AB", **_pair)
+                    # 2026-10-16 Hermes Agent: inherit the event writer's mode-scoped root.
+                    log_ab_pair(_pair, os.path.join(os.path.dirname(_MTS_EVENT_LOG), "ab_test"))
+                except Exception:
+                    logger.warning("[HVWAP_ADAPTIVE_AB] shadow evaluation unavailable", exc_info=True)
+        except Exception as _hvwap_exc:
+            # 2026-08-24: fail-closed for the candidate only — NEVER disturb
+            # the baseline, but record an EXPLICIT diagnostic event (the
+            # previous warning-only path left the production ledger with zero
+            # visibility on pipeline failures).
+            logger.warning("[HVWAP_CANDIDATE] telemetry eval failed (fail-closed)", exc_info=True)
+            try:
+                self._hvwap_emit_data_unavailable(
+                    bar, reason="EVAL_EXCEPTION",
+                    detail=f"{type(_hvwap_exc).__name__}: {_hvwap_exc}")
+            except Exception:
+                pass
+
+    def _hvwap_emit_data_unavailable(self, bar: dict, *, reason: str,
+                                     detail: str | None = None) -> None:
+        """2026-08-24 Hermes Agent: explicit fail-closed diagnostic for the
+        HVWAP candidate pipeline.
+
+        Emits one HVWAP_DATA_UNAVAILABLE event per 5m bucket (rate-limited)
+        whenever the pipeline cannot evaluate: NO_BAR_TIMESTAMP (no parseable
+        bar ts), EVAL_EXCEPTION (candidate evaluation raised), WARMUP_PENDING
+        (position held, first completed-bar emission pending), or
+        HAS_POSITION_NON_BOOL (truthy-but-not-True _has_position). The
+        dashboard uses these to distinguish NOT_EVALUATED /
+        DATA_PIPELINE_MISSING from a real UNKNOWN/BLOCK verdict, with last
+        event age + reason. Telemetry-only: never raises, never touches
+        baseline/risk/order state.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                bar_close_time,
+            )
+            _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
+            _bucket = int(_close // 300.0) if _close is not None else 0
+            if getattr(self, "_hvwap_diag_last_bucket", None) == _bucket:
+                return
+            self._hvwap_diag_last_bucket = _bucket
+            _payload = {
+                "reason": reason,
+                "detail": detail,
+                "has_position": (
+                    self._has_position is True
+                    or bar.get("_mts_authority_has_position") is True
+                ),
+                "lifecycle": getattr(self, "_lifecycle", None),
+                "trade_id": getattr(self, "_trade_id", None),
+                "n_completed_5m_bars": len(self._hvwap_5m_bars),
+                "armed": getattr(self, "_hvwap_armed", False),
+                "n_pending_bucket": _bucket,
+            }
+            _append_event("HVWAP_DATA_UNAVAILABLE", **_payload)
+        except Exception:
+            logger.warning("[HVWAP] diagnostic emission failed (non-fatal)", exc_info=True)
+
+    def _hvwap_paper_gate(self) -> tuple[bool, str]:
+        """2026-08-23 Hermes Agent: paper-only activation gate (fail-closed).
+
+        Active ONLY when effective_mode == "paper_active" (injected by the
+        monitor each tick) or env PAPER_MODE is truthy, AND live_order_allowed
+        is False. Any live mode, live_order_allowed=True, or unknown mode ->
+        (False, reason): the candidate can never touch a live/broker path.
+        """
+        _mode = getattr(self, "_hvwap_execution_mode", None)
+        _live_allowed = bool(getattr(self, "_hvwap_live_order_allowed", False))
+        _pm = (os.getenv("PAPER_MODE", "") or "").strip().lower()
+        _pm_on = _pm in ("true", "1", "yes")
+        if _live_allowed:
+            return False, "LIVE_ORDER_ALLOWED"
+        if _mode is not None and str(_mode).startswith("live"):
+            return False, f"LIVE_MODE:{_mode}"
+        if _mode is not None and _mode != "paper_active":
+            return False, f"MODE:{_mode}"
+        if _mode == "paper_active" or _pm_on:
+            return True, ("PAPER_ACTIVE" if _mode == "paper_active" else "PAPER_MODE_ENV")
+        return False, "MODE_UNKNOWN"
+
+    def _mts_atr_release_trend_gate(self) -> tuple[bool, str]:
+        """2026-08-26 Hermes Agent: paper-only ATR-release trend gate (fail-closed).
+
+        ON only when the monitor-injected effective_mode == "paper_active"
+        AND live_order_allowed is False AND env MTS_ATR_RELEASE_TREND_GATE is
+        not "0" (default ON for paper). Any live/unknown mode,
+        live_order_allowed=True, or explicit "0" -> OFF: the baseline ATR
+        release fallback keeps its existing behavior (no trend requirement).
+        The result is surfaced into the lifecycle adapter context as the
+        pure boolean key release_trend_gate_enabled.
+        """
+        _mode = getattr(self, "_hvwap_execution_mode", None)
+        _live_allowed = bool(getattr(self, "_hvwap_live_order_allowed", False))
+        if _live_allowed:
+            return False, "LIVE_ORDER_ALLOWED"
+        if _mode is not None and _mode != "paper_active":
+            return False, f"MODE:{_mode}"
+        if _mode is None:
+            return False, "MODE_UNKNOWN"
+        _env = (os.getenv("MTS_ATR_RELEASE_TREND_GATE", "") or "").strip().lower()
+        if _env == "0":
+            return False, "ENV_DISABLED"
+        return True, "PAPER_ACTIVE"
+
+    def _build_trend_reversal_input(self) -> dict | None:
+        """Build paper-only reversal evidence from the latest HVWAP verdict.
+
+        Reversal requires a completed/session-valid verdict, a 15m reversal,
+        and two opposing completed 5m confirmations. Missing or stale data is
+        never converted into an exit signal.
+        """
+        ok, _ = self._hvwap_paper_gate()
+        if not ok:
+            return None
+        verdict = getattr(self, "_hvwap_last_verdict", None)
+        if verdict is None:
+            return None
+        _sig15 = getattr(getattr(verdict, "signal_15m", None), "value", getattr(verdict, "signal_15m", None))
+        if _sig15 != "REVERSAL" or not bool(getattr(verdict, "micro_conflict", False)):
+            return None
+        if not bool(getattr(verdict, "bars_complete", False)) or not bool(getattr(verdict, "session_boundary_ok", False)):
+            return None
+        if int(getattr(verdict, "n_completed_5m_bars", 0) or 0) < 2:
+            return None
+        _age = getattr(verdict, "quote_age_ms", None)
+        try:
+            _age_f = float(_age)
+            _max_age = float(getattr(self, "_max_quote_age_ms", 10000.0))
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= _age_f <= _max_age):
+            return None
+        return {
+            "decision_ts": str(getattr(verdict, "decision_ts", "")),
+            "asof_ts": str(getattr(verdict, "decision_ts", "")),
+            "reversal_confirmed": True,
+            "decision_max_quote_age_ms": _age_f,
+            "window_max_quote_age_ms": _age_f,
+            "signal_15m": _sig15,
+            "micro_conflict": True,
+        }
+
+    def _hvwap_release_quote_age_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
+        """Defensive parity with the baseline freshness gate (decoupled-leg
+        semantics: only the RELEASED leg's quote age matters)."""
+        _key = "near_tick_age_ms" if rel_leg == "NEAR" else "far_tick_age_ms"
+        _age = bar.get(_key)
+        try:
+            _age_f = float(_age or 0.0)
+        except (TypeError, ValueError):
+            _age_f = 0.0
+        _max = float(getattr(self, "_max_quote_age_ms", 10000.0))
+        return _age_f <= _max, _age_f
+
+    def _exit_spread_width_limit(self) -> float:
+        # 2026-10-12 Codex: PAPER exits pay executable BBO friction rather
+        # than inheriting an entry liquidity cap. LIVE/unknown stay unchanged.
+        if (getattr(self, "_hvwap_execution_mode", None) == "paper_active"
+                and not getattr(self, "_hvwap_live_order_allowed", False)):
+            cap = getattr(self, "_paper_exit_max_spread_width", None)
+            return float("inf") if cap is None else float(cap)
+        return float(getattr(self, "_max_spread_width", 50.0))
+
+    def _hvwap_release_width_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
+        """Defensive parity with the baseline quote-validity + spread-width
+        gates for the released leg (missing quote keys are NOT a failure —
+        the baseline width gate only applies when keys are present)."""
+        _bid_k, _ask_k = (("near_bid", "near_ask") if rel_leg == "NEAR"
+                          else ("far_bid", "far_ask"))
+        _b, _a = bar.get(_bid_k), bar.get(_ask_k)
+        _max = self._exit_spread_width_limit()
+        if _b is None and _a is None:
+            return True, 0.0
+        _numeric = (isinstance(_b, (int, float)) and not isinstance(_b, bool)
+                    and isinstance(_a, (int, float)) and not isinstance(_a, bool))
+        if not _numeric:
+            return False, float("nan")      # QUOTE_INVALID parity
+        _w = float(_a) - float(_b)
+        return _w <= _max, _w
+
+    def _hvwap_maybe_paper_release(self, bar: dict, now, near_close: float,
+                                    far_close: float) -> Signal | None:
+        """2026-08-23 Hermes Agent: paper-only direct VWAP release wiring.
+
+        Called from on_bar AFTER _manage_position returned None with the
+        baseline-clear marker set (no baseline lifecycle exit decision this
+        tick). An ALIGNED_PASS Hierarchical VWAP verdict MAY create a PAPER
+        release intent for verdict.hypothetical_release_leg via the EXISTING
+        paper lifecycle/order simulator — the same PARTIAL_EXIT signal path
+        the baseline RELEASE decision uses (monitor _submit_mts_order_signal
+        -> order_mgr + paper_fill_sim).
+
+        Guarantees:
+          * PAPER-ONLY: effective_mode paper_active / PAPER_MODE=true and
+            live_order_allowed False; live modes fail closed — never a
+            broker/live order path.
+          * NEVER blocks/replaces baseline: fires only when the baseline
+            adapter produced NO exit decision this tick (risk exits, Policy
+            J, timeout, baseline release all take precedence via
+            _hvwap_baseline_clear_tick), lifecycle is OPEN, phase SPREAD,
+            release_group ARMED/INACTIVE, no exit owner, no released leg.
+          * IDEMPOTENT: one candidate release intent per trade
+            (_hvwap_release_sent_trade_id); the lifecycle RELEASE_* state +
+            release_group TRIGGERED + release timer block duplicates on
+            subsequent ticks.
+          * FRESH-BAR: requires at least one completed 5m bar committed
+            after construction/recovery (_hvwap_armed) — never retroactive
+            on startup from an old verdict.
+          * DEFENSIVE PARITY: quote age and bid/ask validity/width are
+            re-checked so a stale/invalid/wide quote cannot be bypassed.
+        """
+        try:
+            from strategies.plugins.futures.active.mts_hvwap_candidate import (
+                HvwapStatus,
+            )
+        except Exception:
+            HvwapStatus = None
+        try:
+            _ok, _reason = self._hvwap_paper_gate()
+            if not _ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason=_reason, trade_id=getattr(self, "_trade_id", None))
+                return None
+            # baseline-clear marker (defense in depth; on_bar checks it first):
+            # when the baseline lifecycle evaluation produced ANY exit
+            # decision this tick, the candidate must not act.
+            if not getattr(self, "_hvwap_baseline_clear_tick", False):
+                return None
+            _v = getattr(self, "_hvwap_last_verdict", None)
+            if (_v is None or HvwapStatus is None
+                    or _v.status != HvwapStatus.ALIGNED_PASS):
+                return None
+            if not getattr(self, "_hvwap_armed", False):
+                return None
+            if self._has_position is not True:
+                return None
+            if getattr(self, "_released_leg", None) is not None:
+                return None
+            if getattr(self, "_lifecycle", "OPEN") != "OPEN":
+                return None
+            if getattr(self, "_hvwap_release_sent_trade_id", None) == getattr(
+                    self, "_trade_id", None):
+                return None
+            if getattr(self, "_manual_exit_requested", False):
+                return None
+            if getattr(self, "_release_pending_mono", 0.0) > 0:
+                return None
+            if (getattr(self, "_release_near_ticks", 0) > 0
+                    or getattr(self, "_release_far_ticks", 0) > 0):
+                return None
+            _lc = getattr(self, "_lifecycle_oca", None)
+            if _lc is None:
+                return None
+            _phase = getattr(_lc, "phase", None)
+            if getattr(_phase, "value", _phase) != PositionPhase.SPREAD.value:
+                return None
+            _rg = getattr(_lc, "release_group", None)
+            _rg_status = getattr(getattr(_rg, "status", None), "value", "")
+            if _rg_status not in ("ARMED", "INACTIVE"):
+                return None
+            if getattr(_lc, "exit_owner", None) is not None:
+                return None
+            _rel = getattr(_v, "hypothetical_release_leg", None)
+            if _rel not in ("NEAR", "FAR"):
+                return None
+            _exit_price = near_close if _rel == "NEAR" else far_close
+            if _exit_price is None or _exit_price <= 0:
+                return None
+            _age_ok, _age = self._hvwap_release_quote_age_ok(bar, _rel)
+            if not _age_ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason="STALE_QUOTE", quote_age_ms=_age,
+                              trade_id=getattr(self, "_trade_id", None))
+                return None
+            _width_ok, _w = self._hvwap_release_width_ok(bar, _rel)
+            if not _width_ok:
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason="QUOTE_INVALID_OR_WIDE", width=_w,
+                              trade_id=getattr(self, "_trade_id", None))
+                return None
+
+            # ── apply the PAPER release intent (existing lifecycle path) ──
+            _leg = Leg.NEAR if _rel == "NEAR" else Leg.FAR
+            self._lifecycle = f"RELEASE_{_leg.value}"
+            self._release_ts = now
+            self._release_mono = time.monotonic()
+            self._release_pending_mono = time.monotonic()
+            self._release_price = _exit_price
+            _decision = LifecycleDecision(action=LifecycleAction.RELEASE,
+                                          release_leg=_leg,
+                                          winner="HVWAP_CANDIDATE")
+            _commit_action(self._lifecycle_oca, _decision)
+            self._hvwap_release_sent_trade_id = self._trade_id
+            _append_event(
+                "HVWAP_RELEASE_INTENT",
+                source="HVWAP_CANDIDATE",
+                release_leg=_rel,
+                exit_price=_exit_price,
+                decision_ts=_v.decision_ts,
+                session_label=_v.session_label,
+                regime_60m=_v.regime_60m.value,
+                signal_15m=_v.signal_15m.value,
+                consecutive_confirmed_bars=_v.consecutive_confirmed_bars,
+                retained_direction=_v.retained_direction,
+                status=_v.status.value,
+                gate_mode=_reason,
+                fresh_bar_after_wiring=self._hvwap_armed,
+                trade_id=getattr(self, "_trade_id", None),
+            )
+            try:
+                _write_mts_state(
+                    has_position=True, action=f"RELEASE_{_leg.value}",
+                    reason="HVWAP_CANDIDATE",
+                    near_entry=self._near_entry, far_entry=self._far_entry,
+                    near_last=near_close, far_last=far_close,
+                    near_side=self._near_side, far_side=self._far_side,
+                    spread_z=bar.get("spread_z"),  # 2026-10-08 Codex: retain unknown.
+                    release_price=_exit_price,
+                    trade_id=self._trade_id, ticker=self._ticker,
+                    lifecycle=lifecycle_to_dict(self._lifecycle_oca),
+                )
+            except Exception:
+                logger.warning("[HVWAP_RELEASE] state write failed (non-fatal)",
+                               exc_info=True)
+            logger.warning(
+                "[HVWAP_RELEASE_INTENT] leg=%s price=%.1f decision_ts=%s "
+                "source=HVWAP_CANDIDATE mode=%s",
+                _rel, _exit_price, _v.decision_ts, _reason)
+            return Signal("PARTIAL_EXIT", f"TMF_RELEASE_{_leg.value}", confidence=0.4)
+        except Exception:
+            # fail-closed for the candidate only: never blocks the baseline
+            logger.warning("[HVWAP_RELEASE] eval failed (fail-closed)", exc_info=True)
+            return None
 
     def _ensure_lifecycle_adapter_initialized(self, source: str = "NORMAL") -> None:
         """
@@ -1541,9 +2847,12 @@ class TMFSpread(StrategyBase):
                     trail_mult = float(mfe_tighten.get("level_1_trail_mult", 1.6))
             
             trail = atr * trail_mult
-            # Ensure sensible bounds for TMF (Micro Taiwan Index)
-            # Tiered floors: Stop needs 10pt safety, Trail needs 20pt room to breathe
-            return max(10.0, stop), max(20.0, trail)
+            # 2026-07-31 Hermes Agent: floor = configured fixed values so
+            # runtime (_get_thresholds) and risk-meta (_get_risk_meta) agree:
+            # effective = max(configured_fixed, ATR*mult). Previously
+            # _get_thresholds used hardcoded 10/20 (later 60) while
+            # _get_risk_meta used 10/60 and tests expected config floors.
+            return max(self._release_stop_fixed, stop), max(self._trail_dist_fixed, trail)
         return self._release_stop_fixed, self._trail_dist_fixed
 
     def _apply_vwap_exit(self, bar: dict, trail_dist: float) -> float:
@@ -1574,7 +2883,7 @@ class TMFSpread(StrategyBase):
 
     def sync_position(self, trade_id: str, side: str,
                       near_entry: float, far_entry: float,
-                      entry_spread_z: float = 3.0, **kwargs) -> None:
+                      entry_spread_z: float | None = None, **kwargs) -> None:
         """
         Synchronize in-memory position state after a manual/spread entry.
 
@@ -1590,6 +2899,8 @@ class TMFSpread(StrategyBase):
         self._far_entry = far_entry
         self._near_side = "LONG" if side == "LONG" else "SHORT"
         self._far_side = "SHORT" if side == "LONG" else "LONG"
+        # 2026-10-08 Codex: confirmed snapshots never fabricate the entry gate.
+        entry_spread_z = _finite_spread_z_or_none(entry_spread_z)
         self._entry_spread_z = entry_spread_z
         self._released_leg = None
         self._release_ts = None
@@ -1599,6 +2910,11 @@ class TMFSpread(StrategyBase):
         self._entry_ts = kwargs.get("entry_ts") or datetime.now()
         # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
         self._entry_time_monotonic = time.monotonic()
+        # 2026-08-04 P0: canonical guard clock — receive-epoch ms at entry
+        # settled, same clock domain as lifecycle transitions. ISO is display
+        # only; epoch integer is the decision source of truth.
+        self._entry_guard_start_ms = time.time() * 1000.0
+        self._entry_ts_ms = self._entry_guard_start_ms
         self._set_single_leg_extrema(peak=near_entry, nadir=far_entry)
         self._spread_near_high = near_entry
         self._spread_near_low = near_entry
@@ -1617,8 +2933,10 @@ class TMFSpread(StrategyBase):
         self._trail_exit_start_time = 0.0
 
         # [GSD] Log confirmed fills and ENTRY event
-        _append_fill(self._ticker, "NEAR", "NEAR", self._near_side, 1, near_entry, "ENTRY", trade_id, spread_z=entry_spread_z)
-        _append_fill(self._ticker, "FAR", "FAR", self._far_side, 1, far_entry, "ENTRY", trade_id, spread_z=entry_spread_z)
+        _append_fill(self._ticker, "NEAR", "NEAR", self._near_side, 1, near_entry, "ENTRY", trade_id,
+                     spread_z=entry_spread_z, **(kwargs.get("near_fill_provenance") or {}))
+        _append_fill(self._ticker, "FAR", "FAR", self._far_side, 1, far_entry, "ENTRY", trade_id,
+                     spread_z=entry_spread_z, **(kwargs.get("far_fill_provenance") or {}))
         # 2026-05-27 Gemini CLI: Use dynamic multiplier for event logging
         _mult = get_point_value(self._ticker)
         # 2026-06-23 Gemini CLI: Retrieve price sources with dynamic keys and default to UNSET to satisfy AST checks
@@ -1665,6 +2983,9 @@ class TMFSpread(StrategyBase):
         self._release_ts = event_time or datetime.now()
         self._single_leg_started_at = self._release_ts
         self._release_mono = time.monotonic()
+        # ── RESTART_BASELINE: 記錄持倉的 trading session (fill-time),
+        # 供重啟後的 baseline gate 拒絕其他 session 的報價 ──
+        self._position_session_type = _session_label()
         # 2026-07-22 Gemini CLI: Avoid release price defaulting to 0.0 or remaining_leg_price if invalid
         _entry_fallback = self._near_entry if released_leg == Leg.NEAR else self._far_entry
         self._release_price = fill_price if fill_price > 0 else (remaining_leg_price if remaining_leg_price > 0 else _entry_fallback)
@@ -1736,8 +3057,53 @@ class TMFSpread(StrategyBase):
             fill_price, remaining_leg_price, source, order_id,
         )
 
+    def enter_broker_reconciled_single_leg(
+        self, *, released_leg: str, remaining_side: str,
+        order_id: str | None, broker_order_id: str | None,
+        snapshot_hash: str | None, position_session: str | None,
+    ) -> None:
+        """Broker-confirmed single-leg lifecycle transition (2026-08-18).
+
+        Local fills lack the RELEASE/FILLED record, but the canonical broker
+        snapshot proves the released contract is GONE and the remaining leg
+        is present.  Infer the SINGLE_LEG transition from position-level
+        broker evidence — WITHOUT synthesizing a release price / PnL — and
+        re-arm the trail via PENDING_REANCHOR so the RESTART_BASELINE gate
+        (first fresh remaining-leg BBO) establishes the anchor.
+        """
+        self._released_leg = released_leg
+        self._side = remaining_side
+        _rel = Leg.NEAR if released_leg == "near" else Leg.FAR
+        _rem = Leg.FAR if released_leg == "near" else Leg.NEAR
+        self._lifecycle = f"TRAILING_{remaining_side}"
+        self._lifecycle_oca = PositionLifecycle(
+            phase=PositionPhase.SINGLE_LEG,
+            release_group=ReleaseGroup(
+                status=ReleaseGroupStatus.FILLED,
+                filled_leg=_rel, canceled_leg=_rem),
+            trail_group=TrailGroup(
+                status=TrailGroupStatus.ARMED,
+                remaining_leg=_rem,
+                trigger_ts=datetime.now().isoformat()),
+        )
+        # ── RESTART_BASELINE: 水合/重啟後的單腿一律 PENDING_REANCHOR,
+        # anchor 由 baseline gate 從 fresh BBO 建立 (不用任何合成價) ──
+        self._set_single_leg_extrema(peak=0.0, nadir=0.0)
+        self._single_leg_anchor_price = 0.0
+        self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
+        self._trail_warmup_tick_count = 0
+        self._trail_started_at = None
+        self._trail_anchor_source = "BROKER_RECONCILIATION"
+        self._position_session_type = position_session
+        # broker-reconciliation identity — persisted via the state write
+        self._broker_recovery_source = "broker_reconciliation"
+        self._broker_recovery_order_id = order_id
+        self._broker_recovery_broker_order_id = broker_order_id
+        self._broker_recovery_snapshot_hash = snapshot_hash
+
     def sync_release(self, leg: str | Leg, price: float, release_price: float = 0.0,
-                     order_id: str = "", event_time: datetime | None = None) -> None:
+                     order_id: str = "", event_time: datetime | None = None,
+                     fill_provenance: dict | None = None) -> None:
         """
         Synchronize state after a leg release (PARTIAL_EXIT) is confirmed.
         Transitions lifecycle from RELEASE_NEAR/FAR to TRAILING mode.
@@ -1812,11 +3178,12 @@ class TMFSpread(StrategyBase):
             realized_pnl=_realized,
             leg_mfe=_leg_mfe,
             leg_mae=_leg_mae,
-            price_source=_LIVE_TICK,
+            price_source=(fill_provenance or {}).get("price_source", _LIVE_TICK),
             quote_age_ms=0.0,
             near_pnl=_release_near_pnl,
             far_pnl=_release_far_pnl,
             spread_pnl=_release_spread_pnl,
+            **{k: v for k, v in (fill_provenance or {}).items() if k != "price_source"},
         )
 
         logger.info("[MTS_RELEASE_SYNC] leg_released=%s rem_side=%s price=%s release_price=%s realized_pnl=%s lifecycle=%s trade_id=%s",
@@ -1837,6 +3204,7 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr or 0.0,
             lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
         )
 
     def _pnl_far(self, far_close: float) -> float:
@@ -1875,8 +3243,10 @@ class TMFSpread(StrategyBase):
         release_stop = round(atr_val * stop_mult, 2) if has_release_atr else self._release_stop_fixed
         trail_dist = round(atr_val * trail_mult, 2) if has_trail_atr else self._trail_dist_fixed
         
-        release_stop_floor = 10.0
-        trail_dist_floor = 60.0  # 2026-07-07: 20→60, ~0.82 ATR for TMF night (~73 pt)
+        # 2026-07-31 Hermes Agent: floors = configured fixed values (same rule as
+        # _get_thresholds) so runtime decision and state-file risk meta agree.
+        release_stop_floor = self._release_stop_fixed
+        trail_dist_floor = self._trail_dist_fixed
         
         final_release_stop = max(release_stop_floor, release_stop) if has_release_atr else release_stop
         final_trail_dist = max(trail_dist_floor, trail_dist) if has_trail_atr else trail_dist
@@ -1926,7 +3296,7 @@ class TMFSpread(StrategyBase):
         }
 
     def write_state(self, action: str, reason: str, **kwargs) -> None:
-        """Write the current state to /tmp/mts_position_state.json.
+        """Write the current state to the canonical runtime state file.
         2026-06-26 Gemini CLI: Centralized state writing to avoid heartbeat wipes.
         """
         kw = dict(kwargs)
@@ -1942,7 +3312,9 @@ class TMFSpread(StrategyBase):
 
         _near_last = float(_near_last_val) if _near_last_val is not None else 0.0
         _far_last = float(_far_last_val) if _far_last_val is not None else 0.0
-        _spread_z = float(_spread_z_val) if _spread_z_val is not None else 0.0
+        _spread_z = _finite_spread_z_or_none(_spread_z_val)
+        # 2026-10-08 Codex: pass entry and current separately to the disk writer.
+        kw["entry_spread_z"] = getattr(self, "_entry_spread_z", None)
         _trail_pts = float(_trail_pts_val) if _trail_pts_val is not None else 0.0
         _release_stop = float(_release_stop_val) if _release_stop_val is not None else 0.0
         _trail_dist = float(_trail_dist_val) if _trail_dist_val is not None else 0.0
@@ -1969,6 +3341,11 @@ class TMFSpread(StrategyBase):
             ticker=self._ticker,
             atr=self._last_atr,
             lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+            # ── broker-reconciled single-leg recovery identity (2026-08-18)
+            broker_recovery_source=getattr(self, "_broker_recovery_source", None),
+            broker_recovery_order_id=getattr(self, "_broker_recovery_order_id", None),
+            broker_recovery_snapshot_hash=getattr(self, "_broker_recovery_snapshot_hash", None),
             **kw
         )
 
@@ -1985,6 +3362,309 @@ class TMFSpread(StrategyBase):
             n_pnl = self._pnl_near(near_close)
             f_pnl = self._pnl_far(far_close)
         return n_pnl + f_pnl
+
+    def _recover_paper_policy_j_peak(self, entry_ts_ms, now_ms):
+        """2026-10-13 Codex: recover confirmed risk memory, never a position/fill.
+
+        The legacy snapshot peak is not proof of confirmation. Replay only the
+        same open PAPER spread's durable confirmation events after its entry
+        quarantine, once on the first synchronized post-restart baseline.
+        """
+        if (getattr(self, "_hvwap_execution_mode", None) != "paper_active"
+                or getattr(self, "_hvwap_live_order_allowed", False)
+                or not getattr(self, "_has_position", False)
+                or getattr(self, "_released_leg", None) is not None
+                or not getattr(self, "_trade_id", None)):
+            return None
+        from core.runtime_paths import mts_data_mode
+        if mts_data_mode() != "paper":
+            return None
+        peak = None
+        guard_ms = float(getattr(self, "_entry_peak_guard_ms", 15000.0))
+        try:
+            with open(_MTS_EVENT_LOG) as source:
+                for line in source:
+                    if '"POLICY_J_PEAK_CONFIRMED"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                        if (not isinstance(row, dict)
+                                or row.get("event") != "POLICY_J_PEAK_CONFIRMED"
+                                or row.get("trade_id") != self._trade_id
+                                or row.get("mode", "paper") != "paper"
+                                or row.get("phase", "SPREAD") != "SPREAD"):
+                            continue
+                        value = row.get("durable_peak")
+                        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                                or not math.isfinite(value)):
+                            continue
+                        stamp = iso_to_epoch_ms(row.get("ts"))
+                        if not (entry_ts_ms + guard_ms <= stamp <= now_ms):
+                            continue
+                        peak = value if peak is None else max(peak, value)
+                    except (ValueError, TypeError):
+                        continue
+        except OSError:
+            logger.warning("[POLICY_J_PEAK_RECOVERY_UNAVAILABLE] trade_id=%s", self._trade_id)
+            return None
+        if peak is not None:
+            _append_event("POLICY_J_PEAK_RESTORED", trade_id=self._trade_id,
+                          durable_peak=peak, source="PAPER_CONFIRMED_EVENTS")
+        return peak
+
+    def _update_policy_j_peak(self, current_pnl_pts, near_mark, far_mark, now_ms,
+                              mark_age_ms=0.0, pair_skew_ms=0.0, entry_ts_ms=0.0,
+                              phase="SPREAD") -> bool:
+        """Policy J peak update with spike validation (2026-08-03 hotfix).
+
+        Entry-completion gate, per-trade reset, candidate confirmation,
+        freshness/skew rejection, entry-window spike quarantine.
+        Returns True when a durable (confirmed) peak exists.
+        """
+        _PV = float(getattr(self, "_point_value", 10.0))
+        _COST = float(getattr(self, "_estimated_cost", 92.0))
+        _s_conf = int(getattr(self, "_peak_confirmation_samples", 3))
+        _t_conf = float(getattr(self, "_peak_confirmation_tolerance_twd", 100.0))
+        _ms_conf = float(getattr(self, "_peak_confirmation_ms", 1000.0))
+        _guard_ms = float(getattr(self, "_entry_peak_guard_ms", 15000.0))
+        _max_jump = float(getattr(self, "_max_single_update_jump_twd", 200.0))
+        for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
+                   "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
+                   "_pj_last_upl", "_pj_last_eval_ts",
+                   "_pj_guard_state", "_pj_guard_provisional_peak",
+                   "_pj_guard_initialized", "_pj_guard_just_completed",
+                   "_pj_guard_source", "_pj_guard_config_key",
+                   "_pj_guard_effective_ms"):
+            if not hasattr(self, _a):
+                setattr(self, _a, None)
+        _tid = getattr(self, "_trade_id", None)
+        # ── Entry-completion gate (2026-08-04 hotfix: real attrs) ──
+        _na = float(getattr(self, "_near_entry", 0.0) or 0.0)
+        _fa = float(getattr(self, "_far_entry", 0.0) or 0.0)
+        _ph = str(phase)
+        if not (_na > 0 and _fa > 0) or not _ph.endswith(("SPREAD", "SINGLE_LEG")):
+            _now_ms_g = datetime.now().timestamp() * 1000.0
+            if _now_ms_g - float(getattr(self, "_pj_last_suppress_ms", 0.0)) > 5000.0:
+                _append_event("POLICY_J_TRIGGER_SUPPRESSED", trade_id=_tid,
+                              reason="ENTRY_NOT_SETTLED",
+                              current_upl=float(current_pnl_pts) * _PV - _COST,
+                              phase=phase, near_entry=_na, far_entry=_fa)
+                self._pj_last_suppress_ms = _now_ms_g
+            return self._pj_durable_peak is not None
+        # ── Per-trade reset ──
+        if self._pj_trade_id != _tid:
+            self._pj_trade_id = _tid
+            self._pj_durable_peak = None
+            self._pj_candidate_peak = None
+            self._pj_candidate_ts = None
+            self._pj_candidate_count = 0
+            self._pj_last_mark_pair = None
+            self._pj_last_upl = None
+            self._pj_guard_state = None
+            self._pj_guard_provisional_peak = None
+            self._pj_guard_initialized = False
+            self._pj_guard_just_completed = False
+        _upl = float(current_pnl_pts) * _PV - _COST
+        _pair = (near_mark, far_mark)
+        # ── freshness / skew gate ──
+        if mark_age_ms > 5000.0 or pair_skew_ms > 2000.0:
+            _append_event("POLICY_J_PEAK_REJECTED", trade_id=_tid, reason="MARK_NOT_FRESH",
+                          current_upl=_upl, near_mark=near_mark, far_mark=far_mark,
+                          near_mark_age_ms=mark_age_ms, pair_skew_ms=pair_skew_ms)
+            self._pj_last_upl = _upl
+            return self._pj_durable_peak is not None
+        # ── Entry peak guard: provisional quarantine (2026-08-04) ──
+        # Dead-code fix: _entry_peak_guard_ms was initialized (2112) but never
+        # consumed — opening spikes became durable peaks and triggered giveback
+        # exits 0-11s after entry (5 trades 15:00-15:22 night session).
+        _guard_ms = float(getattr(self, "_entry_peak_guard_ms", 15000.0))
+        _elapsed_ms = None
+        _entry_reason = None
+        if not (entry_ts_ms and entry_ts_ms > 0.0):
+            _entry_reason = _ENTRY_GUARD_REASON_MISSING
+        elif now_ms <= 0.0:
+            _entry_reason = "NOW_TS_MISSING"
+        else:
+            _elapsed_ms = max(0.0, now_ms - entry_ts_ms)
+            # 2026-10-12 Codex: elapsed holding time is not invalid entry
+            # evidence. Cross-day inventory keeps the original guard anchor;
+            # never reset its clock or suppress Policy J solely for age.
+        if _entry_reason is not None:
+            # Fail-safe: untrusted entry time blocks Policy J peak activation;
+            # other risk controllers (ATR/hard/release/emergency) keep running.
+            self._pj_guard_state = None
+            self._pj_guard_initialized = False
+            _append_event("POLICY_J_TRIGGER_SUPPRESSED", trade_id=_tid,
+                          reason=_entry_reason,
+                          current_upl=float(current_pnl_pts) * _PV - _COST,
+                          phase=phase, elapsed_ms=_elapsed_ms, guard_ms=_guard_ms)
+            self._pj_last_upl = float(current_pnl_pts) * _PV - _COST
+            return self._pj_durable_peak is not None
+        if _elapsed_ms < _guard_ms:
+            # ── In guard window: provisional quarantine ──
+            self._pj_guard_state = "QUARANTINE"
+            self._pj_guard_initialized = False
+            if self._pj_guard_provisional_peak is None or _upl > self._pj_guard_provisional_peak:
+                self._pj_guard_provisional_peak = _upl
+            _append_event("POLICY_J_GUARD_QUARANTINE", trade_id=_tid,
+                          current_upl=_upl,
+                          provisional_peak=self._pj_guard_provisional_peak,
+                          elapsed_ms=round(_elapsed_ms, 1), guard_ms=_guard_ms,
+                          phase=phase)
+            self._pj_last_mark_pair = _pair
+            self._pj_last_upl = _upl
+            self._pj_last_eval_ts = now_ms
+            return self._pj_durable_peak is not None
+        if _elapsed_ms is None:
+            # ── Fail-safe: entry timestamp missing -> no quarantine, normal path.
+            #    Policy J must never be permanently disabled by a missing anchor.
+            self._pj_guard_state = None
+        elif not self._pj_guard_initialized:
+            # ── Guard window elapsed: baseline from CURRENT synchronized mark,
+            #    NEVER the window spike. No giveback evaluation on this tick.
+            self._pj_guard_state = "COMPLETE"
+            self._pj_guard_initialized = True
+            self._pj_guard_just_completed = True
+            # 2026-10-13 Codex: restart must not erase a confirmed same-trade
+            # PAPER high-water mark after an UNSENT quote rejection. Keep the
+            # first-tick guard, freshness checks and unconfirmed-spike isolation.
+            _recovered_peak = (self._recover_paper_policy_j_peak(entry_ts_ms, now_ms)
+                               if getattr(self, "_hvwap_execution_mode", None) == "paper_active"
+                               else None)
+            self._pj_durable_peak = (_upl if _recovered_peak is None
+                                     else max(_upl, _recovered_peak))
+            _append_event("POLICY_J_GUARD_BASELINE", trade_id=_tid,
+                          baseline=_upl,
+                          provisional_peak=self._pj_guard_provisional_peak,
+                          elapsed_ms=round(_elapsed_ms, 1), guard_ms=_guard_ms,
+                          phase=phase)
+            self._pj_last_mark_pair = _pair
+            self._pj_last_upl = _upl
+            self._pj_last_eval_ts = now_ms
+            return self._pj_durable_peak is not None
+        # ── spike quarantine (jump detection) ──
+        _prev = self._pj_last_upl if self._pj_last_upl is not None else _upl
+        _jump = abs(_upl - _prev)
+        _spiky = _jump > _max_jump
+        _durable = self._pj_durable_peak
+        if _durable is None or _upl > _durable:
+            _cand = self._pj_candidate_peak
+            if _cand is None or _upl > _cand:
+                self._pj_candidate_peak = _upl
+                self._pj_candidate_ts = now_ms
+                self._pj_candidate_count = 1
+                _append_event("POLICY_J_PEAK_CANDIDATE", trade_id=_tid, current_upl=_upl,
+                              near_mark=near_mark, far_mark=far_mark, candidate_count=1,
+                              spiky=_spiky)
+            elif _upl >= (_cand - _t_conf):
+                if _pair != self._pj_last_mark_pair:
+                    self._pj_candidate_count += 1
+                    self._pj_candidate_ts = now_ms
+            else:
+                _append_event("POLICY_J_PEAK_REJECTED", trade_id=_tid, reason="CANDIDATE_NORMALIZED",
+                              current_upl=_upl, candidate_peak=_cand)
+                self._pj_candidate_peak = None
+                self._pj_candidate_count = 0
+                self._pj_candidate_ts = None
+            _confirmed = (self._pj_candidate_count >= _s_conf) or (
+                self._pj_candidate_ts is not None and (now_ms - self._pj_candidate_ts) >= _ms_conf)
+            if _confirmed and not _spiky and self._pj_candidate_peak is not None:
+                _new = max(_durable or 0.0, self._pj_candidate_peak)
+                if _new > (_durable or 0.0):
+                    self._pj_durable_peak = _new
+                    _append_event("POLICY_J_PEAK_CONFIRMED", trade_id=_tid, durable_peak=_new,
+                                  candidate_peak=self._pj_candidate_peak,
+                                  candidate_count=self._pj_candidate_count)
+                self._pj_candidate_peak = None
+                self._pj_candidate_count = 0
+                self._pj_candidate_ts = None
+        else:
+            # current <= durable — candidate collapse cancels candidate
+            if self._pj_candidate_peak is not None and _upl < (self._pj_candidate_peak - _t_conf):
+                _append_event("POLICY_J_PEAK_REJECTED", trade_id=_tid, reason="CANDIDATE_NORMALIZED",
+                              current_upl=_upl, candidate_peak=self._pj_candidate_peak)
+                self._pj_candidate_peak = None
+                self._pj_candidate_count = 0
+                self._pj_candidate_ts = None
+        self._pj_last_mark_pair = _pair
+        self._pj_last_upl = _upl
+        self._pj_last_eval_ts = now_ms
+        return self._pj_durable_peak is not None
+
+    def _build_decision_evidence(self, exit_reason: str, pnl: float, bar: dict) -> dict:
+        """Capture every release/exit predicate at the decision timestamp.
+
+        This is deliberately a snapshot, not a reconstructed explanation: a
+        later fill/reconciliation pass must be able to tell which ATR, PnL,
+        trail, VWAP and trend predicates were true or false when the action
+        was selected.
+        """
+        risk = self._get_risk_meta(bar)
+        near = float(bar.get("near_close", 0.0) or 0.0)
+        far = float(bar.get("far_close", 0.0) or 0.0)
+        near_pnl = self._pnl_near(near) if near else None
+        far_pnl = self._pnl_far(far) if far else None
+        release_threshold = risk.get("final_release_stop")
+        if release_threshold is None:
+            release_threshold = risk.get("release_stop")
+        release_threshold = float(release_threshold or 0.0)
+        try:
+            release_gate = bool(self._mts_atr_release_trend_gate()[0])
+        except Exception:
+            release_gate = False
+        trend = getattr(self, "_trend_confirmed_snapshot", None)
+        try:
+            reversal = self._build_trend_reversal_input()
+        except Exception as exc:
+            # Evidence collection must never change the decision/execution path.
+            reversal = {"available": False, "error": type(exc).__name__}
+        phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+        phase = getattr(phase, "value", phase)
+        released = getattr(self, "_released_leg", None)
+        remaining = None
+        if released in ("near", "far"):
+            remaining = "far" if released == "near" else "near"
+        rem_price = far if remaining == "far" else near if remaining == "near" else None
+        rem_vwap = bar.get(f"{remaining}_vwap") if remaining else None
+        rem_side = getattr(self, "_side", None)
+        vwap_violated = (
+            rem_price is not None and rem_vwap is not None and
+            ((rem_side == "LONG" and rem_price < rem_vwap) or
+             (rem_side == "SHORT" and rem_price > rem_vwap))
+        )
+        return {
+            "action": exit_reason,
+            "pnl_pts": round(float(pnl), 4),
+            "phase": phase,
+            "near_side": getattr(self, "_near_side", None),
+            "far_side": getattr(self, "_far_side", None),
+            "near_pnl_pts": near_pnl,
+            "far_pnl_pts": far_pnl,
+            "atr": risk.get("atr"),
+            "release_stop_mode": risk.get("release_stop_mode"),
+            "release_stop_base_pts": risk.get("release_stop"),
+            "release_stop_threshold_pts": release_threshold,
+            "trail_distance_mode": risk.get("trail_distance_mode"),
+            "trail_distance_pts": risk.get("final_trail_dist"),
+            "peak": getattr(self, "_peak", None),
+            "nadir": getattr(self, "_nadir", None),
+            "remaining_leg": remaining,
+            "remaining_side": rem_side,
+            "remaining_price": rem_price,
+            "remaining_vwap": rem_vwap,
+            "vwap_exit_enabled": bool(getattr(self, "_params", {}).get("vwap_exit", {}).get("enabled", False)),
+            "vwap_violated": bool(vwap_violated),
+            "release_near_stop_hit": near_pnl is not None and near_pnl <= -release_threshold,
+            "release_far_stop_hit": far_pnl is not None and far_pnl <= -release_threshold,
+            "trend_release_enabled": os.getenv("MTS_TREND_RELEASE_ENABLED") == "1",
+            "trend_snapshot": trend if isinstance(trend, dict) else None,
+            "trend_release_pass": bool(trend and trend.get("pass_release")),
+            "trend_reversal": reversal,
+            "atr_release_trend_gate_enabled": release_gate,
+            "manual_requested": bool(getattr(self, "_manual_exit_requested", False)),
+            "mfe_pts": round(float(getattr(self, "_mfe_pts", 0.0)), 4),
+            "mae_pts": round(float(getattr(self, "_mae_pts", 0.0)), 4),
+        }
 
     def _log_exit_decision(self, exit_reason: str, pnl: float, bar: dict) -> dict:
         """Helper to generate, print, and log the structured exit decision.
@@ -2009,6 +3689,7 @@ class TMFSpread(StrategyBase):
             "post_release_anchor": round(self._post_release_anchor_price, 2) if self._post_release_anchor_price is not None else None,
             # 2026-07-16 Hermes Agent: MTF score at exit time
             "mtf_score": self._mtf_score_at_release,
+            "decision_evidence": self._build_decision_evidence(exit_reason, pnl, bar),
         }
         logger.info("[MTS_EXIT_LOG] %s", json.dumps(exit_data))
         _append_event("EXIT_LOG", **exit_data)
@@ -2044,27 +3725,57 @@ class TMFSpread(StrategyBase):
                         pass
         except Exception:
             return False
+        _abandoned = _abandoned_trade_ids()
         # An entry is "open" if its trade_id appears more in ENTRY than in EXIT+RELEASE
         from collections import Counter
         _entry_counts = Counter(_entries)
         _exit_counts = Counter(_exits)
         for tid, ecnt in _entry_counts.items():
+            if tid in _abandoned:
+                continue
             if ecnt > _exit_counts.get(tid, 0):
                 return True
         return False
 
     def _restore_from_fills_log(self) -> bool:
-        """Rebuild position state from fills log using exact leg quantity accounting."""
+        """Rebuild position state from fills log. Returns True on success."""
+        # LIVE fills are historical evidence, never current position truth.
+        # The monitor sets this tri-state marker from a current-session broker
+        # snapshot before allowing fills-led reconstruction.  PENDING and
+        # UNKNOWN are deliberately fail-closed; only a broker-confirmed
+        # matching position may revive an OPEN lifecycle.
+        _broker_truth = getattr(
+            self, "_fills_recovery_broker_truth", None)
+        if _broker_truth in ("FLAT", "PENDING", "UNKNOWN"):
+            _reason = ("BROKER_FLAT" if _broker_truth == "FLAT"
+                       else "BROKER_UNAVAILABLE")
+            logger.warning(
+                "[MTS_FILLS_RECOVERY_REFUSED] reason=%s broker_truth=%s",
+                _reason, _broker_truth,
+            )
+            _append_event(
+                "MTS_FILLS_RECOVERY_REFUSED",
+                reason=_reason,
+                broker_truth=_broker_truth,
+            )
+            return False
+        # The monitor sets this marker after a successful current-session
+        # broker snapshot.  In LIVE mode historical fills are evidence only;
+        # they must not recreate a position the broker has proved flat.
+        if getattr(self, "_broker_truth_flat", False) is True:
+            return False
         if not os.path.exists(_MTS_FILL_LOG):
             return False
         try:
+            _abandoned = _abandoned_trade_ids()
+            # Find the most recent open trade
             _trades: dict[str, list[dict]] = {}
             with open(_MTS_FILL_LOG) as _f:
                 for _line in _f:
                     try:
                         rec = json.loads(_line.strip())
                         tid = rec.get("trade_id")
-                        if tid:
+                        if tid and tid not in _abandoned:
                             _trades.setdefault(tid, []).append(rec)
                     except Exception:
                         pass
@@ -2072,40 +3783,45 @@ class TMFSpread(StrategyBase):
             if not _trades:
                 return False
 
+            # Find the latest open trade by timestamp
             _latest_open_tid = None
             _latest_open_entries = []
             _latest_ts = ""
-
             for tid, fills in _trades.items():
-                near_open_qty = sum(int(f.get("qty", 1)) for f in fills if f.get("fill_type") == "ENTRY" and f.get("leg") == "NEAR")
-                far_open_qty = sum(int(f.get("qty", 1)) for f in fills if f.get("fill_type") == "ENTRY" and f.get("leg") == "FAR")
-
-                for f in fills:
-                    ft = f.get("fill_type", "")
-                    leg = f.get("leg", "")
-                    qty = int(f.get("qty", 1))
-                    if ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR") and leg == "NEAR":
-                        near_open_qty -= qty
-                    elif ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_FAR") and leg == "FAR":
-                        far_open_qty -= qty
-
-                # Check for over-close underflow anomaly
-                if near_open_qty < 0 or far_open_qty < 0:
-                    logger.error(
-                        "[COMBINED_EXIT_RECOVERY_QTY_UNDERFLOW] Anomaly detected for trade_id=%s: near_qty=%d far_qty=%d",
-                        tid, near_open_qty, far_open_qty,
+                # 2026-07-31 Hermes Agent: qty-aware + terminal-aware open
+                # detection. Previously counted fill ROWS (not qty) and ignored
+                # COMBINED_EXIT_COMPLETED — a qty=2 entry with one 1-lot exit
+                # was wrongly seen as closed, and a COMPLETED event with
+                # unclosed legs was wrongly restored (fail-open).
+                _terminal_present = any(f.get("fill_type") == "COMBINED_EXIT_COMPLETED" for f in fills)
+                _near_open = 0.0
+                _far_open = 0.0
+                for _f in fills:
+                    _ft = _f.get("fill_type")
+                    _qty = float(_f.get("qty") or 0)
+                    _leg = _f.get("leg")
+                    if _ft == "ENTRY":
+                        if _leg == "NEAR":
+                            _near_open += _qty
+                        elif _leg == "FAR":
+                            _far_open += _qty
+                    elif _ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
+                        if _leg == "NEAR":
+                            _near_open -= _qty
+                        elif _leg == "FAR":
+                            _far_open -= _qty
+                _any_open = _near_open > 0 or _far_open > 0
+                if _terminal_present and _any_open:
+                    # COMPLETED marker exists but a leg still shows open qty —
+                    # data inconsistency. Fail-closed: do NOT restore (let the
+                    # monitor reconciliation path own the verdict).
+                    logger.warning(
+                        "[MTS_RESTORE_FAIL_CLOSED] trade=%s COMPLETED present but near_open=%.0f far_open=%.0f",
+                        tid, _near_open, _far_open,
                     )
-
-                # Check if terminal completion event is present
-                has_terminal_completed = any(f.get("fill_type") in ("COMBINED_EXIT_COMPLETED", "TRADE_SETTLED") for f in fills)
-                if has_terminal_completed and (near_open_qty != 0 or far_open_qty != 0):
-                    logger.error(
-                        "[RECOVERY_TERMINAL_EVENT_POSITION_MISMATCH] Terminal completion event seen but remaining open qty != 0 for trade_id=%s (near=%d far=%d)",
-                        tid, near_open_qty, far_open_qty,
-                    )
-                    continue
-
-                if (near_open_qty > 0 or far_open_qty > 0) and not has_terminal_completed:
+                    _any_open = False
+                if _any_open:
+                    # Find timestamp of first entry fill
                     _first_entry_ts = ""
                     for f in fills:
                         if f.get("fill_type") == "ENTRY":
@@ -2116,8 +3832,6 @@ class TMFSpread(StrategyBase):
                         _latest_ts = _first_entry_ts
                         _latest_open_tid = tid
                         _latest_open_entries = fills
-                        _latest_open_near_qty = near_open_qty
-                        _latest_open_far_qty = far_open_qty
 
             if not _latest_open_tid:
                 return False
@@ -2129,6 +3843,7 @@ class TMFSpread(StrategyBase):
             if not _entry_fills:
                 return False
 
+            # Determine near/far from entry fills
             _near_entry = _far_entry = 0.0
             _near_side = _far_side = None
             for ef in _entry_fills:
@@ -2148,13 +3863,33 @@ class TMFSpread(StrategyBase):
             self._far_entry = _far_entry
             self._near_side = "LONG" if _near_side in ("LONG", "BUY") else "SHORT"
             self._far_side = "LONG" if _far_side in ("LONG", "BUY") else "SHORT"
-            self._near_open_qty = _latest_open_near_qty
-            self._far_open_qty = _latest_open_far_qty
             self._released_leg = None
             self._trade_id = _latest_open_tid
             self._lifecycle = "OPEN"
             self._position_epoch = _latest_open_tid
 
+            # 2026-07-30 Gemini CLI: Preserve peak_net_exit_pnl_twd across fills-led recovery
+            # 2026-07-31 Hermes Agent: ADR-025 compliance — NO Disk->RAM backfill unless
+            # the state file belongs to the SAME trade_id AND is schema-valid. This is
+            # STARTUP_RECOVERY only; a stale/foreign trade snapshot must never resurrect
+            # the old combined peak into a new or single-leg position.
+            _prev_state = self._read_mts_state()
+            _prev_peak = 0.0
+            if _prev_state and str(_prev_state.get("trade_id") or "") == str(_latest_open_tid):
+                _prev_schema = _prev_state.get("schema_version")
+                try:
+                    _schema_ok = (_prev_schema is None) or (int(_prev_schema) >= 3)
+                except (ValueError, TypeError):
+                    _schema_ok = False
+                if _schema_ok:
+                    try:
+                        _prev_peak = float(_prev_state.get("peak_net_exit_pnl_twd") or 0.0)
+                    except (ValueError, TypeError):
+                        _prev_peak = 0.0
+            if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None or self._peak_net_exit_pnl_twd < _prev_peak:
+                self._peak_net_exit_pnl_twd = _prev_peak
+
+            # Process release fills if any
             for rf in _release_fills:
                 _rf_price = rf.get("price")
                 if rf.get("leg") == "NEAR":
@@ -2168,28 +3903,35 @@ class TMFSpread(StrategyBase):
                     self._lifecycle = f"TRAILING_{self._side}"
                     self._release_price = float(_rf_price) if _rf_price is not None else 0.0
 
-            # Restore Policy J peak UPL across restarts
-            _st = self._read_mts_state()
-            if _st and _st.get("trade_id") == _latest_open_tid:
-                _raw_peak = _st.get("peak_net_exit_pnl_twd")
-                try:
-                    _val = float(_raw_peak) if _raw_peak is not None else 0.0
-                    import math
-                    if math.isnan(_val) or math.isinf(_val):
-                        logger.warning("[MTS_PEAK_STATE_CORRUPTED] Recovered peak invalid: NaN or Inf value (%s). Safe initialization to 0.0", _raw_peak)
-                        self._peak_net_exit_pnl_twd = 0.0
-                    else:
-                        self._peak_net_exit_pnl_twd = _val
-                except (ValueError, TypeError):
-                    logger.warning("[MTS_PEAK_STATE_CORRUPTED] Recovered peak invalid: non-numeric value (%s). Safe initialization to 0.0", _raw_peak)
-                    self._peak_net_exit_pnl_twd = 0.0
-            elif _st is None:
-                logger.info("[MTS_PEAK_STATE_DEFAULT] No state file found during recovery. Initializing peak_net_exit_pnl_twd to 0.0")
-                self._peak_net_exit_pnl_twd = 0.0
+            if self._released_leg is not None:
+                # ── RESTART_BASELINE: 重啟後的單腿 anchor 一律 PENDING_REANCHOR,
+                # 由 baseline gate 從 fresh BBO 建立 (不能用 release fill 價污染);
+                # 並記錄持倉 session 供 baseline gate 比對 ──
+                self._set_single_leg_extrema(peak=0.0, nadir=0.0)
+                self._single_leg_anchor_price = 0.0
+                self._trail_anchor_status = TrailAnchorStatus.PENDING_REANCHOR
+                self._trail_warmup_tick_count = 0
+                self._trail_started_at = None
+                self._trail_anchor_source = "RESTORE_RECONSTRUCTION"
+                self._position_session_type = (
+                    _release_fills[0].get("session")
+                    or _entry_fills[0].get("session")
+                )
+
+            # Restore lifecycle OCA phase and group status
+            if hasattr(self, "_lifecycle_oca"):
+                self._lifecycle_oca.phase = PositionPhase.SPREAD if self._released_leg is None else PositionPhase.SINGLE_LEG
+                if self._released_leg is None:
+                    self._lifecycle_oca.release_group.status = ReleaseGroupStatus.ARMED
+                else:
+                    self._lifecycle_oca.release_group.status = ReleaseGroupStatus.FILLED
+                    self._lifecycle_oca.release_group.filled_leg = Leg.NEAR if self._released_leg == "near" else Leg.FAR
+                    self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
+                    self._lifecycle_oca.trail_group.remaining_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
 
             logger.warning(
-                "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s peak_pnl=%.1f",
-                _latest_open_tid, _near_entry, _far_entry, self._released_leg, self._lifecycle, getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+                "[MTS_FILLS_RECOVERY] Restored trade_id=%s near=%.1f far=%.1f released=%s lifecycle=%s",
+                _latest_open_tid, _near_entry, _far_entry, self._released_leg, self._lifecycle,
             )
             return True
         except Exception:
@@ -2262,9 +4004,43 @@ class TMFSpread(StrategyBase):
             # detects SUBMITTING with a missing order id on next tick.
 
     # ── Hot-reload / restart recovery ────────────────────────────────────────
+    @staticmethod
+    def _fills_trade_is_terminal(trade_id: str) -> bool:
+        """True when fills log shows trade ENTRY count <= EXIT/RELEASE count.
+
+        ADR-025: the fills log (broker-confirmed, append-only) is the runtime
+        authority over the state snapshot. A trade whose entries are all
+        matched by EXIT/RELEASE fills is fully closed — the state file must
+        not resurrect it as an open position.
+        """
+        if not trade_id:
+            return False
+        _log = _MTS_FILL_LOG
+        if not os.path.exists(_log):
+            return False
+        _entry_cnt = 0
+        _exit_cnt = 0
+        try:
+            with open(_log) as _f:
+                for _line in _f:
+                    try:
+                        rec = json.loads(_line.strip())
+                        if str(rec.get("trade_id") or "") != str(trade_id):
+                            continue
+                        ft = rec.get("fill_type", "")
+                        if ft == "ENTRY":
+                            _entry_cnt += 1
+                        elif ft in ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_NEAR", "COMBINED_EXIT_FAR"):
+                            _exit_cnt += 1
+                    except Exception:
+                        pass
+        except Exception:
+            return False
+        return _entry_cnt > 0 and _entry_cnt <= _exit_cnt
+
     def _restore_position_state(self) -> bool:
         """
-        Attempt to restore in-memory state from /tmp/mts_position_state.json.
+        Attempt to restore in-memory state from the canonical runtime state file.
         2026-05-27 Gemini CLI: Enhanced with log reconstruction for 100% confidence.
 
         Called at the top of on_bar() when _has_position is False.
@@ -2277,7 +4053,30 @@ class TMFSpread(StrategyBase):
         if os.getenv("MTS_BACKTEST") == "1":
             return False
 
+        # LIVE broker truth is authoritative for the current session.  When
+        # the monitor has just proved the futures account flat, historical
+        # fills are telemetry and must not resurrect a local ghost position.
+        if getattr(self, "_broker_truth_flat", False) is True:
+            self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
+            self._mts_state_write_enabled = True
+            return False
+
         state = self._read_mts_state()
+
+        # An audited abandon is terminal across every recovery authority.
+        # The JSON state writer may have persisted a stale OPEN snapshot after
+        # the abandon decision; never let that snapshot resurrect the trade.
+        if state and state.get("has_position") is True:
+            _state_trade_id = str(state.get("trade_id") or "").strip()
+            if _state_trade_id and _state_trade_id in _abandoned_trade_ids():
+                logger.warning(
+                    "[MTS_RESTORE_SKIP] reason=ABANDONED_TRADE trade_id=%s",
+                    _state_trade_id,
+                )
+                self._has_position = False
+                self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
+                self._mts_state_write_enabled = True
+                return False
 
         # ═══════════════════════════════════════════════════════════════
         # P0: Fills log authority check
@@ -2322,6 +4121,72 @@ class TMFSpread(StrategyBase):
                 self._mts_state_write_enabled = True
                 return False
         
+        # 2026-07-31 Hermes Agent: ADR-025 reverse authority check.
+        # State snapshot says OPEN, but the fills log (broker-confirmed runtime
+        # authority) proves this trade_id is terminal (all ENTRYs matched by
+        # EXIT/RELEASE). A stale snapshot must NOT resurrect a closed trade —
+        # force FLAT so dashboard/UPL/Policy J all agree with reality.
+        if state and state.get("has_position") is True and state.get("trade_id"):
+            if self._fills_trade_is_terminal(str(state.get("trade_id"))):
+                logger.warning(
+                    "[MTS_RECOVERY] State says OPEN but fills log confirms trade %s is terminal (fully closed). Forcing FLAT.",
+                    state.get("trade_id"),
+                )
+                self._has_position = False
+                self._mts_recovery_state = RecoveryState.FLAT_CONFIRMED
+                self._mts_state_write_enabled = True
+                return False
+
+        # 2026-10-08 Codex: same-trade PAPER fills repair directionless JSON
+        # before it can become an apparently recovered, unmanageable position.
+        from core.runtime_paths import mts_data_mode
+        _paper_direction_recovered = False
+        # 2026-10-12 Codex: elapsed time cannot close a PAPER position. Only
+        # matching, unambiguous local inventory may attest an aged snapshot.
+        _paper_aged_recovered = False
+        _paper_snapshot_expired = False
+        if mts_data_mode() == "paper" and state and state.get("_updated"):
+            try:
+                _saved_at = datetime.fromisoformat(state["_updated"])
+                _paper_snapshot_expired = (
+                    datetime.now(_saved_at.tzinfo) - _saved_at).total_seconds() >= 3600
+            except (TypeError, ValueError):
+                pass
+        if (mts_data_mode() == "paper" and state and state.get("has_position")
+                and state.get("released_leg") is None
+                and (_paper_snapshot_expired or any(state.get(k) not in ("LONG", "SHORT")
+                        for k in ("near_side", "far_side")))):
+            try:
+                from strategies.futures.mts_ledger_authority import project_fills, MtsAuthority
+                with open(_MTS_FILL_LOG, encoding="utf-8") as handle:
+                    fills = [json.loads(line) for line in handle if line.strip()]
+                auth = project_fills(
+                    (row for row in fills if row.get("mode") == "paper"
+                     and (_paper_snapshot_expired or row.get("trade_id") == state.get("trade_id"))), source="PAPER")
+                if not (state.get("trade_id") and auth.status is MtsAuthority.OPEN
+                        and not auth.anomalies
+                        and auth.trade_id == state["trade_id"]
+                        and auth.near_qty * auth.far_qty < 0
+                        and (not _paper_snapshot_expired or
+                             (abs(auth.near_qty) == abs(auth.far_qty) == 1
+                              and all(row.get("mode") == "paper" for row in fills)
+                              and state.get("near_side") == auth.near_side
+                              and state.get("far_side") == auth.far_side))
+                        and auth.near_side in ("LONG", "SHORT")
+                        and auth.far_side in ("LONG", "SHORT")
+                        and math.isclose(auth.near_entry, float(state["near_entry"]))
+                        and math.isclose(auth.far_entry, float(state["far_entry"]))):
+                    raise ValueError("missing same-trade PAPER direction evidence")
+                _paper_direction_recovered = any(state.get(k) not in ("LONG", "SHORT")
+                                                for k in ("near_side", "far_side"))
+                state = dict(state, near_side=auth.near_side, far_side=auth.far_side)
+                _paper_aged_recovered = _paper_snapshot_expired
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                self._mts_recovery_state = RecoveryState.RECOVERY_REQUIRED
+                self._mts_state_write_enabled = False
+                logger.warning("[MTS_RESTORE_REJECTED] reason=PAPER_DIRECTION_UNPROVEN error=%s", exc)
+                return False
+
         # 1. Primary Source: JSON State File
         if state and state.get("has_position") is True:
             action = state.get("state", "")
@@ -2335,7 +4200,7 @@ class TMFSpread(StrategyBase):
                         _now = datetime.now(_ts.tzinfo) if _ts.tzinfo else datetime.now()
                         _age_min = (_now - _ts).total_seconds() / 60.0
                         # 60 min expiration for production stability
-                        if _age_min < 60:
+                        if _age_min < 60 or _paper_aged_recovered:
                             # 2026-05-27 Gemini CLI: Only accept JSON if it has valid peak/nadir memory
                             _rem_side = state.get("remaining_side")
                             # 2026-06-23 Gemini CLI: Remove numeric defaults in .get() to comply with no_get_numeric_fallback contract
@@ -2378,17 +4243,45 @@ class TMFSpread(StrategyBase):
                                     _pollute_pass = False
                             if _pollute_pass:
                                 self._has_position = True
-                                self._lifecycle = state.get("state", "OPEN")
+                                # 2026-07-31 Hermes Agent: sync legacy _lifecycle
+                                # string with OCA phase. Raw state value like
+                                # "RELEASE_NEAR" would keep on_bar's RELEASE_*
+                                # guard active forever after restart
+                                # (_release_mono=0 never expires) and block
+                                # _manage_position -> restored SINGLE_LEG stuck.
+                                if state.get("released_leg") is not None:
+                                    self._lifecycle = f"TRAILING_{_rem_side}"
+                                    # 2026-07-31 Hermes Agent: restored SINGLE_LEG
+                                    # must NOT re-enter trail warmup (release
+                                    # happened pre-restart). Without this the
+                                    # TRAIL_WARMUP gate blocks exit forever
+                                    # (_single_leg_entered_mono=0 -> elapsed 0 <
+                                    # warmup 500ms -> never evaluates trail).
+                                    self._single_leg_entered_mono = time.monotonic() - 10.0
+                                    self._single_leg_post_fill_ticks = getattr(
+                                        self, "_single_leg_warmup_ticks", 2
+                                    )
+                                else:
+                                    self._lifecycle = state.get("state", "OPEN")
                                 # 2026-07-22 Gemini CLI: Restore state_revision from disk during recovery
                                 self._state_revision = int(state.get("state_revision", 0))
                                 # 2026-06-23 Gemini CLI: Safe parsing of float fields to prevent NoneType TypeError
-                                self._entry_spread_z = float(state.get("entry_spread_z") or 0.0)
+                                # 2026-10-08 Codex: legacy unknown stays unknown after restart.
+                                self._entry_spread_z = _finite_spread_z_or_none(state.get("entry_spread_z"))
                                 self._near_entry = float(state.get("near_entry") or 0.0)
                                 self._far_entry = float(state.get("far_entry") or 0.0)
                                 self._near_side = state.get("near_side")
                                 self._far_side = state.get("far_side")
                                 self._released_leg = state.get("released_leg")
                                 self._side = _rem_side
+                                # 2026-07-31 Hermes Agent: ADR-025 — combined peak is only
+                                # meaningful for a full 2-leg position. In SINGLE_LEG the
+                                # combined peak is frozen: restore 0.0, never the stale
+                                # disk value (which was inflated by single-leg PnL).
+                                if state.get("released_leg") is None:
+                                    self._peak_net_exit_pnl_twd = float(state.get("peak_net_exit_pnl_twd") or 0.0)
+                                else:
+                                    self._peak_net_exit_pnl_twd = 0.0
                                 self._set_single_leg_extrema(peak=_peak, nadir=_nadir)
 
                                 # ── ADR-009 Task 6: Restart Reconciliation ──
@@ -2485,6 +4378,19 @@ class TMFSpread(StrategyBase):
                                 
                                 # Best effort timestamps
                                 self._entry_ts = datetime.fromisoformat(state.get("entry_ts")) if state.get("entry_ts") else datetime.now()
+                                # 2026-08-04 P0: canonical guard clock on restore
+                                try:
+                                    _g0 = float(state.get("entry_guard_start_ms") or state.get("entry_ts_ms") or 0.0)
+                                    if _g0 > 0.0:
+                                        self._entry_guard_start_ms = _g0
+                                        self._entry_ts_ms = _g0
+                                    else:
+                                        _m0, _src0 = migrate_entry_time(state.get("entry_ts"))
+                                        self._entry_guard_start_ms = _m0
+                                        self._entry_ts_ms = _m0
+                                except Exception:
+                                    self._entry_guard_start_ms = None
+                                    self._entry_ts_ms = None
                                 self._release_ts = datetime.now() if self._released_leg else None
                                 self._release_mono = time.monotonic() if self._released_leg else 0.0
                                 # 2026-05-27 Gemini CLI: Set monotonic entry time on restore to prevent immediate watchdog kill (P4)
@@ -2498,6 +4404,14 @@ class TMFSpread(StrategyBase):
                                 self._single_leg_entered_mono = time.monotonic()
                                 self._single_leg_post_fill_ticks = 0
                                 self._single_leg_last_tick_ts = 0.0
+                                if _paper_direction_recovered or _paper_aged_recovered:
+                                    self.write_state(
+                                        action, ("PAPER_LEDGER_RECOVERED" if _paper_aged_recovered
+                                                 else "PAPER_DIRECTION_RECOVERED"),
+                                        near_last=state.get("near_last", 0.0),
+                                        far_last=state.get("far_last", 0.0),
+                                        spread_z=state.get("current_spread_z", state.get("spread_z")),
+                                    )
                                 logger.info("[MTS_RESTORE_OK] source=JSON action=%s trade_id=%s", action, self._trade_id)
                                 return True
                             else:
@@ -2562,6 +4476,12 @@ class TMFSpread(StrategyBase):
                             if release_f:
                                 self._released_leg = "near" if release_f["leg"] == "NEAR" else "far"
                                 self._side = "LONG" if (self._released_leg == "near" and self._far_side == "LONG") or (self._released_leg == "far" and self._near_side == "LONG") else "SHORT"
+                                # ── RESTART_BASELINE: 記錄持倉 session (release fill
+                                # 優先, entry fill 兜底), 供 baseline gate 比對 ──
+                                self._position_session_type = (
+                                    release_f.get("session")
+                                    or last_entry.get("session")
+                                )
                                 # [P0 Fix] Restart recovery: released-leg fill price must NOT
                                 # become remaining-leg trail anchor. Set PENDING_REANCHOR instead,
                                 # so the first fresh remaining-leg tick initializes the real anchor.
@@ -2609,11 +4529,21 @@ class TMFSpread(StrategyBase):
 
     def _is_same_bar_as_release(self, bar_ts) -> bool:
         """P1: True if bar_ts is in the same 5-min bucket as the release event."""
+        # 2026-07-31 Antigravity: Normalize timezones between bar_ts and _release_ts to prevent tz-offset guard bypass
         if bar_ts is None or not getattr(self, "_release_ts", None):
             return True  # conservative
-        _bar_ts = pd.Timestamp(bar_ts) if not isinstance(bar_ts, pd.Timestamp) else bar_ts
-        _rel_ts = pd.Timestamp(self._release_ts) if not isinstance(self._release_ts, pd.Timestamp) else self._release_ts
-        return int(_bar_ts.timestamp() / 300) == int(_rel_ts.timestamp() / 300)
+        try:
+            _bar_ts = pd.Timestamp(bar_ts) if not isinstance(bar_ts, pd.Timestamp) else bar_ts
+            _rel_ts = pd.Timestamp(self._release_ts) if not isinstance(self._release_ts, pd.Timestamp) else self._release_ts
+            
+            if _bar_ts.tzinfo is None:
+                _bar_ts = _bar_ts.tz_localize("Asia/Taipei")
+            if _rel_ts.tzinfo is None:
+                _rel_ts = _rel_ts.tz_localize("Asia/Taipei")
+
+            return int(_bar_ts.timestamp() / 300) == int(_rel_ts.timestamp() / 300)
+        except Exception:
+            return True  # conservative fallback
 
     def _append_skip(self, reason: str, **kwargs) -> None:
         """Append SKIP event only if reason changed or 5min elapsed since last."""
@@ -2644,6 +4574,8 @@ class TMFSpread(StrategyBase):
             self._confirm_ms = float(_params.get("confirm_ms", getattr(self, "_confirm_ms", 200.0)))
             self._max_quote_age_ms = float(_params.get("max_quote_age_ms", getattr(self, "_max_quote_age_ms", 10000.0)))
             self._max_spread_width = float(_params.get("max_spread_width", getattr(self, "_max_spread_width", 50.0)))
+            # 2026-10-12 Codex: optional PAPER-only exit cap; entry unchanged.
+            self._paper_exit_max_spread_width = _params.get("paper_exit_max_spread_width")
 
             # 2026-07-16 Hermes Agent: ADR-011 Phase 4 hot-reload warmup params
             self._single_leg_warmup_ms = float(_params.get("single_leg_warmup_ms", getattr(self, "_single_leg_warmup_ms", 500.0)))
@@ -2671,6 +4603,11 @@ class TMFSpread(StrategyBase):
         else:
             now = datetime.now()
 
+        # 2026-08-23 Hermes Agent: Hierarchical VWAP candidate arm (MTS 2.0).
+        # Parallel, telemetry-only; cannot gate the baseline decision arm,
+        # cannot emit orders, cannot raise (fail-closed for the candidate).
+        self._hvwap_candidate_tick(bar, now)
+
         # ── [Fix] Prevent duplicate submissions ──
         # 2026-06-11 JVS Claw: Add timeout for RELEASE lifecycle states
         # If release is stuck >60s without fill confirmation, reset to OPEN
@@ -2679,10 +4616,27 @@ class TMFSpread(StrategyBase):
             if self._lifecycle in ("RELEASE_NEAR", "RELEASE_FAR") and getattr(self, "_release_mono", 0.0) > 0.0:
                 _release_age = time.monotonic() - self._release_mono
                 if _release_age > 60:
-                    logger.warning("[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck for %.0fs. Resetting to OPEN for retry.", self._lifecycle, _release_age)
-                    self._lifecycle = "OPEN"
-                    self._release_ts = None
-                    self._release_mono = 0.0
+                    # Broker-truth guard: the watchdog may still protect a
+                    # live broker order/position.  Resetting to OPEN would
+                    # drop stop/trail protection and permit a resend, so it
+                    # is allowed ONLY when the broker proved flat.  While the
+                    # broker order/position is not terminal, keep the pending
+                    # lifecycle (EXIT_PENDING semantics) and never resend.
+                    if getattr(self, "_broker_truth_flat", False) is True:
+                        logger.warning("[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck for %.0fs. Resetting to OPEN for retry.", self._lifecycle, _release_age)
+                        self._lifecycle = "OPEN"
+                        self._release_ts = None
+                        self._release_mono = 0.0
+                    else:
+                        logger.warning(
+                            "[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck %.0fs "
+                            "but broker order/position still live — keeping "
+                            "pending (no reset, no resend)", self._lifecycle,
+                            _release_age)
+                        self._set_eval(
+                            skip_reason="MTS_RELEASE_PENDING_BROKER_LIVE",
+                            lifecycle=self._lifecycle)
+                        return None
                     # Fall through to continue processing
                 else:
                     self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
@@ -2728,8 +4682,17 @@ class TMFSpread(StrategyBase):
             # 💡 [Fixed 2026-05-27] Re-sync self._trade_id from bar data if missing
             if not self._trade_id:
                 self._trade_id = bar.get("trade_id")
-            
-            return self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
+            _mgmt_result = self._manage_position(near_close, far_close, bar.get("spread_z"), now, bar)
+            # 2026-08-23 Hermes Agent: paper-only HVWAP release wiring. Fires
+            # ONLY when the baseline produced NO exit decision for this tick
+            # (_hvwap_baseline_clear_tick) and the baseline returned no signal
+            # — the candidate can never replace or block stop-loss, Policy J,
+            # emergency exit, timeout, baseline release, or reconciliation.
+            if _mgmt_result is None and getattr(self, "_hvwap_baseline_clear_tick", False):
+                _hvwap_sig = self._hvwap_maybe_paper_release(bar, now, near_close, far_close)
+                if _hvwap_sig is not None:
+                    return _hvwap_sig
+            return _mgmt_result
 
         # ── Staleness gate (only for new entry) ──
         atr = bar.get("atr", 0.0)
@@ -2789,6 +4752,19 @@ class TMFSpread(StrategyBase):
         except Exception:
             pass
 
+        # ── [MAINT-LOCK] Maintenance entry lock (2026-08-05) ──
+        # Blocks NEW ENTRIES only; existing position risk/exit unaffected.
+        # Audited once per 5min (not per tick). Flag read by trading system.
+        if _maintenance_entry_lock_active():
+            _now_l = time.time()
+            if _now_l - float(getattr(self, "_maint_lock_log_ts", 0.0)) > 300.0:
+                self._maint_lock_log_ts = _now_l
+                _append_event("MAINTENANCE_ENTRY_LOCK", trade_id=self._trade_id,
+                              reason="maintenance_entry_lock_active",
+                              phase=str(getattr(self, "_lifecycle", "")))
+            self._set_eval(skip_reason="MAINTENANCE_ENTRY_LOCK")
+            return None
+
         # ── [Fix] Prevent duplicate submissions ──
         if self._lifecycle == "SUBMITTING":
             self._set_eval(skip_reason="ENTRY_ALREADY_SUBMITTED")
@@ -2829,6 +4805,9 @@ class TMFSpread(StrategyBase):
         self._entry_ts = now
         # 2026-05-27 Gemini CLI: Use monotonic time for robust grace period (P2)
         self._entry_time_monotonic = time.monotonic()
+        # 2026-08-04 P0: canonical guard clock (receive epoch at entry)
+        self._entry_guard_start_ms = time.time() * 1000.0
+        self._entry_ts_ms = self._entry_guard_start_ms
         self._near_entry = near_close
         self._far_entry = far_close
         self._near_side = "SHORT" if spread_z_f > 0 else "LONG"
@@ -2842,25 +4821,13 @@ class TMFSpread(StrategyBase):
         # Calculate initial thresholds for state logging
         _init_stop, _init_trail = self._get_thresholds(bar)
 
-        _write_mts_state(
-            has_position=False, action="SUBMITTING", reason=_reason,
-            near_entry=near_close, far_entry=far_close,
-            near_last=near_close, far_last=far_close,
-            near_side=self._near_side, far_side=self._far_side,
-            spread_z=spread_z_f, released_leg=None,
-            release_stop_points=_init_stop,
-            trail_distance_points=_init_trail,
-            trade_id=self._trade_id,
-            # 2026-05-27 Gemini CLI: Pass current ticker to _write_mts_state for dynamic point value
-            ticker=self._ticker,
-            atr=self._last_atr, # 2026-06-26 Gemini CLI: pass current ATR to state writer
-            lifecycle=self._current_lifecycle_state(),
-        )
-        _append_event("ENTRY_SUBMITTED", action=_action, near_side=self._near_side, far_side=self._far_side,
-                       near_entry=near_close, far_entry=far_close, spread_z=spread_z_f,
-                       # 2026-07-16 Gemini CLI: Record indicators for generate_daily_report.py
-                       mtf_score=bar.get("mtf_score"), vwap=bar.get("vwap"),
-                       near_vwap=bar.get("near_vwap"), far_vwap=bar.get("far_vwap"))
+        # Broker-truth boundary: this method only creates a submission intent.
+        # Do not persist leg sides/prices or emit *_SUBMITTED here.  The
+        # monitor emits submission telemetry only after the broker gateway
+        # accepts the order; confirmed fills then call sync_position(), which
+        # is the owner of durable open-position state.  In particular, a
+        # rejected/quarantined entry must not resurrect stale near_side/far_side
+        # on the next release evaluation.
         
         # [Fix] Fill log moved to sync_position for true deferred sync
         # _append_fill(...) - removed from here
@@ -3004,6 +4971,10 @@ class TMFSpread(StrategyBase):
         # 2026-06-30 Gemini CLI: Expected behavior: Bypass time/tick confirmation checks during backtesting because backtests run instantly and monotonic time does not advance.
         _is_backtest = os.getenv("MTS_BACKTEST") == "1"
         """Manage existing spread position — release check + trailing exit."""
+        # 2026-08-23 Hermes Agent: HVWAP candidate release wiring — reset the
+        # baseline-clear marker; set True only after the lifecycle adapter
+        # evaluated with NO exit decision for this tick (see on_bar hook).
+        self._hvwap_baseline_clear_tick = False
         # 2026-05-27 Gemini CLI: Order in-flight guard (Contract 3)
         if self._lifecycle == "EXITING":
             self._set_eval(skip_reason="EXIT_ALREADY_SUBMITTED")
@@ -3015,7 +4986,9 @@ class TMFSpread(StrategyBase):
         if self._lifecycle_oca and self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
             # Sync legacy _lifecycle string for compat
             self._lifecycle = f"TRAILING_{self._side}"
-            if self._single_leg_post_fill_ticks < self._single_leg_warmup_ticks:
+            _pticks = getattr(self, "_single_leg_post_fill_ticks", 0)
+            _wticks = getattr(self, "_single_leg_warmup_ticks", 2)
+            if isinstance(_pticks, (int, float)) and isinstance(_wticks, (int, float)) and _pticks < _wticks:
                 if not _is_backtest:
                     self._single_leg_post_fill_ticks += 1
                 else:
@@ -3033,37 +5006,52 @@ class TMFSpread(StrategyBase):
                         self._single_leg_post_fill_ticks += 1
                         self._single_leg_last_tick_ts = _ts_float
 
-        # -- P0 Fix: Trail anchor re-anchor gate (2026-07-24) --
-        # After restart recovery, _trail_anchor_status may be PENDING_REANCHOR.
-        # Wait for a fresh remaining-leg tick before allowing trail evaluation.
+        # ── RESTART_BASELINE (bounded slice 2026-08-18) ──
+        # 重啟後的單腿 trail anchor 只能由「broker 確認的單腿 + 剩餘腿的
+        # fresh BBO + 同 trading session」建立; baseline 只是 trailing
+        # protection metadata, 永不寫入 avg_cost / UPL / Policy-J /
+        # two-leg entry time。任何輸入 missing / stale / session mismatch
+        # → fail-closed, 維持 PENDING_REANCHOR。
         if self._trail_anchor_status == TrailAnchorStatus.PENDING_REANCHOR:
-            _rem_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
-            _rem_price = far_close if _rem_leg == Leg.FAR else near_close
-            _fresh = (
-                _rem_price > 0
-                and not (hasattr(_rem_price, "item") and pd.isna(_rem_price))
-            )
-            if _fresh:
-                self._set_single_leg_extrema(peak=_rem_price, nadir=_rem_price)
-                self._single_leg_anchor_price = _rem_price
-                self._single_leg_anchor_event_time_ns = time.monotonic_ns()
-                self._trail_anchor_status = TrailAnchorStatus.READY
-                self._trail_warmup_tick_count = 0
-                self._trail_started_at = None
-                self._trail_anchor_source = "FIRST_FRESH_QUOTE"
-                self._set_eval(skip_reason="TRAIL_REANCHOR_INITIALIZED")
-                logger.info(
-                    "[MTS_REANCHOR] status=READY side=%s anchor=%.2f leg=%s",
-                    self._side, _rem_price, _rem_leg.value,
-                )
+            # released_leg 缺失時無法推導剩餘腿 — 預設 NEAR 會造成跨腿污染
+            if self._released_leg not in ("near", "far"):
+                self._set_eval(skip_reason="TRAIL_REANCHOR_NOT_SINGLE_LEG")
                 return None
-            else:
-                self._set_eval(skip_reason="TRAIL_REANCHOR_WAITING_FRESH_QUOTE")
+            _rem_leg = Leg.FAR if self._released_leg == "near" else Leg.NEAR
+            # broker/fills truth 確認持倉存在 (_broker_truth_flat is False)
+            if getattr(self, "_broker_truth_flat", False) is True:
+                self._set_eval(skip_reason="TRAIL_REANCHOR_NOT_BROKER_CONFIRMED")
                 logger.info(
-                    "[MTS_REANCHOR] status=PENDING_REANCHOR no_fresh_quote side=%s",
+                    "[MTS_REANCHOR] status=PENDING_REANCHOR reason=NOT_BROKER_CONFIRMED side=%s",
                     self._side,
                 )
                 return None
+            _anchor, _reason = _restart_baseline_quote(
+                bar,
+                rem_leg=_rem_leg,
+                position_session_type=getattr(self, "_position_session_type", None),
+                max_quote_age_ms=float(getattr(self, "_max_quote_age_ms", 0.0) or 0.0),
+            )
+            if _anchor is None:
+                self._set_eval(skip_reason=_reason)
+                logger.info(
+                    "[MTS_REANCHOR] status=PENDING_REANCHOR reason=%s side=%s",
+                    _reason, self._side,
+                )
+                return None
+            self._set_single_leg_extrema(peak=_anchor, nadir=_anchor)
+            self._single_leg_anchor_price = _anchor
+            self._single_leg_anchor_event_time_ns = time.monotonic_ns()
+            self._trail_anchor_status = TrailAnchorStatus.READY
+            self._trail_warmup_tick_count = 0
+            self._trail_started_at = None
+            self._trail_anchor_source = "RESTART_BASELINE_FRESH_BBO"
+            self._set_eval(skip_reason="TRAIL_REANCHOR_INITIALIZED")
+            logger.info(
+                "[MTS_REANCHOR] status=READY side=%s anchor=%.2f leg=%s source=RESTART_BASELINE_FRESH_BBO",
+                self._side, _anchor, _rem_leg.value,
+            )
+            return None
 
         # 2026-06-26 Gemini CLI: build dynamic risk metadata
         _risk_meta = self._get_risk_meta(bar)
@@ -3142,36 +5130,72 @@ class TMFSpread(StrategyBase):
                     _rem_low = float(bar.get("near_low", 0))
             else:
                 _rem_high = _rem_low = 0.0
-            # ── P0: Policy J Entry-Initialization Peak Warmup Gate ──
-            # Do not update peak until position is fully established
-            # and warmup period has elapsed. Prevents transient valuation
-            # during two-leg entry from contaminating peak tracking.
-            _ce_eligible = False
-            _warmup_ms = float(self._params.get("policy_j_entry_warmup_ms", 3000.0))
-            _phase = self._lifecycle_oca.phase if self._lifecycle_oca else None
-            _both_legs_open = (getattr(self, "_near_open_qty", 0) > 0
-                              and getattr(self, "_far_open_qty", 0) > 0)
-            if _phase == PositionPhase.SPREAD and _both_legs_open:
-                if self._entry_established_at is None:
-                    self._entry_established_at = time.time()
-                _elapsed_ms = (time.time() - self._entry_established_at) * 1000.0
-                if _elapsed_ms >= _warmup_ms:
-                    _ce_eligible = True
-            elif _phase == PositionPhase.SINGLE_LEG:
-                # Single-leg: peak is always eligible (entry already established)
-                _ce_eligible = True
-            
-            _current_net_exit_twd = float(current_pnl * 10.0 - 92.0)
-            if _ce_eligible:
-                if not hasattr(self, "_peak_net_exit_pnl_twd") or self._peak_net_exit_pnl_twd is None:
-                    self._peak_net_exit_pnl_twd = 0.0
-                if _current_net_exit_twd > self._peak_net_exit_pnl_twd:
-                    self._peak_net_exit_pnl_twd = _current_net_exit_twd
+            # ── Track Peak Net Exit PnL TWD for Policy J Live Combined Exit ──
+            # 2026-07-31 Hermes Agent: Item 3 — only update combined peak in SPREAD phase.
+            # In SINGLE_LEG the combined peak is frozen; single-leg PnL must NOT
+            # re-inflate it (observed 434668 -> 434738 after leg release).
+            _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+            # 2026-08-03 Policy J Peak Spike Validation hotfix (Hermes):
+            # candidate-confirmed durable peak; entry gate; spike quarantine.
+            _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
+            if _lc_phase in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
+                # 2026-08-04 P0: canonical guard clock — receive-epoch ms via
+                # time.time()*1000 (same domain as entry settled / lifecycle).
+                # NEVER derive now from bar timestamp .timestamp() (mixed
+                # naive/aware semantics caused the 8h phantom elapsed).
+                try:
+                    _now_ms = time.time() * 1000.0
+                except Exception:
+                    _now_ms = 0.0
+                _entry_ts_ms = 0.0
+                _g = getattr(self, "_entry_guard_start_ms", 0.0) or 0.0
+                if _g > 0.0:
+                    _entry_ts_ms = float(_g)
+                elif getattr(self, "_entry_ts_ms", 0.0) or 0.0 > 0.0:
+                    _entry_ts_ms = float(getattr(self, "_entry_ts_ms", 0.0) or 0.0)
+                elif getattr(self, "_entry_ts", None):
+                    # legacy fallback: epoch from naive Taipei ISO (documented)
+                    try:
+                        _entry_ts_ms = iso_to_epoch_ms(self._entry_ts.isoformat())
+                    except Exception:
+                        _entry_ts_ms = 0.0
+                _pj_ok = self._update_policy_j_peak(
+                    current_pnl, near_close, far_close,
+                    now_ms=_now_ms, mark_age_ms=float(bar.get("quote_age_ms") or 0.0),
+                    pair_skew_ms=float(bar.get("pair_skew_ms") or 0.0),
+                    entry_ts_ms=_entry_ts_ms, phase=str(_lc_phase))
+                # durable peak (confirmed) is the Policy J reference
+                if self._pj_durable_peak is not None:
+                    self._peak_net_exit_pnl_twd = self._pj_durable_peak
+
+            # Auto-repair stale lifecycle phase if state has_position=True but phase is FLAT
+            if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca.phase == PositionPhase.FLAT:
+                if self._released_leg is None:
+                    self._lifecycle_oca.phase = PositionPhase.SPREAD
+                    self._lifecycle_oca.release_group.status = ReleaseGroupStatus.ARMED
+                    logger.warning("[MTS_REPAIR] has_position=True but phase was FLAT -> Repaired to SPREAD")
+                else:
+                    self._lifecycle_oca.phase = PositionPhase.SINGLE_LEG
+                    self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
+                    logger.warning("[MTS_REPAIR] has_position=True but phase was FLAT -> Repaired to SINGLE_LEG")
 
             # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
             from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
+            _trend_enabled, _trend_snap = self._build_trend_release_input()
+            _trend_reversal_snap = self._build_trend_reversal_input()
+            # 2026-08-26 Hermes Agent: paper-only ATR-release trend gate —
+            # computed here (monitor-injected mode + live flag + env) and
+            # surfaced into the adapter context as a pure boolean.
+            _atr_gate_on, _atr_gate_reason = self._mts_atr_release_trend_gate()
             _adapter_input = LifecycleEvaluationInput(
                 strategy_state={
+                    "policy_j_guard_just_completed": bool(getattr(self, "_pj_guard_just_completed", False)),
+                    # 2026-09-29 Hermes Agent: mark freshness for the intercept
+                    # gate. Unknown provenance (paper/backtest) stays permissive.
+                    "marks_live": (
+                        str(bar.get("near_price_source") or "") != "BAR_CLOSE"
+                        and str(bar.get("far_price_source") or "") != "BAR_CLOSE"
+                    ),
                     "near_pnl_pts": _n_pnl,
                     "far_pnl_pts": _f_pnl,
                     "floating_pnl_pts": current_pnl,
@@ -3190,6 +5214,10 @@ class TMFSpread(StrategyBase):
                     "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
                     "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+                    "trend_release_enabled": (_trend_enabled, _trend_snap)[0],
+                    "trend_confirmed": (_trend_enabled, _trend_snap)[1],
+                    "trend_reversal_confirmed": _trend_reversal_snap,
+                    "release_trend_gate_enabled": _atr_gate_on,
                     "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
                     "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
                 },
@@ -3202,50 +5230,15 @@ class TMFSpread(StrategyBase):
                 execution_mode="BACKTEST" if _is_backtest else "LIVE",
             )
             self._ensure_lifecycle_adapter_initialized("LATE_INIT")
+            if getattr(self, "_pj_guard_just_completed", False):
+                self._pj_guard_just_completed = False  # consumed once
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
-
-            # P1: Write Policy J evaluator snapshot for Dashboard (fail-open)
-            try:
-                import json as _pj_json
-                _snap = {
-                    "snapshot_id": getattr(self, "_last_applied_event_time", datetime.now()).isoformat() if hasattr(datetime, "isoformat") else str(datetime.now()),
-                    "trade_id": getattr(self, "_trade_id", ""),
-                    "event_time": now.isoformat(),
-                    "processed_at": datetime.now().isoformat(),
-                    "lifecycle_phase": str(self._lifecycle_oca.phase.value) if self._lifecycle_oca and hasattr(self._lifecycle_oca.phase, "value") else "",
-                    "entry_fully_established": _both_legs_open if "_both_legs_open" in dir() else False,
-                    "warmup_complete": _ce_eligible if "_ce_eligible" in dir() else False,
-                    "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
-                    "current_net_exit_twd": _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0,
-                    "activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
-                    "giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
-                    "exit_line_twd": max(0.0, getattr(self, "_peak_net_exit_pnl_twd", 0.0) - float(self._params.get("combined_upl_giveback_twd", 100.0))),
-                    "enabled": self._params.get("enable_combined_upl_trail", False),
-                    "eligible": _ce_eligible if "_ce_eligible" in dir() else False,
-                    "activated": getattr(self, "_peak_net_exit_pnl_twd", 0.0) >= float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
-                    "would_trigger": False,
-                    "giveback_trigger": False,
-                    "decision": str(_decision.action.value) if _decision and hasattr(_decision.action, "value") else ("COMBINED_EXIT" if _decision and _decision.action == LifecycleAction.COMBINED_EXIT else str(_decision.action) if _decision else "NONE"),
-                }
-                _net = getattr(self, "_peak_net_exit_pnl_twd", 0.0) - float(self._params.get("combined_upl_giveback_twd", 100.0))
-                _curr = _current_net_exit_twd if "_current_net_exit_twd" in dir() else 0.0
-                if _net > 0 and _curr < _net:
-                    _snap["giveback_trigger"] = True
-                    _snap["would_trigger"] = True
-                    _snap["trigger_reason"] = "GIVEBACK"
-                elif _snap["activated"] and _snap["eligible"]:
-                    _snap["would_trigger"] = True
-                    _snap["trigger_reason"] = "ACTIVATION"
-                _snap["exit_line_twd"] = max(0.0, _net)
-                _tmp = "/tmp/policy_j_snapshot.json"
-                _tmp2 = _tmp + ".tmp"
-                with open(_tmp2, "w") as _pjf:
-                    _pj_json.dump(_snap, _pjf, default=str, indent=2)
-                import os as _pj_os
-                _pj_os.replace(_tmp2, _tmp)
-            except Exception:
-                pass
+            # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
+            # baseline-clear marker: the candidate may act only when the
+            # baseline lifecycle evaluation produced NO exit decision (risk
+            # exits / Policy J / timeout / release all take precedence).
+            self._hvwap_baseline_clear_tick = (_decision is None)
 
             # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
             if getattr(self, "_soak_collector", None) is not None:
@@ -3305,11 +5298,16 @@ class TMFSpread(StrategyBase):
                     }), file=_sys.stderr)
 
             # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
+            # 2026-08-26 Hermes Agent: the paper-only ATR-release trend gate
+            # deliberately suppresses RELEASE when no valid/matching trend
+            # snapshot exists — decision=None on an ATR stop hit is then the
+            # expected gate outcome, not a regression.
             if (
                 _decision is None
                 and self._lifecycle_oca.phase == PositionPhase.SPREAD
                 and self._lifecycle_oca.release_group.status == ReleaseGroupStatus.ARMED
                 and (_n_pnl <= -_release_stop or _f_pnl <= -_release_stop)
+                and not _atr_gate_on
             ):
                 logger.error(
                     "[MTS_RELEASE_DECISION_INVARIANT_VIOLATION] far_hit/near_hit is True but evaluate_lifecycle_actions returned None — P0"
@@ -3333,7 +5331,7 @@ class TMFSpread(StrategyBase):
             if self._release_pending_mono <= 0:
                 self._release_pending_mono = time.monotonic()
                 logger.info("[MTS_ACTION_TIMEOUT_STATE] action=RELEASE event=TIMER_START")
-        elif _active_action == LifecycleAction.TRAIL:
+        elif _active_action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
             # TRAIL: only legal in SINGLE_LEG with confirmed fill
             _rg = self._lifecycle_oca.release_group
             if self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG and _rg.status in (
@@ -3379,7 +5377,7 @@ class TMFSpread(StrategyBase):
             if _decision.action == LifecycleAction.RELEASE:
                 _target_leg = _decision.release_leg
                 _target_age = near_age if _target_leg == Leg.NEAR else far_age
-            elif _decision.action == LifecycleAction.TRAIL:
+            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
                 _rel = self._lifecycle_oca.release_group.filled_leg
                 if _rel is None and self._released_leg:
                     _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
@@ -3418,7 +5416,7 @@ class TMFSpread(StrategyBase):
                 _loss = abs(_n_pnl) if _rel_leg == Leg.NEAR else abs(_f_pnl)
                 if _loss > _release_stop * _mult:
                     _risk_escalated = True
-            elif _decision.action == LifecycleAction.TRAIL:
+            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
                 _rel = self._lifecycle_oca.release_group.filled_leg
                 if _rel is None and self._released_leg:
                     _rel = Leg.FAR if self._released_leg == "far" else Leg.NEAR
@@ -3451,7 +5449,10 @@ class TMFSpread(StrategyBase):
                 logger.warning("[MTS_QUOTE_GUARD_BYPASS] reason=%s action=%s age=%.0f ms", 
                                _reason_str, _decision.action.name, quote_age_ms)
 
-        if quote_age_ms > self._max_quote_age_ms and not _bypass_quote_guard:
+        # 2026-10-12 Codex: PAPER cannot manufacture a stale emergency fill.
+        _paper_exit_policy = (getattr(self, "_hvwap_execution_mode", None) == "paper_active"
+                              and not getattr(self, "_hvwap_live_order_allowed", False))
+        if quote_age_ms > self._max_quote_age_ms and (_paper_exit_policy or not _bypass_quote_guard):
             self._set_eval(skip_reason="STALE_QUOTE_AGE", age=quote_age_ms)
             logger.warning("[MTS_RELEASE_BLOCKED] reason=STALE_QUOTE_AGE age=%.0f/%s", quote_age_ms, self._max_quote_age_ms)
             return None
@@ -3461,12 +5462,98 @@ class TMFSpread(StrategyBase):
         near_ask = bar.get("near_ask", near_close)
         far_bid = bar.get("far_bid", far_close)
         far_ask = bar.get("far_ask", far_close)
+        # A release leg can be identified from the current risk evaluation
+        # before the quote-width gate.  This matters after broker hydration
+        # or restart recovery, where the lifecycle adapter may not yet have
+        # materialized a RELEASE decision for the current bar.  Do not let a
+        # wide *other* leg suppress an already breached single-leg release.
+        _candidate_release_leg = None
+        if _decision is None:
+            try:
+                _release_stop_probe, _trail_probe, _ = self._evaluate_risk(
+                    near_close, far_close, current_pnl, bar)
+                _near_hit_probe = self._pnl_near(near_close) <= -_release_stop_probe
+                _far_hit_probe = self._pnl_far(far_close) <= -_release_stop_probe
+                _phase_probe = getattr(self._lifecycle_oca, "phase", None)
+                _rg_probe = getattr(self._lifecycle_oca, "release_group", None)
+                _armed_probe = str(getattr(getattr(_rg_probe, "status", None),
+                                           "value", "")) == "ARMED"
+                if _phase_probe == PositionPhase.SPREAD and _armed_probe:
+                    if _near_hit_probe and not _far_hit_probe:
+                        _candidate_release_leg = Leg.NEAR
+                    elif _far_hit_probe and not _near_hit_probe:
+                        _candidate_release_leg = Leg.FAR
+            except Exception:
+                _candidate_release_leg = None
+        # [P0b] LEG-SCOPED width gate (aligns with the decoupled leg
+        # freshness check): a single-leg RELEASE only crosses the
+        # released leg's spread — a wide quote on the OTHER leg must not
+        # block it.  The default (no release / non-RELEASE decision)
+        # keeps checking BOTH legs (conservative).
+        _rel_leg = None
+        if _decision is not None and _decision.action == LifecycleAction.RELEASE:
+            _rel_leg = _decision.release_leg
+        elif _candidate_release_leg is not None:
+            _rel_leg = _candidate_release_leg
+        _check_near = _rel_leg is None or _rel_leg == Leg.NEAR
+        _check_far = _rel_leg is None or _rel_leg == Leg.FAR
+
+        # [P0c2] QUOTE VALIDITY — BEFORE the width arithmetic.  Any raw
+        # bid/ask (present keys, either leg) that would corrupt the
+        # arithmetic — None / str / bool / non-numeric / NaN / ±Inf —
+        # blocks with QUOTE_INVALID (never a TypeError).  A SINGLE-LEG
+        # RELEASE additionally requires the RELEASED leg's quote to be
+        # present (no fallback-to-close), positive and non-inverted, so
+        # a missing/zero/inverted quote is never read as a "0-point
+        # width" that wrongly passes the close.  The default (both-leg)
+        # path keeps the conservative WIDTH check only (pre-existing
+        # semantics; a missing key falls back to the close safely).
+        _quote_ok = True
+        for _label, _bkey, _akey in (("NEAR", "near_bid", "near_ask"),
+                                     ("FAR", "far_bid", "far_ask")):
+            _b = bar.get(_bkey)
+            _a = bar.get(_akey)
+            _key_present = _bkey in bar or _akey in bar
+            _strict_numeric = (isinstance(_b, (int, float))
+                               and not isinstance(_b, bool)
+                               and isinstance(_a, (int, float))
+                               and not isinstance(_a, bool)
+                               and _b == _b and _a == _a  # NaN
+                               and abs(_b) != float("inf")
+                               and abs(_a) != float("inf"))
+            if _key_present and not _strict_numeric:
+                _quote_ok = False
+                break
+            if _rel_leg is not None or _paper_exit_policy:
+                _rel = (_label == "NEAR" and _rel_leg == Leg.NEAR) or (
+                    _label == "FAR" and _rel_leg == Leg.FAR)
+                if _rel_leg is not None and not _rel:
+                    continue
+                if (not _key_present
+                        or not _strict_numeric
+                        or _b <= 0 or _a <= 0 or _a < _b):
+                    _quote_ok = False
+                    break
+        if not _quote_ok:
+            self._set_eval(
+                skip_reason="QUOTE_INVALID",
+                near_bid=bar.get("near_bid"), near_ask=bar.get("near_ask"),
+                far_bid=bar.get("far_bid"), far_ask=bar.get("far_ask"))
+            logger.warning(
+                "[MTS_RELEASE_BLOCKED] reason=QUOTE_INVALID "
+                "near=%r/%r far=%r/%r",
+                bar.get("near_bid"), bar.get("near_ask"),
+                bar.get("far_bid"), bar.get("far_ask"))
+            return None
+
         near_width = near_ask - near_bid
         far_width = far_ask - far_bid
 
-        if near_width > self._max_spread_width or far_width > self._max_spread_width:
+        _exit_width_limit = self._exit_spread_width_limit()
+        if ((_check_near and near_width > _exit_width_limit)
+                or (_check_far and far_width > _exit_width_limit)):
             self._set_eval(skip_reason="WIDE_SPREAD_WIDTH", near_width=near_width, far_width=far_width)
-            logger.warning("[MTS_RELEASE_BLOCKED] reason=WIDE_SPREAD_WIDTH near=%.1f far=%.1f max=%.1f", near_width, far_width, self._max_spread_width)
+            logger.warning("[MTS_RELEASE_BLOCKED] reason=WIDE_SPREAD_WIDTH near=%.1f far=%.1f max=%.1f", near_width, far_width, _exit_width_limit)
             return None
 
         # Dynamic thresholds
@@ -3584,6 +5671,7 @@ class TMFSpread(StrategyBase):
                 total_upl=_total_upl,
                 atr=float(bar.get("atr", 0.0) or 0.0),
                 quote_age_ms=quote_age_ms,
+                spread_z=spread_z,  # 2026-10-08 Codex: propagate the actual current mark.
             )
 
         # 2026-07-09 Hermes Agent: release diagnostic eval — fires whenever a leg is at threshold
@@ -3661,46 +5749,11 @@ class TMFSpread(StrategyBase):
                 self._lifecycle = f"RELEASE_{_release_leg.value}"
                 self._release_ts = now
                 self._release_mono = time.monotonic()
-                self._released_leg = _rel_leg_str
+                # released_leg is the FILL-confirmation marker, set only by
+                # sync_release/_enter_single_leg_after_release_fill on
+                # LEG_FILLED.  The trigger must NOT mark it (would hide the
+                # leg's inventory before the broker confirms the fill).
                 self._release_price = _exit_price
-                
-                # 2026-07-28 Gemini CLI: Phase 1B experiment instrumentation
-                if self._release_event_id_observed is None:
-                    import uuid
-                    _rid = uuid.uuid4().hex[:20]
-                    self._release_event_id_observed = _rid
-                    try:
-                        observe_release_decision(
-                            trade_id=self._trade_id or "",
-                            release_leg=_release_leg.value.upper(),
-                            release_reason=_signal_reason,
-                            release_event_id=_rid,
-                            position_direction="WIDE" if self._near_side == "SHORT" else "NARROW",
-                            near_entry=self._near_entry,
-                            far_entry=self._far_entry,
-                            near_side=self._near_side or "",
-                            far_side=self._far_side or "",
-                            near_bid=near_close,
-                            near_ask=far_close,
-                            near_last=near_close,
-                            far_bid=far_close,
-                            far_ask=far_close,
-                            far_last=far_close,
-                            near_quote_age_ms=0,
-                            far_quote_age_ms=0,
-                            spread_value=near_close - far_close,
-                            spread_z=_risk_meta.get("spread_z"),
-                            atr=_risk_meta.get("atr"),
-                            stop_mult=_risk_meta.get("stop_mult"),
-                            trail_mult=_risk_meta.get("trail_mult"),
-                            release_price=_exit_price,
-                        )
-                    except Exception:
-                        import logging
-                        logging.getLogger(__name__).exception(
-                            "[COMBINED_EXIT_EXPERIMENT_HOOK_FAILED] trade_id=%s release_leg=%s",
-                            self._trade_id, _release_leg.value,
-                        )
                 
                 # 2026-07-14 Gemini CLI: Reset shadow tracking variables on leg release
                 self._shadow_exit_triggered = False
@@ -3716,20 +5769,48 @@ class TMFSpread(StrategyBase):
                 _anchor = far_close if _release_leg == Leg.NEAR else near_close
                 if _anchor > 0:
                     self._post_release_anchor_price = _anchor
-                    _append_event("POST_RELEASE_ANCHOR_SET", remaining_leg="FAR" if _release_leg == Leg.NEAR else "NEAR", anchor_price=_anchor)
+                    # 2026-07-31 Hermes Agent: reset remaining-leg trail extrema to
+                    # the release anchor. Previously _single_leg_nadir kept the
+                    # entry-time extreme (e.g. 43600), so any bounce past
+                    # nadir+trail_dist after release fired TRAIL exit within 1s
+                    # (observed 11:46:21 release -> 11:46:22 exit, ~151 pts
+                    # giveback). Post-release trail must restart from anchor.
+                    _rem_leg_s = "FAR" if _release_leg == Leg.NEAR else "NEAR"
+                    if self._side == "LONG":
+                        self._set_single_leg_extrema(peak=_anchor, nadir=self._single_leg_nadir)
+                    else:  # SHORT remaining leg
+                        self._set_single_leg_extrema(peak=self._single_leg_peak, nadir=_anchor)
+                    _append_event(
+                        "POST_RELEASE_TRAIL_RESET",
+                        remaining_leg=_rem_leg_s,
+                        anchor_price=_anchor,
+                        old_nadir=self._single_leg_nadir,
+                    )
+                    _append_event("POST_RELEASE_ANCHOR_SET", remaining_leg=_rem_leg_s, anchor_price=_anchor)
                 # MFE/MAE
                 _mfe = (self._near_max - self._near_entry) if self._near_side == "LONG" else (self._near_entry - self._near_min)
                 _mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
                 self._log_exit_decision(exit_reason="RELEASE_STOP", pnl=_pnl_pts, bar=bar)
                 _risk_meta["mtf_score"] = self._mtf_score_at_release
-                _append_event(f"RELEASE_{_release_leg.value}_SUBMITTED", released_leg=_release_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, mfe=round(_mfe,2), mae=round(_mae,2), **_risk_meta)
-                # 2026-07-09 Hermes Agent: P0 — commit lifecycle state NOW, after all
-                # pre-order guards (tick confirmation, BB filter) have passed.
-                _commit_action(self._lifecycle_oca, _decision)
+                # Broker-truth boundary: lifecycle/state and *_SUBMITTED
+                # telemetry are committed by monitor.py only after the
+                # gateway accepts the release order.  A blocked release must
+                # leave no leg-bearing state behind.
                 logger.warning("[LIFECYCLE_DECISION] action=%s release_leg=%s", _decision.action, _decision.release_leg)
-                _write_mts_state(has_position=True, action=f"RELEASE_{_release_leg.value}", reason=f"{_release_leg.value}_pnl={_pnl_pts:.1f}", near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, near_status="RELEASED" if _release_leg == Leg.NEAR else "OPEN", far_status="RELEASED" if _release_leg == Leg.FAR else "OPEN", near_realized_override=_realized if _release_leg == Leg.NEAR else None, far_realized_override=_realized if _release_leg == Leg.FAR else None, spread_z=spread_z, released_leg=_rel_leg_str, release_price=_exit_price, release_stop_points=int(release_stop), trail_distance_points=int(trail_dist), trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
+                # P1-B durable-exit-intent: a release STARTS the exit sequence —
+                # persist the intent for the REMAINING leg before emitting
+                try:
+                    _ilog = _exit_intent_log()
+                    _rem_leg_s = "FAR" if _release_leg == Leg.NEAR else "NEAR"
+                    if _p1b_exit_submitted(_ilog, getattr(self, "_trade_id", ""), [_rem_leg_s]):
+                        logger.info("[P1B_GATE] exit already submitted for %s — suppressing release re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
+                except Exception:
+                    pass  # intent log unavailable → legacy behavior
                 return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
-            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
+            elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
                 # ── ADR-011 Phase 4: Post-fill warmup guard ──
                 # Blocks TRAIL if warmup (500ms / 2 ticks) hasn't completed.
                 # Prevents immediate EXIT triggered by stale pre-fill prices or
@@ -3769,6 +5850,66 @@ class TMFSpread(StrategyBase):
                 _turnover = (_rem_entry + _exit_price) * _mult
                 _cost = 40.0 + _turnover * 2e-5
                 _realized = _pnl_pts * _mult - _cost
+                # P0-1 (codex): Policy-J durable event + intent gate BEFORE
+                # any EXIT_REMAINING / EXIT_* state / shadow-exit mutation —
+                # an append failure must leave NO false "exited" records
+                _ilog = None
+                try:
+                    _ilog = _exit_intent_log()
+                    _rem_name = _rem_leg.value if hasattr(_rem_leg, "value") else str(_rem_leg)
+                    _rem_leg_s = str(_rem_name).upper()
+                    if _p1b_exit_submitted(_ilog, getattr(self, "_trade_id", ""), [_rem_leg_s]):
+                        logger.info("[P1B_GATE] exit already submitted for %s — suppressing re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
+                except Exception:
+                    pass  # intent log unavailable → legacy behavior
+                _pj_event = None
+                if getattr(_decision, "winner", None) == "POLICY_J_SINGLE_LEG":
+                    try:
+                        _rel_leg_s = str(getattr(self, "_released_leg", "") or "")
+                        _rel_realized = getattr(self, f"_{_rel_leg_s}_realized_override", None)
+                        if _rel_realized is None:
+                            _rel_entry = self._near_entry if _rel_leg_s == "near" else self._far_entry
+                            _rel_side = self._near_side if _rel_leg_s == "near" else self._far_side
+                            _rel_px = float(getattr(self, "_release_price", _rel_entry) or _rel_entry)
+                            _rel_realized = ((_rel_px - _rel_entry) if _rel_side == "LONG"
+                                             else (_rel_entry - _rel_px)) * _mult
+                        _remaining_upl = _pnl_pts * _mult
+                        _current_net = (_rel_realized + _remaining_upl
+                                        - float(getattr(self, "_estimated_cost", 92.0)))
+                        _pj_fields = dict(
+                            trade_id=getattr(self, "_trade_id", ""),
+                            released_leg=_rel_leg_s,
+                            remaining_leg=_rem_leg.value,
+                            released_realized_pnl_twd=round(float(_rel_realized), 2),
+                            remaining_upl_twd=round(float(_remaining_upl), 2),
+                            current_net_exit_pnl_twd=round(float(_current_net), 2),
+                            peak_net_exit_pnl_twd=round(float(getattr(self, "_peak_net_exit_pnl_twd", 0.0) or 0.0), 2),
+                            activation_twd=float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
+                            giveback_twd=float(self._params.get("combined_upl_giveback_twd", 100.0)),
+                            winner="POLICY_J_SINGLE_LEG",
+                            action="EXIT",
+                            reason=f"TMF_{_exit_reason}",
+                        )
+                        _iid_for_ev = None
+                        for _i in _ilog.list_active():
+                            if _ilog.get(_i).get("trade_id") == getattr(self, "_trade_id", ""):
+                                _iid_for_ev = _i
+                                break
+                        if _iid_for_ev is None:
+                            _iid_for_ev = _ilog.create(getattr(self, "_trade_id", ""),
+                                                       "COMBINED_EXIT", leg=_rem_leg_s)
+                        _pj_event = _ilog.append_event(
+                            _iid_for_ev, "POLICY_J_SINGLE_LEG_TRIGGERED", **_pj_fields)
+                        # P1 (codex): persist the correlation on the strategy so
+                        # the confirmed-fill settlement record carries it
+                        self._pj_exit_event_id = _pj_event["event_id"]
+                        self._pj_exit_winner = "POLICY_J_SINGLE_LEG"
+                    except Exception:
+                        logger.error("[P1B_POLICY_J_EVENT_FAILED] fail-closed — suppressing emission", exc_info=True)
+                        return None
                 self._lifecycle = "EXITING"
                 self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
 
@@ -3776,7 +5917,8 @@ class TMFSpread(StrategyBase):
                 _peak_or_nadir = self._peak if _rem_side == "LONG" else self._nadir
                 _retracement = (_peak_or_nadir - _exit_price) if _rem_side == "LONG" else (_exit_price - _peak_or_nadir)
                 _warmup_elapsed = round((time.monotonic() - self._single_leg_entered_mono) * 1000.0, 1) if self._single_leg_entered_mono > 0 else 0.0
-                _warmup_ticks = int(self._single_leg_post_fill_ticks)
+                _pt = getattr(self, "_single_leg_post_fill_ticks", 0)
+                _warmup_ticks = int(_pt) if isinstance(_pt, (int, float)) else 0
                 
                 self._risk_mode_at_exit = _risk_meta.get("risk_mode", "FIXED_FALLBACK")
                 _risk_meta["risk_mode_at_exit"] = self._risk_mode_at_exit
@@ -3790,16 +5932,65 @@ class TMFSpread(StrategyBase):
                 _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
                 _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
                 self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
-                return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0)
+                return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0,
+                              event_id=_pj_event["event_id"] if _pj_event else "",
+                              winner="POLICY_J_SINGLE_LEG" if _pj_event else "")
             elif _decision.action == LifecycleAction.COMBINED_EXIT:
                 _exit_reason = "COMBINED_EXIT"
                 logger.info("[POLICY_J_LIVE_TRIGGERED] Executing COMBINED_EXIT (SPREAD -> FLAT)")
                 self._lifecycle = "EXITING"
                 self._log_exit_decision(exit_reason=_exit_reason, pnl=current_pnl, bar=bar)
-                _append_event("COMBINED_EXIT_SUBMITTED", exit_reason=_exit_reason, gross_points=current_pnl, **_risk_meta)
+                self._combined_exit_in_flight = True
+                # Persist the actual Policy J decision evidence.  Without this,
+                # replay cannot distinguish a confirmed giveback from a rejected
+                # transient quote spike.
+                _pj_peak = getattr(self, "_peak_net_exit_pnl_twd", None)
+                _pj_current = float(current_pnl) * float(_mult) - float(getattr(self, "_estimated_cost", 92.0))
+                _pj_activation = float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0))
+                _pj_giveback = float(self._params.get("combined_upl_giveback_twd", 100.0))
+                _pj_trigger_path = getattr(_decision, "winner", None) or "POLICY_J_SPREAD_GIVEBACK"
+                # Durable event counterpart to the logger-only marker.  The
+                # winner is assigned by the pure lifecycle adapter enum path;
+                # report/replay must not infer it from PnL after the fact.
+                _append_event(
+                    "POLICY_J_LIVE_TRIGGERED",
+                    trade_id=self._trade_id,
+                    trigger_path=_pj_trigger_path,
+                    action="COMBINED_EXIT",
+                    phase="SPREAD",
+                    current_net_exit_pnl_twd=round(_pj_current, 2),
+                    peak_net_exit_pnl_twd=(round(float(_pj_peak), 2)
+                                           if _pj_peak is not None else None),
+                )
+                _append_event(
+                    "COMBINED_EXIT_SUBMITTED",
+                    trade_id=self._trade_id,
+                    exit_reason=_exit_reason,
+                    policy_j_trigger_path=_pj_trigger_path,
+                    gross_points=current_pnl,
+                    policy_j_durable_peak_twd=_pj_peak,
+                    policy_j_current_net_twd=_pj_current,
+                    policy_j_activation_twd=_pj_activation,
+                    policy_j_giveback_twd=_pj_giveback,
+                    policy_j_drawdown_twd=(float(_pj_peak) - _pj_current) if _pj_peak is not None else None,
+                    policy_j_peak_confirmed=bool(getattr(self, "_pj_durable_peak", None) is not None),
+                    policy_j_candidate_pending=bool(getattr(self, "_pj_candidate_peak", None) is not None),
+                    policy_j_guard_state=getattr(self, "_pj_guard_state", None),
+                    **_risk_meta,
+                )
                 _commit_action(self._lifecycle_oca, _decision)
-                _write_mts_state(has_position=True, action="COMBINED_EXIT", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
-                self._peak_net_exit_pnl_twd = 0.0
+                # 2026-07-30: State write moved to monitor.py after successful order submission
+                # P1-B durable-exit-intent: gate + both-leg intent persisted
+                # BEFORE the signal is emitted (dispatcher submits via ids)
+                try:
+                    _ilog = _exit_intent_log()
+                    if _p1b_exit_submitted(_ilog, getattr(self, "_trade_id", ""), ["NEAR", "FAR"]):
+                        logger.info("[P1B_GATE] exit already submitted for %s — suppressing COMBINED_EXIT re-emission", getattr(self, "_trade_id", ""))
+                        return None
+                    if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
+                        _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT")
+                except Exception:
+                    pass  # intent log unavailable → legacy behavior
                 return Signal("EXIT", "TMF_COMBINED_EXIT", confidence=1.0, stop_loss=0)
             elif _decision.action == LifecycleAction.MANUAL:
                 # MANUAL: full flatten — same as STOPLOSS/TIMEOUT
@@ -3867,6 +6058,7 @@ class TMFSpread(StrategyBase):
                 trail_distance_points=trail_dist, trade_id=self._trade_id,
                 ticker=self._ticker,
                 lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                 **_risk_meta
             )
             return None
@@ -3919,6 +6111,129 @@ class TMFSpread(StrategyBase):
         atr_val = bar.get("atr")
         if not atr_val or pd.isna(atr_val):
             atr_val = self._last_atr or 20.0
+        # 2026-08-02 Antigravity: Production Governance RenkoTracker Integration (Items A-K Audit Compliant)
+        _renko_exit_enabled = bool(getattr(self, "_params", {}).get("enable_renko_exit", False))
+        _renko_brick_mult = float(getattr(self, "_params", {}).get("renko_brick_multiplier", 0.5))
+        _renko_signal_exit = False
+
+        if self._lifecycle_oca and self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG:
+            # Item C: Executable price selection for risk control
+            _rem_executable_price = _rem_price
+            _price_source_name = "LAST_TRADE"
+            if self._side == "LONG":
+                _rem_bid = float(bar.get("far_bid" if _rem_leg_label == "FAR" else "near_bid", _rem_price))
+                if _rem_bid > 0:
+                    _rem_executable_price = _rem_bid
+                    _price_source_name = "EXECUTABLE_BID"
+            else: # SHORT
+                _rem_ask = float(bar.get("far_ask" if _rem_leg_label == "FAR" else "near_ask", _rem_price))
+                if _rem_ask > 0:
+                    _rem_executable_price = _rem_ask
+                    _price_source_name = "EXECUTABLE_ASK"
+
+            # Item C & F: Initialization / Persistence Recovery
+            if getattr(self, "_renko_tracker", None) is None:
+                from strategies.plugins.futures.active.renko_tracker import RenkoTracker
+                
+                # Check if state JSON has serialized renko_status to recover on PM2 restart
+                _recovered = False
+                _state_disk = getattr(self, "_disk_state_cache", {})
+                if _state_disk and "renko_status" in _state_disk and isinstance(_state_disk["renko_status"], dict):
+                    try:
+                        self._renko_tracker = RenkoTracker.from_dict(_state_disk["renko_status"])
+                        _recovered = True
+                        logger.info("[MTS_RENKO_RECOVERY] Restored RenkoTracker state from disk!")
+                    except Exception as _re_err:
+                        logger.warning("[MTS_RENKO_RECOVERY_ERR] Failed to restore RenkoTracker: %s", _re_err)
+
+                if not _recovered:
+                    # Fresh Episode Initialization
+                    _calc_brick = max(round((atr_val * _renko_brick_mult) * 4.0) / 4.0, 2.0)
+                    self._renko_tracker = RenkoTracker(
+                        anchor_price=_rem_executable_price,
+                        brick_size=_calc_brick,
+                        symbol=_rem_leg_label,
+                        position_side=self._side,
+                        price_source=_price_source_name,
+                        episode_id=str(getattr(self, "_trade_id", "")),
+                        initialized_phase="SINGLE_LEG"
+                    )
+            
+            # [4A] Session Calendar Gate + Gap Re-entry (renko-only; hard-risk untouched)
+            _renko_gate_ok = True
+            _renko_bar_ts = bar.get("timestamp", bar.get("ts"))
+            if _renko_bar_ts is not None:
+                try:
+                    from core.date_utils import is_taifex_trading_session
+                    _renko_dt = pd.Timestamp(_renko_bar_ts)
+                    _renko_in_session = bool(is_taifex_trading_session(_renko_dt))
+                except Exception:
+                    _renko_in_session = True
+                if not _renko_in_session:
+                    _renko_gate_ok = False
+                    logger.info("[RENKO_SESSION_GATE_REJECT] ts=%s — non-session tick; renko add skipped (zero mutation)", _renko_bar_ts)
+            if _renko_gate_ok:
+                try:
+                    _renko_now_ts = float(pd.Timestamp(_renko_bar_ts).timestamp()) if _renko_bar_ts is not None else None
+                except Exception:
+                    _renko_now_ts = None
+                _renko_last = getattr(self, "_renko_last_accepted_ts", None)
+                if _renko_now_ts is not None and _renko_last is not None and (_renko_now_ts - _renko_last) >= 900:
+                    self._renko_gap_quarantine_left = 2
+                    logger.info("[RENKO_GAP_REENTRY] gap>=900s since last accepted renko tick — next 2 ticks quarantined")
+                if getattr(self, "_renko_gap_quarantine_left", 0) > 0:
+                    self._renko_gap_quarantine_left -= 1
+                    _renko_gate_ok = False
+                    logger.info("[RENKO_GAP_QUARANTINE] remaining=%d ts=%s — add skipped (zero mutation)",
+                                getattr(self, "_renko_gap_quarantine_left", 0), _renko_bar_ts)
+                elif _renko_now_ts is not None:
+                    self._renko_last_accepted_ts = _renko_now_ts
+            if _renko_gate_ok:
+                # Process tick with RenkoTracker — fail-closed capability guard
+                if not callable(getattr(self._renko_tracker, "add", None)):
+                    logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() missing on RenkoTracker — renko shadow disabled for this episode")
+                    self._renko_tracker = None
+                    return
+                try:
+                    _r_bricks, _r_trend, _r_meta = self._renko_tracker.add(_rem_executable_price)
+                except Exception as _exc:
+                    logger.warning("[RENKO_CAPABILITY_UNAVAILABLE] add() failed: %s — renko shadow disabled for this episode", _exc)
+                    self._renko_tracker = None
+                    return
+
+                # [B1] persist renko_status on brick events via canonical CAS writer
+                if _r_bricks > 0 and getattr(self, "_renko_tracker", None) is not None:
+                    try:
+                        _write_mts_state(
+                            has_position=True, action="RENKO_BRICK", reason=f"bricks={_r_bricks}",
+                            trade_id=getattr(self, "_trade_id", ""),
+                            ticker=getattr(self, "_ticker", "TMF"),
+                            lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, "_lifecycle_oca") else {},
+                            renko_status=_renko_status_payload(self),
+                        )
+                    except Exception as _bexc:
+                        logger.warning("[RENKO_STATE_WRITE_ERR] %s", _bexc)
+            
+                # Item B & E: Adverse reversal detection with 2-Layer Idempotency
+                if _renko_exit_enabled and _r_meta.get("is_adverse_reversal", False):
+                    _event_key = f"{getattr(self, '_trade_id', '')}:1:{self._renko_tracker.generation_id}:{self._renko_tracker.brick_sequence}:{_r_trend}"
+                    _emitted = getattr(self, "_emitted_renko_event_keys", set())
+                
+                    if _event_key not in _emitted:
+                        # Item D: Check idempotency & lifecycle pending orders before signaling exit
+                        _has_pending = False
+                        if hasattr(self, "_order_mgr") and self._order_mgr:
+                            _has_pending = bool(getattr(self._order_mgr, "has_pending_exit", lambda: False)())
+                    
+                        if not _has_pending:
+                            _renko_signal_exit = True
+                            if not hasattr(self, "_emitted_renko_event_keys"):
+                                self._emitted_renko_event_keys = set()
+                            self._emitted_renko_event_keys.add(_event_key)
+                            logger.warning(
+                                "[MTS_RENKO_EXIT_SIGNAL] event_key=%s side=%s price=%.1f bricks=%d open=%.1f close=%.1f",
+                                _event_key, self._side, _rem_executable_price, _r_bricks, self._renko_tracker.renko_open, self._renko_tracker.renko_close
+                            )
 
         rem_floating_pnl = (_rem_price - _rem_entry) if self._side == "LONG" else (_rem_entry - _rem_price)
 
@@ -3961,6 +6276,7 @@ class TMFSpread(StrategyBase):
         # Re-evaluate lifecycle after peak/nadir + breakeven adjustments
         if _decision is None:
             try:
+                trail_dist = self._apply_vwap_exit(bar, trail_dist)
                 _ctx2 = LifecycleContext(
                     near_pnl_pts=0, far_pnl_pts=0,
                     floating_pnl_pts=rem_floating_pnl,
@@ -4028,7 +6344,7 @@ class TMFSpread(StrategyBase):
         # Force_lock bypass removed: if force_lock is needed, add to LifecycleContext /
         # evaluate_lifecycle_actions in a separate change.
         # [P0 Guard] TRAIL must have READY anchor
-        if _decision is not None and _decision.action == LifecycleAction.TRAIL:
+        if _decision is not None and _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT):
             assert self._trail_anchor_status == TrailAnchorStatus.READY, (
                 f"[P0_ANCHOR_GUARD] TRAIL without READY anchor: "
                 f"status={self._trail_anchor_status} side={self._side} "
@@ -4036,7 +6352,7 @@ class TMFSpread(StrategyBase):
             )
 
         if _decision is not None and _decision.action in (
-            LifecycleAction.TRAIL, LifecycleAction.STOPLOSS,
+            LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT, LifecycleAction.STOPLOSS,
             LifecycleAction.TIMEOUT, LifecycleAction.MANUAL,
         ):
             exit_triggered = True
@@ -4073,13 +6389,19 @@ class TMFSpread(StrategyBase):
             release_stop_points=release_stop, trail_distance_points=trail_dist,
             trade_id=self._trade_id, ticker=self._ticker,
             lifecycle=self._current_lifecycle_state(),
+            peak_net_exit_pnl_twd=getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+            # ── broker-reconciled single-leg recovery identity (2026-08-18)
+            broker_recovery_source=getattr(self, "_broker_recovery_source", None),
+            broker_recovery_order_id=getattr(self, "_broker_recovery_order_id", None),
+            broker_recovery_snapshot_hash=getattr(self, "_broker_recovery_snapshot_hash", None),
             **_risk_meta
         )
         self._last_applied_event_time = now
         return None
 
     # 2026-06-25 Gemini CLI: Support passing exit_ts for backtests to avoid E-Core cooldown block
-    def _reset(self, reason: str | None = None, exit_ts: datetime | None = None, exit_price: float | None = None) -> None:
+    def _reset(self, reason: str | None = None, exit_ts: datetime | None = None,
+               exit_price: float | None = None, fill_provenance: dict | None = None) -> None:
         # 2026-06-18 Gemini CLI: Fix AttributeError - StrategyBase has no 'config' attribute.
         # Fallback to TMF if _ticker is not yet initialized.
         _ticker = getattr(self, '_ticker', "TMF")
@@ -4135,13 +6457,25 @@ class TMFSpread(StrategyBase):
                 post_release_mfe=_pr_mfe,
                 post_release_mae=_pr_mae,
                 post_release_giveback=_pr_giveback,
-                price_source=_LIVE_TICK,
-                quote_age_ms=0.0
+                price_source=(fill_provenance or {}).get("price_source", _LIVE_TICK),
+                quote_age_ms=0.0,
+                # P1 (codex): decision-event correlation rides the fill record
+                event_id=getattr(self, "_pj_exit_event_id", None),
+                winner=getattr(self, "_pj_exit_winner", None),
+                **{k: v for k, v in (fill_provenance or {}).items() if k != "price_source"},
             )
 
         # 2026-07-01 Gemini CLI: Set in-memory position state to False first to prevent concurrent tick heartbeats from overwriting the file with True.
+
         self._has_position = False
         self._lifecycle = "FLAT"
+        self._combined_exit_in_flight = False
+        self._peak_net_exit_pnl_twd = 0.0
+        for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
+                   "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
+                   "_pj_last_upl", "_pj_exit_event_id", "_pj_exit_winner"):
+            if hasattr(self, _a):
+                setattr(self, _a, None)
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill
         if hasattr(self, '_lifecycle_oca'):
             _was_trailing = self._lifecycle_oca.phase == PositionPhase.SINGLE_LEG
@@ -4155,15 +6489,26 @@ class TMFSpread(StrategyBase):
         _write_mts_state(has_position=False, action="CLOSE", reason=reason or "trail_exit",
                          ticker=_ticker,
                          lifecycle=lifecycle_to_dict(self._lifecycle_oca) if hasattr(self, '_lifecycle_oca') else {},
-                         trail_exit_realized=_trail_exit_realized)
+                         trail_exit_realized=_trail_exit_realized,
+                         renko_status={"tracker_initialized": False, "mode": "INACTIVE",
+                                       "recent_bricks": [], "clear_reason": "FLAT_RESET"})
         self._last_exit_ts = exit_ts or datetime.now()  # 2026-06-25 Gemini CLI: Support passing historical exit timestamp
         self._entry_ts = None
         self._near_entry = 0.0
         self._far_entry = 0.0
         self._near_side = None
         self._far_side = None
-        self._entry_spread_z = 0.0
+        self._entry_spread_z = None  # 2026-10-08 Codex: no active entry while flat.
         self._released_leg = None
+        # 2026-08-23 Hermes Agent: per-trade HVWAP release sentinel — cleared
+        # on flat so the NEXT trade may release again (one intent per trade).
+        self._hvwap_release_sent_trade_id = None
+        # 2026-08-23 Hermes Agent: clear per-trade release timers/tick
+        # counters on flat — a stale baseline release attempt must not block
+        # (or be blocked by) the HVWAP release path on the next trade.
+        self._release_pending_mono = 0.0
+        self._release_near_ticks = 0
+        self._release_far_ticks = 0
         self._release_ts = None
         self._release_mono = 0.0
         self._peak = 0.0
@@ -4182,6 +6527,29 @@ class TMFSpread(StrategyBase):
         self._mfe_pts = 0.0
         self._mae_pts = 0.0
         self._release_price = 0.0
+        # 2026-07-31 Hermes Agent: Item 4 — reset single-leg trail peak/nadir on
+        # trade settle so stale extrema never leak into a new trade.
+        self._single_leg_peak = 0.0
+        self._single_leg_nadir = 0.0
+        self._renko_tracker = None
+        self._emitted_renko_event_keys = set()
+
+
+    def _is_trade_settled_flat(self) -> bool:
+        """ADR-025: Strict settlement gate to prevent premature Policy J reset."""
+        if self._has_position:
+            return False
+        if getattr(self, "_near_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
+            return False
+        if getattr(self, "_far_status", "") in ("SUBMITTED", "PARTIALLY_FILLED", "PENDING"):
+            return False
+        if hasattr(self, "_lifecycle_oca") and self._lifecycle_oca:
+            if self._lifecycle_oca.release_group.status in (
+                ReleaseGroupStatus.SUBMITTING, ReleaseGroupStatus.SUBMITTED, ReleaseGroupStatus.PARTIALLY_FILLEC
+            ):
+                return False
+        return True
+
 
     def cleanup(self) -> None:
         self._reset()

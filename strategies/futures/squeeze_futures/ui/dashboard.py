@@ -95,42 +95,41 @@ def load_market_data(date: str = None):
 @st.cache_data(ttl=1)
 def parse_trade_log(date: str = None):
     """解析交易日誌"""
-    # 始終使用今日日期
-    datetime.now().strftime("%Y-%m-%d")
+    target_date = date or datetime.now().strftime("%Y-%m-%d")
     
     trades = []
     if LOG_FILE.exists():
         with open(LOG_FILE, 'r') as f:
             for line in f:
-                if True:  # Date check disabled for testing
-                    try:
-                        time_part = line.split(']')[0].replace('[', '')
+                time_part = line.split(']')[0].replace('[', '')
+                if target_date and target_date not in time_part:
+                    continue
+                try:
+                    if 'PARTIAL_EXIT' in line:
+                        trade_type = 'PARTIAL'
+                    elif 'EXIT' in line:
+                        trade_type = 'EXIT'
+                    elif 'BUY' in line:
+                        trade_type = 'BUY'
+                    elif 'SELL' in line:
+                        trade_type = 'SELL'
+                    else:
+                        continue
                         
-                        if 'PARTIAL_EXIT' in line:
-                            trade_type = 'PARTIAL'
-                        elif 'EXIT' in line:
-                            trade_type = 'EXIT'
-                        elif 'BUY' in line:
-                            trade_type = 'BUY'
-                        elif 'SELL' in line:
-                            trade_type = 'SELL'
-                        else:
-                            continue
+                    price_match = re.search(r'at ([\d.]+)', line)
+                    pnl_match = re.search(r'PnL: ([\d,-]+)', line)
                         
-                        price_match = re.search(r'at ([\d.]+)', line)
-                        pnl_match = re.search(r'PnL: ([\d,-]+)', line)
+                    price = float(price_match.group(1)) if price_match else 0
+                    pnl = float(pnl_match.group(1).replace(',', '')) if pnl_match else 0
                         
-                        price = float(price_match.group(1)) if price_match else 0
-                        pnl = float(pnl_match.group(1).replace(',', '')) if pnl_match else 0
-                        
-                        trades.append({
-                            'timestamp': time_part,
-                            'type': trade_type,
-                            'price': price,
-                            'pnl': pnl,
-                        })
-                    except Exception:
-                        pass
+                    trades.append({
+                        'timestamp': time_part,
+                        'type': trade_type,
+                        'price': price,
+                        'pnl': pnl,
+                    })
+                except Exception:
+                    pass
     
     return pd.DataFrame(trades) if trades else pd.DataFrame()
 

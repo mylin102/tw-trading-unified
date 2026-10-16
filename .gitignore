@@ -91,3 +91,4 @@ data/*calendar_spread*.csv
 data/tmf_calendar_spread*.csv
 data/mtx_calendar_spread*.csv
 *.DISABLED_*
+.worktrees/

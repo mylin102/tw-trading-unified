@@ -16,6 +16,9 @@ from typing import Dict, Any
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from core.runtime_paths import enforce_runtime_identity
+enforce_runtime_identity(__file__)
+
 # ── [BOOT_FINGERPRINT] Unambiguous identity marker ──
 import core.futures_strategy_router as _boot_fsr
 print(
@@ -41,9 +44,52 @@ _lifecycle_recorder: Any = None
 
 # [P0 Fix] Connection state tracking via Shioaji event callback
 _connection_dropped = False
+_order_callback_lock = threading.Lock()
+_order_callback_generation = 0
+_order_callback_fn = None
+
+
+def register_order_callback(api, futures_mons, options_mon):
+    """Idempotently install the single order callback after each login.
+
+    Shioaji may retain callbacks across reconnects, or may clear them; using
+    one stable dispatcher and safely re-registering it handles both cases.
+    A registration failure is a reconnect quarantine, never a permission to
+    continue with order-capable code.
+    """
+    global _order_callback_generation, _order_callback_fn
+    with _order_callback_lock:
+        try:
+            if _order_callback_fn is None:
+                _order_callback_fn = order_dispatcher(futures_mons, options_mon)
+            api.set_order_callback(_order_callback_fn)
+            _order_callback_generation += 1
+            for _mon in futures_mons or []:
+                try:
+                    _mon._callback_registration_generation = _order_callback_generation
+                    _mon._append_mts_event(
+                        "ORDER_CALLBACK_REGISTERED",
+                        registration_generation=_order_callback_generation,
+                        observation_type="CALLBACK_REGISTRATION",
+                        normalization_result="ACCEPTED")
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            for _mon in futures_mons or []:
+                try:
+                    _mon._append_mts_event(
+                        "ORDER_CALLBACK_REGISTRATION_FAILED",
+                        registration_generation=_order_callback_generation,
+                        observation_type="CALLBACK_REGISTRATION",
+                        normalization_result="REJECTED",
+                        rejection_reason=type(exc).__name__)
+                except Exception:
+                    pass
+            _quarantine_for_handoff(futures_mons, reason="ORDER_CALLBACK_REGISTRATION_FAILED")
+            return False
 
 BASE = os.path.dirname(__file__)
-RESTART_FLAG = Path(BASE) / ".restart"
 HEALTH_INTERVAL = 30  # seconds between health checks
 RESTART_RETRY_LIMIT = 5
 RESTART_WINDOW_SECS = 300  # 5 minutes
@@ -218,6 +264,18 @@ def order_dispatcher(futures_mons, options_mon):
                     f_mon.on_order_event(order_state, data)
             except Exception as e:
                 console.print(f"[red][futures order err] {e}[/red]")
+                try:
+                    f_mon._callback_exception_count = getattr(
+                        f_mon, "_callback_exception_count", 0) + 1
+                    f_mon._append_mts_event(
+                        "ORDER_CALLBACK_EXCEPTION",
+                        observation_type=("FDEAL_CALLBACK" if "Deal" in str(order_state)
+                                          or "FDEAL" in str(order_state)
+                                          else "FORDER_CALLBACK"),
+                        normalization_result="REJECTED",
+                        rejection_reason="CALLBACK_EXCEPTION")
+                except Exception:
+                    pass
             finally:
                 _thread_local.state_path = None
 
@@ -248,6 +306,7 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
     _lock = threading.Lock()
     _last_mtx_update_log_at = {"ts": 0.0}
     _mtx_update_log_interval_secs = 5.0
+    from core.callback_trace_context import emit as _trace_emit
     
     def on_bidask(exchange, bidask):
         # Safety checks
@@ -267,6 +326,8 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
             # Use monitor instance (handle OptionsMonitor wrapper)
             mon = options_mon.monitor if hasattr(options_mon, 'monitor') else options_mon
             code = bidask.code
+            _trace_emit("FALLBACK_DISPATCHER_ENTRY", dispatcher="bidask_dispatcher",
+                        route_result="FALLBACK_ENTERED")
             
             # Safe price extraction
             try:
@@ -314,23 +375,52 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                         continue
                     # TMF near
                     if f_mon.contract and code == f_mon.contract.code:
-                        if f_ticker not in f_mon.market_data:
-                            f_mon.market_data[f_ticker] = {}
-                        f_mon.market_data[f_ticker]["bid"] = float(bid)
-                        f_mon.market_data[f_ticker]["ask"] = float(ask)
-                        f_mon.market_data[f_ticker]["close"] = mid
-                        f_mon.market_data[f_ticker]["bidask_at"] = time.time()
+                        _before = dict(f_mon.market_data.get(f_ticker, {}) or {})
+                        # 2026-08-27 (codex review v5): NEVER write
+                        # bid/ask/bidask_at directly here.  on_bidask() is
+                        # the SINGLE validated writer (finite/positive/
+                        # non-crossed validation, canonical route,
+                        # generation_id, bidask_received_at).  A direct
+                        # write here would pollute BidAsk freshness before
+                        # validation and race the verified writer.
+                        try:
+                            f_mon.on_bidask(exchange, bidask)
+                        except Exception:
+                            pass
+                        _after = dict(f_mon.market_data.get(f_ticker, {}) or {})
+                        _trace_emit("MTS_BBO_CACHE_UPDATE", monitor_instance_identity=id(f_mon),
+                                    active_near_code=getattr(getattr(f_mon, "contract", None), "code", None),
+                                    active_far_code=getattr(getattr(f_mon, "far_contract", None), "code", None),
+                                    active_near_aliases=sorted(getattr(f_mon, "_canonical_near_codes", set()) or set()),
+                                    active_far_aliases=sorted(getattr(f_mon, "_canonical_far_codes", set()) or set()),
+                                    resolved_role="near", route_result="EXACT_NEAR_MATCH",
+                                    validation_result="BBO_VALID" if bid <= ask else "BBO_INVALID",
+                                    cache_before=_before, cache_after=_after,
+                                    cache_updated=_after != _before,
+                                    cache_update_monotonic_ns=time.monotonic_ns())
                         matched = True
                         break
                     # TMF far
                     if f_mon.far_contract and code == f_mon.far_contract.code:
                         _far_key = f"{f_ticker}_FAR"
-                        if _far_key not in f_mon.market_data:
-                            f_mon.market_data[_far_key] = {}
-                        f_mon.market_data[_far_key]["bid"] = float(bid)
-                        f_mon.market_data[_far_key]["ask"] = float(ask)
-                        f_mon.market_data[_far_key]["close"] = mid
-                        f_mon.market_data[_far_key]["bidask_at"] = time.time()
+                        _before = dict(f_mon.market_data.get(_far_key, {}) or {})
+                        # 2026-08-27 (codex review v5): sole validated
+                        # writer is on_bidask() — see near branch note.
+                        try:
+                            f_mon.on_bidask(exchange, bidask)
+                        except Exception:
+                            pass
+                        _after = dict(f_mon.market_data.get(_far_key, {}) or {})
+                        _trace_emit("MTS_BBO_CACHE_UPDATE", monitor_instance_identity=id(f_mon),
+                                    active_near_code=getattr(getattr(f_mon, "contract", None), "code", None),
+                                    active_far_code=getattr(getattr(f_mon, "far_contract", None), "code", None),
+                                    active_near_aliases=sorted(getattr(f_mon, "_canonical_near_codes", set()) or set()),
+                                    active_far_aliases=sorted(getattr(f_mon, "_canonical_far_codes", set()) or set()),
+                                    resolved_role="far", route_result="EXACT_FAR_MATCH",
+                                    validation_result="BBO_VALID" if bid <= ask else "BBO_INVALID",
+                                    cache_before=_before, cache_after=_after,
+                                    cache_updated=_after != _before,
+                                    cache_update_monotonic_ns=time.monotonic_ns())
                         matched = True
                         break
 
@@ -542,7 +632,65 @@ def _subscribe_otm_skew_contracts(api, om, fm, sk_engine, console=None):
     return otm_contracts
 
 
+# 2026-08-05: broker health tracker (INCIDENT_broker_session_recovery).
+# Replaces the binary 2-attempt-exit with a classified state machine.
+_BROKER_HEALTH_TRACKER = None
+
+
+def _get_broker_health():
+    global _BROKER_HEALTH_TRACKER
+    if _BROKER_HEALTH_TRACKER is None:
+        from core.broker_health import BrokerHealthTracker
+        _BROKER_HEALTH_TRACKER = BrokerHealthTracker()
+    return _BROKER_HEALTH_TRACKER
+
+
 def api_is_healthy(api):
+    """Classified broker health check.
+
+    Returns the BrokerHealthTracker state (str). The main loop exits ONLY on
+    PROCESS_RESTART_REQUIRED. Generic 500/timeout never exit the process.
+    """
+    if api is None:
+        return "UNKNOWN"
+    _tracker = _get_broker_health()
+    for attempt in range(2):
+        try:
+            api.list_positions(api.futopt_account)
+            try:
+                from core.channel_safety import get_safety_state
+                get_safety_state().set_account_healthy()
+            except Exception:
+                pass
+            _tracker.record_success()
+            return _tracker.state.value
+        except Exception as exc:
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            _failed_msg = f"{type(exc).__name__}: {exc}"
+            console.print(f"[dim]api_is_healthy: list_positions failed (2 attempts): {_failed_msg}[/dim]")
+            from core.broker_health import BrokerErrorClass, classify_broker_error
+            _cls = classify_broker_error(exc)
+            _tracker.record_failure(exc)
+            try:
+                from core.channel_safety import get_safety_state, AccountDegradedReason
+                if _cls in (BrokerErrorClass.AUTHENTICATION_FAILURE,
+                            BrokerErrorClass.AUTHORIZATION_FAILURE,
+                            BrokerErrorClass.SDK_SESSION_CLOSED,
+                            BrokerErrorClass.CONNECTION_RESET):
+                    get_safety_state().set_account_degraded(
+                        AccountDegradedReason.SHIOAJI_CONNECTION_ERROR, _failed_msg)
+                else:
+                    get_safety_state().set_account_degraded(
+                        AccountDegradedReason.LIST_POSITIONS_FAILED, _failed_msg)
+            except Exception:
+                pass
+            return _tracker.state.value
+    return _tracker.state.value
+
+
+
     """Quick check if Shioaji session is still usable, with a small retry."""
     if api is None:
         return False
@@ -573,14 +721,228 @@ def api_is_healthy(api):
     return False
 
 
-def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
+
+def verify_startup_reconciliation(api, *, paper_only=False) -> bool:
+    """Fail closed after reboot until broker position and order state are known.
+
+    This function performs read-only broker reconciliation only.  It never
+    creates monitors, subscribes market data, or reaches order-routing code.
+    """
+    from core.channel_safety import (
+        AccountDegradedReason,
+        get_safety_state,
+    )
+
+    safety = get_safety_state()
+    # 2026-10-04 Codex: PAPER's account is local simulation, never broker-flat evidence.
+    if paper_only is True:
+        safety.set_account_healthy()
+        safety.set_reconciled()
+        console.print("[green]PAPER_STARTUP_READY: local simulation; broker positions/orders not queried[/green]")
+        return True
+    try:
+        account = api.futopt_account
+        api.update_status(account)
+        positions = list(api.list_positions(account))
+        trades = list(api.list_trades())
+    except Exception as exc:
+        safety.set_account_degraded(
+            AccountDegradedReason.RECONCILIATION_PENDING,
+            f"STARTUP_BROKER_QUERY_FAILED: {type(exc).__name__}: {exc}",
+        )
+        console.print("[bold red]RECOVERY_REQUIRED: broker reconciliation query failed; new entries remain blocked[/bold red]")
+        return False
+
+    terminal_statuses = {"Filled", "Cancelled", "Expired", "Done"}
+    open_orders = [
+        trade
+        for trade in trades
+        if getattr(getattr(trade, "status", None), "status", "") not in terminal_statuses
+    ]
+
+    safety.set_account_healthy()
+    if positions or open_orders:
+        safety.set_account_degraded(
+            AccountDegradedReason.RECONCILIATION_PENDING,
+            f"STARTUP_RECONCILIATION_REQUIRED: positions={len(positions)} open_orders={len(open_orders)}",
+        )
+        console.print(
+            "[bold yellow]RECOVERY_REQUIRED: broker reports open position/order; "
+            "new entries remain blocked pending operator reconciliation[/bold yellow]"
+        )
+        return False
+
+    safety.set_reconciled()
+    console.print("[green]STARTUP_RECONCILED: broker flat and no open orders; entry gate may evaluate normally[/green]")
+    return True
+
+
+def _persist_ctx(mon):
+    """[Step 6] persist a monitor's execution context to the canonical
+    dashboard-readable file. Failure never enables LIVE (reader keeps the
+    last good state). [Step 8] also syncs the broker-adapter gate
+    reference so the adapter chokepoint enforces the same context."""
+    _client = getattr(mon, "client", None)
+    if _client is not None and hasattr(_client, "_execution_context"):
+        _client._execution_context = getattr(mon, "_execution_context", None)
+    try:
+        from core.execution_context_state import persist_execution_context
+        persist_execution_context(mon._execution_context.to_dict())
+    except Exception as _pexc:
+        print(f"[dim]⚠️ exec ctx persist failed: {_pexc} "
+              f"(file keeps last good state)[/dim]")
+
+
+def _quarantine_for_handoff(monitors, reason="RECONNECT_HANDOFF"):
+    """[Live wiring Step 5] atomic handoff: quarantine EVERY execution
+    context BEFORE any re-login/wait — zero order calls during the
+    reconnect window (the per-route gates block on the quarantined ctx).
+    Explicit audit reason, fail-closed."""
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    for m in monitors or []:
+        ctx = getattr(m, "_execution_context", None)
+        if ctx is None:
+            continue
+        m._execution_context = with_effective_mode(
+            ctx, ModeTransitionState.LIVE_QUARANTINED.value,
+            live_order_allowed=False,
+            audit_reasons=(reason,) + tuple(
+                getattr(ctx, "audit_reasons", ()) or ()))
+        _persist_ctx(m)
+
+
+def _reconnect_monitors(fm):
+    """Normalize fm to a list of monitors (the call site passes a list)."""
+    if fm is None:
+        return []
+    return fm if isinstance(fm, (list, tuple)) else [fm]
+
+
+def _recertify_after_reconnect(mon, api, *, defer_promotion=False):
+    """After a successful resubscribe the certificate-required transition
+    MAY proceed: fresh certify -> transition_with_certificate. Any
+    failure leaves the context LIVE_QUARANTINED with an explicit reason —
+    orders stay blocked until a successful recertification."""
+    from core.live_route_certificate import (
+        CertificateIssuer, build_runtime_certification_context, certify_route,
+        transition_with_certificate)
+    from core.mode_transition import ModeTransitionState, with_effective_mode
+    cfg_path = getattr(mon, "config_path", None)
+    if cfg_path is None:
+        return False
+    try:
+        issuer = CertificateIssuer()
+        cert, failures = certify_route(
+            api, process_start_id=f"monitor-{os.getpid()}",
+            issuer=issuer, config_path=cfg_path)
+        if cert is None:
+            mon._execution_context = with_effective_mode(
+                mon._execution_context,
+                ModeTransitionState.LIVE_QUARANTINED.value,
+                live_order_allowed=False,
+                audit_reasons=tuple(failures) or ("RECERTIFY_FAILED",))
+            _persist_ctx(mon)
+            return False
+        runtime = build_runtime_certification_context(
+            api, cfg_path,
+            {"process_state": {"process_start_id": f"monitor-{os.getpid()}"}})
+        # Rebuild lost metadata only from the freshly certified API. Never
+        # silently switch an already-bound account or authorize from JSON.
+        _account = getattr(runtime, "account_hash", "")
+        _generation = getattr(runtime, "session_generation", "")
+        _ctx = getattr(mon, "_execution_context", None)
+        if not _account or not _generation or _ctx is None:
+            _quarantine_for_handoff([mon], reason="RECERTIFY_IDENTITY_UNAVAILABLE")
+            return False
+        if getattr(_ctx, "account_id_hash", None) not in (None, "", _account):
+            _quarantine_for_handoff([mon], reason="RECERTIFY_ACCOUNT_MISMATCH")
+            return False
+        from dataclasses import replace
+        mon._execution_context = replace(
+            _ctx, account_id_hash=_account, live_order_allowed=False)
+        # [D1] after a relogin the registry holds a NEW generation — bind
+        # it into the quarantined ctx + confirm before promoting
+        bind = getattr(mon, "_bind_session_generation", None)
+        if callable(bind):
+            try:
+                bind()
+            except Exception:
+                pass
+        if str(getattr(mon._execution_context, "session_id", "")) != str(_generation):
+            _quarantine_for_handoff([mon], reason="SESSION_GENERATION_MISMATCH")
+            return False
+        confirm = getattr(mon, "_confirm_session_generation", None)
+        if callable(confirm):
+            try:
+                if not confirm():
+                    mon._execution_context = with_effective_mode(
+                        mon._execution_context,
+                        ModeTransitionState.LIVE_QUARANTINED.value,
+                        live_order_allowed=False,
+                        audit_reasons=("SESSION_GENERATION_MISMATCH",))
+                    _persist_ctx(mon)
+                    return False
+            except Exception:
+                return False
+        # [P0 post-startup gate] in-process, UNAVOIDABLE — the reconnect's
+        # recertify is ALSO a LIVE_READY transition: the fresh read-only
+        # snapshot + the core gate run BEFORE the transition (no skippable
+        # operator CLI subprocess). Any failure keeps QUARANTINED +
+        # POST_STARTUP_GATE_FAILED + refusal codes.
+        _run_gate = getattr(mon, "_run_post_startup_gate", None)
+        if callable(_run_gate):
+            try:
+                _g, _g_ev = _run_gate()
+                if not _g.ok:
+                    mon._execution_context = with_effective_mode(
+                        mon._execution_context,
+                        ModeTransitionState.LIVE_QUARANTINED.value,
+                        live_order_allowed=False,
+                        audit_reasons=("POST_STARTUP_GATE_FAILED",) +
+                                      tuple(getattr(_g, "refusal_codes", ()) or ()))
+                    _persist_ctx(mon)
+                    return False
+            except Exception:
+                mon._execution_context = with_effective_mode(
+                    mon._execution_context,
+                    ModeTransitionState.LIVE_QUARANTINED.value,
+                    live_order_allowed=False,
+                    audit_reasons=("POST_STARTUP_GATE_FAILED",))
+                _persist_ctx(mon)
+                return False
+        # The broker gate may take time. A generation change during it must
+        # invalidate this transition too, not just the earlier binding.
+        if callable(confirm) and not confirm():
+            _quarantine_for_handoff([mon], reason="SESSION_GENERATION_MISMATCH")
+            return False
+        _certified_ctx = transition_with_certificate(
+            mon._execution_context, cert, issuer, runtime=runtime)
+        if defer_promotion:
+            return _certified_ctx if _certified_ctx.is_live_ready() else False
+        mon._execution_context = _certified_ctx
+        _persist_ctx(mon)
+        return bool(mon._execution_context.is_live_ready())
+    except Exception:
+        return False
+
+
+def _try_shioaji_reconnect(api, fm, om, dry_run: bool,
+                          recertify: bool = True) -> bool:
     """Attempt in-process Shioaji re-login + re-subscribe after data stagnation.
 
     Returns True if reconnect succeeded and system can continue.
     Returns False if reconnect failed (network down or session expired) —
     caller should exit for PM2 restart.
 
+    recertify=True (default): re-certify to LIVE_READY inside this call
+    (existing behavior — callers that need immediate recertification).
+    recertify=False: defer recertification to the caller so the 30s
+    verification window runs BEFORE any LIVE_READY promotion (strict
+    recertify ordering, 2026-08-27 codex review).  The context stays
+    QUARANTINED until the caller recertifies after a passing window.
+
     Strategy:
+    0. ATOMIC HANDOFF: quarantine all execution contexts BEFORE re-login
     1. If Shioaji event callback already detected drop (code 12), wait for it
     2. Otherwise, attempt full re-login
     3. On network failure, wait with backoff before giving up
@@ -590,12 +952,46 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
 
     global _connection_dropped
 
+    mons = _reconnect_monitors(fm)
+    _om_mon = getattr(om, "monitor", None) if om is not None else None
+    handoff_targets = mons + ([_om_mon] if _om_mon is not None else [])
+
+    def _reconnect_evidence(event: str, **payload):
+        """Leave a P1 reconnect trace on every monitor when available."""
+        for _m in mons:
+            _append = getattr(_m, "_append_mts_event", None)
+            if callable(_append):
+                try:
+                    _append(event, **payload)
+                except Exception:
+                    # Evidence must never turn a recovered session into a
+                    # false success/failure; the execution gate remains the
+                    # authority for trading permission.
+                    pass
+
+    _reconnect_evidence(
+        "SESSION_RECONNECT_ATTEMPT",
+        reason="SESSION_DEATH_OR_DATA_STAGNATION",
+    )
+
+    # ── Phase 0: quarantine BEFORE any re-login/wait (Step 5) ──
+    _quarantine_for_handoff(handoff_targets)
+
     # ── Phase 1: Shioaji auto-reconnect already in progress ──
     if _connection_dropped:
         console.print("[yellow]⏳ Shioaji auto-reconnect (code 12) in progress — waiting 30s...[/yellow]")
         time.sleep(30)
         if not _connection_dropped:
             console.print("[green]✅ Shioaji auto-reconnect completed[/green]")
+            if not register_order_callback(api, mons, om):
+                console.print("[red]❌ Order callback restore failed — QUARANTINED[/red]")
+                return False
+            if recertify:
+                _recerts = [_recertify_after_reconnect(m, api) for m in mons]
+                if not all(_recerts):
+                    console.print("[red]❌ Re-certification failed after auto-reconnect — QUARANTINED, exiting for restart[/red]")
+                    return False
+            _reconnect_evidence("SESSION_RECONNECT_READY")
             return True
         console.print("[yellow]⚠️ Shioaji auto-reconnect still pending — attempting manual re-login[/yellow]")
 
@@ -608,6 +1004,7 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
 
     if not api_key or not secret_key:
         console.print("[red]❌ Missing API credentials — cannot reconnect[/red]")
+        _quarantine_for_handoff(handoff_targets, reason="RECONNECT_LOGIN_FAILED")
         return False
 
     for attempt in range(3):
@@ -615,14 +1012,30 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             console.print(f"[cyan]🔄 Re-login attempt {attempt+1}/3...[/cyan]")
             safe_login(api, api_key, secret_key, contracts_timeout=10000)
             console.print("[green]✅ Shioaji re-login successful[/green]")
+            _reconnect_evidence("SESSION_RECONNECT_RELOGIN_SUCCESS")
+            if not register_order_callback(api, mons, om):
+                console.print("[red]❌ Order callback registration failed — QUARANTINED[/red]")
+                return False
 
-            # Re-subscribe all contracts
-            if fm and fm.contract:
-                api.quote.subscribe(fm.contract, quote_type='tick')
-                console.print(f"[dim]📡 Re-subscribed: {fm.contract.code}[/dim]")
-            if fm and fm.far_contract:
-                api.quote.subscribe(fm.far_contract, quote_type='tick')
-                console.print(f"[dim]📡 Re-subscribed far: {fm.far_contract.code}[/dim]")
+            # Re-subscribe all contracts (per monitor; near + far). BBO is
+            # required for entry freshness; tick-only recovery leaves the
+            # strategy permanently stale while last trades continue.
+            from core.broker.shioaji_compat import safe_subscribe
+            for m in mons:
+                if getattr(m, "contract", None):
+                    safe_subscribe(api, m.contract, quote_type='tick')
+                    safe_subscribe(api, m.contract, quote_type='bidask')
+                    console.print(f"[dim]📡 Re-subscribed tick+bidask: {m.contract.code}[/dim]")
+                if getattr(m, "far_contract", None):
+                    try:
+                        safe_subscribe(api, m.far_contract, quote_type='tick')
+                        safe_subscribe(api, m.far_contract, quote_type='bidask')
+                        console.print(f"[dim]📡 Re-subscribed far tick+bidask: {m.far_contract.code}[/dim]")
+                    except Exception as _fexc:
+                        console.print(f"[red]❌ Far resubscribe failed: {_fexc} — QUARANTINED[/red]")
+                        _quarantine_for_handoff(handoff_targets,
+                                                reason="FAR_RESUBSCRIBE_FAILED")
+                        return False
             if om:
                 for key in ["MTX", "C", "P"]:
                     con = om.monitor.active_contracts.get(key)
@@ -637,9 +1050,25 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
             # tick_dispatcher is defined in the outer scope — we pass None for now,
             # the existing callbacks should still be wired
             _connection_dropped = False
+            # post-success: recertification proceeds (Step 5) — if it
+            # fails the reconnect is a FAILURE: return False (never True
+            # on failed recertification; context stays QUARANTINED).
+            # recertify=False defers this to the caller (verification
+            # window runs first — strict ordering).
+            if recertify:
+                _recerts = [_recertify_after_reconnect(m, api) for m in mons]
+                if not all(_recerts):
+                    console.print("[red]❌ Re-certification failed after re-login — QUARANTINED, exiting for restart[/red]")
+                    return False
+            _reconnect_evidence("SESSION_RECONNECT_READY")
             return True
 
         except Exception as e:
+            _reconnect_evidence(
+                "SESSION_RECONNECT_FAILED",
+                attempt=attempt + 1,
+                error_type=type(e).__name__,
+            )
             console.print(f"[yellow]⚠️ Re-login attempt {attempt+1} failed: {e}[/yellow]")
             if attempt < 2:
                 wait = (attempt + 1) * 15  # 15s, 30s, 45s backoff
@@ -647,7 +1076,231 @@ def _try_shioaji_reconnect(api, fm, om, dry_run: bool) -> bool:
                 time.sleep(wait)
 
     console.print("[red]❌ All re-login attempts failed — network may be down[/red]")
+    _quarantine_for_handoff(handoff_targets, reason="RECONNECT_LOGIN_FAILED")
     return False
+
+
+def _shutdown_exit_code(reason: str) -> int:
+    """Map lifecycle shutdown causes to supervisor-visible exit codes."""
+    if reason == "RECOVERABLE_SESSION_LOSS":
+        return 75
+    if reason.startswith("SIGNAL_") or reason == "OPERATOR_STOP":
+        return 0
+    return 1
+
+
+def _feed_stale_session_decision(api, monitors, feed_health,
+                                   try_reconnect, verify_window,
+                                   market_open=True,
+                                   health_check_now=None,
+                                   health_interval=300):
+    """Feed-stale decision, session-first (2026-08-27 Phase 1).
+
+    Returns one of:
+      "keep_alive" — market closed / recess: stay alive, no action
+      "degrade"    — session HEALTHY but feed stale (low-volume silence):
+                     degrade in place, NEVER exit
+      "resume"     — session down -> reconnect ok -> verify window pass:
+                     resume monitoring (entry stays blocked until
+                     recertification; exits are untouched)
+      "exit"       — reconnect failed OR verification window failed:
+                     exit to human supervision
+
+    Pure decision: recovery hooks are injected (testable without booting
+    the main loop).  Never touches entry/exit layers directly.
+    """
+    if not market_open:
+        return "keep_alive"
+    _bh = api_is_healthy(api)
+    # A broker query can be reported as DEGRADED after the underlying session
+    # has died. Combine that state with stale futures data as a second signal;
+    # a live feed still degrades in place.
+    _feed_stale = False
+    try:
+        _ages = (feed_health.snapshot() or {}).get("ages", {})
+        _feed_stale = float(_ages.get("MXF", float("inf"))) > 300.0
+    except (AttributeError, TypeError, ValueError):
+        _feed_stale = False
+
+    # A SESSION-level state always triggers reconnect. DEGRADED /
+    # TRANSIENT_FAILURE are broker-query-level when the stream (Tick/BidAsk)
+    # is healthy; they must remain degrade-only in that case. When the
+    # futures feed is also stale, the conjunction is session-level evidence.
+    # SESSION_INVALID is always session-down; PROCESS_RESTART_REQUIRED is
+    # auth exhaustion (handled above in the main loop, but kept
+    # session-level here too for the pure decision). DEGRADED/
+    # TRANSIENT_FAILURE join this set only when futures data is also stale.
+    _session_down = _bh in (
+        "SESSION_INVALID", "PROCESS_RESTART_REQUIRED",
+    ) or (_bh in ("DEGRADED", "TRANSIENT_FAILURE") and _feed_stale)
+    if not _session_down:
+        return "degrade"
+    if try_reconnect(api, monitors, None, False):
+        if verify_window(monitors, api, duration_s=30, interval_s=5):
+            return "resume"
+    return "exit"
+
+
+def _verify_reconnect_window(monitors, api, duration_s=30, interval_s=5,
+                           quarantine_callable=None):
+    """Post-reconnect verification window (2026-08-27 Phase 1, codex-approved).
+
+    After _try_shioaji_reconnect(..., recertify=False) succeeds, the system
+    must NOT resume monitoring immediately: it runs a bounded verification
+    window first (MONOTONIC clock — NTP steps must not truncate it).
+
+    Checks every `interval_s` seconds for `duration_s`:
+      1. session ready  — api_is_healthy(api) returns a healthy state
+      2. per-leg BidAsk callbacks live — near AND far market_data slots'
+         bidask_at must advance across the window (a monitor-level tick
+         timestamp can hide a dead far BidAsk subscription)
+      3. BBO valid on BOTH legs — bid/ask finite, positive, ask >= bid
+         (non-crossed), bidask_at present (entry-freshness contract)
+      4. generation fencing — every BBO slot must carry generation_id ==
+         the CURRENT session_registry generation for this api (stale
+         generation caches are rejected)
+
+    Entry stays blocked during the window: `quarantine_callable` is
+    invoked on EVERY interval (idempotent re-assert of QUARANTINED /
+    live_order_allowed=False) so a premature recertify cannot unblock
+    entry mid-window.  Policy J / stop-loss / emergency exit run in the
+    strategy layer and are NEVER touched.  True only if the whole window
+    passes; any violation -> False (caller exits to human supervision).
+    """
+    _deadline = time.monotonic() + duration_s
+    # per-leg BidAsk liveness: record each slot's bidask_at at window start
+    _base_bidask = {}
+    for m in monitors:
+        _md = getattr(m, "market_data", {}) or {}
+        for _code in _leg_codes(m):
+            # BidAsk liveness uses bidask_received_at (monotonic, written
+            # ONLY by on_bidask).  NEVER bidask_at — the tick path wrote
+            # that in earlier revisions and must not fake BidAsk
+            # freshness (codex review v4).
+            _base_bidask[(id(m), _code)] = (
+                (_md.get(_code) or {}).get("bidask_received_at") or 0.0)
+    _saw_advance = {k: False for k in _base_bidask}
+    while time.monotonic() < _deadline:
+        # 0. entry stays blocked for the whole window (idempotent)
+        if quarantine_callable is not None:
+            try:
+                quarantine_callable()
+            except Exception:
+                return False
+        # 1. session ready
+        _h = api_is_healthy(api)
+        if _h not in ("HEALTHY", "OK", "healthy", "ok", "RECOVERING"):
+            console.print(
+                f"[red]⛔ [RECONNECT_VERIFY] session not ready: {_h}[/red]")
+            return False
+        for m in monitors:
+            _md = getattr(m, "market_data", {}) or {}
+            # 3. BBO valid on BOTH legs + 4. generation fencing
+            for _code in _leg_codes(m):
+                _slot = _md.get(_code) or {}
+                if not _valid_leg_bbo(_slot):
+                    console.print(
+                        f"[red]⛔ [RECONNECT_VERIFY] {_code} invalid BBO "
+                        f"({_bbo_invalid_reason(_slot)})[/red]")
+                    return False
+                if not _bbo_matches_generation(_slot, api):
+                    console.print(
+                        f"[red]⛔ [RECONNECT_VERIFY] {_code} stale-generation "
+                        f"BBO (slot gen != current)[/red]")
+                    return False
+                # 2. per-leg BidAsk advance vs window start (monotonic
+                #    receive timestamp — tick writes must NOT count)
+                _at = _slot.get("bidask_received_at") or 0.0
+                if _at > _base_bidask.get((id(m), _code), 0.0):
+                    _saw_advance[(id(m), _code)] = True
+            # generation confirm (ctx binding still current)
+            _cf = getattr(m, "_confirm_session_generation", None)
+            if callable(_cf):
+                try:
+                    if not _cf():
+                        console.print(
+                            f"[red]⛔ [RECONNECT_VERIFY] session generation "
+                            f"mismatch[/red]")
+                        return False
+                except Exception:
+                    return False
+        time.sleep(interval_s)
+    # every near+far slot must have seen at least one BidAsk advance
+    for _k, _saw in _saw_advance.items():
+        if not _saw:
+            console.print(
+                f"[red]⛔ [RECONNECT_VERIFY] slot {_k[1]} no BidAsk advance "
+                f"in window[/red]")
+            return False
+    console.print("[green]✅ [RECONNECT_VERIFY] verification window passed[/green]")
+    return True
+
+
+def _leg_codes(mon):
+    """Near + far market_data slot codes for a monitor (contract codes +
+    <ticker>_FAR naming)."""
+    _codes = []
+    for _contract in (getattr(mon, "contract", None),
+                      getattr(mon, "far_contract", None)):
+        _c = getattr(_contract, "code", None)
+        if _c:
+            _codes.append(_c)
+    _ticker = getattr(mon, "ticker", "") or ""
+    if _ticker:
+        _codes.append(f"{_ticker}_FAR")
+    return _codes
+
+
+def _valid_leg_bbo(slot):
+    """BBO validity: bid/ask finite, positive, ask >= bid (non-crossed),
+    bidask_at present."""
+    _b, _a, _at = (slot.get("bid"), slot.get("ask"), slot.get("bidask_at"))
+    if not (_b and _a and _at):
+        return False
+    try:
+        _bf, _af = float(_b), float(_a)
+    except (TypeError, ValueError):
+        return False
+    import math as _m
+    if not (_m.isfinite(_bf) and _m.isfinite(_af)):
+        return False
+    if _bf <= 0 or _af <= 0:
+        return False
+    if _af < _bf:
+        return False
+    return True
+
+
+def _bbo_invalid_reason(slot):
+    _b, _a, _at = (slot.get("bid"), slot.get("ask"), slot.get("bidask_at"))
+    if not (_b and _a and _at):
+        return "MISSING"
+    try:
+        _bf, _af = float(_b), float(_a)
+    except (TypeError, ValueError):
+        return "NON_NUMERIC"
+    import math as _m
+    if not (_m.isfinite(_bf) and _m.isfinite(_af)):
+        return "NON_FINITE"
+    if _bf <= 0 or _af <= 0:
+        return "NON_POSITIVE"
+    if _af < _bf:
+        return "CROSSED"
+    return "OK"
+
+
+def _bbo_matches_generation(slot, api):
+    """BBO cache generation fencing: slot.generation_id must equal the
+    current session_registry generation for this api.  A slot written by
+    a PREVIOUS generation (stale subscription) is rejected."""
+    try:
+        from core.live_route_certificate import session_registry
+        _gen = session_registry.generation(api)
+        if not _gen:
+            return False  # no current generation -> cannot fence
+        return str(slot.get("generation_id") or "") == str(_gen)
+    except Exception:
+        return False
 
 
 def _setup_event_callback(api, fm, om):
@@ -680,6 +1333,11 @@ def _setup_event_callback(api, fm, om):
         elif event_code == 13:
             console.print("[bold green]✅ Shioaji 重連成功！恢復資料流[/bold green]")
             _connection_dropped = False
+            if not register_order_callback(api, [fm] if fm else [], om):
+                _connection_dropped = True
+                _quarantine_for_handoff([fm] if fm else [],
+                                        reason="ORDER_CALLBACK_REGISTRATION_FAILED")
+                return
             # Re-subscribe to ensure data flow restoration
             try:
                 if fm and fm.contract:
@@ -750,12 +1408,45 @@ def feeds_are_fresh(feed_health, require_tx=True, require_futures=True):
     return (len(problems) == 0), problems, snap
 
 
+def update_startup_progress(step: str, progress_pct: int, message: str, status: str = "IN_PROGRESS"):
+    try:
+        import json, time
+        data = {
+            "status": status,
+            "step": step,
+            "progress_pct": progress_pct,
+            "message": message,
+            "timestamp": time.time()
+        }
+        with open("/tmp/futures_system_startup.json", "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
 def run_system(dry_run=False, config_name="futures"):
-    """運行交易系統，遇到斷線或重啟請求時結束進程，由外部腳本重新拉起"""
-    # 啟動時立即清除重啟旗標，避免循環重啟
-    if RESTART_FLAG.exists():
-        RESTART_FLAG.unlink()
-        console.print("[dim]Old restart flag cleared.[/dim]")
+    """Run the trading system; supervised recovery is limited to classified failures."""
+    # [sealed live profile] validate the config name BEFORE any broker
+    # login — unknown/missing config => fast-fail (fail-closed; live
+    # deployments must use the sealed --config futures_live profile)
+    # 2026-10-04 Codex: explicit all-PAPER profiles only; mixed/unknown stays fail-closed.
+    import yaml
+    # 2026-10-12 Codex: validate the actual PAPER profile before broker login.
+    from core.futures_profiles import resolve_futures_profile
+    _paper_only = bool(config_name.strip()) and os.environ.get("TRADING_FUTURES_MODE", "paper") == "paper"
+    for _ci in (c.strip() for c in config_name.split(",") if c.strip()):
+        _cf = f"{_ci.replace('.yaml', '')}.yaml"
+        if not os.path.exists(os.path.join(BASE, "config", _cf)):
+            raise RuntimeError(
+                f"Unknown futures config: {_cf} — refusing to start "
+                f"(fail-closed; live deployments must use "
+                f"--config futures_live)")
+        with open(resolve_futures_profile(Path(BASE) / "config" / _cf), encoding="utf-8") as _fh:
+            _startup_cfg = yaml.safe_load(_fh)
+        _paper_only = _paper_only and isinstance(_startup_cfg, dict) and _startup_cfg.get("live_trading") is False
+    with open(os.path.join(BASE, "config", "options_strategy.yaml"), encoding="utf-8") as _fh:
+        _options_cfg = yaml.safe_load(_fh)
+    _paper_only = _paper_only and isinstance(_options_cfg, dict) and _options_cfg.get("live_trading") is False
+    update_startup_progress("SHIOAJI_CONNECTING", 30, "📡 正在與 永豐期貨 建立安全連線與 Session...", status="STARTING")
 
     # ── Lifecycle provenance recorder ──
     from core.lifecycle_provenance import LifecycleRecorder
@@ -799,17 +1490,14 @@ def run_system(dry_run=False, config_name="futures"):
             )
             time.sleep(_delay)
 
+    _shutdown_reason = "MAIN_LOOP_RETURNED"
     try:
         if not dry_run:
             api = get_api()
             console.print("[green]✅ Single Shioaji session established[/green]")
 
-            # Mark safety state as reconciled (post-restart, fresh login)
-            try:
-                from core.channel_safety import get_safety_state
-                get_safety_state().set_reconciled()
-            except Exception:
-                pass
+            # 2026-08-05 Codex: login alone never unlocks post-reboot entries.
+            verify_startup_reconciliation(api, paper_only=_paper_only)
 
             # ── Shioaji quote event callback (provenance only) ──
             try:
@@ -828,10 +1516,12 @@ def run_system(dry_run=False, config_name="futures"):
 
             # [rshioaji 1.5.10+] Ensure contracts are loaded in cache before monitors start
             from core.broker.shioaji_compat import fetch_all_contracts
+            update_startup_progress("CONTRACT_SYNC", 55, "📡 正在向永豐期貨下載與同步全場期貨/選擇權契約規格 (約需 10-20 秒)...", status="STARTING")
             console.print("[cyan]📡 Synchronizing all broker contracts (this may take 1-5 minutes)...[/cyan]")
             print(f"[CONTRACT_SYNC_START] timeout=300s", flush=True)
             if fetch_all_contracts(api, timeout=300):
                 console.print("[green]✅ Contracts synchronized successfully.[/green]")
+                update_startup_progress("MONITOR_INIT", 80, "🛡️ 契約載入完成，正在進行 LIVE_PREFLIGHT 風控與賬戶檢測...", status="PREFLIGHT")
                 print(f"[CONTRACT_SYNC_PROGRESS] success", flush=True)
             else:
                 console.print("[yellow]⚠️ Contract synchronization timed out, continuing with best effort.[/yellow]")
@@ -851,17 +1541,22 @@ def run_system(dry_run=False, config_name="futures"):
         futures_mons = []
         for cfg_item in config_names:
             _base_cfg = cfg_item.replace(".yaml", "")
-            if _is_night:
-                _config_file = f"{_base_cfg}_night.yaml"
-                if not os.path.exists(os.path.join(BASE, "config", _config_file)):
-                    _config_file = f"{_base_cfg}.yaml"
-            else:
-                _config_file = f"{_base_cfg}.yaml"
+            # 2026-08-04 Gemini CLI: Unified single config source (futures.yaml) for both day & night
+            _config_file = f"{_base_cfg}.yaml"
+            _config_path_full = os.path.join(BASE, "config", _config_file)
+            # [sealed live profile] unknown/missing config => FAST-FAIL
+            # before any broker/monitor startup (fail-closed; the LIVE
+            # deployment uses the sealed config/futures_live.yaml profile)
+            if not os.path.exists(_config_path_full):
+                raise RuntimeError(
+                    f"Unknown futures config: {_config_file} — refusing "
+                    f"to start (fail-closed; live deployments must use "
+                    f"--config futures_live)")
             console.print(f"[dim]📋 Futures config for {cfg_item}: {_config_file} (session={'night' if _is_night else 'day'})[/dim]")
 
             fm_inst = FuturesMonitor(
                 api=api,
-                config_path=os.path.join(BASE, "config", _config_file),
+                config_path=_config_path_full,
                 dry_run=dry_run,
             )
             fm_inst.setup()
@@ -950,6 +1645,8 @@ def run_system(dry_run=False, config_name="futures"):
             from core.broker.shioaji_compat import set_tick_callback, set_bidask_callback, safe_subscribe
             _tmf_tick_fn = tick_dispatcher(futures_mons, om, feed_health, tx_bar_builder)
             _tmf_bidask_fn = bidask_dispatcher(futures_mons, om, sk_engine)
+            _session_tick_callback = _tmf_tick_fn
+            _session_bidask_callback = _tmf_bidask_fn
 
             # Install GlobalCallbackAdapter so MTX ticks are routed to passive collector AND tick_dispatcher
             if _mtx_runtime is not None:
@@ -967,6 +1664,8 @@ def run_system(dry_run=False, config_name="futures"):
                     return _gca_adapter.on_tick(*a)
                 set_tick_callback(api, _gca_tick_wrapper)
                 set_bidask_callback(api, _mtx_runtime.adapter.on_bidask)
+                _session_tick_callback = _gca_tick_wrapper
+                _session_bidask_callback = _mtx_runtime.adapter.on_bidask
                 console.print("[green]✅ GlobalCallbackAdapter installed (TMF + MTX routing with fallback dispatch)[/green]")
 
                 # Start MTX runtime (resolves contracts, binds routes, starts writer)
@@ -995,7 +1694,9 @@ def run_system(dry_run=False, config_name="futures"):
                 set_bidask_callback(api, _tmf_bidask_fn)
 
             # [P0 Fix] Centralized order dispatcher to avoid "Already borrowed" error
-            api.set_order_callback(order_dispatcher(futures_mons, om))
+            if not register_order_callback(api, futures_mons, om):
+                console.print("[red]❌ Order event callback registration failed — QUARANTINED[/red]")
+                return
             console.print("[green]✅ Order event callback registered[/green]")
 
             # [Skew Integration] Wire skew engine into FuturesMonitor for strategy context
@@ -1010,6 +1711,13 @@ def run_system(dry_run=False, config_name="futures"):
                         console.print(f"[green]📡 Subscribed {f_mon.ticker} tick: {f_mon.contract.code}[/green]")
                     except Exception as e:
                         console.print(f"[yellow]⚠️ {f_mon.ticker} subscribe failed: {e}[/yellow]")
+                    # 2026-08-04 review: Model C needs executable BBO — futures
+                    # bidask (BidAskFOPv1) is the real source; tick carries last only.
+                    try:
+                        safe_subscribe(api, f_mon.contract, quote_type='bidask')
+                        console.print(f"[green]📡 Subscribed {f_mon.ticker} bidask: {f_mon.contract.code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ {f_mon.ticker} bidask subscribe failed: {e}[/yellow]")
 
                 if f_mon.far_contract is not None:
                     try:
@@ -1017,6 +1725,11 @@ def run_system(dry_run=False, config_name="futures"):
                         console.print(f"[green]📡 Subscribed far-month {f_mon.ticker} tick: {f_mon.far_contract.code}[/green]")
                     except Exception as e:
                         console.print(f"[yellow]⚠️ Far-month {f_mon.ticker} subscribe failed: {e}[/yellow]")
+                    try:
+                        safe_subscribe(api, f_mon.far_contract, quote_type='bidask')
+                        console.print(f"[green]📡 Subscribed far-month {f_mon.ticker} bidask: {f_mon.far_contract.code}[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️ Far-month {f_mon.ticker} bidask subscribe failed: {e}[/yellow]")
 
             # ── Subscribe MTX ticks (passive collection) ──
             if _mtx_runtime is not None and _mtx_runtime.collector.is_resolved:
@@ -1058,6 +1771,104 @@ def run_system(dry_run=False, config_name="futures"):
         # [P0 Fix] Setup connection event monitoring
         _setup_event_callback(api, futures_mons, om)
         console.print("[green]✅ Connection event callback registered[/green]")
+
+        # A dead SolClient cannot be repaired by calling login() again on the
+        # same Shioaji object (2026-09-22 incident: login returned success,
+        # then list_positions immediately remained SessionNotEstablished).
+        # Build and verify a replacement object, restore every callback and
+        # subscription, then atomically publish it.  No order API is called.
+        if api is not None:
+            from core.shioaji_session import (
+                SessionReconnectController, _login as _session_login,
+                install_replacement_api)
+            _session_reconnect = SessionReconnectController(
+                max_attempts=3, backoff_seconds=(1.0, 2.0))
+
+            def _session_event(event, **payload):
+                for _mon in futures_mons:
+                    try:
+                        _mon._append_mts_event(event, **payload)
+                    except Exception:
+                        pass
+
+            def _restore_session_channels(candidate):
+                set_tick_callback(candidate, _session_tick_callback)
+                set_bidask_callback(candidate, _session_bidask_callback)
+                if not register_order_callback(candidate, futures_mons, om):
+                    raise RuntimeError("order callback registration failed")
+                _setup_event_callback(candidate, futures_mons, om)
+                for _mon in futures_mons:
+                    for _contract in (getattr(_mon, "contract", None),
+                                      getattr(_mon, "far_contract", None)):
+                        if _contract is not None:
+                            safe_subscribe(candidate, _contract,
+                                           quote_type="tick")
+                            safe_subscribe(candidate, _contract,
+                                           quote_type="bidask")
+                for _key in ("MTX", "C", "P"):
+                    _contract = om.monitor.active_contracts.get(_key)
+                    if _contract is not None:
+                        safe_subscribe(candidate, _contract,
+                                       quote_type="tick")
+                        if _key != "MTX":
+                            safe_subscribe(candidate, _contract,
+                                           quote_type="bidask")
+
+            def _request_session_reconnect(exc, **evidence):
+                nonlocal api
+                _live_mons = [
+                    _mon for _mon in futures_mons
+                    if getattr(getattr(_mon, "_execution_context", None),
+                               "requested_mode", None) == "live"
+                ]
+                _quarantine_for_handoff(_live_mons,
+                                        reason="SESSION_RECONNECT_PENDING")
+                _session_event("SESSION_RECONNECT_TRIGGERED", **evidence)
+                _old_api = api
+                _new_api = _session_reconnect.reconnect(
+                    exc, api_factory=sj.Shioaji,
+                    login=_session_login,
+                    restore=_restore_session_channels,
+                    verify=lambda candidate: candidate.list_positions(
+                        account=candidate.futopt_account) is not None,
+                    emit=_session_event)
+                if _new_api is None:
+                    return False
+                if not install_replacement_api(_old_api, _new_api):
+                    _session_event("SESSION_RECONNECT_FAILED",
+                                   error_type="SESSION_SWAP_RACE")
+                    return False
+                api = _new_api
+                for _mon in futures_mons:
+                    _mon.api = _new_api
+                    if getattr(_mon, "client", None) is not None:
+                        _mon.client.api = _new_api
+                om.api = _new_api
+                om.monitor.api = _new_api
+                try:
+                    _recert_results = [
+                        _recertify_after_reconnect(_mon, _new_api, defer_promotion=True)
+                        for _mon in _live_mons
+                    ]
+                    _recert_ok = all(
+                        _result is not False and _result.is_live_ready()
+                        for _result in _recert_results)
+                except Exception:
+                    _recert_ok = False
+                if not _recert_ok:
+                    _quarantine_for_handoff(
+                        _live_mons, reason="SESSION_RECERTIFY_FAILED")
+                    _session_event("SESSION_RECONNECT_FAILED",
+                                   error_type="RECERTIFY_FAILED")
+                    return False
+                for _mon, _certified_ctx in zip(_live_mons, _recert_results):
+                    _mon._execution_context = _certified_ctx
+                    _persist_ctx(_mon)
+                _session_event("SESSION_RECONNECT_READY", **evidence)
+                return True
+
+            for _mon in futures_mons:
+                _mon._session_reconnect_callback = _request_session_reconnect
         # Re-enable when futures MTS is stable and options logic is revised.
         _options_enabled = False
         if _options_enabled:
@@ -1067,6 +1878,7 @@ def run_system(dry_run=False, config_name="futures"):
         for fm, ft in futures_threads:
             ft.start()
         console.print(f"[bold green]🚀 Unified Monitors Running ({', '.join(fm.ticker for fm in futures_mons)})[/bold green]")
+        update_startup_progress("SYSTEM_READY", 100, "✅ 系統與 Preflight 檢查完成，實時交易監控運作中！", status="READY")
         for fm, ft in futures_threads:
             print(f"[RUNTIME_LOOP_STARTED] futures_thread={ft.ident} ticker={fm.ticker}", flush=True)
 
@@ -1101,12 +1913,8 @@ def run_system(dry_run=False, config_name="futures"):
                     futures_mons = []
                     for cfg_item in config_names:
                         _base_cfg = cfg_item.replace(".yaml", "")
-                        if _is_night:
-                            _config_file = f"{_base_cfg}_night.yaml"
-                            if not os.path.exists(os.path.join(BASE, "config", _config_file)):
-                                _config_file = f"{_base_cfg}.yaml"
-                        else:
-                            _config_file = f"{_base_cfg}.yaml"
+                        # 2026-08-04 Gemini CLI: Unified single config source (futures.yaml) for both day & night
+                        _config_file = f"{_base_cfg}.yaml"
                         
                         fm_inst = FuturesMonitor(
                             api=api,
@@ -1153,6 +1961,12 @@ def run_system(dry_run=False, config_name="futures"):
                         for f_mon in futures_mons:
                             if f_mon.contract is not None:
                                 api.quote.subscribe(f_mon.contract, quote_type='tick')
+                                # 2026-08-04 review: reconnect must also restore
+                                # futures bidask (Model C BBO source)
+                                try:
+                                    api.quote.subscribe(f_mon.contract, quote_type=sj.constant.QuoteType.BidAsk)
+                                except Exception as e:
+                                    console.print(f"[yellow]⚠️ Re-subscribe {f_mon.ticker} bidask failed: {e}[/yellow]")
 
                             if f_mon.far_contract is not None:
                                 try:
@@ -1160,6 +1974,10 @@ def run_system(dry_run=False, config_name="futures"):
                                     console.print(f"[green]📡 Re-Subscribed far-month {f_mon.ticker} Futures tick: {f_mon.far_contract.code}[/green]")
                                 except Exception as e:
                                     console.print(f"[yellow]⚠️ Re-subscribe far-month {f_mon.ticker} Futures failed: {e}[/yellow]")
+                                try:
+                                    api.quote.subscribe(f_mon.far_contract, quote_type=sj.constant.QuoteType.BidAsk)
+                                except Exception as e:
+                                    console.print(f"[yellow]⚠️ Re-subscribe far-month {f_mon.ticker} bidask failed: {e}[/yellow]")
 
                         om.monitor.find_best_contracts(futures_mons[0])
                         om.monitor.pre_fill_bars()
@@ -1189,6 +2007,7 @@ def run_system(dry_run=False, config_name="futures"):
                     console.print(f"[bold red]💥 Restart failed: {e}[/bold red]")
                     import traceback
                     console.print(traceback.format_exc())
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
 
             now = time.time()
@@ -1237,22 +2056,25 @@ def run_system(dry_run=False, config_name="futures"):
                     continue
                 else:
                     console.print("[red]💀 Reconnect failed — exiting for PM2 restart[/red]")
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
             elif stale_secs > (stale_limit * 0.6) and not stagnation_warned:
                 console.print(f"[bold yellow]⚠️ DATA WARNING: No data for {stale_secs/60:.1f} mins. Watching...[/bold yellow]")
                 stagnation_warned = True
             
-            if RESTART_FLAG.exists():
-                RESTART_FLAG.unlink()
-                console.print("[bold yellow]🔄 Restart requested. Exiting for external supervisor...[/bold yellow]")
-                break
-
             now = time.time()
             if not dry_run and now > startup_grace_until and now > health_check_at:
-                # 1) API session health
-                if not api_is_healthy(api):
-                    console.print("[red]💀 Shioaji session dead — exiting for external supervisor[/red]")
+                # 1) API session health — classified; exit ONLY on
+                #    PROCESS_RESTART_REQUIRED (auth exhaustion). Generic
+                #    500/timeout degrade state + block entry, never exit.
+                # 2026-10-04 Codex: PAPER account readiness is local; quote freshness is checked below.
+                _bh_state = "PAPER_LOCAL" if _paper_only else api_is_healthy(api)
+                if _bh_state == "PROCESS_RESTART_REQUIRED":
+                    console.print("[red]💀 Broker session unrecoverable (relogin exhausted) — exiting for external supervisor[/red]")
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
+                elif _bh_state in ("SESSION_INVALID", "DEGRADED", "TRANSIENT_FAILURE"):
+                    console.print(f"[yellow]⚠️ Broker health: {_bh_state} — entry blocked, feed/risk continue[/yellow]")
 
                 # 2) Feed freshness health
                 try:
@@ -1286,11 +2108,74 @@ def run_system(dry_run=False, config_name="futures"):
                         health_check_at = now + HEALTH_INTERVAL
                         time.sleep(2)
                         continue
+                    # ── 2026-08-27 Phase 1 (codex-approved): session health
+                    # takes priority over tick age (see
+                    # _feed_stale_session_decision).  Low-volume silence with
+                    # a healthy session degrades in place, never exits.
+                    _decision = _feed_stale_session_decision(
+                        api, futures_mons, feed_health,
+                        try_reconnect=lambda _a, _fm, _om, _dr:
+                            _try_shioaji_reconnect(
+                                _a, _fm, _om if 'om' in dir() else None, _dr,
+                                recertify=False),
+                        verify_window=lambda _mons, _a, duration_s, interval_s:
+                            _verify_reconnect_window(
+                                _mons, _a, duration_s=duration_s,
+                                interval_s=interval_s,
+                                quarantine_callable=lambda:
+                                    _quarantine_for_handoff(
+                                        _reconnect_monitors(futures_mons))),
+                        market_open=is_taifex_futures_market_open(),
+                    )
+                    if _decision == "keep_alive":
+                        health_check_at = now + HEALTH_INTERVAL
+                        time.sleep(2)
+                        continue
+                    if _decision == "degrade":
+                        console.print(
+                            "[yellow]Feed stale but session healthy — "
+                            "degrading, NOT exiting (night-session "
+                            "low-volume guard)[/yellow]")
+                        health_check_at = now + HEALTH_INTERVAL
+                        time.sleep(2)
+                        continue
+                    if _decision == "resume":
+                        # verification window PASSED — recertify NOW so the
+                        # context leaves QUARANTINED only after the window
+                        # proved session/callback/BBO/generation health.
+                        # (quarantine_callable kept it blocked throughout.)
+                        _recerts = [_recertify_after_reconnect(m, api)
+                                    for m in _reconnect_monitors(futures_mons)]
+                        if not all(_recerts):
+                            console.print(
+                                "[red]❌ Recertification failed after "
+                                "verification window — exiting for human "
+                                "supervision[/red]")
+                            console.print(
+                                "[bold red]Feed stale — exiting for external "
+                                "supervisor: " + "; ".join(problems) +
+                                "[/bold red]")
+                            _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
+                            break
+                        console.print(
+                            "[green]✅ Controlled recovery complete — "
+                            "resuming monitoring[/green]")
+                        for bucket in ['TX', 'MXF', 'OPTIONS']:
+                            feed_health.last_tick_ts[bucket] = time.time()
+                        last_data_at = time.time()
+                        health_check_at = now + HEALTH_INTERVAL
+                        time.sleep(2)
+                        continue
+                    # "exit"
+                    console.print(
+                        "[red]❌ Controlled recovery failed — exiting "
+                        "for human supervision[/red]")
                     console.print(
                         "[bold red]Feed stale — exiting for external supervisor: "
                         + "; ".join(problems)
                         + "[/bold red]"
                     )
+                    _shutdown_reason = "RECOVERABLE_SESSION_LOSS"
                     break
 
                 health_check_at = now + HEALTH_INTERVAL
@@ -1312,8 +2197,12 @@ def run_system(dry_run=False, config_name="futures"):
         _rec = _lifecycle_recorder
         if _rec is not None:
             try:
-                _rec.set_shutdown_cause("MAIN_LOOP_RETURNED", "MAIN_LOOP")
-                _rec.record_event("MAIN_LOOP_RETURNED")
+                _rec.set_shutdown_cause(_shutdown_reason, "MAIN_LOOP")
+                _rec.record_event(
+                    "MAIN_LOOP_RETURNED",
+                    shutdown_reason=_shutdown_reason,
+                    pm2_exit_code=_shutdown_exit_code(_shutdown_reason),
+                )
                 _rec.record_event("SHUTDOWN_BEGIN")
             except Exception:
                 pass
@@ -1375,6 +2264,19 @@ def run_system(dry_run=False, config_name="futures"):
             # Final sleep before logout - reduces C++ crash risk
             time.sleep(2)
 
+            # [Step 7] session invalidation: quarantine every futures
+            # monitor context BEFORE the broker logout (centralized
+            # registry unregister lives in shioaji_session.logout —
+            # monitors only quarantine + persist, never re-implement)
+            try:
+                for _m in _reconnect_monitors(
+                        futures_mons if "futures_mons" in dir() else []):
+                    _on_logout = getattr(_m, "_on_session_logout", None)
+                    if callable(_on_logout):
+                        _on_logout()
+            except Exception as _lexc:
+                console.print(f"[dim]Session-logout quarantine error: {_lexc}[/dim]")
+
             logout()
 
             # Final buffer before process exit - prevents macOS "Python quit unexpectedly" dialog
@@ -1385,6 +2287,9 @@ def run_system(dry_run=False, config_name="futures"):
             console.print(f"[dim]Cleanup error: {e}[/dim]")
             # Still sleep to reduce C++ crash risk
             time.sleep(2)
+
+    if _shutdown_reason != "MAIN_LOOP_RETURNED":
+        raise SystemExit(_shutdown_exit_code(_shutdown_reason))
     
 def main():
     """Main entry point with macOS signal handling."""

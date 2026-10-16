@@ -263,3 +263,32 @@ def test_policy_j_primary_exit_and_fallback():
     assert decision_fallback.action == LifecycleAction.RELEASE
     assert decision_fallback.release_leg == Leg.NEAR
 
+
+
+def test_policy_j_single_leg_combined_pnl_exit():
+    """2026-08-03 Gemini CLI: Verify Policy J evaluation on combined total PnL during SINGLE_LEG phase."""
+    from strategies.plugins.futures.active.tmf_spread import LifecycleContext
+    from strategies.plugins.futures.active.mts_lifecycle_adapter import evaluate_lifecycle_actions
+    lc = PositionLifecycle(phase=PositionPhase.SINGLE_LEG)
+    lc.release_group.status = ReleaseGroupStatus.COMPLETED
+    lc.trail_group.status = TrailGroupStatus.ARMED
+    ctx_single_leg_pj = LifecycleContext(
+        near_pnl_pts=-100.0,
+        far_pnl_pts=124.0,
+        floating_pnl_pts=124.0,
+        entry_age_secs=200.0,
+        release_stop_threshold=80.0,
+        trail_dist=50.0,
+        trailing_side=Side.LONG,
+        peak=43500.0,
+        nadir=43000.0,
+        rem_high=43500.0,
+        rem_low=43480.0,
+        enable_combined_upl_trail=True,
+        combined_upl_activation_net_pnl_twd=200.0,
+        combined_upl_giveback_twd=50.0,
+        peak_net_exit_pnl_twd=208.0,
+    )
+    decision = evaluate_lifecycle_actions(ctx_single_leg_pj, lc)
+    assert decision is not None
+    assert decision.action == LifecycleAction.TRAIL
