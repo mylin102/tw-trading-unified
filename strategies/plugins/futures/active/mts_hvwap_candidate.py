@@ -38,7 +38,7 @@ from __future__ import annotations
 import datetime as _dt
 import math
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Any, Optional, Sequence
 
@@ -47,6 +47,8 @@ from strategies.plugins.futures.active.mts_oi_estimator import OISnapshot
 from strategies.plugins.futures.active.mts_vol_adjuster import VolAdjuster
 # 2026-10-15 Hermes Agent: Task 1.3.2 optional event-based quality observation.
 from strategies.plugins.futures.active.mts_vol_quality import VolQuality
+# 2026-10-15 Hermes Agent: pure Phase 1 adaptive observation.
+from strategies.plugins.futures.active.mts_adaptive_vwap import AdaptiveVWAP, AdaptiveVWAPConfig
 
 from strategies.plugins.futures.active.mts_lifecycle_adapter import (
     counter_trend_leg_from_sides,
@@ -558,6 +560,11 @@ class HvwapCandidateVerdict:
     # 2026-10-15 Hermes Agent: optional event quality, separate from Z-score quality.
     vol_quality_score: Optional[float] = None
     vol_quality_level: Optional[str] = None
+    # 2026-10-15 Hermes Agent: adaptive observations, never arbitration inputs.
+    adaptive_price: Optional[float] = None
+    chips_strength: Optional[float] = None
+    alpha: Optional[float] = None
+    adaptive_twap: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -657,6 +664,9 @@ def evaluate_hvwap_candidate(
     oi_snapshot: Optional[OISnapshot] = None,
     # 2026-10-15 Hermes Agent: same completed-bar window as oi_snapshot; None = unavailable.
     event_sequence: Optional[Sequence[dict[str, Any]]] = None,
+    # 2026-10-15 Hermes Agent: baseline remains the default decision arm.
+    use_adaptive: bool = False,
+    adaptive_config: Optional[AdaptiveVWAPConfig] = None,
 ) -> HvwapCandidateVerdict:
     """Top-level Hierarchical VWAP candidate arbitration (PURE, telemetry-only).
 
@@ -915,7 +925,7 @@ def evaluate_hvwap_candidate(
             logging.getLogger(__name__).warning(
                 "[HVWAP_CANDIDATE] volume quality unavailable", exc_info=True)
 
-    return HvwapCandidateVerdict(
+    verdict = HvwapCandidateVerdict(
         decision_ts=str(decision_ts),
         session_label=label,
         status=status,
@@ -949,6 +959,42 @@ def evaluate_hvwap_candidate(
         vol_quality_score=quality.quality_score if quality is not None else None,
         vol_quality_level=quality.quality_level if quality is not None else None,
     )
+    # 2026-10-16 Hermes Agent: share the baseline calculation between A/B arms.
+    return (add_adaptive_observation(verdict, near_bars=near_bars,
+                                    oi_snapshot=oi_snapshot, config=adaptive_config, decision_ts=decision_ts)
+            if use_adaptive else verdict)
+
+
+def add_adaptive_observation(verdict: HvwapCandidateVerdict, *, near_bars,
+                             oi_snapshot: Optional[OISnapshot], config=None, decision_ts=None) -> HvwapCandidateVerdict:
+    """2026-10-16 Hermes Agent: enrich immutable baseline without rescoring voters."""
+    from strategies.plugins.futures.active.mts_adaptive_vwap import parse_ts
+    if (oi_snapshot is None or verdict.vol_quality_score is None
+            or verdict.vol_zscore is None or verdict.near.vwap is None
+            or verdict.vol_anomaly_level not in ("NORMAL", "HIGH", "EXTREME")):
+        return verdict
+    # 2026-10-16 Hermes Agent: preserve existing pandas/epoch normalization before serialization.
+    dts = to_epoch_secs(decision_ts) if decision_ts is not None else parse_ts(verdict.decision_ts)
+    if dts is None:
+        return verdict
+    _, start = vwap_session_bounds(dts)
+    session_bars = [b for b in near_bars if (bt := to_epoch_secs(b.get("ts"))) is not None
+                    and start <= bt <= dts]
+    if not session_bars:
+        return verdict
+    close_ts = max(to_epoch_secs(b["ts"]) for b in session_bars)
+    if oi_snapshot.ts != close_ts:
+        return verdict
+    adaptive = AdaptiveVWAP.compute(
+        ts=close_ts, oi_intensity=oi_snapshot.oi_intensity, oi_direction=oi_snapshot.oi_direction,
+        vol_quality=verdict.vol_quality_score, vol_zscore=verdict.vol_zscore,
+        vwap=verdict.near.vwap, bars=session_bars, config=config,
+    )
+    if adaptive is None:
+        return verdict
+    return replace(verdict, adaptive_price=adaptive.adaptive_price, chips_strength=adaptive.chips_strength,
+                   alpha=adaptive.alpha, adaptive_twap=adaptive.twap)
+
 
 
 def _unknown_verdict(decision_ts: Any, reason: str, *,

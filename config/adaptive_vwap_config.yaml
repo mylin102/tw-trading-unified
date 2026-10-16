@@ -1,0 +1,12 @@
+# 2026-10-15 Hermes Agent: Phase 1 shadow observation only; no execution switch.
+window_secs: 300
+bar_secs: 300
+intensity_full_scale: 10
+weights: [0.25, 0.25, 0.30, 0.20]
+alpha_midpoint: 50
+alpha_scale: 15
+shadow_enabled: true
+# 2026-10-16 Hermes Agent: one replay week = five observed trading dates.
+minimum_trading_days: 5
+minimum_win_rate_gain_pp: 2
+minimum_mdd_reduction_pct: 5

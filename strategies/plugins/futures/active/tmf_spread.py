@@ -2036,6 +2036,15 @@ class TMFSpread(StrategyBase):
         self._oi_snapshot = None
         # 2026-10-15 Hermes Agent: cache the exact OI window for VolQuality.
         self._oi_event_sequence = None
+        # 2026-10-15 Hermes Agent: load shadow calibration once, fail closed on config errors.
+        self._adaptive_vwap_config = None
+        try:
+            from strategies.plugins.futures.active.mts_adaptive_vwap import AdaptiveVWAPConfig
+            _adaptive_path = context.config.get("adaptive_vwap_config_path", os.path.join(
+                os.path.dirname(__file__), "..", "..", "..", "..", "config", "adaptive_vwap_config.yaml"))
+            self._adaptive_vwap_config = AdaptiveVWAPConfig.load(_adaptive_path)
+        except Exception:
+            logger.warning("[HVWAP_ADAPTIVE_AB] invalid configuration; shadow disabled", exc_info=True)
         self._hvwap_5m_bars: deque = deque(maxlen=320)
         self._hvwap_last_bucket: int | None = None
         self._hvwap_pending_snapshot: dict | None = None
@@ -2348,7 +2357,8 @@ class TMFSpread(StrategyBase):
                     except Exception:
                         logger.warning("[HVWAP_CANDIDATE] OI estimate unavailable", exc_info=True)
                     self._oi_snapshot_key = _oi_key
-                verdict = evaluate_hvwap_candidate(
+                # 2026-10-15 Hermes Agent: share identical immutable inputs between shadow arms.
+                _candidate_inputs = dict(
                     oi_snapshot=self._oi_snapshot,
                     event_sequence=getattr(self, "_oi_event_sequence", None),
                     decision_ts=_close,
@@ -2364,6 +2374,7 @@ class TMFSpread(StrategyBase):
                     far_quote_age_ms=_f_age,
                     position_phase=_phase,
                 )
+                verdict = evaluate_hvwap_candidate(**_candidate_inputs)
                 self._hvwap_last_verdict = verdict
                 if getattr(self, "_hvwap_last_emit_bucket", None) == _bucket:
                     return
@@ -2423,6 +2434,21 @@ class TMFSpread(StrategyBase):
                 "counterfactual": _cf.to_dict() if _cf else None,
             })
             _append_event("HVWAP_CANDIDATE", **_payload)
+            # 2026-10-15 Hermes Agent: paired shadow record at the existing 5m
+            # emission cadence; never replaces the baseline release verdict.
+            _adaptive_cfg = getattr(self, "_adaptive_vwap_config", None)
+            if _adaptive_cfg is not None and _adaptive_cfg.shadow_enabled:
+                try:
+                    from strategies.plugins.futures.active.mts_adaptive_ab import evaluate_hvwap_ab, paired_record, log_ab_pair
+                    _arms = evaluate_hvwap_ab(baseline=verdict, config=_adaptive_cfg, **_candidate_inputs)
+                    _pair_id = f"{getattr(self, '_trade_id', None)}:{verdict.decision_ts}"
+                    _pair = paired_record(_pair_id, _arms, _adaptive_cfg)
+                    self._adaptive_last_pair = _pair
+                    _append_event("HVWAP_ADAPTIVE_AB", **_pair)
+                    # 2026-10-16 Hermes Agent: inherit the event writer's mode-scoped root.
+                    log_ab_pair(_pair, os.path.join(os.path.dirname(_MTS_EVENT_LOG), "ab_test"))
+                except Exception:
+                    logger.warning("[HVWAP_ADAPTIVE_AB] shadow evaluation unavailable", exc_info=True)
         except Exception as _hvwap_exc:
             # 2026-08-24: fail-closed for the candidate only — NEVER disturb
             # the baseline, but record an EXPLICIT diagnostic event (the
