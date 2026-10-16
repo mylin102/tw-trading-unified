@@ -233,3 +233,52 @@ def test_paper_never_admits_live(tmp_path):
         _rt(runtime_status="PAPER_ACTIVE", is_paper_runtime=True,
             config_hash="cd" * 32), ev)
     assert not scope["ok"] and "paper view with live" in scope["reason"]
+
+
+# --- select_mts_reporting_day: must never pin the panel to a day older
+# than the ledger's newest day (2026-10-16 regression: dashboard showed
+# +331.1/2026-10-13 for the entire 00:00-07:59 tail of 2026-10-14's night
+# session, because the caller passed a "current day" one trading day
+# behind the ledger's own 15:00-rollover bucketing) ---
+
+from core.performance_provenance import select_mts_reporting_day
+
+
+def _fill(ts, net=0):
+    return {"timestamp": ts, "session": "night", "net_pnl": net}
+
+
+def test_select_mts_reporting_day_never_pins_behind_ledger_newest(tmp_path):
+    """Ledger already has 10-14 records; even if the caller's current-day
+    clock is stale (still says 10-13), the selector must not return the
+    older day -- it must surface the newest day the ledger actually has."""
+    fills = _write_ledger(tmp_path, [
+        _fill("2026-10-13T10:00:00", net=100),
+        _fill("2026-10-13T20:17:00", net=-50),  # night session -> 10-14
+    ])
+    stale_current_day = "2026-10-13"  # caller's clock disagrees with ledger
+    reporting_day = select_mts_reporting_day(fills, None, stale_current_day)
+    assert reporting_day == "2026-10-14", (
+        "selector pinned the panel to a day older than the ledger's "
+        f"newest day; got {reporting_day!r}")
+
+
+def test_select_mts_reporting_day_still_falls_back_when_current_has_no_records(tmp_path):
+    """Unrelated behavior must survive: when the (correct) current day has
+    no records yet and no newer day exists either, fall back to the
+    latest prior day."""
+    fills = _write_ledger(tmp_path, [
+        _fill("2026-10-08T10:00:00", net=100),
+    ])
+    reporting_day = select_mts_reporting_day(fills, None, "2026-10-13")
+    assert reporting_day == "2026-10-08"
+
+
+def test_select_mts_reporting_day_exact_match_still_wins(tmp_path):
+    """Unrelated behavior must survive: current day with records is
+    returned as-is."""
+    fills = _write_ledger(tmp_path, [
+        _fill("2026-10-13T10:00:00", net=100),
+    ])
+    reporting_day = select_mts_reporting_day(fills, None, "2026-10-13")
+    assert reporting_day == "2026-10-13"
