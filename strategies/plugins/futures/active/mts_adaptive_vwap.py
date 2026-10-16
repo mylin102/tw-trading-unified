@@ -52,6 +52,9 @@ class AdaptiveVWAPConfig:
     alpha_midpoint: float = 50.0
     alpha_scale: float = 15.0
     shadow_enabled: bool = True
+    # 2026-10-16 Hermes Agent: opt-in finite-window EMA for offline validation.
+    reference_method: str = "twap"
+    ema_span: int = 5
     # 2026-10-16 Hermes Agent: supplement defines one week as five trading dates.
     minimum_trading_days: float = 5.0
     minimum_win_rate_gain_pp: float = 2.0
@@ -78,6 +81,12 @@ class AdaptiveVWAPConfig:
         object.__setattr__(self, "weights", weights)
         if not isinstance(self.shadow_enabled, bool):
             raise ValueError("shadow_enabled must be a boolean")
+        if self.reference_method not in ("twap", "ema"):
+            raise ValueError("reference_method must be twap or ema")
+        if isinstance(self.ema_span, bool) or not isinstance(self.ema_span, int) or self.ema_span < 2:
+            raise ValueError("ema_span must be an integer >= 2")
+        if self.reference_method == "ema" and self.window_secs < self.ema_span * self.bar_secs:
+            raise ValueError("EMA window must cover ema_span complete bars")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> AdaptiveVWAPConfig:
@@ -190,6 +199,28 @@ class AdaptiveVWAP:
         return AdaptiveVWAP._twap_stats(bars, decision_ts, window_secs, bar_secs)[0]
 
     @staticmethod
+    def _ema_stats(bars, decision_ts, window_secs, bar_secs, span):
+        """2026-10-16 Hermes Agent: oldest-close seeded EMA; no gap bridging/future use."""
+        end = parse_ts(decision_ts)
+        if end is None or bars is None:
+            return None, 0.0
+        samples = {}
+        for bar in bars:
+            if not isinstance(bar, Mapping):
+                continue
+            ts, price = parse_ts(bar.get("ts")), _number(bar.get("close"))
+            if ts is not None and end - window_secs < ts <= end and price is not None and price > 0:
+                samples[ts] = price
+        ordered = sorted(samples)
+        if (len(ordered) < span or ordered[-1] != end
+                or any(not math.isclose(b-a, bar_secs, abs_tol=1e-6) for a, b in zip(ordered, ordered[1:]))):
+            return None, 0.0
+        ema, weight = samples[ordered[0]], 2.0 / (span + 1)
+        for ts in ordered[1:]:
+            ema = weight * samples[ts] + (1-weight) * ema
+        return ema, min(window_secs, len(ordered) * bar_secs)
+
+    @staticmethod
     def compute_adaptive_price(vwap, twap, alpha) -> Optional[float]:
         v, t, a = map(_number, (vwap, twap, alpha))
         if v is None or v <= 0 or t is None or t <= 0 or a is None or not 0 <= a <= 1:
@@ -208,7 +239,10 @@ class AdaptiveVWAP:
         try:
             chips = AdaptiveVWAP._chips_strength(oi_intensity, oi_direction, vol_quality, vol_zscore, cfg)
             alpha = AdaptiveVWAP._compute_alpha(chips, cfg)
-            twap, covered = AdaptiveVWAP._twap_stats(bars, end, window, cfg.bar_secs)
+            if cfg.reference_method == "ema":
+                twap, covered = AdaptiveVWAP._ema_stats(bars, end, window, cfg.bar_secs, cfg.ema_span)
+            else:
+                twap, covered = AdaptiveVWAP._twap_stats(bars, end, window, cfg.bar_secs)
         except ValueError:
             return None
         price = AdaptiveVWAP.compute_adaptive_price(volume_price, twap, alpha)

@@ -9,6 +9,13 @@ from scripts.research import compare_ab_results as report
 from scripts.research import run_adaptive_ab_backtest as replay
 
 
+def legacy_config(tmp_path):
+    """2026-10-16 Hermes Agent: v1 fixtures explicitly pin the original model."""
+    path = tmp_path / "v1.yaml"
+    path.write_text("window_secs: 300\nbar_secs: 300\nreference_method: twap\n")
+    return path
+
+
 def snapshot(path, *, future_close=130, gap=False):
     lines = ["ts,Open,High,Low,Close,Volume,Amount"]
     start = datetime(2026, 7, 6, 9, 10)
@@ -27,7 +34,8 @@ def study(tmp_path, *, future_close=130, gap=False):
     near = snapshot(tmp_path / "near.csv", future_close=future_close, gap=gap)
     far = snapshot(tmp_path / "far.csv", future_close=future_close, gap=gap)
     output = tmp_path / "output"
-    replay.run_study(near, far, start_date="2026-07-06", end_date="2026-07-06", output_dir=output)
+    replay.run_study(near, far, start_date="2026-07-06", end_date="2026-07-06", output_dir=output,
+                     config_path=legacy_config(tmp_path))
     a = report.load_arm(sorted(output.glob("baseline_*.jsonl")), "baseline")
     b = report.load_arm(sorted(output.glob("adaptive_*.jsonl")), "adaptive")
     return output, a, b
@@ -55,7 +63,8 @@ def test_next_bar_open_fill_and_known_pnl(tmp_path):
     assert all(not r["real_order_emitted"] for r in b.values())
     with pytest.raises(ValueError, match="already exists"):
         replay.run_study(output.parent / "near.csv", output.parent / "far.csv",
-            start_date="2026-07-06", end_date="2026-07-06", output_dir=output)
+            start_date="2026-07-06", end_date="2026-07-06", output_dir=output,
+            config_path=legacy_config(tmp_path))
 
 
 def test_future_mutation_cannot_change_current_signal(tmp_path):
@@ -126,7 +135,8 @@ def test_uncalibrated_inputs_never_get_fake_outcomes(tmp_path):
     for path in (near, far):
         path.write_text(path.read_text().replace(" 09:", " 12:"))
     output = tmp_path / "output"
-    replay.run_study(near, far, start_date="2026-07-06", end_date="2026-07-06", output_dir=output)
+    replay.run_study(near, far, start_date="2026-07-06", end_date="2026-07-06", output_dir=output,
+                     config_path=legacy_config(tmp_path))
     a = report.load_arm(list(output.glob("baseline_*.jsonl")), "baseline")
     b = report.load_arm(list(output.glob("adaptive_*.jsonl")), "adaptive")
     assert all(r["gross_pnl_points"] is None for r in a.values())

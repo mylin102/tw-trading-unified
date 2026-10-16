@@ -4,6 +4,41 @@
 
 The fusion algorithm, optional candidate fields, paired collection, configuration, offline replay and net-outcome comparison are implemented. Phase 1 computes observations; baseline arbitration and order execution retain their existing authority. No production deployment or real A/B profitability improvement is claimed.
 
+## 2026-10-16 v2 offline validation extension
+
+Hermes Agent: `/tmp/codex-task-improve-validation.md` authorizes the multi-file research change below. The earlier sections describe the initial Phase 1 implementation and its historical verification results.
+
+- `AdaptiveVWAPConfig()` retains the original TWAP defaults for API compatibility. The repository YAML now opts into `reference_method: ema`, `window_secs: 1500`, `ema_span: 5`, `bar_secs: 300`. No order-execution switch was added.
+- EMA is a finite-window exponential smoother seeded by the oldest of five complete, contiguous 5-minute closes, with coefficient `2/(5+1)`. Fewer bars or a missing interval yields unavailable. A 60-second window on 5-minute close inputs still degenerates, so dispatch option A was rejected.
+- `AdaptiveVWAPSnapshot.twap` remains the legacy serialized field name; with `reference_method: ema` it contains EMA, not a mathematical TWAP. Interpret it with the recorded config; v2 research records use the explicit `ema` key.
+- `config/adaptive_validation_config.yaml` is consumed only by the research CLI. Baseline and adaptive share a 0.1% price-to-reference distance gate, two-bar confirmation and canonical Renko/ADL/reference arbitration. Adaptive additionally requires alpha≥0.3 and adaptive-to-VWAP displacement≥0.1%. These are preset model assumptions, not parameters selected from v2 PnL.
+- Volume calibration uses strictly prior same-leg, same-clock-segment 5-minute volumes: minimum30, maximum120 samples. Score first, then append current volume. The whole-snapshot statistics are diagnostic only. Production `ZSCORE_PARAMS` stays unchanged because CSV volume units and contract provenance remain unverified.
+- The lifecycle replay calls existing `evaluate_lifecycle_actions()` and `counter_trend_leg_from_sides()`. For the fixed LONG NEAR / SHORT FAR inventory, canonical Trend Release retains LONG NEAR and releases FAR; bearish confirmation is used separately for remaining-leg reversal, not to invert the entry-side mapping.
+- Both arms share hypothetical spread entries and maintain separate non-overlapping inventories. Entry is allowed only when both arms are flat, cooldown is satisfied, and both have margin for two legs; costs use product configuration plus adverse slippage. Initial research scenario capital is100000 TWD, not an amendment of the runtime PAPER capital limit.
+- All fills use the next contiguous paired bar open. Missing bars cancel the pending fill, not the position. Open inventory remains marked and visible at the dataset end; no fabricated terminal exit. Mark-to-liquidation equity includes estimated exit fees/tax/slippage and is distinct from realized episode PnL.
+- Hard stop, timeout and Policy J remain above trend gates. `marks_live=False` preserves the actual adapter's closed-bar release-intercept refusal. Policy J's existing decision formula hardcodes10 TWD/point and92 TWD friction; v2 refuses other point values and separately accounts actual configured costs in the fill ledger. This legacy discrepancy is reported, not changed here.
+- Tick MID, BBO freshness, tick-confirmed peaks, actual MTS entry records, OI and fraud-quality history are unavailable. The result is explicitly `OFFLINE_MTS_LIFECYCLE_BAR_PROXY_V2`, never complete production replay or a promotion candidate.
+
+The CLI now defaults to v2; use a fresh output directory:
+
+```bash
+TASK_PYTHON=/Users/mylin/Documents/mylin102/tw-trading-unified-deploy-cli-20261015/venv/bin/python3
+taskpolicy -c background "$TASK_PYTHON" scripts/research/run_adaptive_ab_backtest.py \
+  --model-version v2 --near data/tmf_near_20260712.csv --far data/tmf_far_20260712.csv \
+  --start-date 2026-07-06 --end-date 2026-07-10 --output-dir logs/adaptive_v2_reproduction \
+  --config config/adaptive_vwap_config.yaml --validation-config config/adaptive_validation_config.yaml
+taskpolicy -c background "$TASK_PYTHON" scripts/research/compare_ab_results.py \
+  --baseline 'logs/adaptive_v2_reproduction/baseline_*.jsonl' \
+  --adaptive 'logs/adaptive_v2_reproduction/adaptive_*.jsonl' \
+  --output reports/adaptive_v2_reproduction.md
+```
+
+For v1 compatibility, explicitly pass `--model-version v1` and a YAML with `reference_method: twap`, `window_secs: 300`, `bar_secs: 300`; the v1 runner refuses EMA instead of silently changing its frozen model. Original source/config is pinned at commit `3ec71658`.
+
+Reports: [v2 comparison](../../reports/ab_comparison_20261016_v2.md), [volume diagnosis](../../reports/volume_calibration_diagnosis.md). Current authoritative artifacts are under `logs/ab_test_20261016_v2_verified/`; earlier v2 directories are intermediate evidence, not the final result.
+
+The5% gate uses all paired records as denominator and excludes availability-only probe differences. It requires both common-reference same-state candidate differences and actual portfolio action/leg differences to reach5%, plus at least one different paired exit. No threshold or capital adjustment is permitted merely to turn this snapshot's result into a pass. Strategy promotion always remains NO_GO for this assumption-based, reused sample.
+
 ## Specification decisions
 
 The supplied `/tmp/ADAPTIVE_VWAP_SPEC.md` contains contradictions. Clarification was requested; the following assumptions were stated before implementation and remain explicit:

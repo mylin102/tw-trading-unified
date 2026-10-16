@@ -80,6 +80,9 @@ def run_study(near_path, far_path, *, start_date, end_date, output_dir,
     if isinstance(initial_equity, bool) or not isinstance(initial_equity, (float, int)) or not 0 < initial_equity < float("inf"):
         raise ValueError("initial equity must be finite and positive")
     cfg = AdaptiveVWAPConfig.load(config_path)
+    # 2026-10-16 Hermes Agent: refuse to silently change the frozen v1 model.
+    if cfg.reference_method != "twap" or cfg.window_secs != 300 or cfg.bar_secs != 300:
+        raise ValueError("v1 requires its frozen 300-second TWAP config; use --model-version v2 for EMA")
     start = datetime.fromisoformat(start_date).replace(tzinfo=TW).timestamp()
     end = (datetime.fromisoformat(end_date).replace(tzinfo=TW) + timedelta(days=1)).timestamp()
     if start >= end:
@@ -195,11 +198,25 @@ def main(argv=None):
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--initial-equity-points", type=float, default=40000)
+    # 2026-10-16 Hermes Agent: prevent silently mixing v1 point equity with v2 TWD capital.
+    parser.add_argument("--initial-equity-points", type=float)
     parser.add_argument("--config", type=Path, default=ROOT / "config/adaptive_vwap_config.yaml")
+    # 2026-10-16 Hermes Agent: v1 remains explicit; new CLI defaults to paired lifecycle v2.
+    parser.add_argument("--model-version", choices=("v1", "v2"), default="v2")
+    parser.add_argument("--validation-config", type=Path, default=ROOT / "config/adaptive_validation_config.yaml")
+    parser.add_argument("--futures-config", type=Path, default=ROOT / "config/futures.yaml")
     args = parser.parse_args(argv)
+    if args.model_version == "v2":
+        if args.initial_equity_points is not None:
+            raise ValueError("v2 uses TWD capital in validation config, not --initial-equity-points")
+        from scripts.research.adaptive_validation_v2 import run_v2
+        print(json.dumps(run_v2(args.near, args.far, start_date=args.start_date, end_date=args.end_date,
+            output_dir=args.output_dir, config_path=args.config, validation_path=args.validation_config,
+            futures_path=args.futures_config), indent=2))
+        return
     print(json.dumps(run_study(args.near, args.far, start_date=args.start_date, end_date=args.end_date,
-        output_dir=args.output_dir, config_path=args.config, initial_equity=args.initial_equity_points), indent=2))
+        output_dir=args.output_dir, config_path=args.config,
+        initial_equity=40000.0 if args.initial_equity_points is None else args.initial_equity_points), indent=2))
 
 
 if __name__ == "__main__":

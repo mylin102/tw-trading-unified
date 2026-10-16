@@ -1,6 +1,9 @@
 # 2026-10-15 Hermes Agent: Phase 1 shadow observation only; no execution switch.
-window_secs: 300
+# 2026-10-16 Hermes Agent: five completed bars, finite-window EMA (not a TWAP).
+window_secs: 1500
 bar_secs: 300
+reference_method: ema
+ema_span: 5
 intensity_full_scale: 10
 weights: [0.25, 0.25, 0.30, 0.20]
 alpha_midpoint: 50
