@@ -5524,6 +5524,7 @@ elif _selected_product == "TMF":
     from core.performance_provenance import (
         classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl, live_upl_presented_reason,
         select_mts_reporting_day)
+    from core.date_utils import get_trading_day as _mts_exchange_trading_day
     _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
     _events_path_scope = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode scope.
     if _exit_only_dashboard:
@@ -5623,7 +5624,17 @@ elif _selected_product == "TMF":
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:
         _fills_path_scope = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode scope.
-        _scope_current_day = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
+        # 2026-10-16 Hermes Agent: use the SAME trading-day boundary the
+        # ledger itself buckets by (TAIFEX 15:00 night-session rollover,
+        # core.date_utils.get_trading_day) -- NOT TRADE_DATE_STR, which is
+        # get_trade_day's 08:00 continuous-session boundary used only for
+        # trade-record filename matching (see L355-358). Using the wrong
+        # boundary pinned the MTS panel to the previous trading day for the
+        # entire 00:00-07:59 tail of the night session.
+        _scope_current_day_dt = _mts_exchange_trading_day(datetime.datetime.now())
+        _scope_current_day = (_scope_current_day_dt.strftime("%Y-%m-%d")
+                               if hasattr(_scope_current_day_dt, "strftime")
+                               else str(_scope_current_day_dt))
         _scope_trading_day = select_mts_reporting_day(
             _fills_path_scope, _events_path_scope, _scope_current_day)
         _mts_perf_scope = scope_mts_performance(

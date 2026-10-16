@@ -94,6 +94,14 @@ def select_mts_reporting_day(fills_path, events_path,
 
     This is deliberately a date selector, not a performance aggregation:
     provenance classification still receives exactly one trading day.
+
+    Forward-looking guard (2026-10-16 Hermes Agent): if the ledger already
+    has records for a day NEWER than current_trading_day, that means the
+    caller's trading-day clock is stale/wrong relative to the ledger's own
+    15:00-rollover bucketing (core.date_utils.get_trading_day) -- never
+    pin the panel behind the ledger's newest day. This previously let the
+    dashboard freeze on the prior day's PnL for the whole 00:00-07:59 tail
+    of a night session.
     """
     days = set()
     for path in (fills_path, events_path):
@@ -101,6 +109,10 @@ def select_mts_reporting_day(fills_path, events_path,
             day = _record_trading_day(rec)
             if day:
                 days.add(day)
+    if days:
+        newest = max(days)
+        if newest > current_trading_day:
+            return newest
     if current_trading_day in days:
         return current_trading_day
     prior = [day for day in days if day < current_trading_day]
