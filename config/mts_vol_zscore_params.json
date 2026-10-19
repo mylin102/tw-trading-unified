@@ -1,0 +1,38 @@
+{
+  "params": {
+    "day": {
+      "mean": 2330.8015695067265,
+      "std": 1922.5549447436022
+    },
+    "night": {
+      "mean": 1039.8468078280398,
+      "std": 1221.523168396989
+    }
+  },
+  "source": {
+    "bar_granularity": "5-minute",
+    "candidate_files": 64,
+    "duplicate_date_files_omitted": 4,
+    "filename_date_range": [
+      "20260722",
+      "20261020"
+    ],
+    "path": "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-runtime/logs/market_data",
+    "rows_from_other_trade_dates_excluded": 2092,
+    "rows_missing_or_nonfinite_volume_excluded": 248,
+    "rows_outside_sessions_excluded": 171,
+    "rows_read": 11559,
+    "rows_used": 8910,
+    "selected_files": 60,
+    "selected_live_files": 28,
+    "selected_paper_files": 32,
+    "trade_date_rule": "day 08:45-13:45 same date; night 15:00-05:00, 15:00+ maps to next calendar date",
+    "trading_day_field_mismatches": 0,
+    "usable_trade_dates": 56,
+    "used_trade_date_range": [
+      "20260722",
+      "20261020"
+    ],
+    "zero_volume_rows_excluded": 138
+  }
+}
