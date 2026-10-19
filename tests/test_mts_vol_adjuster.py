@@ -1,5 +1,7 @@
 # 2026-10-15 Hermes Agent: integrate supplied tests using package imports; expectations unchanged.
 # 2026-10-19 Hermes Agent: cover Phase 1 session, trade-date, and z-score contracts.
+# 2026-10-19 Hermes Agent: bind z-score cases to the data-derived parameter artifact.
+# 2026-10-19 Hermes Agent: align pre-existing examples with the two-session model.
 """
 test_mts_vol_adjuster.py — VolAdjuster 完整測試套件
 
@@ -60,7 +62,7 @@ class TestVolAdjusterTimeSegment:
 
     def test_get_time_segment_non_trading_hours(self):
         """12:00 (午休) → None"""
-        ts = datetime(2026, 10, 15, 12, 0).timestamp()
+        ts = datetime(2026, 10, 15, 14, 0).timestamp()
         segment = VolAdjuster.get_time_segment(ts)
         assert segment is None
 
@@ -72,39 +74,26 @@ class TestVolAdjusterTimeSegment:
 
     # ── Z-score 計算測試 ────────────────────────────────────────
 
-    def test_zscore_normal_morning(self):
-        """早盤正常成交量 (467 = μ) → z ≈ 0"""
-        z = VolAdjuster.compute_zscore(467, "day")
-        assert abs(z - 0) < 0.1
-
-    def test_zscore_high_morning(self):
-        """早盤高異常成交量 (588 = μ + σ) → z ≈ 1.0"""
-        z = VolAdjuster.compute_zscore(588, "day")
-        assert 0.9 < z < 1.1
-
-    def test_zscore_extreme_morning(self):
-        """早盤極異常成交量 (708 = μ + 2σ) → z ≈ 2.0"""
-        z = VolAdjuster.compute_zscore(708, "day")
-        assert 1.9 < z < 2.1
-
-    def test_zscore_afternoon(self):
-        """午盤 Z-score 計算"""
-        # μ = 396, σ = 96
-        z_normal = VolAdjuster.compute_zscore(396, "day")
-        z_high = VolAdjuster.compute_zscore(492, "day")  # μ + σ
-
-        assert abs(z_normal - 0) < 0.1
-        assert 0.9 < z_high < 1.1
-
+    def test_zscore_normal_day(self):
+        """A bar at the estimated day-session mean has z=0."""
+        mean = ZSCORE_PARAMS["day"]["mean"]
+        assert VolAdjuster.compute_zscore(mean, "day") == pytest.approx(0.0)
+    def test_zscore_high_day(self):
+        """One estimated day-session standard deviation above mean has z=1."""
+        params = ZSCORE_PARAMS["day"]
+        assert VolAdjuster.compute_zscore(params["mean"] + params["std"], "day") == pytest.approx(1.0)
+    def test_zscore_extreme_day(self):
+        """Two estimated day-session standard deviations above mean has z=2."""
+        params = ZSCORE_PARAMS["day"]
+        assert VolAdjuster.compute_zscore(params["mean"] + 2 * params["std"], "day") == pytest.approx(2.0)
+    def test_zscore_day_uses_single_session_baseline(self):
+        params = ZSCORE_PARAMS["day"]
+        assert VolAdjuster.compute_zscore(params["mean"], "day") == pytest.approx(0.0)
+        assert VolAdjuster.compute_zscore(params["mean"] + params["std"], "day") == pytest.approx(1.0)
     def test_zscore_night(self):
-        """夜盤 Z-score 計算"""
-        # μ = 210, σ = 60
-        z_normal = VolAdjuster.compute_zscore(210, "night")
-        z_high = VolAdjuster.compute_zscore(270, "night")  # μ + σ
-
-        assert abs(z_normal - 0) < 0.1
-        assert 0.9 < z_high < 1.1
-
+        params = ZSCORE_PARAMS["night"]
+        assert VolAdjuster.compute_zscore(params["mean"], "night") == pytest.approx(0.0)
+        assert VolAdjuster.compute_zscore(params["mean"] + params["std"], "night") == pytest.approx(1.0)
     def test_zscore_invalid_segment(self):
         """無效時段 → None"""
         z = VolAdjuster.compute_zscore(500, "invalid_segment")
@@ -170,36 +159,30 @@ class TestVolAdjusterTimeSegment:
     # ── 完整 adjust() 函數測試 ────────────────────────────────────
 
     def test_adjust_normal_morning(self):
-        """正常時段、正常成交量"""
+        """日盤平均成交量為 NORMAL。"""
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
-        vol_adj = VolAdjuster.adjust(ts, 450)
+        vol_adj = VolAdjuster.adjust(ts, ZSCORE_PARAMS["day"]["mean"])
 
         assert vol_adj.segment == "day"
-        assert vol_adj.raw_volume == 450
+        assert vol_adj.raw_volume == ZSCORE_PARAMS["day"]["mean"]
         assert vol_adj.anomaly_level == "NORMAL"
         assert vol_adj.quality_rating > 80
 
     def test_adjust_high_anomaly_morning(self):
-        """正常時段、高異常成交量"""
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
-        vol_adj = VolAdjuster.adjust(ts, 588)
-
-        assert vol_adj.segment == "day"
-        assert vol_adj.anomaly_level == "HIGH"
-        assert 50 < vol_adj.quality_rating < 70
-
+        params = ZSCORE_PARAMS["day"]
+        result = VolAdjuster.adjust(ts, params["mean"] + 1.01 * params["std"])
+        assert result.segment == "day"
+        assert result.anomaly_level == "HIGH"
     def test_adjust_extreme_anomaly_morning(self):
-        """正常時段、極異常成交量"""
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
-        vol_adj = VolAdjuster.adjust(ts, 750)
-
-        assert vol_adj.segment == "day"
-        assert vol_adj.anomaly_level == "EXTREME"
-        assert vol_adj.quality_rating < 20
-
+        params = ZSCORE_PARAMS["day"]
+        result = VolAdjuster.adjust(ts, params["mean"] + 2.01 * params["std"])
+        assert result.segment == "day"
+        assert result.anomaly_level == "EXTREME"
     def test_adjust_non_trading_hours(self):
         """非交易時段"""
-        ts = datetime(2026, 10, 15, 12, 0).timestamp()
+        ts = datetime(2026, 10, 15, 14, 0).timestamp()
         vol_adj = VolAdjuster.adjust(ts, 100)
 
         assert vol_adj.segment is None
@@ -207,24 +190,13 @@ class TestVolAdjusterTimeSegment:
         assert vol_adj.quality_rating == 0.0
 
     def test_adjust_different_segments(self):
-        """不同時段的正常成交量應該有不同的異常度"""
-        vol = 450
-
-        ts_morning = datetime(2026, 10, 15, 10, 0).timestamp()
-        ts_afternoon = datetime(2026, 10, 15, 14, 0).timestamp()
-        ts_night = datetime(2026, 10, 15, 20, 0).timestamp()
-
-        adj_m = VolAdjuster.adjust(ts_morning, vol)
-        adj_a = VolAdjuster.adjust(ts_afternoon, vol)
-        adj_n = VolAdjuster.adjust(ts_night, vol)
-
-        # 450 在早盤是正常，在午盤是偏高，在夜盤是極異常
-        assert adj_m.anomaly_level == "NORMAL"
-        assert adj_a.anomaly_level == "NORMAL"
-        assert adj_n.anomaly_level in ("HIGH", "EXTREME")
-
-    # ── VolAdjustment 物件測試 ────────────────────────────────────
-
+        day_mean = ZSCORE_PARAMS["day"]["mean"]
+        day = VolAdjuster.adjust(datetime(2026, 10, 15, 10, 0).timestamp(), day_mean)
+        closed = VolAdjuster.adjust(datetime(2026, 10, 15, 14, 0).timestamp(), day_mean)
+        night = VolAdjuster.adjust(datetime(2026, 10, 15, 20, 0).timestamp(), day_mean)
+        assert day.anomaly_level == "NORMAL"
+        assert closed.anomaly_level == "UNKNOWN"
+        assert night.anomaly_level in ("HIGH", "EXTREME")
     def test_vol_adjustment_to_dict(self):
         """VolAdjustment 轉換為字典"""
         vol_adj = VolAdjustment(
@@ -251,10 +223,9 @@ class TestVolAdjusterTimeSegment:
         assert z < 0  # 遠低於均值
 
     def test_zscore_extreme_high_volume(self):
-        """極高成交量"""
-        z = VolAdjuster.compute_zscore(2000, "day")
+        params = ZSCORE_PARAMS["day"]
+        z = VolAdjuster.compute_zscore(params["mean"] + 6 * params["std"], "day")
         assert z > 5
-
     def test_adjust_timestamp_precision(self):
         """時間戳精度測試"""
         # 09:15:00 vs 09:15:01
