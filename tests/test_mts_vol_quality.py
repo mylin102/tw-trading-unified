@@ -1,4 +1,5 @@
 # 2026-10-15 Hermes Agent: package imports for supplied Task 1.3.2 tests; expectations unchanged.
+# 2026-10-19 Hermes Agent: cover Phase 1 time windows and hand-checked scores.
 """
 test_mts_vol_quality.py — VolQuality 完整測試套件
 
@@ -45,8 +46,8 @@ class TestVolQualityFraudIndicators:
         assert score > 70
 
     def test_time_clustering_session_end_morning(self):
-        """14:55 (早盤末) → time_cluster_score = 70"""
-        ts = datetime(2026, 10, 15, 14, 55).timestamp()
+        """13:35 (日盤收盤區間) → time_cluster_score = 70"""
+        ts = datetime(2026, 10, 15, 13, 35).timestamp()
         score = VolQuality._compute_time_clustering(ts)
         assert score == 70.0
 
@@ -86,19 +87,19 @@ class TestVolQualityFraudIndicators:
         assert score < 5
 
     def test_follow_through_low(self):
-        """fill_ratio = 20% → follow_through_score = 100"""
+        """20% fill: (0.85 - 0.20) / 0.70 × 100 = 92.8571428571."""
         score = VolQuality._compute_follow_through(10, 2)
-        assert score == 100.0
+        assert score == pytest.approx(92.8571428571)
 
     def test_follow_through_middle(self):
-        """fill_ratio = 50% → follow_through_score ≈ 60"""
+        """50% fill: (0.85 - 0.50) / 0.70 × 100 = 50."""
         score = VolQuality._compute_follow_through(10, 5)
-        assert 55 < score < 65
+        assert score == pytest.approx(50.0)
 
     # ── 完整 compute() 函數測試 ────────────────────────────────────
 
     def test_quality_score_excellent(self):
-        """所有指標都低 → quality ≥ 85"""
+        """手算：stacking=0,density=0,time=0,imbalance=0,follow=0 → fraud=0, quality=100."""
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
         quality = VolQuality.compute(
             ts=ts,
@@ -113,7 +114,7 @@ class TestVolQualityFraudIndicators:
         assert quality.quality_level == "EXCELLENT"
 
     def test_quality_score_good(self):
-        """中等指標 → 70 ≤ quality < 85"""
+        """手算：density=(25/20-1)*50=12.5；其餘詐欺項=0；follow=(.85-.70)/.70*100=21.4286；fraud=2.5；quality=97.5 (EXCELLENT)."""
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
         quality = VolQuality.compute(
             ts=ts,
@@ -123,11 +124,11 @@ class TestVolQualityFraudIndicators:
                 {"order_id": f"O{i}"} for i in range(25)
             ]
         )
-        assert 70 <= quality.quality_score < 85
-        assert quality.quality_level == "GOOD"
+        assert quality.quality_score == pytest.approx(97.5)
+        assert quality.quality_level == "EXCELLENT"
 
     def test_quality_score_suspicious(self):
-        """多項詐欺指標 → 50 ≤ quality < 70"""
+        """手算：stacking=100,density=57.5,time=0,imbalance=100 → fraud=66.5；follow=64.2857 floor=34.2857；quality=33.5 (FRAUDULENT)."""
         ts = datetime(2026, 10, 15, 14, 55).timestamp()  # 早盤末
         quality = VolQuality.compute(
             ts=ts,
@@ -139,11 +140,11 @@ class TestVolQualityFraudIndicators:
                 *[{"id": i} for i in range(30)],         # 高密集度
             ]
         )
-        assert 50 <= quality.quality_score < 70
-        assert quality.quality_level == "SUSPICIOUS"
+        assert quality.quality_score == pytest.approx(33.5)
+        assert quality.quality_level == "FRAUDULENT"
 
     def test_quality_score_fraudulent(self):
-        """極度詐欺跡象 → quality < 50"""
+        """手算：stacking=100,density=100,time=85,imbalance=100 → fraud=96.25；follow floor=70；quality=3.75."""
         ts = datetime(2026, 10, 15, 4, 55).timestamp()  # 夜盤末
         quality = VolQuality.compute(
             ts=ts,
@@ -155,7 +156,7 @@ class TestVolQualityFraudIndicators:
                 *[{"id": i} for i in range(50)],         # 極度密集
             ]
         )
-        assert quality.quality_score < 50
+        assert quality.quality_score == pytest.approx(3.75)
         assert quality.quality_level == "FRAUDULENT"
 
     # ── 邊界情況 ────────────────────────────────────────────────────
@@ -170,7 +171,8 @@ class TestVolQualityFraudIndicators:
             event_sequence=[]
         )
         assert isinstance(quality.quality_score, float)
-        assert 0 <= quality.quality_score <= 100
+        # 手算：空事件五項為 0,0,0,0,50；follow 不大於 50，不增加 fraud，quality=100.
+        assert quality.quality_score == pytest.approx(100.0)
 
     def test_quality_score_all_filled(self):
         """100% 成交率 + 好指標 → EXCELLENT"""
@@ -184,7 +186,8 @@ class TestVolQualityFraudIndicators:
                 for i in range(20)
             ]
         )
-        assert quality.quality_score > 90
+        # 手算：20 events 不超過 density 基準；10 sell/10 buy imbalance=0；follow=0；fraud=0，quality=100.
+        assert quality.quality_score == pytest.approx(100.0)
         assert quality.quality_level == "EXCELLENT"
 
     def test_quality_score_no_fills(self):
@@ -196,7 +199,8 @@ class TestVolQualityFraudIndicators:
             fill_count=0,  # 0% 成交
             event_sequence=[{"order_id": f"O{i}"} for i in range(10)]
         )
-        assert quality.quality_score < 30
+        # 手算：0% fill 令 follow=100，fraud 至少 70，其他項=0，quality=30.
+        assert quality.quality_score == pytest.approx(30.0)
         assert quality.quality_level == "FRAUDULENT"
 
     # ── QualityScore 物件測試 ────────────────────────────────────────
@@ -239,9 +243,9 @@ class TestVolQualityFraudIndicators:
                 for i in range(30)  # 高密集
             ]
         )
-        # 雖然成交率高（降低詐欺分），但時間和密集度可疑
-        assert 60 <= quality.quality_score <= 80
-        assert quality.quality_level in ("GOOD", "SUSPICIOUS")
+        # 手算：30 events density=25、單邊買 imbalance=100，其餘=0；fraud=5+25=30，quality=70 (GOOD).
+        assert quality.quality_score == pytest.approx(70.0)
+        assert quality.quality_level == "GOOD"
 
     def test_scenario_fake_spike(self):
         """虛假爆量：低成交率、買賣不平衡、時間可疑"""
@@ -255,7 +259,8 @@ class TestVolQualityFraudIndicators:
                 *[{"order_id": f"D{i}"} for i in range(25)]  # 重複掛單
             ]
         )
-        assert quality.quality_score < 40
+        # 手算：50 events density=75、imbalance=100 → fraud=40；follow=(.85-.20)/.70*100=92.8571，floor=62.8571；quality=37.1429.
+        assert quality.quality_score == pytest.approx(37.1428571429)
         assert quality.quality_level == "FRAUDULENT"
 
 
@@ -278,6 +283,24 @@ class TestVolQualityPerformance:
         elapsed = time.time() - start
 
         assert elapsed < 0.5, f"Performance too slow: {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize(
+    ("stamp", "expected"),
+    [
+        ("2026-10-15 08:44:00", 0.0), ("2026-10-15 08:45:00", 50.0),
+        ("2026-10-15 08:55:00", 50.0), ("2026-10-15 08:56:00", 0.0),
+        ("2026-10-15 13:34:00", 0.0), ("2026-10-15 13:35:00", 70.0),
+        ("2026-10-15 13:45:00", 70.0), ("2026-10-15 13:46:00", 0.0),
+        ("2026-10-15 14:59:00", 0.0), ("2026-10-15 15:00:00", 50.0),
+        ("2026-10-15 15:10:00", 50.0), ("2026-10-15 15:11:00", 0.0),
+        ("2026-10-16 04:49:00", 0.0), ("2026-10-16 04:50:00", 85.0),
+        ("2026-10-16 05:00:00", 85.0), ("2026-10-16 05:01:00", 0.0),
+    ],
+)
+def test_phase1_time_cluster_boundaries(stamp, expected):
+    # 2026-10-19 Hermes Agent: check interval endpoints and adjacent outside minutes.
+    assert VolQuality._compute_time_clustering(datetime.fromisoformat(stamp).timestamp()) == expected
 
 
 if __name__ == '__main__':

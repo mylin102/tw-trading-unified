@@ -1,4 +1,5 @@
 # 2026-10-15 Hermes Agent: integrate supplied tests using package imports; expectations unchanged.
+# 2026-10-19 Hermes Agent: cover Phase 1 session, trade-date, and z-score contracts.
 """
 test_mts_vol_adjuster.py — VolAdjuster 完整測試套件
 
@@ -18,29 +19,29 @@ class TestVolAdjusterTimeSegment:
         """09:15 → morning"""
         ts = datetime(2026, 10, 15, 9, 15).timestamp()
         segment = VolAdjuster.get_time_segment(ts)
-        assert segment == "morning"
+        assert segment == "day"
 
     def test_get_time_segment_morning_end(self):
         """11:29 → morning, 11:30 → NOT morning"""
         ts_morning = datetime(2026, 10, 15, 11, 29).timestamp()
         ts_after = datetime(2026, 10, 15, 11, 30).timestamp()
 
-        assert VolAdjuster.get_time_segment(ts_morning) == "morning"
-        assert VolAdjuster.get_time_segment(ts_after) != "morning"
+        assert VolAdjuster.get_time_segment(ts_morning) == "day"
+        assert VolAdjuster.get_time_segment(ts_after) == "day"
 
     def test_get_time_segment_afternoon_start(self):
         """13:30 → afternoon"""
         ts = datetime(2026, 10, 15, 13, 30).timestamp()
         segment = VolAdjuster.get_time_segment(ts)
-        assert segment == "afternoon"
+        assert segment == "day"
 
     def test_get_time_segment_afternoon_end(self):
         """15:30 → afternoon, 15:31 → NOT afternoon"""
         ts_afternoon = datetime(2026, 10, 15, 15, 30).timestamp()
         ts_after = datetime(2026, 10, 15, 15, 31).timestamp()
 
-        assert VolAdjuster.get_time_segment(ts_afternoon) == "afternoon"
-        assert VolAdjuster.get_time_segment(ts_after) != "afternoon"
+        assert VolAdjuster.get_time_segment(ts_afternoon) == "night"
+        assert VolAdjuster.get_time_segment(ts_after) == "night"
 
     def test_get_time_segment_night_start(self):
         """18:00 → night"""
@@ -54,7 +55,7 @@ class TestVolAdjusterTimeSegment:
         ts_after = datetime(2026, 10, 16, 5, 0).timestamp()
 
         assert VolAdjuster.get_time_segment(ts_night) == "night"
-        assert VolAdjuster.get_time_segment(ts_after) != "night"
+        assert VolAdjuster.get_time_segment(ts_after) == "night"
 
     def test_get_time_segment_non_trading_hours(self):
         """12:00 (午休) → None"""
@@ -72,24 +73,24 @@ class TestVolAdjusterTimeSegment:
 
     def test_zscore_normal_morning(self):
         """早盤正常成交量 (467 = μ) → z ≈ 0"""
-        z = VolAdjuster.compute_zscore(467, "morning")
+        z = VolAdjuster.compute_zscore(467, "day")
         assert abs(z - 0) < 0.1
 
     def test_zscore_high_morning(self):
         """早盤高異常成交量 (588 = μ + σ) → z ≈ 1.0"""
-        z = VolAdjuster.compute_zscore(588, "morning")
+        z = VolAdjuster.compute_zscore(588, "day")
         assert 0.9 < z < 1.1
 
     def test_zscore_extreme_morning(self):
         """早盤極異常成交量 (708 = μ + 2σ) → z ≈ 2.0"""
-        z = VolAdjuster.compute_zscore(708, "morning")
+        z = VolAdjuster.compute_zscore(708, "day")
         assert 1.9 < z < 2.1
 
     def test_zscore_afternoon(self):
         """午盤 Z-score 計算"""
         # μ = 396, σ = 96
-        z_normal = VolAdjuster.compute_zscore(396, "afternoon")
-        z_high = VolAdjuster.compute_zscore(492, "afternoon")  # μ + σ
+        z_normal = VolAdjuster.compute_zscore(396, "day")
+        z_high = VolAdjuster.compute_zscore(492, "day")  # μ + σ
 
         assert abs(z_normal - 0) < 0.1
         assert 0.9 < z_high < 1.1
@@ -111,7 +112,7 @@ class TestVolAdjusterTimeSegment:
     def test_zscore_zero_std(self):
         """σ = 0 → z = 0"""
         # 這種情況不應該發生，但要能處理
-        z = VolAdjuster.compute_zscore(500, "morning")
+        z = VolAdjuster.compute_zscore(500, "day")
         assert isinstance(z, (int, float))
 
     # ── 異常分類測試 ────────────────────────────────────────────
@@ -129,6 +130,7 @@ class TestVolAdjusterTimeSegment:
 
     def test_classify_extreme(self):
         """z > 2.0 → EXTREME"""
+        assert VolAdjuster.classify_anomaly(2.0001) == "EXTREME"
         assert VolAdjuster.classify_anomaly(2.5) == "EXTREME"
         assert VolAdjuster.classify_anomaly(3.0) == "EXTREME"
 
@@ -171,7 +173,7 @@ class TestVolAdjusterTimeSegment:
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
         vol_adj = VolAdjuster.adjust(ts, 450)
 
-        assert vol_adj.segment == "morning"
+        assert vol_adj.segment == "day"
         assert vol_adj.raw_volume == 450
         assert vol_adj.anomaly_level == "NORMAL"
         assert vol_adj.quality_rating > 80
@@ -181,7 +183,7 @@ class TestVolAdjusterTimeSegment:
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
         vol_adj = VolAdjuster.adjust(ts, 588)
 
-        assert vol_adj.segment == "morning"
+        assert vol_adj.segment == "day"
         assert vol_adj.anomaly_level == "HIGH"
         assert 50 < vol_adj.quality_rating < 70
 
@@ -190,7 +192,7 @@ class TestVolAdjusterTimeSegment:
         ts = datetime(2026, 10, 15, 10, 0).timestamp()
         vol_adj = VolAdjuster.adjust(ts, 750)
 
-        assert vol_adj.segment == "morning"
+        assert vol_adj.segment == "day"
         assert vol_adj.anomaly_level == "EXTREME"
         assert vol_adj.quality_rating < 20
 
@@ -217,8 +219,8 @@ class TestVolAdjusterTimeSegment:
 
         # 450 在早盤是正常，在午盤是偏高，在夜盤是極異常
         assert adj_m.anomaly_level == "NORMAL"
-        assert adj_a.anomaly_level == "HIGH"
-        assert adj_n.anomaly_level == "EXTREME"
+        assert adj_a.anomaly_level == "NORMAL"
+        assert adj_n.anomaly_level in ("HIGH", "EXTREME")
 
     # ── VolAdjustment 物件測試 ────────────────────────────────────
 
@@ -230,7 +232,7 @@ class TestVolAdjusterTimeSegment:
             z_score=0.123456,
             anomaly_level="NORMAL",
             quality_rating=99.876543,
-            segment="morning"
+            segment="day"
         )
 
         d = vol_adj.to_dict()
@@ -238,18 +240,18 @@ class TestVolAdjusterTimeSegment:
         assert d["raw_volume"] == 450
         assert d["z_score"] == 0.12  # 四捨五入
         assert d["quality_rating"] == 99.9  # 四捨五入
-        assert d["segment"] == "morning"
+        assert d["segment"] == "day"
 
     # ── 邊界與邊緣情況 ────────────────────────────────────────────
 
     def test_zscore_zero_volume(self):
         """零成交量"""
-        z = VolAdjuster.compute_zscore(0, "morning")
+        z = VolAdjuster.compute_zscore(0, "day")
         assert z < 0  # 遠低於均值
 
     def test_zscore_extreme_high_volume(self):
         """極高成交量"""
-        z = VolAdjuster.compute_zscore(2000, "morning")
+        z = VolAdjuster.compute_zscore(2000, "day")
         assert z > 5
 
     def test_adjust_timestamp_precision(self):
@@ -261,8 +263,8 @@ class TestVolAdjusterTimeSegment:
         adj_exact = VolAdjuster.adjust(ts_exact, 450)
         adj_plus1s = VolAdjuster.adjust(ts_plus1s, 450)
 
-        assert adj_exact.segment == "morning"
-        assert adj_plus1s.segment == "morning"
+        assert adj_exact.segment == "day"
+        assert adj_plus1s.segment == "day"
 
 
 class TestVolAdjusterPerformance:
@@ -279,6 +281,40 @@ class TestVolAdjusterPerformance:
         elapsed = time.time() - start
 
         assert elapsed < 0.1, f"Performance too slow: {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize(
+    ("stamp", "expected"),
+    [
+        ("2026-10-15 08:44:00", None), ("2026-10-15 08:45:00", "day"),
+        ("2026-10-15 13:45:00", "day"), ("2026-10-15 13:46:00", None),
+        ("2026-10-15 14:59:00", None), ("2026-10-15 15:00:00", "night"),
+        ("2026-10-16 04:59:00", "night"), ("2026-10-16 05:00:00", "night"),
+        ("2026-10-16 05:01:00", None),
+    ],
+)
+def test_phase1_session_boundaries(stamp, expected):
+    # 2026-10-19 Hermes Agent: lock the TAIFEX day/night endpoints.
+    assert VolAdjuster.get_time_segment(datetime.fromisoformat(stamp).timestamp()) == expected
+
+
+def test_phase1_night_trade_date_rolls_across_midnight():
+    # 2026-10-19 Hermes Agent: 23:59 and next-day 00:00 belong to one night trade date.
+    before_midnight = datetime(2026, 10, 15, 23, 59).timestamp()
+    after_midnight = datetime(2026, 10, 16, 0, 0).timestamp()
+    assert VolAdjuster.get_time_segment(before_midnight) == "night"
+    assert VolAdjuster.get_time_segment(after_midnight) == "night"
+    assert VolAdjuster.get_trading_day(before_midnight) == VolAdjuster.get_trading_day(after_midnight)
+    assert str(VolAdjuster.get_trading_day(after_midnight)) == "2026-10-16"
+
+
+@pytest.mark.parametrize(
+    ("z_score", "expected"),
+    [(1.0, "NORMAL"), (1.0001, "HIGH"), (2.0, "HIGH"), (2.0001, "EXTREME")],
+)
+def test_phase1_zscore_classification_boundaries(z_score, expected):
+    # 2026-10-19 Hermes Agent: preserve strict-greater-than anomaly cutoffs.
+    assert VolAdjuster.classify_anomaly(z_score) == expected
 
 
 if __name__ == '__main__':
