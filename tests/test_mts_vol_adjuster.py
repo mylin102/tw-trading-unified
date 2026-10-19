@@ -10,6 +10,7 @@ from datetime import datetime
 import pytest
 
 from strategies.plugins.futures.active.mts_vol_adjuster import VolAdjuster, VolAdjustment, ZSCORE_PARAMS
+from scripts.research.estimate_vol_zscore_params import load_params_output
 
 
 class TestVolAdjusterTimeSegment:
@@ -281,6 +282,11 @@ class TestVolAdjusterPerformance:
         elapsed = time.time() - start
 
         assert elapsed < 0.1, f"Performance too slow: {elapsed:.3f}s"
+
+
+def test_phase1_zscore_params_match_estimator_output():
+    # 2026-10-19 Hermes Agent: the runtime parameters must be the committed estimator artifact.
+    assert ZSCORE_PARAMS == load_params_output()
 
 
 @pytest.mark.parametrize(
