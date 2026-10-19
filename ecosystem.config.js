@@ -24,7 +24,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PROJECT_ROOT = __dirname;
-const CANONICAL_RELEASE_ROOT = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release18';
+const CANONICAL_RELEASE_ROOT = "/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release19";
 const isProduction = process.env.NODE_ENV === 'production'
   || process.env.DEPLOY_MODE === 'production';
 
