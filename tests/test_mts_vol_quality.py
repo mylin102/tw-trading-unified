@@ -129,7 +129,7 @@ class TestVolQualityFraudIndicators:
 
     def test_quality_score_suspicious(self):
         """手算：stacking=100,density=57.5,time=0,imbalance=100 → fraud=66.5；follow=64.2857 floor=34.2857；quality=33.5 (FRAUDULENT)."""
-        ts = datetime(2026, 10, 15, 14, 55).timestamp()  # 早盤末
+        ts = datetime(2026, 10, 15, 14, 55).timestamp()  # outside the configured S4 windows
         quality = VolQuality.compute(
             ts=ts,
             order_count=10,
@@ -233,7 +233,7 @@ class TestVolQualityFraudIndicators:
 
     def test_scenario_real_spike(self):
         """真實爆量：高成交率、但時間/密集度可疑"""
-        ts = datetime(2026, 10, 15, 14, 58).timestamp()  # 早盤末
+        ts = datetime(2026, 10, 15, 14, 58).timestamp()  # outside the configured S4 windows
         quality = VolQuality.compute(
             ts=ts,
             order_count=20,
@@ -249,7 +249,7 @@ class TestVolQualityFraudIndicators:
 
     def test_scenario_fake_spike(self):
         """虛假爆量：低成交率、買賣不平衡、時間可疑"""
-        ts = datetime(2026, 10, 15, 17, 59).timestamp()  # 午盤末
+        ts = datetime(2026, 10, 15, 17, 59).timestamp()  # outside the configured S4 windows
         quality = VolQuality.compute(
             ts=ts,
             order_count=10,

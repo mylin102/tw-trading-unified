@@ -102,13 +102,13 @@ class OIEstimator:
         """
         events = self._load_events()
 
-        # 篩選時間窗口內的事件 (開區間: window_start < ts <= decision_ts)
+        # 2026-10-19 Hermes Agent: parse each timestamp once; keep the left-open/right-closed window.
         window_start = decision_ts - window_secs
-        window_events = [
-            e for e in events
-            if self._parse_ts(e.get('ts', '')) is not None and
-               window_start < self._parse_ts(e.get('ts', '')) <= decision_ts
-        ]
+        window_events = []
+        for event in events:
+            event_ts = self._parse_ts(event.get('ts', ''))
+            if event_ts is not None and window_start < event_ts <= decision_ts:
+                window_events.append(event)
 
         # 分類訂單
         new_orders = self._deduplicate_orders(window_events, [

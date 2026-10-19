@@ -11,21 +11,21 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, asdict
-from datetime import datetime
+import datetime
+import json
+from pathlib import Path
 from typing import Optional
 
 
 # Z-score 校準參數（根據 PoC 驗證）
-ZSCORE_PARAMS = {
-    "morning": {"mean": 467, "std": 121},      # 09:15-11:30
-    "afternoon": {"mean": 396, "std": 96},     # 13:30-15:30
-    "night": {"mean": 210, "std": 60},         # 18:00-05:00
-}
+# 2026-10-19 Hermes Agent: parameters are generated from the committed 5-minute runtime-bar artifact.
+_PARAMS_PATH = Path(__file__).resolve().parents[4] / "config" / "mts_vol_zscore_params.json"
+ZSCORE_PARAMS = json.loads(_PARAMS_PATH.read_text(encoding="utf-8"))["params"]
 
+# 2026-10-19 Hermes Agent: keep the session map aligned with get_time_segment.
 TIME_SEGMENTS = {
-    "morning": [(9, 15), (11, 30)],
-    "afternoon": [(13, 30), (15, 30)],
-    "night": [(18, 0), (5, 0)],
+    "day": [(8, 45), (13, 45)],
+    "night": [(15, 0), (5, 0)],  # cross-midnight
 }
 
 
@@ -37,7 +37,7 @@ class VolAdjustment:
     z_score: float  # Z-score
     anomaly_level: str  # "NORMAL" | "HIGH" | "EXTREME" | "UNKNOWN"
     quality_rating: float  # [0, 100]
-    segment: Optional[str] = None  # "morning" | "afternoon" | "night"
+    segment: Optional[str] = None  # "day" | "night"
 
     def to_dict(self) -> dict:
         """轉換為字典"""
@@ -61,23 +61,27 @@ class VolAdjuster:
             ts: epoch seconds
 
         Returns:
-            "morning" | "afternoon" | "night" | None
+            "day" | "night" | None
         """
-        dt = datetime.fromtimestamp(ts)
-        hour, minute = dt.hour, dt.minute
-
-        # Morning: 09:15-11:30
-        if (hour == 9 and minute >= 15) or (9 < hour < 11) or (hour == 11 and minute < 30):
-            return "morning"
-
-        # Afternoon: 13:30-15:30
-        elif (hour == 13 and minute >= 30) or (13 < hour < 15) or (hour == 15 and minute <= 30):
-            return "afternoon"
-
-        # Night: 18:00-05:00 (next day)
-        elif hour >= 18 or hour < 5:
+        # 2026-10-19 Hermes Agent: classify only the TAIFEX day and night sessions.
+        dt = datetime.datetime.fromtimestamp(ts)
+        clock = dt.time()
+        if datetime.time(8, 45) <= clock <= datetime.time(13, 45):
+            return "day"
+        if clock >= datetime.time(15, 0) or clock <= datetime.time(5, 0):
             return "night"
+        return None
 
+    @staticmethod
+    def get_trading_day(ts: float) -> Optional[datetime.date]:
+        """Return the calendar trade date for a day/night-session timestamp."""
+        # 2026-10-19 Hermes Agent: map 15:00+ night bars to the next session date.
+        dt = datetime.datetime.fromtimestamp(ts)
+        clock = dt.time()
+        if datetime.time(15, 0) <= clock:
+            return dt.date() + datetime.timedelta(days=1)
+        if clock <= datetime.time(5, 0) or datetime.time(8, 45) <= clock <= datetime.time(13, 45):
+            return dt.date()
         return None
 
     @staticmethod
@@ -87,7 +91,7 @@ class VolAdjuster:
 
         Args:
             volume: 成交量
-            segment: 時段 ("morning" | "afternoon" | "night")
+            segment: 時段 ("day" | "night")
 
         Returns:
             Z-score 或 None (無效時段)

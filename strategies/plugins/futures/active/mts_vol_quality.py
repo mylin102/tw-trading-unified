@@ -1,7 +1,7 @@
 """mts_vol_quality.py — Vol Quality Score (修正版本)"""
 
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, time
 from typing import Optional, List, Dict
 
 
@@ -83,11 +83,12 @@ class VolQuality:
     
     @staticmethod
     def _compute_time_clustering(ts: float) -> float:
-        dt = datetime.fromtimestamp(ts)
-        hour, minute = dt.hour, dt.minute
-        if (hour == 14 and minute >= 50) or (hour == 15 and minute == 0): return 70.0
-        if (hour == 17 and minute >= 50) or (hour == 18 and minute == 0): return 70.0
-        if (hour == 4 and minute >= 50) or (hour == 5 and minute == 0): return 85.0
+        # 2026-10-19 Hermes Agent: score only the agreed session open/close intervals.
+        clock = datetime.fromtimestamp(ts).time()
+        if time(13, 35) <= clock <= time(13, 45): return 70.0
+        if time(4, 50) <= clock <= time(5, 0): return 85.0
+        if time(8, 45) <= clock <= time(8, 55): return 50.0
+        if time(15, 0) <= clock <= time(15, 10): return 50.0
         return 0.0
     
     @staticmethod
