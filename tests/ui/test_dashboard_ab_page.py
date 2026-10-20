@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 
 # 2026-10-20 Hermes Agent: verify the requested automatic-multipage filename and page title.
 PAGE_PATH = Path(__file__).parents[2] / "ui" / "pages" / "07_A∕B_Test.py"
@@ -73,6 +75,65 @@ def test_missing_values_render_as_na_and_epoch_is_displayed_as_original_taipei_t
 def test_missing_paired_file_returns_no_data(tmp_path):
     page = _load_page()
     assert page.load_paired_records("20261020", directory=tmp_path) == []
+
+
+def test_sim_outcome_reader_filters_pending_events_and_lists_sim_only_day(tmp_path):
+    page = _load_page()
+    path = tmp_path / "ab_sim_20261020.jsonl"
+    path.write_text("\n".join((
+        json.dumps({"event_type": "AB_SIM_PENDING", "pair_id": "p1"}),
+        json.dumps({"event_type": "AB_SIM_OUTCOME", "pair_id": "p1", "fill_status": "FILLED"}),
+    )) + "\n", encoding="utf-8")
+    assert page.list_available_days(tmp_path) == ["20261020"]
+    assert page.load_sim_outcomes("20261020", directory=tmp_path) == [
+        {"event_type": "AB_SIM_OUTCOME", "pair_id": "p1", "fill_status": "FILLED"}
+    ]
+
+
+def test_sim_outcome_summary_rates_and_two_average_differences():
+    page = _load_page()
+    outcomes = [
+        {"fill_status": "FILLED", "diff_points": 2, "diff_twd": 20},
+        {"fill_status": "TIMEOUT_MARKET", "diff_points": -2, "diff_twd": -20},
+        {"fill_status": "SESSION_END_MARKET", "diff_points": 10, "diff_twd": 100},
+        {"fill_status": "ABANDONED_RESTART", "diff_points": None, "diff_twd": None},
+        {"fill_status": "INVALID_BBO", "diff_points": None, "diff_twd": None},
+    ]
+    summary = page.summarize_sim_outcomes(outcomes)
+    assert summary["fill_status_distribution"] == {
+        "FILLED": 1, "TIMEOUT_MARKET": 1, "SESSION_END_MARKET": 1,
+        "ABANDONED_RESTART": 1, "INVALID_BBO": 1,
+    }
+    assert summary["adaptive_fill_rate"] == pytest.approx(1 / 3)
+    assert summary["filled_mean_diff_points"] == 2
+    assert summary["filled_mean_diff_twd"] == 20
+    assert summary["timeout_inclusive_mean_diff_points"] == 0
+    assert summary["timeout_inclusive_mean_diff_twd"] == 0
+    assert summary["timeout_inclusive_count"] == 2
+
+
+def test_conclusion_uses_timeout_inclusive_outcomes_and_no_legacy_complete_pair_claim():
+    page = _load_page()
+    outcomes = [
+        {"fill_status": "FILLED", "diff_points": 3, "diff_twd": 30},
+        {"fill_status": "TIMEOUT_MARKET", "diff_points": 1, "diff_twd": 10},
+    ]
+    result = page.build_conclusion(
+        [_pair("p1", {"status": "PASS"}, {"status": "PASS"})],
+        sim_outcomes=outcomes,
+    )
+    assert "adaptive 平均較 baseline 好 2.00 點（20.0 TWD）" in result["conclusion"]
+    assert "n=2" in result["conclusion"]
+
+
+def test_d1_timestamp_note_is_a_fixed_placeholder_and_page_shows_sim_layer():
+    page = _load_page()
+    source = PAGE_PATH.read_text(encoding="utf-8")
+    assert page.D1_DEPLOYMENT_TIME_PLACEHOLDER == "{D1 deployment time}"
+    assert "之前的紀錄 decision_ts 有 +8 小時偏移（既有缺陷 e8735d466），以原值顯示" in source
+    assert "adaptive 成交率" in source
+    assert "AB_SIM_OUTCOME" in source
+    assert "兩邊皆有出場價的配對" not in source
 
 
 def test_daily_summary_reports_status_distribution_and_top_block_reasons():
