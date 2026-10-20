@@ -26,7 +26,7 @@ AB_SIM_STATUSES = (
     "ABANDONED_RESTART", "INVALID_BBO",
 )
 # 2026-10-20 Hermes Agent: Hermes fills the actual deployment timestamp after D1 ships.
-D1_DEPLOYMENT_TIME_PLACEHOLDER = "{D1 deployment time}"
+D1_DEPLOYMENT_TIME_PLACEHOLDER = "2026-10-20 16:09（台北）"
 DETAIL_FIELDS = (
     ("baseline.status", "status"),
     ("adaptive.status", "status"),
