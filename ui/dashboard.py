@@ -239,6 +239,83 @@ def _to_num(val, default=0.0):
     except Exception:
         return float(default)
 
+
+def build_mts_fills_display(fills):
+    """Build the MTS fills table without inferring missing legacy costs."""
+    rows = []
+    net_total = 0.0
+    friction_total = 0.0
+    friction_na = 0
+
+    def _number(value):
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _fmt(value, signed=False):
+        if value is None:
+            return "N/A"
+        return f"{value:+.1f}" if signed else f"{value:.1f}"
+
+    for fill in fills:
+        realized = _number(fill.get("realized_pnl"))
+        gross = _number(fill.get("gross_pnl"))
+        fee = _number(fill.get("fee"))
+        tax = _number(fill.get("tax"))
+        has_costs = gross is not None and fee is not None and tax is not None
+        friction = fee + tax if has_costs else None
+        if realized is not None:
+            net_total += realized
+        if has_costs:
+            friction_total += friction
+        else:
+            friction_na += 1
+
+        fill_type = fill.get("fill_type", "?")
+        status = {
+            "COMBINED_EXIT": "未扣摩擦成本",
+            "EXIT": "已扣費(未分列)",
+            "RELEASE": "已扣費(未分列)",
+        }.get(fill_type, "") if not has_costs else ""
+        ts = fill.get("timestamp", "")
+        try:
+            ts = ts[:19].replace("T", " ") if ts else "?"
+        except (TypeError, AttributeError):
+            ts = str(ts)
+        ticker = fill.get("ticker", "?")
+        leg = fill.get("leg", "?")
+        contract = fill.get("contract", "")
+        ticker_display = (f"{ticker}_{contract}" if contract in ("NEAR", "FAR")
+                          else f"{ticker}{contract}" if contract
+                          else f"{ticker}_{leg}")
+        qty = _number(fill.get("qty"))
+        price = _number(fill.get("price"))
+        rows.append({
+            "時間": ts,
+            "腿": leg,
+            "類型": fill_type,
+            "淨損益": _fmt(realized, signed=True) if realized is not None else "",
+            "摩擦成本": _fmt(friction) if friction is not None else "N/A",
+            "毛利": _fmt(gross),
+            "手續費": _fmt(fee),
+            "稅": _fmt(tax),
+            "Ticker": ticker_display,
+            "Side": fill.get("side", "?"),
+            "Qty": int(qty) if qty is not None and qty.is_integer() else qty,
+            "Price": _fmt(price) if price is not None else fill.get("price", ""),
+            "Trade ID": fill.get("trade_id", "?"),
+            "狀態": status,
+        })
+
+    summary = {
+        "淨損益": f"{net_total:+.1f}",
+        "摩擦成本": f"{friction_total:.1f} (N/A: {friction_na} 列)",
+    }
+    return rows, summary
+
 # ── Custom CSS ──
 st.markdown("""
     <style>
@@ -6892,60 +6969,13 @@ elif _selected_product == "TMF":
                         if _fills:
                             _fills = _fills[-40:][::-1]  # Show last 40 for more history
                             st.markdown("**MTS Trade Fills**")
-                            _fill_rows = []
-                            for _fl in _fills:
-                                try:
-                                    _fl_ts = _fl.get("timestamp", "")
-                                    if _fl_ts:
-                                        try: _fl_ts = _fl_ts[:19].replace("T", " ")
-                                        except: pass
-                                    else:
-                                        _fl_ts = "?"
-                                    
-                                    _fl_ticker = _fl.get("ticker", "?")
-                                    _fl_leg = _fl.get("leg", "?")
-                                    _fl_contract = _fl.get("contract", "")
-                                    
-                                    # Build readable ticker — V-model: display raw log fields
-                                    _fl_ticker_display = _fl_ticker
-                                    if _fl_contract and _fl_contract not in ("NEAR", "FAR"):
-                                        _fl_ticker_display = f"{_fl_ticker}{_fl_contract}"
-                                    elif _fl_contract:
-                                        _fl_ticker_display = f"{_fl_ticker}_{_fl_contract}"
-                                    else:
-                                        _fl_ticker_display = f"{_fl_ticker}_{_fl_leg}"
-                                    
-                                    _fl_side = _fl.get("side", "?")
-                                    _fl_qty = _fl.get("qty", 0)
-                                    _fl_price = _fl.get("price", 0)
-                                    _fl_pnl = _fl.get("realized_pnl")
-                                    
-                                    # Robust numeric conversion
-                                    try:
-                                        if isinstance(_fl_qty, str): _fl_qty = float(_fl_qty)
-                                        if isinstance(_fl_price, str): _fl_price = float(_fl_price)
-                                        if isinstance(_fl_pnl, str): _fl_pnl = float(_fl_pnl)
-                                    except: pass
-
-                                    _fl_type = _fl.get("fill_type", "?")
-                                    _fl_tid = _fl.get("trade_id", "?")
-                                    
-                                    _fill_rows.append({
-                                        "時間": _fl_ts,
-                                        "Ticker": _fl_ticker_display,
-                                        "Leg": _fl_leg,
-                                        "Side": _fl_side,
-                                        "Qty": int(_fl_qty) if isinstance(_fl_qty, (int, float)) else _fl_qty,
-                                        "Price": f"{_fl_price:.1f}" if isinstance(_fl_price, (int, float)) else _fl_price,
-                                        "Type": _fl_type,
-                                        "損益": f"{_fl_pnl:+.1f}" if isinstance(_fl_pnl, (int, float)) else "",
-                                        "Trade ID": _fl_tid,
-                                    })
-                                except Exception:
-                                    continue
-                                    
+                            _fill_rows, _fill_summary = build_mts_fills_display(_fills)
                             if _fill_rows:
                                 st.dataframe(pd.DataFrame(_fill_rows), width='stretch', hide_index=True)
+                                st.caption(
+                                    f"淨損益合計 {_fill_summary['淨損益']} | "
+                                    f"摩擦成本合計 {_fill_summary['摩擦成本']}"
+                                )
                     except Exception:
                         pass
         else:
