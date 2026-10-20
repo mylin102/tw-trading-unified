@@ -1247,7 +1247,10 @@ def settle_mts_trade(
     # ── Idempotent fill append ──
     if _near_valid:
         if not _has_settled_exit(trade_id, "NEAR"):
-            _near_pnl = _near_gross - (_fees / 2)
+            _near_cost_share = _fees / 2
+            _near_fee = min(40.0, _near_cost_share)
+            _near_tax = _near_cost_share - _near_fee
+            _near_pnl = _near_gross - _near_cost_share
             _append_fill(
                 ticker=ticker,
                 contract="NEAR",
@@ -1257,6 +1260,9 @@ def settle_mts_trade(
                 price=near_exit_price,
                 fill_type="EXIT",
                 trade_id=trade_id,
+                gross_pnl=round(_near_gross, 1),
+                fee=_near_fee,
+                tax=_near_tax,
                 realized_pnl=round(_near_pnl, 1),
                 settlement_status=_settlement_status,
                 settled_from=settlement_source,
@@ -1266,7 +1272,10 @@ def settle_mts_trade(
 
     if _far_valid:
         if not _has_settled_exit(trade_id, "FAR"):
-            _far_pnl = _far_gross - (_fees / 2)
+            _far_cost_share = _fees / 2
+            _far_fee = min(40.0, _far_cost_share)
+            _far_tax = _far_cost_share - _far_fee
+            _far_pnl = _far_gross - _far_cost_share
             _append_fill(
                 ticker=ticker,
                 contract="FAR",
@@ -1276,6 +1285,9 @@ def settle_mts_trade(
                 price=far_exit_price,
                 fill_type="EXIT",
                 trade_id=trade_id,
+                gross_pnl=round(_far_gross, 1),
+                fee=_far_fee,
+                tax=_far_tax,
                 realized_pnl=round(_far_pnl, 1),
                 settlement_status=_settlement_status,
                 settled_from=settlement_source,
@@ -3142,6 +3154,9 @@ class TMFSpread(StrategyBase):
         _released_pnl_pts = (self._release_price - _released_entry) if _released_side_for_pnl == "LONG" else (_released_entry - self._release_price)
         _mult = float(get_point_value(self._ticker))
         _cost = 40.0 + (self._release_price + _released_entry) * _mult * 2e-5
+        # 2026-10-20 Hermes Agent spec, implemented by Codex: expose the components already deducted from RELEASE PnL.
+        _gross_pnl = _released_pnl_pts * _mult
+        _tax = (self._release_price + _released_entry) * _mult * 2e-5
         _realized = _released_pnl_pts * _mult - _cost
         
         # MFE/MAE calculation
@@ -3175,6 +3190,9 @@ class TMFSpread(StrategyBase):
             fill_type="RELEASE",
             trade_id=self._trade_id or "MISSING_TID",
             spread_z=None,
+            gross_pnl=_gross_pnl,
+            fee=40.0,
+            tax=_tax,
             realized_pnl=_realized,
             leg_mfe=_leg_mfe,
             leg_mae=_leg_mae,
@@ -6417,6 +6435,9 @@ class TMFSpread(StrategyBase):
             _mult = float(get_point_value(_ticker))
             _turnover = (_rem_entry + exit_price) * _mult
             _cost = 40.0 + _turnover * 2e-5
+            # 2026-10-20 Hermes Agent spec, implemented by Codex: expose the components while preserving the existing EXIT value.
+            _gross_pnl = _pnl_pts * _mult
+            _tax = _turnover * 2e-5
             _realized = _pnl_pts * _mult - _cost
             
             # MFE/MAE calculations
@@ -6450,6 +6471,9 @@ class TMFSpread(StrategyBase):
                 fill_type="EXIT",
                 trade_id=self._trade_id or "MISSING_TID",
                 spread_z=None,
+                gross_pnl=_gross_pnl,
+                fee=40.0,
+                tax=_tax,
                 realized_pnl=_realized,
                 leg_mfe=_leg_mfe,
                 leg_mae=_leg_mae,

@@ -16350,6 +16350,7 @@ class FuturesMonitor:
         # 2026-08-03 Phase B: canonical combined settlement event.
         # One COMBINED_EXIT_SETTLED per trade — never re-emitted across
         # restart / duplicate callback (dedupe by trade_id + fills log scan).
+        _combined_exit_costs = {}
         try:
             from strategies.plugins.futures.active.tmf_spread import _append_fill
             _ce_id = trade_id  # combined_exit_id == trade_id for MTS lifecycle
@@ -16377,11 +16378,29 @@ class FuturesMonitor:
                     _q = int(tracker.get(f"{_lk}_filled_qty") or 0)
                     _sgn = 1.0 if str(_sb).upper() == "LONG" else -1.0
                     _g = (_ex - _en) * _q * _pv2 * _sgn
+                    # 2026-10-20 Hermes Agent spec, implemented by Codex: settle only net PnL and preserve its cost breakdown.
+                    _fee = 40.0 * _q if _q > 0 else 0.0
+                    _tax = ((_en + float(_ex)) * _pv2 * _q * 2e-5
+                            if _q > 0 else 0.0)
+                    _net = round(_g - _fee - _tax, 1)
+                    _combined_exit_costs[_lk] = {
+                        "gross_pnl": round(_g, 1),
+                        "fee": _fee,
+                        "tax": _tax,
+                        "realized_pnl": _net,
+                    }
                     _set[f"{_lk}_entry_avg_price"] = _en
                     _set[f"{_lk}_exit_avg_price"] = float(_ex)
                     _set[f"{_lk}_closed_qty"] = _q
                     _set[f"{_lk}_realized_pnl_gross"] = round(_g, 1)
+                    _set[f"{_lk}_realized_pnl_net"] = _net
+                    _set[f"{_lk}_fee"] = _fee
+                    _set[f"{_lk}_tax"] = _tax
                 _combined_gross = round(_set["near_realized_pnl_gross"] + _set["far_realized_pnl_gross"], 1)
+                _combined_net = round(
+                    _set["near_realized_pnl_net"] + _set["far_realized_pnl_net"], 1)
+                _combined_fees = _set["near_fee"] + _set["far_fee"]
+                _combined_tax = _set["near_tax"] + _set["far_tax"]
                 _effective_mode = getattr(
                     getattr(self, "_execution_context", None),
                     "effective_mode", "")
@@ -16402,16 +16421,16 @@ class FuturesMonitor:
                     near_contract=self.contract.code if getattr(self, "contract", None) else "NEAR",
                     far_contract=self.far_contract.code if getattr(self, "far_contract", None) else "FAR",
                     combined_realized_pnl_gross=_combined_gross,
-                    combined_realized_pnl_net=None,
-                    pnl_status="GROSS_ONLY",
-                    fees=None,
-                    tax=None,
+                    combined_realized_pnl_net=_combined_net,
+                    pnl_status="NET",
+                    fees=_combined_fees,
+                    tax=_combined_tax,
                     price_confidence="EXACT",
                     settled_at=datetime.now().isoformat(),
                     **_live_settlement,
                     **_set,
                 )
-                console.print(f"[green]📗 [COMBINED_EXIT_SETTLED] trade_id={trade_id} gross={_combined_gross:+.0f}[/green]")
+                console.print(f"[green]📗 [COMBINED_EXIT_SETTLED] trade_id={trade_id} net={_combined_net:+.0f}[/green]")
         except Exception as _se:
             console.print(f"[red] [COMBINED_EXIT_SETTLED_ERR] trade_id={trade_id} error={_se}[/red]")
 
@@ -16431,14 +16450,12 @@ class FuturesMonitor:
             # canonical per-leg fill (exit-side mapping, actual fill price,
             # realized PnL from state cost basis). No shared `price` for both
             # legs; no hardcoded SELL/BUY.
-            _point_value = float((getattr(self, "cfg", None) or {}).get("point_value", 10) or 10)
             for _leg_key, _leg_name, _ctr in (
                 ("near", "NEAR", self.contract.code if getattr(self, "contract", None) else "NEAR"),
                 ("far", "FAR", self.far_contract.code if getattr(self, "far_contract", None) else "FAR"),
             ):
                 _side_before = tracker.get(f"{_leg_key}_side") or "UNKNOWN"
                 _exit_side = "SELL" if str(_side_before).upper() == "LONG" else "BUY"
-                _entry = float(tracker.get(f"{_leg_key}_entry") or 0.0)
                 _exit_px = tracker.get(f"{_leg_key}_price")
                 # 2026-08-27 (codex spec §3): paper fills must NEVER be
                 # marked BROKER_FILL — that is broker-truth provenance for
@@ -16450,11 +16467,7 @@ class FuturesMonitor:
                     else "STATE_SNAPSHOT")
                 if _exit_px is None:
                     _exit_px = float(price or 0.0)
-                _qty = int(tracker.get(f"{_leg_key}_filled_qty") or 0)
-                if str(_side_before).upper() == "LONG":
-                    _pnl = (_exit_px - _entry) * _qty * _point_value
-                else:
-                    _pnl = (_entry - _exit_px) * _qty * _point_value
+                _exit_costs = _combined_exit_costs[_leg_key]
                 _append_fill(
                     ticker=getattr(self, "ticker", "TMF"),
                     contract=_ctr,
@@ -16468,7 +16481,10 @@ class FuturesMonitor:
                     price=_exit_px,
                     fill_type="COMBINED_EXIT",
                     trade_id=trade_id,
-                    realized_pnl=round(_pnl, 1),
+                    gross_pnl=_exit_costs["gross_pnl"],
+                    fee=_exit_costs["fee"],
+                    tax=_exit_costs["tax"],
+                    realized_pnl=_exit_costs["realized_pnl"],
                     position_side_before_exit=str(_side_before),
                     position_effect="CLOSE",
                     price_source=_px_source,
