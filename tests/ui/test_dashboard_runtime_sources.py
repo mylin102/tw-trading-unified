@@ -70,3 +70,43 @@ def test_live_runtime_hides_legacy_daily_pnl_panel():
     source = Path(__file__).parents[2] / "ui" / "dashboard.py"
     text = source.read_text(encoding="utf-8")
     assert "if not _live_runtime and not _exit_only_dashboard and os.path.exists(_fills_path):" in text
+
+
+def test_mts_fill_display_shows_explicit_cost_fields_and_order():
+    # 2026-10-20 Codex: verify the Hermes-approved friction table contract.
+    import ui.dashboard as dashboard
+
+    rows, summary = dashboard.build_mts_fills_display([
+        {"fill_type": "EXIT", "leg": "NEAR", "realized_pnl": 45.0,
+         "gross_pnl": 100.0, "fee": 40.0, "tax": 15.0,
+         "timestamp": "2026-10-20T09:00:00", "ticker": "TMF", "qty": 1,
+         "price": 101.0, "side": "SELL", "trade_id": "T1"},
+    ])
+
+    assert list(rows[0])[:8] == [
+        "時間", "腿", "類型", "淨損益", "摩擦成本", "毛利", "手續費", "稅",
+    ]
+    assert rows[0]["淨損益"] == "+45.0"
+    assert rows[0]["摩擦成本"] == "55.0"
+    assert rows[0]["毛利"] == "100.0"
+    assert rows[0]["手續費"] == "40.0"
+    assert rows[0]["稅"] == "15.0"
+    assert summary["淨損益"] == "+45.0"
+    assert summary["摩擦成本"] == "55.0 (N/A: 0 列)"
+
+
+def test_mts_fill_display_marks_legacy_rows_n_a_without_estimating_costs():
+    # 2026-10-20 Codex: legacy costs must stay unknown rather than be inferred.
+    import ui.dashboard as dashboard
+
+    rows, summary = dashboard.build_mts_fills_display([
+        {"fill_type": "COMBINED_EXIT", "leg": "NEAR", "realized_pnl": 120.0},
+        {"fill_type": "RELEASE", "leg": "FAR", "realized_pnl": -10.0},
+    ])
+
+    assert rows[0]["摩擦成本"] == rows[0]["毛利"] == rows[0]["手續費"] == rows[0]["稅"] == "N/A"
+    assert rows[0]["狀態"] == "未扣摩擦成本"
+    assert rows[1]["摩擦成本"] == rows[1]["毛利"] == rows[1]["手續費"] == rows[1]["稅"] == "N/A"
+    assert rows[1]["狀態"] == "已扣費(未分列)"
+    assert summary["淨損益"] == "+110.0"
+    assert summary["摩擦成本"] == "0.0 (N/A: 2 列)"
