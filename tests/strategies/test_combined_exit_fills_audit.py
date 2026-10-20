@@ -237,3 +237,52 @@ def test_real_trade_id_preserved(tmp_path):
     _complete_both(mon, tmp_path, "mts-auto-123456-789", 43825.0, 43910.0, sp)
     near = [f for f in _read_fills(tmp_path) if f.get("leg") == "NEAR"][0]
     assert near["trade_id"] == "mts-auto-123456-789"
+
+
+def test_existing_settled_row_does_not_block_missing_leg_fills(tmp_path):
+    # 2026-10-20 Hermes Agent spec, implemented by Codex: cover crash after SETTLED but before leg rows.
+    mon = _make_monitor(tmp_path)
+    sp = _state_file(tmp_path)
+    with open(mon._fill_log, "w", encoding="utf-8") as f:
+        f.write(json.dumps({
+            "event_type": "COMBINED_EXIT_SETTLED", "trade_id": "T-CRASH-SETTLED",
+        }) + "\n")
+    persistence_failed = MagicMock()
+    mon._enter_settlement_persistence_failed = persistence_failed
+
+    _complete_both(mon, tmp_path, "T-CRASH-SETTLED", 43825.0, 43910.0, sp)
+
+    fills = _read_fills(tmp_path)
+    legs = [f for f in fills if f.get("fill_type") == "COMBINED_EXIT"]
+    assert len(legs) == 2
+    assert all({"gross_pnl", "fee", "tax"} <= f.keys() for f in legs)
+    assert all(f["realized_pnl"] == round(
+        f["gross_pnl"] - f["fee"] - f["tax"], 1) for f in legs)
+    assert not persistence_failed.called
+    assert mon._combined_exit_trackers["T-CRASH-SETTLED"]["settlement_completed"] is True
+
+
+def test_settled_log_read_error_still_writes_net_leg_fills(tmp_path):
+    # 2026-10-20 Hermes Agent spec, implemented by Codex: leg settlement survives SETTLED scan errors.
+    mon = _make_monitor(tmp_path)
+    sp = _state_file(tmp_path)
+    real_open = open
+
+    def _open(path, mode="r", *args, **kwargs):
+        if os.fspath(path) == mon._fill_log and mode == "r":
+            raise OSError("simulated SETTLED log read failure")
+        return real_open(path, mode, *args, **kwargs)
+
+    persistence_failed = MagicMock()
+    mon._enter_settlement_persistence_failed = persistence_failed
+    with patch("builtins.open", side_effect=_open):
+        _complete_both(mon, tmp_path, "T-SETTLED-READ-ERROR", 43825.0, 43910.0, sp)
+
+    fills = _read_fills(tmp_path)
+    legs = [f for f in fills if f.get("fill_type") == "COMBINED_EXIT"]
+    assert len(legs) == 2
+    assert all({"gross_pnl", "fee", "tax"} <= f.keys() for f in legs)
+    assert all(f["realized_pnl"] == round(
+        f["gross_pnl"] - f["fee"] - f["tax"], 1) for f in legs)
+    assert not persistence_failed.called
+    assert mon._combined_exit_trackers["T-SETTLED-READ-ERROR"]["settlement_completed"] is True
