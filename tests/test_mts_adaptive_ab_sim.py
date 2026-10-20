@@ -12,6 +12,8 @@ from strategies.plugins.futures.active.mts_adaptive_ab import (
     log_ab_sim_pending,
     recover_ab_simulations,
 )
+from strategies.plugins.futures.active import tmf_spread
+from strategies.plugins.futures.active.tmf_spread import TMFSpread
 
 
 TW = ZoneInfo("Asia/Taipei")
@@ -113,7 +115,7 @@ def test_diff_sign_uses_exit_side(side, adaptive, baseline, expected):
     assert outcome["diff_twd"] == expected * 10
 
 
-def test_simulation_never_calls_order_manager_and_keeps_pair_release_parity():
+def test_strategy_mount_never_calls_order_manager_or_changes_baseline_state(tmp_path, monkeypatch):
     class OrderManagerSpy:
         called = False
 
@@ -122,9 +124,20 @@ def test_simulation_never_calls_order_manager_and_keeps_pair_release_parity():
             raise AssertionError(f"order manager touched: {name}")
 
     spy = OrderManagerSpy()
-    pending, _ = begin(limit=101)
-    pending["order_manager"] = spy
-    advance_ab_simulation(pending, bar(epoch(10, 1), near_bid=99), epoch(10, 1))
+    pending, _ = begin(limit=100)
+    strategy = object.__new__(TMFSpread)
+    strategy._adaptive_sim_pending = pending
+    strategy._adaptive_sim_recovery_checked = True
+    strategy._order_mgr = spy
+    strategy._lifecycle = "OPEN"
+    strategy._hvwap_baseline_clear_tick = True
+    monkeypatch.setattr(tmf_spread, "_MTS_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    outcome = strategy._hvwap_ab_sim_tick(
+        bar(epoch(10, 1), near_bid=100), datetime.fromtimestamp(epoch(10, 1), TW),
+    )
+    assert outcome["fill_status"] == "FILLED"
+    assert strategy._lifecycle == "OPEN"
+    assert strategy._hvwap_baseline_clear_tick is True
     assert spy.called is False
 
 
