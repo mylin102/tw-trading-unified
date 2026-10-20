@@ -74,6 +74,9 @@ def test_session_close_uses_last_valid_bbo():
     outcome = advance_ab_simulation(pending, bar(epoch(13, 45), near_bid=98), epoch(13, 45))
     assert outcome["fill_status"] == "SESSION_END_MARKET"
     assert outcome["adaptive_fill_px"] == 98
+    pending, _ = begin(decision_ts=epoch(4, 59), quote=bar(epoch(4, 59)), limit=105)
+    outcome = advance_ab_simulation(pending, bar(epoch(5)), epoch(5))
+    assert outcome["fill_status"] == "SESSION_END_MARKET"
 
 
 def test_missing_or_stale_decision_bbo_is_invalid():
@@ -81,6 +84,9 @@ def test_missing_or_stale_decision_bbo_is_invalid():
     assert pending is None
     assert outcome["fill_status"] == "INVALID_BBO"
     pending, outcome = begin(quote={"near_bid": 100, "near_ask": 101})
+    assert pending is None
+    assert outcome["fill_status"] == "INVALID_BBO"
+    pending, outcome = begin(leg="FAR", side="BUY", quote=bar(epoch(10), far_age=1501))
     assert pending is None
     assert outcome["fill_status"] == "INVALID_BBO"
 
