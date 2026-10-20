@@ -179,38 +179,48 @@ def test_conclusion_branch_when_no_paired_exit_prices():
     result = page.build_conclusion([_pair("valid", {"status": "PASS"}, {"status": "PASS"})])
     assert result["conclusion"] == (
         "判定層：兩邊 status 一致率 100.0%（有效樣本 1）。"
-        "出場價層：尚無兩邊皆有出場價的配對，無法比較 adaptive 與 baseline 的出場價優劣。"
+        "出場模擬層：尚無 AB_SIM_OUTCOME 紀錄，沒有模擬成交樣本。"
     )
 
 
 def test_conclusion_branch_for_fewer_than_thirty_exit_pairs():
     page = _load_page()
-    result = page.build_conclusion([_exit_pair("sell-leg", delta=2, side="LONG")])
+    result = page.build_conclusion(
+        [_exit_pair("sell-leg", delta=2, side="LONG")],
+        sim_outcomes=[{"fill_status": "FILLED", "diff_points": 2, "diff_twd": 20}],
+    )
     assert result["conclusion"] == (
-        "出場價層：adaptive 平均較 baseline 好 2.00 點（20.0 TWD），n=1，樣本不足 30，僅供參考。"
+        "出場模擬層（FILLED + TIMEOUT_MARKET）：adaptive 平均較 baseline 好 2.00 點（20.0 TWD），n=1，樣本不足 30，僅供參考。"
     )
 
 
 def test_conclusion_branch_for_at_least_thirty_exit_pairs():
     page = _load_page()
     records = [_exit_pair(str(i), delta=-1, side="SHORT") for i in range(30)]
-    result = page.build_conclusion(records)
-    assert result["conclusion"] == "出場價層：adaptive 平均較 baseline 好 1.00 點（10.0 TWD），n=30"
+    outcomes = [{"fill_status": "FILLED", "diff_points": 1, "diff_twd": 10}
+                for _ in range(30)]
+    result = page.build_conclusion(records, sim_outcomes=outcomes)
+    assert result["conclusion"] == (
+        "出場模擬層（FILLED + TIMEOUT_MARKET）：adaptive 平均較 baseline 好 1.00 點（10.0 TWD），n=30"
+    )
 
 
 def test_conclusion_direction_for_buyback_leg():
     page = _load_page()
-    result = page.build_conclusion([_exit_pair("buyback", delta=-3, side="SHORT")])
+    result = page.build_conclusion(
+        [_exit_pair("buyback", delta=-3, side="SHORT")],
+        sim_outcomes=[{"fill_status": "FILLED", "diff_points": 3, "diff_twd": 30}],
+    )
     assert "平均較 baseline 好 3.00 點（30.0 TWD）" in result["conclusion"]
 
 
-def test_conclusion_direction_is_undetermined_without_consistent_leg_side():
+def test_conclusion_uses_normalized_negative_sim_difference_without_leg_side():
     page = _load_page()
-    record = _exit_pair("unknown-side", delta=2)
-    record["baseline"].pop("near")
-    record["adaptive"].pop("near")
-    result = page.build_conclusion([record])
-    assert "平均價差 +2.00 點（+20.0 TWD），方向未定" in result["conclusion"]
+    record = _pair("unknown-side", {"status": "PASS"}, {"status": "PASS"})
+    result = page.build_conclusion(
+        [record], sim_outcomes=[{"fill_status": "TIMEOUT_MARKET", "diff_points": -2, "diff_twd": -20}],
+    )
+    assert "平均較 baseline 差 2.00 點（20.0 TWD）" in result["conclusion"]
 
 
 def test_page_filename_and_titles_use_a_b_test():
