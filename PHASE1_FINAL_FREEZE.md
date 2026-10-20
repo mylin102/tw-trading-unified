@@ -80,7 +80,7 @@ PAPER trade: repair the stranded single-leg release after bad BBO. Test-only
 commits faf4e344 and 136a819a; fix fcb11e69982c91058977451a54e1c498dfdbf599.
 This freeze manifest binds that source for an engine-only PAPER release18
 candidate; dashboard SHA remains 45f0ced7c7ea5317c610677c323262f15df7a7a2.
-frozen_tree_hash: 1213d6de1dc43432d3e24734bc3fe914966d5d047b62cab538f0752b9a8d540d
+frozen_tree_hash: 42583a3f03b281c37f0070f80de0a634a2285067ab395d24cd9e5287d049ceb4
 
 Confirmed incident: trade mts-auto-091504-132 emitted HVWAP_RELEASE_INTENT
 for NEAR at 09:28:33.722368, then actual dispatcher emitted
@@ -323,7 +323,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: 1213d6de1dc43432d3e24734bc3fe914966d5d047b62cab538f0752b9a8d540d
+frozen_tree_hash: 42583a3f03b281c37f0070f80de0a634a2285067ab395d24cd9e5287d049ceb4
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
@@ -380,6 +380,7 @@ broker snapshot; do not relabel it a current paper-session broker query.
 
 ## Runtime certification metadata
 ## Runtime certification metadata
+## Runtime certification metadata
 <!-- BEGIN RUNTIME_CERTIFICATION_METADATA -->
 ```json
 {
@@ -391,7 +392,7 @@ broker snapshot; do not relabel it a current paper-session broker query.
     "source": "live_broker"
   },
   "callback_registration_generation": null,
-  "candidate_head": "4ac011f8f09818071a33bb1525e7edea4da8f1c6",
+  "candidate_head": "bb528019a17c541f14bf026cd9c94d11efb96ba4",
   "captured_at": 1790905674995,
   "clean_worktree": true,
   "config_hash": null,
@@ -399,7 +400,7 @@ broker snapshot; do not relabel it a current paper-session broker query.
     "active": 0,
     "retired_unresolved": 7
   },
-  "generated_at": "2026-10-20T03:25:24.268735+00:00",
+  "generated_at": "2026-10-20T08:09:12.245330+00:00",
   "live_order_allowed": false,
   "process": {
     "pid": null,
@@ -408,9 +409,10 @@ broker snapshot; do not relabel it a current paper-session broker query.
   "promotion_mode": "paper_active",
   "refresh_generation": "futures-1790905675114377000-11506",
   "session_id": "5efc6b91b43adb42075104e6d180fc55",
-  "source_tree_hash": "1213d6de1dc43432d3e24734bc3fe914966d5d047b62cab538f0752b9a8d540d",
+  "source_tree_hash": "42583a3f03b281c37f0070f80de0a634a2285067ab395d24cd9e5287d049ceb4",
   "ttl_seconds": 600.0
 }
 ```
 <!-- END RUNTIME_CERTIFICATION_METADATA -->
+
 
