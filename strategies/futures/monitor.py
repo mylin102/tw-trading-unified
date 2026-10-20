@@ -16454,6 +16454,7 @@ class FuturesMonitor:
                 ("near", "NEAR", self.contract.code if getattr(self, "contract", None) else "NEAR"),
                 ("far", "FAR", self.far_contract.code if getattr(self, "far_contract", None) else "FAR"),
             ):
+                _qty = int(tracker.get(f"{_leg_key}_filled_qty") or 0)
                 _side_before = tracker.get(f"{_leg_key}_side") or "UNKNOWN"
                 _exit_side = "SELL" if str(_side_before).upper() == "LONG" else "BUY"
                 _exit_px = tracker.get(f"{_leg_key}_price")
