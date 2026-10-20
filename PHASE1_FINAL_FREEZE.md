@@ -80,7 +80,7 @@ PAPER trade: repair the stranded single-leg release after bad BBO. Test-only
 commits faf4e344 and 136a819a; fix fcb11e69982c91058977451a54e1c498dfdbf599.
 This freeze manifest binds that source for an engine-only PAPER release18
 candidate; dashboard SHA remains 45f0ced7c7ea5317c610677c323262f15df7a7a2.
-frozen_tree_hash: fbaa74040d92a39bf630004f87056e73abb5f7a8633ef497ec9f318c0c7eb2d5
+frozen_tree_hash: 1eadb40fb73c5b2741fc04e0632de79116f861315725b74b1c880cd786a559d3
 
 Confirmed incident: trade mts-auto-091504-132 emitted HVWAP_RELEASE_INTENT
 for NEAR at 09:28:33.722368, then actual dispatcher emitted
@@ -323,7 +323,7 @@ Their scope, counts and broker-flat requirements are historical and
 superseded for this PAPER restoration by the evidence and authority above.
 
 ```text
-frozen_tree_hash: fbaa74040d92a39bf630004f87056e73abb5f7a8633ef497ec9f318c0c7eb2d5
+frozen_tree_hash: 1eadb40fb73c5b2741fc04e0632de79116f861315725b74b1c880cd786a559d3
 ```
 
 Standard re_freeze.py excludes this file, PHASE1_RC_CANDIDATE.md and
@@ -377,3 +377,38 @@ JSON edits, git stash, automatic second restart or LIVE authorization.
 LIVE account-binding/margin problems remain outside this PAPER cutover.
 Paper lacks LIVE certification session: preserve genuine pre-stop last-live
 broker snapshot; do not relabel it a current paper-session broker query.
+
+## Runtime certification metadata
+<!-- BEGIN RUNTIME_CERTIFICATION_METADATA -->
+```json
+{
+  "broker": {
+    "active_orders": 0,
+    "capture": "OK",
+    "futures_positions": 0,
+    "mode": "live",
+    "source": "live_broker"
+  },
+  "callback_registration_generation": null,
+  "candidate_head": "cb807b54ff21ca29857af4432423af94ea5f0b4f",
+  "captured_at": 1790905674995,
+  "clean_worktree": false,
+  "config_hash": null,
+  "durable_locks": {
+    "active": 0,
+    "retired_unresolved": 7
+  },
+  "generated_at": "2026-10-20T00:58:16.815663+00:00",
+  "live_order_allowed": false,
+  "process": {
+    "pid": null,
+    "start_identity": null
+  },
+  "promotion_mode": "paper_active",
+  "refresh_generation": "futures-1790905675114377000-11506",
+  "session_id": "5efc6b91b43adb42075104e6d180fc55",
+  "source_tree_hash": "1eadb40fb73c5b2741fc04e0632de79116f861315725b74b1c880cd786a559d3",
+  "ttl_seconds": 600.0
+}
+```
+<!-- END RUNTIME_CERTIFICATION_METADATA -->
