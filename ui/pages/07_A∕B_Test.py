@@ -20,6 +20,13 @@ from core.runtime_paths import mts_runtime_path
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 PAIR_FILE_RE = re.compile(r"paired_(\d{8})\.jsonl$")
+SIM_FILE_RE = re.compile(r"ab_sim_(\d{8})\.jsonl$")
+AB_SIM_STATUSES = (
+    "FILLED", "TIMEOUT_MARKET", "SESSION_END_MARKET",
+    "ABANDONED_RESTART", "INVALID_BBO",
+)
+# 2026-10-20 Hermes Agent: Hermes fills the actual deployment timestamp after D1 ships.
+D1_DEPLOYMENT_TIME_PLACEHOLDER = "{D1 deployment time}"
 DETAIL_FIELDS = (
     ("baseline.status", "status"),
     ("adaptive.status", "status"),
@@ -46,8 +53,10 @@ def paired_log_directory() -> Path:
 def list_available_days(directory=None) -> list[str]:
     root = Path(directory) if directory is not None else paired_log_directory()
     try:
-        days = [match.group(1) for path in root.glob("paired_*.jsonl")
-                if (match := PAIR_FILE_RE.fullmatch(path.name))]
+        days = [match.group(1) for pattern, regex in (
+                    ("paired_*.jsonl", PAIR_FILE_RE), ("ab_sim_*.jsonl", SIM_FILE_RE))
+                for path in root.glob(pattern)
+                if (match := regex.fullmatch(path.name))]
     except OSError:
         return []
     return sorted(set(days), reverse=True)
@@ -68,6 +77,26 @@ def load_paired_records(day: str, directory=None) -> list[dict]:
                 except (TypeError, ValueError):
                     continue
                 if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        return []
+    return records
+
+
+def load_sim_outcomes(day: str, directory=None) -> list[dict]:
+    """Read only completed AB_SIM_OUTCOME events for one selected day."""
+    if not re.fullmatch(r"\d{8}", str(day)):
+        return []
+    root = Path(directory) if directory is not None else paired_log_directory()
+    records = []
+    try:
+        with (root / f"ab_sim_{day}.jsonl").open("r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(record, dict) and record.get("event_type") == "AB_SIM_OUTCOME":
                     records.append(record)
     except OSError:
         return []
@@ -172,50 +201,81 @@ def summarize_selected_day(records) -> dict:
     }
 
 
+def summarize_sim_outcomes(outcomes) -> dict:
+    distribution = Counter({status: 0 for status in AB_SIM_STATUSES})
+    for outcome in outcomes:
+        status = str(outcome.get("fill_status") or "")
+        if status in distribution:
+            distribution[status] += 1
+    executable_count = sum(distribution[status] for status in (
+        "FILLED", "TIMEOUT_MARKET", "SESSION_END_MARKET"))
+    filled_points = [value for row in outcomes if row.get("fill_status") == "FILLED"
+                     if (value := _finite_number(row.get("diff_points"))) is not None]
+    filled_twd = [value for row in outcomes if row.get("fill_status") == "FILLED"
+                  if (value := _finite_number(row.get("diff_twd"))) is not None]
+    timeout_points = [value for row in outcomes
+                      if row.get("fill_status") in ("FILLED", "TIMEOUT_MARKET")
+                      if (value := _finite_number(row.get("diff_points"))) is not None]
+    timeout_twd = [value for row in outcomes
+                   if row.get("fill_status") in ("FILLED", "TIMEOUT_MARKET")
+                   if (value := _finite_number(row.get("diff_twd"))) is not None]
+    return {
+        "outcome_count": len(outcomes),
+        "fill_status_distribution": dict(distribution),
+        "adaptive_fill_rate": distribution["FILLED"] / executable_count if executable_count else None,
+        "adaptive_fill_count": distribution["FILLED"],
+        "executable_count": executable_count,
+        "filled_mean_diff_points": fmean(filled_points) if filled_points else None,
+        "filled_mean_diff_twd": fmean(filled_twd) if filled_twd else None,
+        "filled_count": len(filled_points),
+        "timeout_inclusive_mean_diff_points": fmean(timeout_points) if timeout_points else None,
+        "timeout_inclusive_mean_diff_twd": fmean(timeout_twd) if timeout_twd else None,
+        "timeout_inclusive_count": len(timeout_points),
+    }
+
+
 # 2026-10-20 Hermes Agent: explain paired results from existing summaries and price comparisons.
 CONCLUSION_EXPLANATION = (
     "Baseline 是相同輸入下關閉 adaptive observation 的候選判定；adaptive 是在 baseline 判定上附加 "
     "AdaptiveVWAP observation 的結果，使用近月 bars、OI snapshot 與 volume 品質資料，不重新評分 voters。"
-    "判定層比較兩邊 status；出場價層比較兩邊皆有出場價的配對。暖機期 UNKNOWN 已排除於有效樣本。"
+    "判定層比較兩邊 status；出場模擬層讀取 AB_SIM_OUTCOME，正價差代表 adaptive 較好，平均包含 FILLED 與 TIMEOUT_MARKET。"
+    "暖機期 UNKNOWN 已排除於有效樣本。"
     "這是 shadow 評估，不影響實際下單。decision_ts 保留原始值。"
 )
 
 
-def build_conclusion(records) -> dict[str, str]:
+def build_conclusion(records, sim_outcomes=()) -> dict[str, str]:
     summary = summarize_selected_day(records)
     valid = summary["valid_samples"]
     if valid == 0:
         return {"conclusion": "目前無有效樣本（全為暖機/UNKNOWN），無法下結論。",
                 "explanation": CONCLUSION_EXPLANATION}
 
-    n = summary["price_comparison_pairs"]
+    sim = summarize_sim_outcomes(sim_outcomes)
+    n = sim["timeout_inclusive_count"]
     if n == 0:
         consistency = summary["status_consistency_rate"]
         agreement = consistency * 100 if consistency is not None else 0.0
+        if sim["outcome_count"] == 0:
+            message = "出場模擬層：尚無 AB_SIM_OUTCOME 紀錄，沒有模擬成交樣本。"
+        else:
+            message = "出場模擬層：目前沒有 FILLED / TIMEOUT_MARKET 的可比較成交樣本。"
         return {
             "conclusion": (
                 f"判定層：兩邊 status 一致率 {agreement:.1f}%（有效樣本 {valid}）。"
-                "出場價層：尚無兩邊皆有出場價的配對，無法比較 adaptive 與 baseline 的出場價優劣。"
+                + message
             ),
             "explanation": CONCLUSION_EXPLANATION,
         }
 
-    delta = summary["exit_delta_points"]
-    twd = summary["exit_delta_twd"]
-    comparable_sides = summary["exit_comparison_sides"]
-    exit_side = comparable_sides[0] if comparable_sides else None
-    if exit_side is None or len(comparable_sides) != n or any(
-        side != exit_side for side in comparable_sides
-    ):
-        amount = f"{delta:+.2f} 點（{twd:+.1f} TWD）"
-        phrase = f"出場價層：adaptive 與 baseline 平均價差 {amount}，方向未定，n={n}"
-    elif delta == 0:
-        phrase = f"出場價層：adaptive 與 baseline 平均持平 0.00 點（0.0 TWD），n={n}"
+    delta = sim["timeout_inclusive_mean_diff_points"]
+    twd = sim["timeout_inclusive_mean_diff_twd"]
+    if delta == 0:
+        phrase = f"出場模擬層（FILLED + TIMEOUT_MARKET）：adaptive 與 baseline 平均持平 0.00 點（0.0 TWD），n={n}"
     else:
-        is_better = (delta > 0) if exit_side == "SELL" else (delta < 0)
-        quality = "好" if is_better else "差"
+        quality = "好" if delta > 0 else "差"
         phrase = (
-            f"出場價層：adaptive 平均較 baseline {quality} {abs(delta):.2f} 點"
+            f"出場模擬層（FILLED + TIMEOUT_MARKET）：adaptive 平均較 baseline {quality} {abs(delta):.2f} 點"
             f"（{abs(twd):.1f} TWD），n={n}"
         )
 
@@ -297,10 +357,10 @@ def build_detail_rows(records) -> list[dict]:
     return rows
 
 
-def _delta_label(points, twd, count):
+def _sim_delta_label(points, twd, count):
     if points is None or twd is None:
         return "N/A"
-    return f"{points:+.2f} 點 / {twd:+.1f} TWD（{count} 組完整配對）"
+    return f"{points:+.2f} 點 / {twd:+.1f} TWD（n={count}）"
 
 
 def render_page():
@@ -308,6 +368,7 @@ def render_page():
     st.title("A/B Test")
     st.caption("唯讀 paired shadow records；不執行交易，也不寫入資料。")
     st.caption("decision_ts 為原始值；以原始 epoch 值轉成台北時間顯示，不修正既有時間偏移。")
+    st.caption(f"{D1_DEPLOYMENT_TIME_PLACEHOLDER} 之前的紀錄 decision_ts 有 +8 小時偏移（既有缺陷 e8735d466），以原值顯示")
 
     directory = paired_log_directory()
     days = list_available_days(directory)
@@ -316,8 +377,10 @@ def render_page():
         return
 
     records_by_day = {day: load_paired_records(day, directory) for day in days}
+    outcomes_by_day = {day: load_sim_outcomes(day, directory) for day in days}
     selected_day = st.selectbox("選擇日期", days, index=0)
     records = records_by_day.get(selected_day, [])
+    sim_outcomes = outcomes_by_day.get(selected_day, [])
     if not records:
         st.info("無資料：所選日期沒有有效 paired records。")
 
@@ -334,23 +397,30 @@ def render_page():
         f"{summary['status_mismatch_count']} / {summary['total_pairs']} 組",
     )
 
-    conclusion = build_conclusion(records)
+    conclusion = build_conclusion(records, sim_outcomes=sim_outcomes)
     st.subheader("結論說明")
     st.write(conclusion["conclusion"])
     st.caption(conclusion["explanation"])
 
-    hypothetical_points = summary["hypothetical_exit_delta_points"]
-    hypothetical_twd = summary["hypothetical_exit_delta_twd"]
-    exit_points = summary["exit_delta_points"]
-    exit_twd = summary["exit_delta_twd"]
-    hypothetical_count = summary["hypothetical_comparison_pairs"]
-    price_count = summary["price_comparison_pairs"]
-    p1, p2 = st.columns(2)
-    p1.metric("Hypothetical exit 價差（adaptive − baseline）",
-              _delta_label(hypothetical_points, hypothetical_twd, hypothetical_count))
-    p2.metric("Executed exit 價差（adaptive − baseline）",
-              _delta_label(exit_points, exit_twd, price_count))
-    st.caption("Hypothetical 與 executed 出場價各自只比較兩邊都有對應價格的配對；一點 = 10 TWD，不補值。")
+    sim_summary = summarize_sim_outcomes(sim_outcomes)
+    st.subheader("出場模擬結果")
+    status_rows = [{"fill_status": status, "筆數": sim_summary["fill_status_distribution"][status]}
+                   for status in AB_SIM_STATUSES]
+    st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+    s1, s2, s3 = st.columns(3)
+    fill_rate = sim_summary["adaptive_fill_rate"]
+    s1.metric("adaptive 成交率",
+              f"{fill_rate:.1%}" if fill_rate is not None else "N/A",
+              f"{sim_summary['adaptive_fill_count']} / {sim_summary['executable_count']} 可比較結果")
+    s2.metric("平均差（FILLED only）",
+              _sim_delta_label(sim_summary["filled_mean_diff_points"],
+                               sim_summary["filled_mean_diff_twd"],
+                               sim_summary["filled_count"]))
+    s3.metric("平均差（含 TIMEOUT_MARKET）",
+              _sim_delta_label(sim_summary["timeout_inclusive_mean_diff_points"],
+                               sim_summary["timeout_inclusive_mean_diff_twd"],
+                               sim_summary["timeout_inclusive_count"]))
+    st.caption("正差表示 adaptive 出場價較好；決策以含 TIMEOUT_MARKET 的平均差為準。SESSION_END_MARKET、INVALID_BBO 與 ABANDONED_RESTART 不納入這兩種平均差。")
 
     st.subheader("每日彙總")
     st.dataframe(pd.DataFrame(build_daily_summary(records_by_day)), use_container_width=True, hide_index=True)
