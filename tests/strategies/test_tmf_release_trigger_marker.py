@@ -41,8 +41,17 @@ def test_release_fill_sync_still_marks_released(tmp_path):
     s, config = _setup_armed(tmp_path, release_stop_points=20)
     s._released_leg = None  # helper artifact; reset to isolate the sync
     assert s._released_leg is None
-    s.sync_release(leg="far", price=45900.0, release_price=45800.0,
-                   order_id="test-fill-1")
+    with patch("strategies.plugins.futures.active.tmf_spread._append_fill") as append_fill, \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        s.sync_release(leg="far", price=45900.0, release_price=45800.0,
+                       order_id="test-fill-1")
+    release_fill = append_fill.call_args.kwargs
+    gross = (45800.0 - s._far_entry) * 10
+    tax = (s._far_entry + 45800.0) * 10 * 2e-5
+    assert release_fill["gross_pnl"] == gross
+    assert release_fill["fee"] == 40.0
+    assert release_fill["tax"] == tax
+    assert release_fill["realized_pnl"] == gross - 40.0 - tax
     assert s._released_leg == "far"
     assert "TRAILING" in s._lifecycle
     # LEG_FILLED path: enters SINGLE_LEG and re-arms the trailing stop
