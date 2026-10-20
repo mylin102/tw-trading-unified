@@ -266,6 +266,8 @@ def test_settled_log_read_error_still_writes_net_leg_fills(tmp_path):
     # 2026-10-20 Hermes Agent spec, implemented by Codex: leg settlement survives SETTLED scan errors.
     mon = _make_monitor(tmp_path)
     sp = _state_file(tmp_path)
+    with open(mon._fill_log, "w", encoding="utf-8") as f:
+        f.write("{}\n")
     real_open = open
 
     def _open(path, mode="r", *args, **kwargs):
