@@ -5,7 +5,7 @@ import pandas as pd
 
 from strategies.futures.monitor import FuturesMonitor
 from strategies.plugins.futures.active.mts_hvwap_candidate import (
-    aggregate_completed_bars, classify_60m_regime, Regime60m,
+    aggregate_completed_bars, classify_60m_regime, Regime60m, to_epoch_secs,
 )
 
 
@@ -16,15 +16,16 @@ def test_memory_history_warms_60m_without_indicator_csv(monkeypatch, tmp_path):
     monitor.live_trading = False
     monitor.ticker = "TMF"
     timestamps = pd.date_range("2026-10-12 08:45", "2026-10-12 11:45", freq="5min")
+    # 2026-10-20 Hermes Agent: keep naive bars as wall-time values until HVWAP normalizes them.
     monitor._tick_bars_deque = deque([
-        {"ts": ts.timestamp(), "open": 49000 + i, "high": 49002 + i,
+        {"ts": ts, "open": 49000 + i, "high": 49002 + i,
          "low": 48999 + i, "close": 49001 + i, "volume": 10}
         for i, ts in enumerate(timestamps)
     ])
     decision = pd.Timestamp("2026-10-12 11:45")
     bars = monitor._get_hvwap_regime_prewarm_bars(decision)
     assert bars, "real current-session K bars must not depend on indicator CSV"
-    assert max(float(b["ts"]) for b in bars) <= decision.timestamp()
+    assert max(float(b["ts"]) for b in bars) <= to_epoch_secs(decision)
     # The 11:45 bucket has not closed; only its predecessors are evidence.
     assert len(bars) == len(timestamps) - 1
     hours = aggregate_completed_bars(bars, decision, 3600)
