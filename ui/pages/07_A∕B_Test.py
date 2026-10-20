@@ -97,50 +97,131 @@ def _finite_number(value):
 def _price_comparisons(records):
     hypothetical_deltas = []
     exit_deltas = []
+    exit_sides = []
     for record in records:
         baseline, adaptive = _arm(record, "baseline"), _arm(record, "adaptive")
-        values = [
+        hypothetical = (
             _finite_number(baseline.get("hypothetical_exit_price")),
             _finite_number(adaptive.get("hypothetical_exit_price")),
+        )
+        if all(value is not None for value in hypothetical):
+            hypothetical_deltas.append(hypothetical[1] - hypothetical[0])
+
+        exits = (
             _finite_number(baseline.get("exit_price")),
             _finite_number(adaptive.get("exit_price")),
-        ]
-        if any(value is None for value in values):
-            continue
-        baseline_hypothetical, adaptive_hypothetical, baseline_exit, adaptive_exit = values
-        hypothetical_deltas.append(adaptive_hypothetical - baseline_hypothetical)
-        exit_deltas.append(adaptive_exit - baseline_exit)
+        )
+        if all(value is not None for value in exits):
+            exit_deltas.append(exits[1] - exits[0])
+            baseline_leg = str(baseline.get("hypothetical_release_leg") or "").lower()
+            adaptive_leg = str(adaptive.get("hypothetical_release_leg") or "").lower()
+            baseline_state = baseline.get(baseline_leg)
+            adaptive_state = adaptive.get(adaptive_leg)
+            baseline_side = (baseline_state.get("side")
+                             if isinstance(baseline_state, dict) else None)
+            adaptive_side = (adaptive_state.get("side")
+                             if isinstance(adaptive_state, dict) else None)
+            baseline_exit_side = {"LONG": "SELL", "SHORT": "BUY"}.get(
+                str(baseline_side).upper() if baseline_side is not None else ""
+            )
+            adaptive_exit_side = {"LONG": "SELL", "SHORT": "BUY"}.get(
+                str(adaptive_side).upper() if adaptive_side is not None else ""
+            )
+            exit_sides.append(
+                baseline_exit_side
+                if baseline_exit_side is not None and baseline_exit_side == adaptive_exit_side
+                else None
+            )
 
-    return hypothetical_deltas, exit_deltas
+    return hypothetical_deltas, exit_deltas, exit_sides
 
 
 def summarize_selected_day(records) -> dict:
     total = len(records)
     valid = 0
+    valid_mismatches = 0
     unknown = 0
     mismatches = 0
     for record in records:
         baseline_status = _status(_arm(record, "baseline"))
         adaptive_status = _status(_arm(record, "adaptive"))
-        valid += baseline_status != "UNKNOWN" and adaptive_status != "UNKNOWN"
+        pair_is_valid = baseline_status != "UNKNOWN" and adaptive_status != "UNKNOWN"
+        valid += pair_is_valid
+        # 2026-10-20 Hermes Agent: conclusion agreement uses only effective samples.
+        valid_mismatches += pair_is_valid and baseline_status != adaptive_status
         unknown += baseline_status == "UNKNOWN" or adaptive_status == "UNKNOWN"
         mismatches += baseline_status != adaptive_status
 
-    hypothetical, executed = _price_comparisons(records)
+    hypothetical, executed, exit_sides = _price_comparisons(records)
     hypothetical_mean = fmean(hypothetical) if hypothetical else None
     exit_mean = fmean(executed) if executed else None
     return {
         "total_pairs": total,
         "valid_samples": valid,
+        "status_consistency_rate": (valid - valid_mismatches) / valid if valid else None,
         "unknown_pairs": unknown,
         "status_mismatch_count": mismatches,
         "status_mismatch_ratio": mismatches / total if total else None,
-        "price_comparison_pairs": len(hypothetical),
+        "hypothetical_comparison_pairs": len(hypothetical),
+        "price_comparison_pairs": len(executed),
+        "exit_comparison_sides": exit_sides,
         "hypothetical_exit_delta_points": hypothetical_mean,
         "hypothetical_exit_delta_twd": hypothetical_mean * 10 if hypothetical_mean is not None else None,
         "exit_delta_points": exit_mean,
         "exit_delta_twd": exit_mean * 10 if exit_mean is not None else None,
     }
+
+
+# 2026-10-20 Hermes Agent: explain paired results from existing summaries and price comparisons.
+CONCLUSION_EXPLANATION = (
+    "Baseline 是相同輸入下關閉 adaptive observation 的候選判定；adaptive 是在 baseline 判定上附加 "
+    "AdaptiveVWAP observation 的結果，使用近月 bars、OI snapshot 與 volume 品質資料，不重新評分 voters。"
+    "判定層比較兩邊 status；出場價層比較兩邊皆有出場價的配對。暖機期 UNKNOWN 已排除於有效樣本。"
+    "這是 shadow 評估，不影響實際下單。decision_ts 保留原始值。"
+)
+
+
+def build_conclusion(records) -> dict[str, str]:
+    summary = summarize_selected_day(records)
+    valid = summary["valid_samples"]
+    if valid == 0:
+        return {"conclusion": "目前無有效樣本（全為暖機/UNKNOWN），無法下結論。",
+                "explanation": CONCLUSION_EXPLANATION}
+
+    n = summary["price_comparison_pairs"]
+    if n == 0:
+        consistency = summary["status_consistency_rate"]
+        agreement = consistency * 100 if consistency is not None else 0.0
+        return {
+            "conclusion": (
+                f"判定層：兩邊 status 一致率 {agreement:.1f}%（有效樣本 {valid}）。"
+                "出場價層：尚無兩邊皆有出場價的配對，無法比較 adaptive 與 baseline 的出場價優劣。"
+            ),
+            "explanation": CONCLUSION_EXPLANATION,
+        }
+
+    delta = summary["exit_delta_points"]
+    twd = summary["exit_delta_twd"]
+    comparable_sides = summary["exit_comparison_sides"]
+    exit_side = comparable_sides[0] if comparable_sides else None
+    if exit_side is None or len(comparable_sides) != n or any(
+        side != exit_side for side in comparable_sides
+    ):
+        amount = f"{delta:+.2f} 點（{twd:+.1f} TWD）"
+        phrase = f"出場價層：adaptive 與 baseline 平均價差 {amount}，方向未定，n={n}"
+    elif delta == 0:
+        phrase = f"出場價層：adaptive 與 baseline 平均持平 0.00 點（0.0 TWD），n={n}"
+    else:
+        is_better = (delta > 0) if exit_side == "SELL" else (delta < 0)
+        quality = "好" if is_better else "差"
+        phrase = (
+            f"出場價層：adaptive 平均較 baseline {quality} {abs(delta):.2f} 點"
+            f"（{abs(twd):.1f} TWD），n={n}"
+        )
+
+    if n < 30:
+        phrase += "，樣本不足 30，僅供參考。"
+    return {"conclusion": phrase, "explanation": CONCLUSION_EXPLANATION}
 
 
 def _distribution(records, arm_name, field):
@@ -223,8 +304,8 @@ def _delta_label(points, twd, count):
 
 
 def render_page():
-    st.set_page_config(page_title="MTS A/B Test | Trading Unified", page_icon="🧪", layout="wide")
-    st.title("MTS Adaptive VWAP A/B 影子比較")
+    st.set_page_config(page_title="A/B Test", page_icon="🧪", layout="wide")
+    st.title("A/B Test")
     st.caption("唯讀 paired shadow records；不執行交易，也不寫入資料。")
     st.caption("decision_ts 為原始值；以原始 epoch 值轉成台北時間顯示，不修正既有時間偏移。")
 
@@ -253,17 +334,23 @@ def render_page():
         f"{summary['status_mismatch_count']} / {summary['total_pairs']} 組",
     )
 
+    conclusion = build_conclusion(records)
+    st.subheader("結論說明")
+    st.write(conclusion["conclusion"])
+    st.caption(conclusion["explanation"])
+
     hypothetical_points = summary["hypothetical_exit_delta_points"]
     hypothetical_twd = summary["hypothetical_exit_delta_twd"]
     exit_points = summary["exit_delta_points"]
     exit_twd = summary["exit_delta_twd"]
+    hypothetical_count = summary["hypothetical_comparison_pairs"]
     price_count = summary["price_comparison_pairs"]
     p1, p2 = st.columns(2)
     p1.metric("Hypothetical exit 價差（adaptive − baseline）",
-              _delta_label(hypothetical_points, hypothetical_twd, price_count))
+              _delta_label(hypothetical_points, hypothetical_twd, hypothetical_count))
     p2.metric("Executed exit 價差（adaptive − baseline）",
               _delta_label(exit_points, exit_twd, price_count))
-    st.caption("價格比較只使用同一配對中兩邊均有 hypothetical_exit_price 與 exit_price 的列；一點 = 10 TWD，不補值。")
+    st.caption("Hypothetical 與 executed 出場價各自只比較兩邊都有對應價格的配對；一點 = 10 TWD，不補值。")
 
     st.subheader("每日彙總")
     st.dataframe(pd.DataFrame(build_daily_summary(records_by_day)), use_container_width=True, hide_index=True)
