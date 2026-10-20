@@ -129,7 +129,7 @@ def test_conclusion_uses_timeout_inclusive_outcomes_and_no_legacy_complete_pair_
 def test_d1_timestamp_note_is_a_fixed_placeholder_and_page_shows_sim_layer():
     page = _load_page()
     source = PAGE_PATH.read_text(encoding="utf-8")
-    assert page.D1_DEPLOYMENT_TIME_PLACEHOLDER == "{D1 deployment time}"
+    assert page.D1_DEPLOYMENT_TIME_PLACEHOLDER == "2026-10-20 16:09（台北）"
     assert "之前的紀錄 decision_ts 有 +8 小時偏移（既有缺陷 e8735d466），以原值顯示" in source
     assert "adaptive 成交率" in source
     assert "AB_SIM_OUTCOME" in source
