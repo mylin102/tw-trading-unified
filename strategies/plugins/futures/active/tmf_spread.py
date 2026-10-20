@@ -2231,6 +2231,9 @@ class TMFSpread(StrategyBase):
                 compute_counterfactual_outcomes,
                 bar_close_time,
             )
+            # 2026-10-20 Hermes Agent: advance the isolated simulated limit
+            # from the same validated BidAsk slots carried by every strategy bar.
+            self._hvwap_ab_sim_tick(bar, now)
             _close = bar_close_time(bar.get("ts") or bar.get("timestamp"))
             if _close is None:
                 # 2026-08-24: explicit fail-closed diagnostic (previously a
@@ -2451,14 +2454,46 @@ class TMFSpread(StrategyBase):
             _adaptive_cfg = getattr(self, "_adaptive_vwap_config", None)
             if _adaptive_cfg is not None and _adaptive_cfg.shadow_enabled:
                 try:
-                    from strategies.plugins.futures.active.mts_adaptive_ab import evaluate_hvwap_ab, paired_record, log_ab_pair
+                    from strategies.plugins.futures.active.mts_adaptive_ab import (
+                        begin_ab_simulation, evaluate_hvwap_ab, log_ab_pair,
+                        log_ab_sim_outcome, log_ab_sim_pending, paired_record,
+                    )
                     _arms = evaluate_hvwap_ab(baseline=verdict, config=_adaptive_cfg, **_candidate_inputs)
                     _pair_id = f"{getattr(self, '_trade_id', None)}:{verdict.decision_ts}"
                     _pair = paired_record(_pair_id, _arms, _adaptive_cfg)
                     self._adaptive_last_pair = _pair
                     _append_event("HVWAP_ADAPTIVE_AB", **_pair)
                     # 2026-10-16 Hermes Agent: inherit the event writer's mode-scoped root.
-                    log_ab_pair(_pair, os.path.join(os.path.dirname(_MTS_EVENT_LOG), "ab_test"))
+                    _sim_dir = os.path.join(os.path.dirname(_MTS_EVENT_LOG), "ab_test")
+                    log_ab_pair(_pair, _sim_dir)
+                    # 2026-10-20 Hermes Agent: compare only the same eligible
+                    # release leg; this observer never calls the order manager.
+                    _base_arm, _adaptive_arm = _pair["baseline"], _pair["adaptive"]
+                    _sim_leg = _base_arm.get("hypothetical_release_leg")
+                    if (getattr(self, "_adaptive_sim_pending", None) is None
+                            and _base_arm.get("candidate_release_eligible") is True
+                            and _adaptive_arm.get("candidate_release_eligible") is True
+                            and _sim_leg in ("NEAR", "FAR")
+                            and _adaptive_arm.get("hypothetical_release_leg") == _sim_leg
+                            and _adaptive_arm.get("adaptive_price") is not None):
+                        _entry_side = getattr(self, f"_{_sim_leg.lower()}_side", None)
+                        _exit_side = "SELL" if _entry_side == "LONG" else "BUY" if _entry_side == "SHORT" else None
+                        if _exit_side is not None:
+                            try:
+                                _point_value = float(get_point_value(self._ticker))
+                            except Exception:
+                                _point_value = 10.0
+                            _sim_pending, _sim_outcome = begin_ab_simulation(
+                                pair_id=_pair_id, leg=_sim_leg, side=_exit_side,
+                                decision_ts=_pair["decision_ts"],
+                                adaptive_price=_adaptive_arm.get("adaptive_price"),
+                                bar=bar, point_value=_point_value,
+                            )
+                            if _sim_pending is not None:
+                                log_ab_sim_pending(_sim_pending, _sim_dir)
+                                self._adaptive_sim_pending = _sim_pending
+                            if _sim_outcome is not None:
+                                log_ab_sim_outcome(_sim_outcome, _sim_dir)
                 except Exception:
                     logger.warning("[HVWAP_ADAPTIVE_AB] shadow evaluation unavailable", exc_info=True)
         except Exception as _hvwap_exc:
@@ -2473,6 +2508,28 @@ class TMFSpread(StrategyBase):
                     detail=f"{type(_hvwap_exc).__name__}: {_hvwap_exc}")
             except Exception:
                 pass
+
+    def _hvwap_ab_sim_tick(self, bar: dict, now) -> dict | None:
+        """Advance only the in-memory A/B observer; never touch order/lifecycle state."""
+        try:
+            from strategies.plugins.futures.active.mts_adaptive_ab import (
+                advance_ab_simulation, log_ab_sim_outcome, recover_ab_simulations,
+            )
+            _sim_dir = os.path.join(os.path.dirname(_MTS_EVENT_LOG), "ab_test")
+            if not getattr(self, "_adaptive_sim_recovery_checked", False):
+                recover_ab_simulations(_sim_dir)
+                self._adaptive_sim_recovery_checked = True
+            _pending = getattr(self, "_adaptive_sim_pending", None)
+            if _pending is None:
+                return None
+            _outcome = advance_ab_simulation(_pending, bar, now)
+            if _outcome is not None:
+                log_ab_sim_outcome(_outcome, _sim_dir)
+                self._adaptive_sim_pending = None
+            return _outcome
+        except Exception:
+            logger.warning("[HVWAP_AB_SIM] pending simulation update unavailable", exc_info=True)
+            return None
 
     def _hvwap_emit_data_unavailable(self, bar: dict, *, reason: str,
                                      detail: str | None = None) -> None:
