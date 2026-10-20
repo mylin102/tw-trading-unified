@@ -28,7 +28,7 @@ def bar(ts, *, near_bid=100, near_ask=101, far_bid=90, far_ask=91,
         "near_bid": near_bid, "near_ask": near_ask,
         "far_bid": far_bid, "far_ask": far_ask,
         "near_bidask_age_ms": near_age, "far_bidask_age_ms": far_age,
-        "near_entry_bbo_state": "FRESH", "far_entry_bbo_state": "FRESH",
+        "near_entry_bbo_state": "OK", "far_entry_bbo_state": "OK",
         "near_close": last, "far_close": last, "close": last,
     }
 
