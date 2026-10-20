@@ -3,6 +3,8 @@ from collections import deque
 from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 import json
+import math
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +17,14 @@ from strategies.plugins.futures.active.mts_vol_quality import VolQuality
 
 TW = timezone(timedelta(hours=8))
 TS = datetime(2026, 10, 15, 10, 0, tzinfo=TW).timestamp()
+# 2026-10-20 Hermes Agent: derive the serialized Gaussian-quality expectation from the artifact.
+VOLUME_PARAMS = json.loads((Path(__file__).parents[1] / "config/mts_vol_zscore_params.json").read_text())["params"]
+
+
+def calibrated_quality(volume, segment):
+    params = VOLUME_PARAMS[segment]
+    z = (volume - params["mean"]) / params["std"] if params["std"] else 0.0
+    return 100 * math.exp(-(z ** 2) / 2)
 
 
 def candidate(**kwargs):
@@ -47,7 +57,7 @@ def test_three_layers_serialize_without_changing_arbitration():
     result = candidate(oi_snapshot=oi, event_sequence=events)
     assert result.vol_quality_score == 100
     assert result.vol_quality_level == "EXCELLENT"
-    assert result.vol_quality == 100  # Z-score quality remains its own field.
+    assert result.vol_quality == pytest.approx(calibrated_quality(467, "day"))  # (P) JSON-derived Gaussian quality.
     assert result.oi_quality == 98.2
     assert replace(result, vol_quality_score=None, vol_quality_level=None) == baseline
     assert result.to_dict()["vol_quality_level"] == "EXCELLENT"
@@ -123,7 +133,7 @@ def test_strategy_passes_exact_completed_window_and_counts(monkeypatch, tmp_path
     assert payload["vol_quality_score"] == compute(**observed[0]).quality_score
     assert payload["vol_quality_level"] == compute(**observed[0]).quality_level
     assert payload["oi_intensity"] == 0.4
-    assert payload["vol_zscore"] == 0
+    assert payload["vol_zscore"] == pytest.approx((467 - VOLUME_PARAMS["day"]["mean"]) / VOLUME_PARAMS["day"]["std"])
     assert payload["release_action_emitted"] is False
     # Same-bar cache must not ingest a newly appended late/future event.
     monkeypatch.setattr(obj._oi_estimator, "estimate_oi", lambda *args: pytest.fail("same-bar reload"))

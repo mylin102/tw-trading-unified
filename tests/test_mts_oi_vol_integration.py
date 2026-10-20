@@ -3,6 +3,8 @@ from collections import deque
 from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 import json
+import math
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +16,18 @@ from strategies.plugins.futures.active.mts_vol_adjuster import VolAdjuster
 
 
 TW = timezone(timedelta(hours=8))
+# 2026-10-20 Hermes Agent: derive volume expectations from the committed calibration artifact.
+VOLUME_PARAMS = json.loads((Path(__file__).parents[1] / "config/mts_vol_zscore_params.json").read_text())["params"]
+
+
+def calibrated_z(volume, segment):
+    params = VOLUME_PARAMS[segment]
+    return (volume - params["mean"]) / params["std"] if params["std"] else 0.0
+
+
+def calibrated_quality(volume, segment):
+    z = calibrated_z(volume, segment)
+    return 100 * math.exp(-(z ** 2) / 2)
 SIGNALS = {"oi_intensity", "oi_direction", "oi_quality", "vol_zscore",
            "vol_anomaly_level", "vol_quality"}
 
@@ -39,9 +53,9 @@ def test_signals_serialize_without_changing_arbitration():
     assert data["oi_intensity"] == 0.4
     assert data["oi_direction"] == 1.0
     assert data["oi_quality"] == 99.3
-    assert data["vol_zscore"] == 0.0
+    assert data["vol_zscore"] == pytest.approx(calibrated_z(467, "day"))
     assert data["vol_anomaly_level"] == "NORMAL"
-    assert data["vol_quality"] == 100.0
+    assert data["vol_quality"] == pytest.approx(calibrated_quality(467, "day"))
     assert replace(enriched, oi_intensity=None, oi_direction=None, oi_quality=None) == baseline
 
 
@@ -57,8 +71,8 @@ def test_latest_bar_by_timestamp_uses_near_volume_only():
     bars = [{"ts": epoch(), "close": 100, "volume": 709},
             {"ts": epoch(9, 55), "close": 100, "volume": 467}]
     result = evaluate(bars)
-    assert result.vol_zscore == 2.0
-    assert result.vol_anomaly_level == "HIGH"
+    assert result.vol_zscore == pytest.approx(calibrated_z(709, "day"))
+    assert result.vol_anomaly_level == "NORMAL"  # (P) JSON-derived z is within the normal band.
 
 
 @pytest.mark.parametrize("volume", [None, -1, float("nan"), float("inf")])
@@ -75,22 +89,23 @@ def test_incomplete_bar_remains_fail_closed():
     assert all(result.to_dict()[key] is None for key in SIGNALS)
 
 
+# 2026-10-20 Hermes Agent: S1 replaces the obsolete sub-session boundaries with TAIFEX sessions.
 @pytest.mark.parametrize("hour,minute,segment", [
-    (9, 14, None), (9, 15, "morning"), (13, 29, None),
-    (13, 30, "afternoon"), (17, 59, None), (18, 0, "night"),
-    (4, 59, "night"), (5, 0, None),
+    (8, 44, None), (8, 45, "day"), (13, 45, "day"),
+    (13, 46, None), (14, 59, None), (15, 0, "night"),
+    (4, 59, "night"), (5, 0, "night"), (5, 1, None),
 ])
 def test_dispatch_session_boundaries(hour, minute, segment):
     assert VolAdjuster.get_time_segment(epoch(hour, minute)) == segment
 
 
-@pytest.mark.parametrize("segment,volume,expected", [
-    ("morning", 588, 1.0), ("afternoon", 492, 1.0), ("night", 270, 1.0),
-])
-def test_segment_calibration_and_exact_one_boundary(segment, volume, expected):
+@pytest.mark.parametrize("segment", ["day", "night"])
+def test_segment_calibration_and_exact_one_boundary(segment):
+    params = VOLUME_PARAMS[segment]
+    volume = params["mean"] + params["std"]
     z = VolAdjuster.compute_zscore(volume, segment)
-    assert z == expected
-    assert VolAdjuster.classify_anomaly(z) == "NORMAL"
+    assert z == pytest.approx(1.0)
+    assert VolAdjuster.classify_anomaly(1.0) == "NORMAL"  # S3 exact boundary; generated z is checked above.
 
 
 def strategy(monkeypatch, tmp_path):
@@ -123,7 +138,7 @@ def test_strategy_reads_writer_path_and_emits_completed_bar_signals(monkeypatch,
     assert obj._oi_estimator.log_path == str(path)
     assert obj._oi_snapshot.ts == epoch()
     assert obj._hvwap_last_verdict.oi_intensity == 0.2
-    assert obj._hvwap_last_verdict.vol_zscore == 0
+    assert obj._hvwap_last_verdict.vol_zscore == pytest.approx(calibrated_z(467, "day"))
     assert len(events) == 1
     name, payload = events[0]
     assert name == "HVWAP_CANDIDATE"
@@ -142,7 +157,7 @@ def test_optional_oi_failure_does_not_remove_hvwap_verdict(monkeypatch, tmp_path
     monkeypatch.setattr(OIEstimator, "estimate_oi", fail)
     tick(obj)
     assert obj._hvwap_last_verdict.oi_direction is None
-    assert obj._hvwap_last_verdict.vol_zscore == 0
+    assert obj._hvwap_last_verdict.vol_zscore == pytest.approx(calibrated_z(467, "day"))
     assert events[0][0] == "HVWAP_CANDIDATE"
 
 

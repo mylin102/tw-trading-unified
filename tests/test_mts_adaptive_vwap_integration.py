@@ -3,6 +3,7 @@ from collections import deque
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import csv
+import math
 import importlib.util
 import json
 from pathlib import Path
@@ -18,6 +19,18 @@ from strategies.plugins.futures.active.mts_oi_estimator import OISnapshot
 
 TW = timezone(timedelta(hours=8))
 TS = datetime(2026, 10, 15, 10, tzinfo=TW).timestamp()
+# 2026-10-20 Hermes Agent: derive the Gaussian-quality expectation from committed parameters.
+VOLUME_PARAMS = json.loads((Path(__file__).parents[1] / "config/mts_vol_zscore_params.json").read_text())["params"]
+
+
+def calibrated_z(volume, segment):
+    params = VOLUME_PARAMS[segment]
+    return (volume - params["mean"]) / params["std"] if params["std"] else 0.0
+
+
+def calibrated_quality(volume, segment):
+    z = calibrated_z(volume, segment)
+    return 100 * math.exp(-(z ** 2) / 2)
 
 
 def make_strategy(monkeypatch, tmp_path):
@@ -55,8 +68,8 @@ def test_shadow_pair_cadence_mode_path_and_quality_source(monkeypatch, tmp_path)
     pair = obj._adaptive_last_pair
     adaptive = pair["adaptive"]
     assert adaptive["vol_quality_score"] == 70  # supplied stacking rule sees ENTRY + FILL
-    assert adaptive["vol_quality"] == 100  # distinct Z-score quality
-    assert adaptive["chips_strength"] == AdaptiveVWAP._chips_strength(.2, 1, 70, 0)
+    assert adaptive["vol_quality"] == pytest.approx(calibrated_quality(467, "day"))  # (P) JSON-derived Z-score quality
+    assert adaptive["chips_strength"] == AdaptiveVWAP._chips_strength(.2, 1, 70, calibrated_z(467, "day"))  # (P) event quality stays 70; z comes from JSON.
     assert adaptive["adaptive_twap"] == 110
     assert pair["baseline"]["status"] == adaptive["status"]
     assert pair["release_action_emitted"] is False
@@ -103,8 +116,9 @@ def test_off_segment_and_mismatched_snapshot_stay_unavailable():
             near_price=100, far_price=90, near_side="LONG", far_side="SHORT", atr_15m=10,
             oi_snapshot=OISnapshot(oi_ts, 1, .2, 1, 1, 0, 1, 99), event_sequence=[], use_adaptive=True)
     assert evaluate(TS, TS - 300).adaptive_price is None
-    noon = datetime(2026, 10, 15, 12, tzinfo=TW).timestamp()
-    assert evaluate(noon, noon).adaptive_price is None
+    # 2026-10-20 Hermes Agent: S1 makes noon a valid day session; test actual recess instead.
+    recess = datetime(2026, 10, 15, 13, 46, tzinfo=TW).timestamp()
+    assert evaluate(recess, recess).adaptive_price is None
 
 
 def replay_module():
@@ -177,7 +191,7 @@ def test_replay_event_signals_and_paired_outcome_join(tmp_path):
     report = module.replay([near], [far], start_date="2026-06-08", end_date="2026-06-12",
         output_dir=tmp_path / "with-signals", timestamp_kind="start", events_path=events,
         outcomes_path=outcome_file)
-    assert report["valid_adaptive_decisions"] == 20  # 09:15 boundary inclusive: four bars per date
+    assert report["valid_adaptive_decisions"] == 28  # (W) S1 admits the additional 09:00-09:14 decisions.
     assert report["comparison"]["paired_count"] == 5
     assert report["comparison"]["promotion"] == "NO_GO"  # equal win rates fail the required gain
     # 2026-10-16 Hermes Agent: valid evaluated pairs may pass the numerical gate;
