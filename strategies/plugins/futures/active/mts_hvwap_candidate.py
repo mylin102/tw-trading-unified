@@ -108,7 +108,7 @@ def to_epoch_secs(value: Any) -> Optional[float]:
 
     Contract (matches tmf_spread.iso_to_epoch_ms legacy semantics):
       * numeric epoch (s or ms, ms auto-detected) -> epoch s
-      * pandas Timestamp -> .timestamp() (epoch-accurate; never stringified)
+      * pandas Timestamp -> timezone-aware epoch; naive values mean Asia/Taipei
       * tz-aware datetime/ISO -> its UTC epoch
       * naive datetime/ISO -> Asia/Taipei wall clock (NEVER machine-local)
     """
@@ -121,6 +121,9 @@ def to_epoch_secs(value: Any) -> Optional[float]:
         return f
     import pandas as pd
     if isinstance(value, pd.Timestamp):
+        # 2026-10-20 Hermes Agent: align naive pandas wall time with naive datetime handling.
+        if value.tzinfo is None:
+            value = value.tz_localize(_TW)
         return value.timestamp()
     if isinstance(value, _dt.datetime):
         dt = value
