@@ -86,7 +86,7 @@ def _complete_trade(tid, **over):
 
 
 class TestReconstruction:
-    def test_combined_settlement_net_takes_precedence_over_gross_and_legs():
+    def test_combined_settlement_net_takes_precedence_over_gross_and_legs(self):
         # 2026-10-20 Codex: Hermes-approved contract requires paper reconstruction to trust settled net PnL.
         trade_fills = [
             {"realized_pnl": 100.0},
