@@ -16350,7 +16350,31 @@ class FuturesMonitor:
         # 2026-08-03 Phase B: canonical combined settlement event.
         # One COMBINED_EXIT_SETTLED per trade — never re-emitted across
         # restart / duplicate callback (dedupe by trade_id + fills log scan).
-        _combined_exit_costs = {}
+        # 2026-10-20 Hermes Agent spec, implemented by Codex: calculate each leg independently of the SETTLED write window.
+        def _calculate_combined_exit_leg_costs(_leg_key):
+            _point_value = float(
+                (getattr(self, "cfg", None) or {}).get("point_value", 10) or 10)
+            _side = tracker.get(f"{_leg_key}_side") or "UNKNOWN"
+            _entry = float(tracker.get(f"{_leg_key}_entry") or 0.0)
+            _exit_price = tracker.get(f"{_leg_key}_price")
+            if _exit_price is None:
+                _exit_price = float(price or 0.0)
+            _qty = int(tracker.get(f"{_leg_key}_filled_qty") or 0)
+            _sign = 1.0 if str(_side).upper() == "LONG" else -1.0
+            _gross = (_exit_price - _entry) * _qty * _point_value * _sign
+            _fee = 40.0 * _qty if _qty > 0 else 0.0
+            _tax = ((_entry + float(_exit_price)) * _point_value * _qty * 2e-5
+                    if _qty > 0 else 0.0)
+            return {
+                "entry_price": _entry,
+                "exit_price": float(_exit_price),
+                "qty": _qty,
+                "gross_pnl": round(_gross, 1),
+                "fee": _fee,
+                "tax": _tax,
+                "realized_pnl": round(_gross - _fee - _tax, 1),
+            }
+
         try:
             from strategies.plugins.futures.active.tmf_spread import _append_fill
             _ce_id = trade_id  # combined_exit_id == trade_id for MTS lifecycle
@@ -16367,35 +16391,16 @@ class FuturesMonitor:
                             _has_settled = True
                             break
             if not _has_settled:
-                _pv2 = float((getattr(self, "cfg", None) or {}).get("point_value", 10) or 10)
                 _set = {}
-                for _lk, _ln in (("near", "NEAR"), ("far", "FAR")):
-                    _sb = tracker.get(f"{_lk}_side") or "UNKNOWN"
-                    _en = float(tracker.get(f"{_lk}_entry") or 0.0)
-                    _ex = tracker.get(f"{_lk}_price")
-                    if _ex is None:
-                        _ex = float(price or 0.0)
-                    _q = int(tracker.get(f"{_lk}_filled_qty") or 0)
-                    _sgn = 1.0 if str(_sb).upper() == "LONG" else -1.0
-                    _g = (_ex - _en) * _q * _pv2 * _sgn
-                    # 2026-10-20 Hermes Agent spec, implemented by Codex: settle only net PnL and preserve its cost breakdown.
-                    _fee = 40.0 * _q if _q > 0 else 0.0
-                    _tax = ((_en + float(_ex)) * _pv2 * _q * 2e-5
-                            if _q > 0 else 0.0)
-                    _net = round(_g - _fee - _tax, 1)
-                    _combined_exit_costs[_lk] = {
-                        "gross_pnl": round(_g, 1),
-                        "fee": _fee,
-                        "tax": _tax,
-                        "realized_pnl": _net,
-                    }
-                    _set[f"{_lk}_entry_avg_price"] = _en
-                    _set[f"{_lk}_exit_avg_price"] = float(_ex)
-                    _set[f"{_lk}_closed_qty"] = _q
-                    _set[f"{_lk}_realized_pnl_gross"] = round(_g, 1)
-                    _set[f"{_lk}_realized_pnl_net"] = _net
-                    _set[f"{_lk}_fee"] = _fee
-                    _set[f"{_lk}_tax"] = _tax
+                for _lk in ("near", "far"):
+                    _costs = _calculate_combined_exit_leg_costs(_lk)
+                    _set[f"{_lk}_entry_avg_price"] = _costs["entry_price"]
+                    _set[f"{_lk}_exit_avg_price"] = _costs["exit_price"]
+                    _set[f"{_lk}_closed_qty"] = _costs["qty"]
+                    _set[f"{_lk}_realized_pnl_gross"] = _costs["gross_pnl"]
+                    _set[f"{_lk}_realized_pnl_net"] = _costs["realized_pnl"]
+                    _set[f"{_lk}_fee"] = _costs["fee"]
+                    _set[f"{_lk}_tax"] = _costs["tax"]
                 _combined_gross = round(_set["near_realized_pnl_gross"] + _set["far_realized_pnl_gross"], 1)
                 _combined_net = round(
                     _set["near_realized_pnl_net"] + _set["far_realized_pnl_net"], 1)
@@ -16454,7 +16459,6 @@ class FuturesMonitor:
                 ("near", "NEAR", self.contract.code if getattr(self, "contract", None) else "NEAR"),
                 ("far", "FAR", self.far_contract.code if getattr(self, "far_contract", None) else "FAR"),
             ):
-                _qty = int(tracker.get(f"{_leg_key}_filled_qty") or 0)
                 _side_before = tracker.get(f"{_leg_key}_side") or "UNKNOWN"
                 _exit_side = "SELL" if str(_side_before).upper() == "LONG" else "BUY"
                 _exit_px = tracker.get(f"{_leg_key}_price")
@@ -16466,9 +16470,9 @@ class FuturesMonitor:
                     "BROKER_FILL" if (self.live_trading and _exit_px is not None)
                     else "PAPER_FILL" if _exit_px is not None
                     else "STATE_SNAPSHOT")
-                if _exit_px is None:
-                    _exit_px = float(price or 0.0)
-                _exit_costs = _combined_exit_costs[_leg_key]
+                _exit_costs = _calculate_combined_exit_leg_costs(_leg_key)
+                _qty = _exit_costs["qty"]
+                _exit_px = _exit_costs["exit_price"]
                 _append_fill(
                     ticker=getattr(self, "ticker", "TMF"),
                     contract=_ctr,
