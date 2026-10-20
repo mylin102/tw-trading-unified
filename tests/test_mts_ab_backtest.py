@@ -132,8 +132,9 @@ def test_source_mutation_rejected(tmp_path):
 
 def test_uncalibrated_inputs_never_get_fake_outcomes(tmp_path):
     near, far = snapshot(tmp_path / "near.csv"), snapshot(tmp_path / "far.csv")
+    # 2026-10-20 Hermes Agent: 12:xx is calibrated day session; use actual 14:xx recess.
     for path in (near, far):
-        path.write_text(path.read_text().replace(" 09:", " 12:"))
+        path.write_text(path.read_text().replace(" 09:", " 14:"))
     output = tmp_path / "output"
     replay.run_study(near, far, start_date="2026-07-06", end_date="2026-07-06", output_dir=output,
                      config_path=legacy_config(tmp_path))
