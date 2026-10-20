@@ -235,7 +235,7 @@ def test_conclusion_explanation_is_plain_text_and_covers_method_contract():
     page = _load_page()
     explanation = page.CONCLUSION_EXPLANATION
     assert all(token in explanation for token in (
-        "baseline", "adaptive", "判定層", "出場價層", "UNKNOWN", "shadow",
+        "baseline", "adaptive", "判定層", "出場模擬層", "UNKNOWN", "shadow",
         "實際下單", "decision_ts", "原始值",
     ))
     assert not any(char.isdigit() for char in explanation)
