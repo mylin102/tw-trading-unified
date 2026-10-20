@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 from core.paper_performance_reconstruction import (
+    _trade_pnl_net,
     reconstruct_paper_daily,
 )
 
@@ -85,6 +86,18 @@ def _complete_trade(tid, **over):
 
 
 class TestReconstruction:
+    def test_combined_settlement_net_takes_precedence_over_gross_and_legs():
+        # 2026-10-20 Codex: Hermes-approved contract requires paper reconstruction to trust settled net PnL.
+        trade_fills = [
+            {"realized_pnl": 100.0},
+            {"realized_pnl": 50.0},
+        ]
+        settlement = {
+            "combined_realized_pnl_net": 123.4,
+            "combined_realized_pnl_gross": 150.0,
+        }
+        assert _trade_pnl_net(trade_fills, settlement) == 123.4
+
     def test_legacy_complete_trade_reconstructed_and_formal_excluded(self):
         """paper runtime + legacy complete ledger -> RECONSTRUCTED metrics
         displayable; formal totals (VERIFIED_PAPER only) stay empty."""

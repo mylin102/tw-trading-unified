@@ -54,13 +54,13 @@ def _fill_event(order_id, qty=1, price=44000.0):
 
 
 
-def _complete_both(mon, tmp_path, trade_id, near_px, far_px, sp):
+def _complete_both(mon, tmp_path, trade_id, near_px, far_px, sp, qty=1):
     with patch("strategies.plugins.futures.active.tmf_spread._get_state_file_path", return_value=sp):
-        mon._apply_combined_exit_fill(_fill_event("O-N", qty=1, price=near_px),
-                                      {"trade_id": trade_id, "lots": 1, "strategy": "MTS_EXIT"},
+        mon._apply_combined_exit_fill(_fill_event("O-N", qty=qty, price=near_px),
+                                      {"trade_id": trade_id, "lots": qty, "strategy": "MTS_EXIT"},
                                       "COMBINED_EXIT_NEAR", near_px)
-        mon._apply_combined_exit_fill(_fill_event("O-F", qty=1, price=far_px),
-                                      {"trade_id": trade_id, "lots": 1, "strategy": "MTS_EXIT"},
+        mon._apply_combined_exit_fill(_fill_event("O-F", qty=qty, price=far_px),
+                                      {"trade_id": trade_id, "lots": qty, "strategy": "MTS_EXIT"},
                                       "COMBINED_EXIT_FAR", far_px)
 
 def _read_fills(tmp_path):
@@ -122,7 +122,14 @@ def test_long_pnl_sign_and_value(tmp_path):
                      near_entry=43770.0, far_entry=43914.0)
     _complete_both(mon, tmp_path, "T4", 43825.0, 43800.0, sp)
     near = [f for f in _read_fills(tmp_path) if f.get("leg") == "NEAR"][0]
-    assert near["realized_pnl"] == pytest.approx((43825.0 - 43770.0) * 1 * 10, abs=0.2)
+    # 2026-10-20 Codex: Hermes-approved contract requires net exit PnL and explicit cost components.
+    gross = (43825.0 - 43770.0) * 1 * 10
+    fee = 40.0
+    tax = (43770.0 + 43825.0) * 10 * 1 * 2e-5
+    assert near["gross_pnl"] == pytest.approx(gross)
+    assert near["fee"] == pytest.approx(fee)
+    assert near["tax"] == pytest.approx(tax)
+    assert near["realized_pnl"] == pytest.approx(round(gross - fee - tax, 1))
 
 
 def test_short_pnl_sign_and_value(tmp_path):
@@ -131,7 +138,74 @@ def test_short_pnl_sign_and_value(tmp_path):
                      near_entry=43914.0, far_entry=43770.0)
     _complete_both(mon, tmp_path, "T5", 43825.0, 43900.0, sp)
     near = [f for f in _read_fills(tmp_path) if f.get("leg") == "NEAR"][0]
-    assert near["realized_pnl"] == pytest.approx((43914.0 - 43825.0) * 1 * 10, abs=0.2)
+    gross = (43914.0 - 43825.0) * 1 * 10
+    fee = 40.0
+    tax = (43914.0 + 43825.0) * 10 * 1 * 2e-5
+    assert near["gross_pnl"] == pytest.approx(gross)
+    assert near["fee"] == pytest.approx(fee)
+    assert near["tax"] == pytest.approx(tax)
+    assert near["realized_pnl"] == pytest.approx(round(gross - fee - tax, 1))
+
+
+def test_combined_exit_matches_strategy_exit_friction_formula_for_multiple_lots(tmp_path):
+    mon = _make_monitor(tmp_path)
+    near_entry, near_exit, qty = 43770.0, 43825.0, 2
+    sp = _state_file(tmp_path, near_side="LONG", far_side="SHORT",
+                     near_entry=near_entry, far_entry=43914.0)
+    _complete_both(mon, tmp_path, "T-PARITY", near_exit, 43800.0, sp, qty=qty)
+    near = next(f for f in _read_fills(tmp_path)
+                if f.get("fill_type") == "COMBINED_EXIT" and f.get("leg") == "NEAR")
+
+    # Same arithmetic as the existing EXIT path: gross - (40 + turnover * 2e-5), per lot.
+    gross = (near_exit - near_entry) * 10 * qty
+    fee = 40.0 * qty
+    tax = (near_entry + near_exit) * 10 * qty * 2e-5
+    strategy_exit_net = round(gross - fee - tax, 1)
+    assert near["gross_pnl"] == pytest.approx(gross)
+    assert near["fee"] == pytest.approx(fee)
+    assert near["tax"] == pytest.approx(tax)
+    assert near["realized_pnl"] == strategy_exit_net
+
+
+def test_combined_exit_zero_qty_has_zero_friction(tmp_path):
+    mon = _make_monitor(tmp_path)
+    sp = _state_file(tmp_path)
+    tracker = mon._get_combined_exit_tracker("T-ZERO")
+    tracker.update({
+        "near_side": "LONG", "far_side": "SHORT",
+        "near_entry": 43770.0, "far_entry": 43914.0,
+        "near_price": 43825.0, "far_price": 43800.0,
+        "near_expected_qty": 0, "far_expected_qty": 0,
+        "near_filled_qty": 0, "far_filled_qty": 0,
+        "near_complete": True, "far_complete": True,
+    })
+    with patch("strategies.plugins.futures.active.tmf_spread._get_state_file_path", return_value=sp):
+        mon._apply_combined_exit_fill(_fill_event("O-Z", qty=0, price=43825.0),
+                                      {"trade_id": "T-ZERO", "lots": 0, "strategy": "MTS_EXIT"},
+                                      "COMBINED_EXIT_NEAR", 43825.0)
+    near = next(f for f in _read_fills(tmp_path)
+                if f.get("fill_type") == "COMBINED_EXIT" and f.get("leg") == "NEAR")
+    assert near["qty"] == 0
+    assert near["gross_pnl"] == 0
+    assert near["fee"] == 0
+    assert near["tax"] == 0
+    assert near["realized_pnl"] == 0
+
+
+def test_combined_settlement_records_net_and_total_costs(tmp_path):
+    mon = _make_monitor(tmp_path)
+    sp = _state_file(tmp_path, near_side="LONG", far_side="SHORT",
+                     near_entry=43770.0, far_entry=43914.0)
+    _complete_both(mon, tmp_path, "T-SETTLED-NET", 43825.0, 43800.0, sp)
+    fills = _read_fills(tmp_path)
+    exits = [f for f in fills if f.get("fill_type") == "COMBINED_EXIT"]
+    settled = next(f for f in fills if f.get("fill_type") == "COMBINED_EXIT_SETTLED")
+    assert len(exits) == 2
+    assert settled["pnl_status"] == "NET"
+    assert settled["combined_realized_pnl_net"] == pytest.approx(
+        sum(f["realized_pnl"] for f in exits))
+    assert settled["fees"] == pytest.approx(sum(f["fee"] for f in exits))
+    assert settled["tax"] == pytest.approx(sum(f["tax"] for f in exits))
 
 
 def test_price_source_broker_fill(tmp_path):

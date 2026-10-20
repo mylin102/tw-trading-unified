@@ -133,6 +133,17 @@ class TestNormalExitPnL:
             far_fill = next(f for f in exit_fills if f["leg"] == "FAR")
             assert near_fill["realized_pnl"] is not None
             assert far_fill["realized_pnl"] is not None
+            # 2026-10-20 Codex: Hermes-approved friction contract preserves old net values while exposing components.
+            assert near_fill["gross_pnl"] == 1000.0
+            assert near_fill["fee"] == 40.0
+            assert near_fill["tax"] == pytest.approx(8.04)
+            assert near_fill["realized_pnl"] == pytest.approx(
+                round(near_fill["gross_pnl"] - near_fill["fee"] - near_fill["tax"], 1))
+            assert far_fill["gross_pnl"] == -1000.0
+            assert far_fill["fee"] == 40.0
+            assert far_fill["tax"] == pytest.approx(8.04)
+            assert far_fill["realized_pnl"] == pytest.approx(
+                round(far_fill["gross_pnl"] - far_fill["fee"] - far_fill["tax"], 1))
         finally:
             for p in ["/tmp/_test_mts_fills_1.jsonl", "/tmp/_test_mts_state_1.json"]:
                 if os.path.exists(p):
