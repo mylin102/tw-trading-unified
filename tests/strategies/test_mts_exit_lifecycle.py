@@ -627,6 +627,171 @@ def test_release_near_quote_zero_blocks(strategy):
     assert signal is None, "a zero quote must block the release"
 
 
+def test_release_counterfactual_is_emitted_for_baseline_release(strategy):
+    """The observation is attached only after baseline selects a release."""
+    strategy = _release_armed_strategy(strategy)
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
+        "near_bid": 44119.0, "near_ask": 44121.0,
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_bidask_age_ms": 100.0, "far_bidask_age_ms": 100.0,
+        "near_entry_bbo_state": "OK", "far_entry_bbo_state": "OK",
+        "near_tick_age_ms": 100.0, "far_tick_age_ms": 100.0,
+        "timestamp": datetime.now(),
+    }
+    ctx = StrategyContext(market=MarketData(last_bar=bar, ticker="TMF"),
+                          position=PositionView(size=1), config={})
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event, \
+         patch("strategies.plugins.futures.active.tmf_spread._append_fill"), \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy.on_bar(ctx)
+    assert signal is not None and signal.reason == "TMF_RELEASE_NEAR"
+    events = [call for call in append_event.call_args_list
+              if call.args and call.args[0] == "RELEASE_COUNTERFACTUAL"]
+    assert len(events) == 1
+    assert events[0].kwargs["release_path"] == "BASELINE"
+    assert events[0].kwargs["release_leg"] == "NEAR"
+
+
+@pytest.mark.parametrize(
+    ("near_side", "far_side", "near_bid", "near_ask", "far_bid", "far_ask",
+     "expected_gross", "expected_net"),
+    [
+        ("LONG", "SHORT", 110.0, 112.0, 188.0, 190.0, 200.0, 119.9),
+        ("SHORT", "LONG", 90.0, 110.0, 190.0, 210.0, -200.0, -280.1),
+    ],
+)
+def test_release_counterfactual_uses_executable_bbo_and_costs(
+        strategy, near_side, far_side, near_bid, near_ask, far_bid, far_ask,
+        expected_gross, expected_net):
+    strategy._trade_id = "cf-trade"
+    strategy._near_entry = 100.0
+    strategy._far_entry = 200.0
+    strategy._near_side = near_side
+    strategy._far_side = far_side
+    bar = {
+        "near_bid": near_bid, "near_ask": near_ask,
+        "far_bid": far_bid, "far_ask": far_ask,
+        "near_bidask_age_ms": 100.0, "far_bidask_age_ms": 100.0,
+        "near_entry_bbo_state": "OK", "far_entry_bbo_state": "OK",
+    }
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event:
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision", release_path="BASELINE",
+            release_leg="NEAR", qty=1)
+    append_event.assert_called_once()
+    name, fields = append_event.call_args.args[0], append_event.call_args.kwargs
+    assert name == "RELEASE_COUNTERFACTUAL"
+    assert fields["near_exit_px"] == (near_bid if near_side == "LONG" else near_ask)
+    assert fields["far_exit_px"] == (far_bid if far_side == "LONG" else far_ask)
+    assert fields["cf_gross_twd"] == pytest.approx(expected_gross)
+    assert fields["cf_fee_twd"] == pytest.approx(80.0)
+    assert fields["cf_tax_twd"] == pytest.approx(0.1)
+    assert fields["cf_net_twd"] == pytest.approx(expected_net)
+    assert fields["bbo_status"] == "OK"
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_status"),
+    [({"near_bidask_age_ms": 501.0}, "STALE"),
+     ({"far_ask": None}, "MISSING")],
+)
+def test_release_counterfactual_invalid_bbo_nulls_all_values(
+        strategy, updates, expected_status):
+    strategy._trade_id = "cf-trade-status"
+    strategy._near_entry = strategy._far_entry = 100.0
+    strategy._near_side = strategy._far_side = "LONG"
+    bar = {
+        "near_bid": 99.0, "near_ask": 101.0,
+        "far_bid": 99.0, "far_ask": 101.0,
+        "near_bidask_age_ms": 100.0, "far_bidask_age_ms": 100.0,
+        "near_entry_bbo_state": "OK", "far_entry_bbo_state": "OK",
+        **updates,
+    }
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event:
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision", release_path="BASELINE",
+            release_leg="FAR", qty=1)
+    fields = append_event.call_args.kwargs
+    assert fields["bbo_status"] == expected_status
+    assert all(fields[key] is None for key in
+               ("cf_gross_twd", "cf_fee_twd", "cf_tax_twd", "cf_net_twd"))
+
+
+def test_release_counterfactual_deduplicates_trade_and_is_exception_safe(strategy):
+    strategy._trade_id = "cf-trade-dedupe"
+    strategy._near_entry = strategy._far_entry = 100.0
+    strategy._near_side = strategy._far_side = "LONG"
+    bar = {
+        "near_bid": 99.0, "near_ask": 101.0,
+        "far_bid": 99.0, "far_ask": 101.0,
+        "near_bidask_age_ms": 100.0, "far_bidask_age_ms": 100.0,
+        "near_entry_bbo_state": "OK", "far_entry_bbo_state": "OK",
+    }
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event:
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision-1", release_path="BASELINE",
+            release_leg="NEAR", qty=1)
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision-2", release_path="HVWAP_CANDIDATE",
+            release_leg="FAR", qty=1)
+    append_event.assert_called_once()
+
+    strategy._trade_id = "cf-trade-exception"
+    strategy._near_entry = object()
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event, \
+         patch("strategies.plugins.futures.active.tmf_spread.logger.warning") as warning:
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision", release_path="BASELINE",
+            release_leg="NEAR", qty=1)
+    append_event.assert_not_called()
+    warning.assert_called_once()
+
+
+def test_hvwap_release_emits_counterfactual_without_changing_signal(strategy):
+    from types import SimpleNamespace
+    from strategies.plugins.futures.active.mts_hvwap_candidate import (
+        HvwapStatus, Regime60m, Signal15m,
+    )
+
+    strategy = _release_armed_strategy(strategy)
+    strategy._trade_id = "cf-hvwap-trade"
+    strategy._lifecycle = "OPEN"
+    strategy._hvwap_armed = True
+    strategy._hvwap_baseline_clear_tick = True
+    strategy._hvwap_release_sent_trade_id = None
+    strategy._manual_exit_requested = False
+    strategy._release_pending_mono = 0.0
+    strategy._release_near_ticks = strategy._release_far_ticks = 0
+    strategy._max_quote_age_ms = 30000
+    strategy._hvwap_last_verdict = SimpleNamespace(
+        status=HvwapStatus.ALIGNED_PASS, regime_60m=Regime60m.RANGING,
+        signal_15m=Signal15m.CONFIRMED_CONTINUATION,
+        hypothetical_release_leg="NEAR", decision_ts="cf-decision",
+        session_label="2026-10-20", retained_direction="BULLISH",
+        consecutive_confirmed_bars=2,
+    )
+    bar = {
+        "near_close": 44120.0, "far_close": 44200.0,
+        "near_bid": 44119.0, "near_ask": 44121.0,
+        "far_bid": 44199.0, "far_ask": 44201.0,
+        "near_tick_age_ms": 100.0, "far_tick_age_ms": 100.0,
+        "near_bidask_age_ms": 100.0, "far_bidask_age_ms": 100.0,
+        "near_entry_bbo_state": "OK", "far_entry_bbo_state": "OK",
+    }
+    with patch.object(strategy, "_hvwap_paper_gate", return_value=(True, "PAPER_ACTIVE")), \
+         patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event, \
+         patch("strategies.plugins.futures.active.tmf_spread._write_mts_state"):
+        signal = strategy._hvwap_maybe_paper_release(
+            bar, datetime.now(), bar["near_close"], bar["far_close"])
+    assert signal is not None and signal.action == "PARTIAL_EXIT"
+    events = [call for call in append_event.call_args_list
+              if call.args and call.args[0] == "RELEASE_COUNTERFACTUAL"]
+    assert len(events) == 1
+    assert events[0].kwargs["release_path"] == "HVWAP_CANDIDATE"
+    assert events[0].kwargs["decision_ts"] == "cf-decision"
+
+
 def test_release_near_quote_missing_fallback_blocks(strategy):
     """[P0c] the released leg's bid/ask fields are MISSING (the gate
     falls back to close => 0-point width): QUOTE_INVALID — block."""
