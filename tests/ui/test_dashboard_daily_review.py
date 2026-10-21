@@ -17,6 +17,13 @@ def _load_page_helpers(monkeypatch, tmp_path):
     fake_streamlit.calls = []
 
     class _Column:
+        # 2026-10-21 Hermes Agent: support both current and legacy page renders.
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
         def metric(self, label, *args, **kwargs):
             fake_streamlit.calls.append(("metric", label))
 
@@ -26,7 +33,19 @@ def _load_page_helpers(monkeypatch, tmp_path):
         def dataframe(self, data, *args, **kwargs):
             fake_streamlit.calls.append(("dataframe", data))
 
-    for name in ("set_page_config", "title", "caption", "info", "error", "subheader"):
+        def write(self, *args, **kwargs):
+            return None
+
+        def markdown(self, *args, **kwargs):
+            return None
+
+        def info(self, *args, **kwargs):
+            return None
+
+    for name in (
+        "set_page_config", "title", "caption", "info", "error", "subheader",
+        "markdown", "write",
+    ):
         setattr(fake_streamlit, name, lambda *args, **kwargs: None)
     fake_streamlit.columns = lambda count: [_Column() for _ in range(count)]
 
