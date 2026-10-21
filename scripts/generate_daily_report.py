@@ -512,6 +512,8 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 pass
             # 2026-08-03 P0 fix: canonical realized PnL. EXPLICIT_EVENT
             # theoretical PnL is NEVER used as realized.
+            # 2026-10-21 Hermes Agent: settlement lookup keys from the current trade.
+            data["trade_id"] = trade_id
             _pnl = _compute_trade_pnl(data, fills_path)
             net_pnl = _pnl.get("net_pnl")
             gross_pnl = _pnl.get("gross_pnl")
