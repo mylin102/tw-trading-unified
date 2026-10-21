@@ -205,22 +205,22 @@ class TestSettlementGate:
     """Settlement day force flat: all phases, full close after 13:30."""
 
     def test_settlement_day_triggers_force_flat(self):
-        """Contract expired + has position → gate returns True, emergency flatten called."""
+        """Held near leg settles today, 13:26 + has position → gate True, emergency flatten called."""
         from strategies.futures.monitor import FuturesMonitor
 
         monitor = FuturesMonitor.__new__(FuturesMonitor)
         monitor.contract = MagicMock()
         monitor.contract.code = "TMFG6"
-        # 2026-07-09 Hermes Agent: use dynamic current date to prevent datetime patch mismatch
-        monitor.contract.delivery_date = datetime.now().strftime("%Y/%m/%d")
-        monitor._is_contract_expired = MagicMock(return_value=True)
         monitor._emergency_flatten_mts = MagicMock()
 
         strategy = _make_mock_strategy(
             phase=PositionPhase.SPREAD, has_position=True,
         )
+        # N1: the gate keys off the held near leg, not self.contract
+        strategy._held_near_contract = MagicMock(code="TMFG6", delivery_date="2026/10/21")
+        strategy._held_far_contract = MagicMock(code="TMFH6", delivery_date="2026/11/18")
 
-        result = monitor._mts_risk_gate_settlement(strategy)
+        result = monitor._mts_risk_gate_settlement(strategy, now=datetime(2026, 10, 21, 13, 26))
 
         assert result is True
         monitor._emergency_flatten_mts.assert_called_once_with(strategy)
@@ -269,17 +269,16 @@ class TestSettlementGate:
         monitor = FuturesMonitor.__new__(FuturesMonitor)
         monitor.contract = MagicMock()
         monitor.contract.code = "TMFG6"
-        # 2026-07-09 Hermes Agent: use dynamic current date to prevent datetime patch mismatch
-        monitor.contract.delivery_date = datetime.now().strftime("%Y/%m/%d")
-        monitor._is_contract_expired = MagicMock(return_value=True)
         monitor._emergency_flatten_mts = MagicMock()
 
         strategy = _make_mock_strategy(
             phase=PositionPhase.SINGLE_LEG, has_position=True,
             released_leg="near", side="LONG",
         )
+        strategy._held_near_contract = MagicMock(code="TMFG6", delivery_date="2026/10/21")
+        strategy._held_far_contract = MagicMock(code="TMFH6", delivery_date="2026/11/18")
 
-        result = monitor._mts_risk_gate_settlement(strategy)
+        result = monitor._mts_risk_gate_settlement(strategy, now=datetime(2026, 10, 21, 13, 26))
 
         assert result is True
         monitor._emergency_flatten_mts.assert_called_once()
