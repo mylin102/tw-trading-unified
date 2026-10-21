@@ -14,8 +14,30 @@ def _load_page_helpers(monkeypatch, tmp_path):
         lambda *parts: str(tmp_path.joinpath(*parts[-1:])),
     )
     fake_streamlit = types.ModuleType("streamlit")
-    for name in ("set_page_config", "title", "caption", "info", "error"):
+    fake_streamlit.calls = []
+
+    class _Column:
+        def metric(self, label, *args, **kwargs):
+            fake_streamlit.calls.append(("metric", label))
+
+        def caption(self, text, *args, **kwargs):
+            fake_streamlit.calls.append(("caption", text))
+
+        def dataframe(self, data, *args, **kwargs):
+            fake_streamlit.calls.append(("dataframe", data))
+
+    for name in ("set_page_config", "title", "caption", "info", "error", "subheader"):
         setattr(fake_streamlit, name, lambda *args, **kwargs: None)
+    fake_streamlit.columns = lambda count: [_Column() for _ in range(count)]
+
+    def _selectbox(label, options, index=0, **kwargs):
+        fake_streamlit.calls.append(("selectbox", label, list(options)))
+        return options[index]
+
+    fake_streamlit.selectbox = _selectbox
+    fake_streamlit.dataframe = lambda data, *args, **kwargs: fake_streamlit.calls.append(
+        ("dataframe", data)
+    )
     monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)
     page = Path(__file__).parents[2] / "ui" / "pages" / "03_trade_review.py"
     return runpy.run_path(str(page))
@@ -97,3 +119,26 @@ def test_daily_review_defaults_to_today_when_ledger_has_today(monkeypatch, tmp_p
     )
 
     assert report["selected_day"] == "2026-10-21"
+
+
+def test_trade_review_renders_trading_day_selector_and_daily_summary(monkeypatch, tmp_path):
+    import json
+
+    fills = [
+        {"trade_id": "night", "fill_type": "ENTRY", "timestamp": "2026-10-20T15:10:00", "session": "night"},
+        {"trade_id": "night", "fill_type": "EXIT", "timestamp": "2026-10-20T15:11:00", "session": "night",
+         "realized_pnl": 8, "gross_pnl": 10, "fee": 1, "tax": 1},
+    ]
+    (tmp_path / "mts_trade_fills.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in fills), encoding="utf-8"
+    )
+    (tmp_path / "mts_spread_events.jsonl").write_text("", encoding="utf-8")
+
+    page = _load_page_helpers(monkeypatch, tmp_path)
+    calls = page["st"].calls
+    selector = next(call for call in calls if call[0] == "selectbox")
+    summary_labels = {call[1] for call in calls if call[0] == "metric"}
+
+    assert selector[1] == "交易日"
+    assert selector[2] == ["2026-10-21"]
+    assert {"淨損益", "交易筆數", "勝率", "摩擦成本合計", "毛利"} <= summary_labels
