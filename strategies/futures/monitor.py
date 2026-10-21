@@ -10281,13 +10281,17 @@ class FuturesMonitor:
         else:
             _held = self._held_leg_contracts(strategy)
             if _held is None:
-                console.print(
-                    "[red]⛔ [POSITION_CONTRACT_UNAVAILABLE] position contracts "
-                    f"unknown; refusing {_action} order[/red]"
-                )
-                self._append_mts_event(
-                    "POSITION_CONTRACT_UNAVAILABLE", action=_action,
-                    reason=_reason, trade_id=getattr(strategy, "_trade_id", ""))
+                # Recorded once per trade; every tick re-attempts and refuses.
+                _unavailable_tid = getattr(strategy, "_trade_id", "")
+                if getattr(self, "_position_unavailable_tid", None) != _unavailable_tid:
+                    self._position_unavailable_tid = _unavailable_tid
+                    console.print(
+                        "[red]⛔ [POSITION_CONTRACT_UNAVAILABLE] position contracts "
+                        f"unknown; refusing {_action} order[/red]"
+                    )
+                    self._append_mts_event(
+                        "POSITION_CONTRACT_UNAVAILABLE", action=_action,
+                        reason=_reason, trade_id=_unavailable_tid)
                 return
             _near_code, _far_code = _held[0].code, _held[1].code
 
@@ -14569,12 +14573,17 @@ class FuturesMonitor:
         _tid = getattr(strategy, "_trade_id", None)
         if not _tid:
             return None
+        # Negative cache: a failed restore is not retried every tick.  The
+        # event log is large; the scan runs again only once trade_id changes.
+        if getattr(self, "_held_restore_failed_tid", None) == _tid:
+            return None
         _source = "POSITION_STATE"
         _pair = self._read_held_from_state(_tid)
         if _pair is None:
             _source = "ENTRY_AUDIT"
             _pair = self._read_held_from_entry_audit(_tid)
         if _pair is None:
+            self._held_restore_failed_tid = _tid
             return None
         strategy._held_near_contract, strategy._held_far_contract = _pair
         self._append_mts_event(
@@ -14623,6 +14632,22 @@ class FuturesMonitor:
             f"!= held {_held_near}/{_held_far}; exit refused[/bold red]")
         return True
 
+    def _record_settlement_unresolved(self, strategy, reason, now):
+        """N1: surface a position the settlement window cannot resolve.
+
+        Audit only: the gate still returns False and submits nothing.  Recorded
+        once per trade, reason and day so the dashboard sees it without a flood.
+        """
+        _tid = getattr(strategy, "_trade_id", None)
+        _key = (_tid, reason, now.date())
+        if getattr(self, "_settlement_unresolved_key", None) == _key:
+            return
+        self._settlement_unresolved_key = _key
+        self._append_mts_event("SETTLEMENT_GATE_UNRESOLVED", trade_id=_tid, reason=reason)
+        console.print(
+            f"[bold red]📅 [SETTLEMENT_GATE_UNRESOLVED] trade_id={_tid} reason={reason}; "
+            f"no settlement order[/bold red]")
+
     def _mts_risk_gate_settlement(self, strategy, now=None) -> bool:
         """N1 settlement force flat: 13:25 <= t < 13:30 on the held near leg's delivery day.
 
@@ -14642,10 +14667,12 @@ class FuturesMonitor:
 
         _held = self._held_leg_contracts(strategy)
         if _held is None:
-            return False  # exit path emits POSITION_CONTRACT_UNAVAILABLE
+            self._record_settlement_unresolved(strategy, "HELD_CONTRACTS_UNKNOWN", _now)
+            return False
         try:
             _delivery = datetime.strptime(_held[0].delivery_date, "%Y/%m/%d").date()
         except Exception:
+            self._record_settlement_unresolved(strategy, "DELIVERY_DATE_UNRESOLVED", _now)
             return False
         if _delivery != _now.date():
             return False  # not the held near leg's settlement day
