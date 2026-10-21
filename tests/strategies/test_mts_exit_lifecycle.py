@@ -627,9 +627,13 @@ def test_release_near_quote_zero_blocks(strategy):
     assert signal is None, "a zero quote must block the release"
 
 
+# 2026-10-21 Hermes Agent: specify observe-only release counterfactual telemetry.
 def test_release_counterfactual_is_emitted_for_baseline_release(strategy):
     """The observation is attached only after baseline selects a release."""
+    from unittest.mock import Mock
+
     strategy = _release_armed_strategy(strategy)
+    strategy.order_mgr = Mock()
     bar = {
         "near_close": 44120.0, "far_close": 44200.0, "atr": 10.0,
         "near_bid": 44119.0, "near_ask": 44121.0,
@@ -651,14 +655,15 @@ def test_release_counterfactual_is_emitted_for_baseline_release(strategy):
     assert len(events) == 1
     assert events[0].kwargs["release_path"] == "BASELINE"
     assert events[0].kwargs["release_leg"] == "NEAR"
+    strategy.order_mgr.assert_not_called()
 
 
 @pytest.mark.parametrize(
     ("near_side", "far_side", "near_bid", "near_ask", "far_bid", "far_ask",
      "expected_gross", "expected_net"),
     [
-        ("LONG", "SHORT", 110.0, 112.0, 188.0, 190.0, 200.0, 119.9),
-        ("SHORT", "LONG", 90.0, 110.0, 190.0, 210.0, -200.0, -280.1),
+        ("LONG", "SHORT", 110.0, 112.0, 188.0, 190.0, 200.0, 119.88),
+        ("SHORT", "LONG", 90.0, 110.0, 190.0, 210.0, -200.0, -280.12),
     ],
 )
 def test_release_counterfactual_uses_executable_bbo_and_costs(
@@ -686,7 +691,7 @@ def test_release_counterfactual_uses_executable_bbo_and_costs(
     assert fields["far_exit_px"] == (far_bid if far_side == "LONG" else far_ask)
     assert fields["cf_gross_twd"] == pytest.approx(expected_gross)
     assert fields["cf_fee_twd"] == pytest.approx(80.0)
-    assert fields["cf_tax_twd"] == pytest.approx(0.1)
+    assert fields["cf_tax_twd"] == pytest.approx(0.12)
     assert fields["cf_net_twd"] == pytest.approx(expected_net)
     assert fields["bbo_status"] == "OK"
 
@@ -738,23 +743,28 @@ def test_release_counterfactual_deduplicates_trade_and_is_exception_safe(strateg
     append_event.assert_called_once()
 
     strategy._trade_id = "cf-trade-exception"
-    strategy._near_entry = object()
+    class ExplodingQuantity:
+        def __float__(self):
+            raise RuntimeError("injected counterfactual calculation failure")
+
     with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event, \
          patch("strategies.plugins.futures.active.tmf_spread.logger.warning") as warning:
         strategy._record_release_counterfactual(
             bar, decision_ts="decision", release_path="BASELINE",
-            release_leg="NEAR", qty=1)
+            release_leg="NEAR", qty=ExplodingQuantity())
     append_event.assert_not_called()
     warning.assert_called_once()
 
 
 def test_hvwap_release_emits_counterfactual_without_changing_signal(strategy):
     from types import SimpleNamespace
+    from unittest.mock import Mock
     from strategies.plugins.futures.active.mts_hvwap_candidate import (
         HvwapStatus, Regime60m, Signal15m,
     )
 
     strategy = _release_armed_strategy(strategy)
+    strategy.order_mgr = Mock()
     strategy._trade_id = "cf-hvwap-trade"
     strategy._lifecycle = "OPEN"
     strategy._hvwap_armed = True
@@ -790,6 +800,7 @@ def test_hvwap_release_emits_counterfactual_without_changing_signal(strategy):
     assert len(events) == 1
     assert events[0].kwargs["release_path"] == "HVWAP_CANDIDATE"
     assert events[0].kwargs["decision_ts"] == "cf-decision"
+    strategy.order_mgr.assert_not_called()
 
 
 def test_release_near_quote_missing_fallback_blocks(strategy):
