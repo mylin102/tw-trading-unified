@@ -29,6 +29,10 @@ def test_daily_review_groups_trading_days_costs_sessions_reasons_and_holding(
         {"trade_id": "day-1", "fill_type": "ENTRY", "timestamp": "2026-10-20T14:50:00", "session": "day"},
         {"trade_id": "day-1", "fill_type": "EXIT", "timestamp": "2026-10-20T14:55:00", "session": "day",
          "realized_pnl": 80, "gross_pnl": 100, "fee": 10, "tax": 10},
+        # 2026-10-21 Hermes Agent: same trading day includes its next day session.
+        {"trade_id": "day-2", "fill_type": "ENTRY", "timestamp": "2026-10-21T09:00:00", "session": "day"},
+        {"trade_id": "day-2", "fill_type": "EXIT", "timestamp": "2026-10-21T09:05:00", "session": "day",
+         "realized_pnl": 10, "gross_pnl": 12, "fee": 1, "tax": 1},
         {"trade_id": "night-1", "fill_type": "ENTRY", "timestamp": "2026-10-20T15:10:00", "session": "night"},
         {"trade_id": "night-1", "fill_type": "COMBINED_EXIT", "timestamp": "2026-10-20T15:12:00", "session": "night",
          "realized_pnl": 46, "gross_pnl": 50, "fee": 2, "tax": 2},
@@ -53,22 +57,25 @@ def test_daily_review_groups_trading_days_costs_sessions_reasons_and_holding(
 
     assert report["available_days"] == ["2026-10-21", "2026-10-20"]
     assert report["selected_day"] == "2026-10-21"
-    assert report["summary"]["trade_count"] == 3
-    assert report["summary"]["net_pnl"] == 83
-    assert report["summary"]["friction_cost"] == 7
+    assert report["summary"]["trade_count"] == 4
+    assert report["summary"]["net_pnl"] == 93
+    assert report["summary"]["win_rate"] == 1
+    assert report["summary"]["friction_cost"] == 9
     assert report["summary"]["unitemized_cost_rows"] == 1
     assert report["summary"]["gross_pnl"] is None
-    assert report["sessions"]["day"]["trade_count"] == 0
+    assert report["sessions"]["day"]["trade_count"] == 1
+    assert report["sessions"]["day"]["net_pnl"] == 10
+    assert report["sessions"]["day"]["friction_cost"] == 2
     assert report["sessions"]["night"]["trade_count"] == 3
     assert report["sessions"]["night"]["net_pnl"] == 83
     assert report["exit_reasons"]["policy_j_trigger_path"] == {"GIVEBACK": 1}
-    assert report["exit_reasons"]["fill_type"] == {"EXIT": 2, "RELEASE": 1}
+    assert report["exit_reasons"]["fill_type"] == {"EXIT": 3, "RELEASE": 1}
 
     holds = report["holding_time"]
-    assert holds["count"] == 2
-    assert holds["median_seconds"] == 82.5
-    assert holds["p25_seconds"] == 63.75
-    assert holds["p75_seconds"] == 101.25
+    assert holds["count"] == 3
+    assert holds["median_seconds"] == 120
+    assert holds["p25_seconds"] == 82.5
+    assert holds["p75_seconds"] == 210
     assert holds["under_60_seconds"] == 1
 
     legacy = next(row for row in report["trades"] if row["trade_id"] == "legacy-1")
