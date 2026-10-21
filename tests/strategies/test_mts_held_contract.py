@@ -37,12 +37,26 @@ def _strategy(has_position=True, near=None, far=None):
     return s
 
 
+@pytest.fixture(autouse=True)
+def isolated_runtime(tmp_path, monkeypatch):
+    """Point position state and the event log at tmp files; never read runtime."""
+    import strategies.futures.monitor as monitor_module
+
+    monkeypatch.delenv("NODE_ENV", raising=False)
+    monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(tmp_path / "mts_spread_events.jsonl"))
+    state_path = tmp_path / "mts_position_state.json"
+    monkeypatch.setattr(monitor_module, "_mts_position_state_path", lambda: state_path)
+    return SimpleNamespace(state_path=state_path, events_path=tmp_path / "mts_spread_events.jsonl")
+
+
 @pytest.fixture
 def monitor():
     """Monitor after the 13:30 rollover: subscribed contracts are the NEW pair."""
     m = FuturesMonitor.__new__(FuturesMonitor)
     m.live_trading = False
     m.dry_run = False
+    m._registry = {}
+    m.cfg = {"mts": {"strategy": "tmf_spread"}}
     m.contract = _contract("TMFK6", "2026/11/18")
     m.far_contract = _contract("TMFL6", "2026/12/16")
     m.order_mgr = MagicMock()
@@ -175,3 +189,123 @@ class TestSettlementGateHeldContract:
         monitor._mts_risk_gate_settlement(strategy, now=datetime(2026, 10, 21, 13, 27))
 
         monitor._emergency_flatten_mts.assert_called_once()
+
+
+ENTRY_TRADE = "N1-TRADE"
+
+
+def _write_state(path, **fields):
+    import json
+    path.write_text(json.dumps(fields), encoding="utf-8")
+
+
+def _held_state(trade_id=ENTRY_TRADE):
+    return dict(
+        has_position=True, trade_id=trade_id,
+        near_contract="TMFJ6", near_delivery_date="2026/10/21",
+        far_contract="TMFK6", far_delivery_date="2026/11/18",
+    )
+
+
+def _restarted_strategy(trade_id=ENTRY_TRADE):
+    """Strategy after a restart: in-memory held pair is gone, position is open."""
+    s = _strategy(has_position=True, near=None, far=None)
+    s._trade_id = trade_id
+    return s
+
+
+class TestRestartHydration:
+    """Restart (PM2 / SESSION_INVALID exit 75) while holding: exits stay on the held pair."""
+
+    def test_exit_after_restart_uses_state_file_held_pair(self, monitor, isolated_runtime):
+        _write_state(isolated_runtime.state_path, **_held_state())
+        strategy = _restarted_strategy()
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+        monitor._submit_mts_order_signal(signal, strategy, {}, datetime(2026, 10, 21, 13, 40))
+
+        symbols = [c.kwargs["symbol"] for c in monitor.order_mgr.create_order.call_args_list]
+        assert symbols == ["TMFJ6", "TMFK6"]
+        assert ("HELD_CONTRACTS_RESTORED", {
+            "trade_id": ENTRY_TRADE, "source": "POSITION_STATE",
+            "near_contract": "TMFJ6", "far_contract": "TMFK6"}) in monitor.events
+
+    def test_exit_after_restart_falls_back_to_entry_audit(self, monitor, isolated_runtime):
+        import json
+        isolated_runtime.events_path.write_text(
+            json.dumps({"event": "ENTRY_AUDIT", "trade_id": "OTHER",
+                        "near_contract": "TMFH6", "far_contract": "TMFI6"}) + "\n"
+            + json.dumps({"event": "ENTRY_AUDIT", "trade_id": ENTRY_TRADE,
+                          "near_contract": "TMFJ6", "far_contract": "TMFK6",
+                          "near_delivery_date": "2026/10/21",
+                          "far_delivery_date": "2026/11/18"}) + "\n",
+            encoding="utf-8")
+        strategy = _restarted_strategy()
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+        monitor._submit_mts_order_signal(signal, strategy, {}, datetime(2026, 10, 21, 13, 40))
+
+        symbols = [c.kwargs["symbol"] for c in monitor.order_mgr.create_order.call_args_list]
+        assert symbols == ["TMFJ6", "TMFK6"]
+        assert ("HELD_CONTRACTS_RESTORED", {
+            "trade_id": ENTRY_TRADE, "source": "ENTRY_AUDIT",
+            "near_contract": "TMFJ6", "far_contract": "TMFK6"}) in monitor.events
+
+    def test_state_for_other_trade_is_not_used(self, monitor, isolated_runtime):
+        _write_state(isolated_runtime.state_path, **_held_state(trade_id="OTHER"))
+        strategy = _restarted_strategy()
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+        monitor._submit_mts_order_signal(signal, strategy, {}, datetime(2026, 10, 21, 13, 40))
+
+        monitor.order_mgr.create_order.assert_not_called()
+        assert [n for n, _ in monitor.events] == ["POSITION_CONTRACT_UNAVAILABLE"]
+
+    def test_settlement_gate_after_restart_uses_restored_near_leg(self, monitor, isolated_runtime):
+        _write_state(isolated_runtime.state_path, **_held_state())
+        strategy = _restarted_strategy()
+        monitor._emergency_flatten_mts = MagicMock()
+
+        result = monitor._mts_risk_gate_settlement(strategy, now=datetime(2026, 10, 21, 13, 26))
+
+        assert result is True
+        monitor._emergency_flatten_mts.assert_called_once()
+
+
+class TestStatePersistence:
+    """Held pair written with the position survives later state writes; cleared when flat."""
+
+    def test_held_pair_carried_forward_then_cleared_when_flat(self, isolated_runtime, monkeypatch):
+        import json
+        import strategies.plugins.futures.active.tmf_spread as tmf_spread
+
+        monkeypatch.setattr(tmf_spread, "_get_state_file_path", lambda: str(isolated_runtime.state_path))
+        tmf_spread._write_mts_state(
+            has_position=True, action="SPREAD", reason="ENTRY", trade_id=ENTRY_TRADE,
+            near_contract="TMFJ6", near_delivery_date="2026/10/21",
+            far_contract="TMFK6", far_delivery_date="2026/11/18")
+        tmf_spread._write_mts_state(has_position=True, action="SPREAD", reason="TICK", trade_id=ENTRY_TRADE)
+
+        held = json.loads(isolated_runtime.state_path.read_text(encoding="utf-8"))
+        assert (held["near_contract"], held["far_contract"]) == ("TMFJ6", "TMFK6")
+
+        tmf_spread._write_mts_state(has_position=False, action="FLAT", reason="EXIT")
+        flat = json.loads(isolated_runtime.state_path.read_text(encoding="utf-8"))
+        assert flat["near_contract"] is None and flat["far_contract"] is None
+
+
+class TestFillLegClassification:
+    def test_near_leg_fill_after_rollover_is_classified_near(self, monitor):
+        near, far = _held_pair()
+        strategy = _strategy(near=near, far=far)
+
+        assert monitor._classify_fill_leg(strategy, "TMFJ6") == "NEAR"
+        assert monitor._classify_fill_leg(strategy, "TMFK6") == "FAR"
+        assert monitor._classify_fill_leg(strategy, "TMFL6") is None
+
+    def test_without_held_pair_falls_back_to_subscribed_codes(self, monitor):
+        strategy = _strategy(near=None, far=None)
+        monitor._restore_held_contracts = MagicMock(return_value=None)
+
+        assert monitor._classify_fill_leg(strategy, "TMFK6") == "NEAR"
+        assert monitor._classify_fill_leg(strategy, "TMFL6") == "FAR"
