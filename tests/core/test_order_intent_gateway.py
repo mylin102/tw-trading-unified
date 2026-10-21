@@ -705,7 +705,10 @@ def _bound_strategy(rid="recon-abc123", trade_id="mts-20260811-085503"):
     return SimpleNamespace(
         _trade_id=trade_id, _reconciliation_id=rid,
         _near_side="SHORT", _far_side="LONG",
-        _near_qty=1, _far_qty=1, _has_position=True)
+        _near_qty=1, _far_qty=1, _has_position=True,
+        # N1: the position is held on the pair the monitor subscribes to
+        _held_near_contract=SimpleNamespace(code="TMFH6", delivery_date=None),
+        _held_far_contract=SimpleNamespace(code="TMFI6", delivery_date=None))
 
 
 def test_e2e_exit_only_without_quarantine_proof_stays_pending(

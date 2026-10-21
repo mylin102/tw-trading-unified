@@ -19,6 +19,12 @@ def _monitor(tmp_path):
     monitor.live_trading = True
     monitor.contract = SimpleNamespace(code="TMFH6")
     monitor.far_contract = SimpleNamespace(code="TMFI6")
+    # N1: close_all resolves the position's HELD pair from the MTS strategy.
+    monitor.cfg = {"mts": {"strategy": "tmf_spread"}}
+    monitor._registry = {"tmf_spread": SimpleNamespace(
+        _has_position=True, _trade_id="mts-emergency",
+        _held_near_contract=SimpleNamespace(code="TMFH6", delivery_date=None),
+        _held_far_contract=SimpleNamespace(code="TMFI6", delivery_date=None))}
     monitor._execution_context = SimpleNamespace(
         requested_mode="live", effective_mode="live_ready", session_id="sess")
     return monitor

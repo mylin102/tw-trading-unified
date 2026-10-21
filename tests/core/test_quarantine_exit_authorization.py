@@ -256,6 +256,10 @@ def _recovered_strategy():
                                    canceled_leg=Leg.FAR),
         trail_group=TrailGroup(status=TrailGroupStatus.ARMED,
                                remaining_leg=Leg.FAR))
+    # N1: the recovered position is held on the pair the monitor subscribes to
+    from types import SimpleNamespace
+    s._held_near_contract = SimpleNamespace(code="TMFH6", delivery_date=None)
+    s._held_far_contract = SimpleNamespace(code="TMFI6", delivery_date=None)
     s._broker_recovery_source = "broker_reconciliation"
     s._broker_recovery_order_id = "ORD-1"
     s._broker_recovery_broker_order_id = "e8c20826"

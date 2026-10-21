@@ -27,6 +27,16 @@ from core.signal import Signal
 from strategies.plugins.futures.active.tmf_spread import PositionPhase, ReleaseGroupStatus
 
 
+@pytest.fixture(autouse=True)
+def _isolate_position_restore(tmp_path, monkeypatch):
+    """Held-pair restore reads position state / event log; keep them in tmp."""
+    import strategies.futures.monitor as _monitor_module
+
+    monkeypatch.setenv("MTS_EVENT_LOG_PATH", str(tmp_path / "mts_spread_events.jsonl"))
+    monkeypatch.setattr(_monitor_module, "_mts_position_state_path",
+                        lambda: tmp_path / "mts_position_state.json")
+
+
 class DummyContract:
     def __init__(self, code):
         self.code = code
@@ -43,6 +53,9 @@ class DummyStrategy:
         self._has_position = True
         self._released_leg = None
         self._side = None
+        # N1: the position was opened on the pair make_mock_monitor subscribes to
+        self._held_near_contract = DummyContract("TMF202607")
+        self._held_far_contract = DummyContract("TMF202608")
 
         class DummyLifecycle:
             phase = PositionPhase.SPREAD
@@ -272,9 +285,13 @@ def test_restart_during_pending_exit_recovers_orders():
 
 # --- Case 14: Stale or mismatched position blocks submission ---
 def test_stale_or_mismatched_position_blocks_submission():
+    # N1: exits close the held pair; an unset subscribed contract does not block
+    # the exit, but a position with no held pair does (see test_mts_held_contract).
     mon = make_mock_monitor()
-    mon.contract = None  # Missing contract
+    mon.contract = None
     strat = DummyStrategy()
+    strat._held_near_contract = None
+    strat._held_far_contract = None
     sig = Signal(action="EXIT", reason="TMF_COMBINED_EXIT")
     bar_dict = {"near_close": 44000.0, "far_close": 44100.0}
 
