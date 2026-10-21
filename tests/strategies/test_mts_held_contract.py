@@ -309,3 +309,89 @@ class TestFillLegClassification:
 
         assert monitor._classify_fill_leg(strategy, "TMFK6") == "NEAR"
         assert monitor._classify_fill_leg(strategy, "TMFL6") == "FAR"
+
+
+class TestRestoreNegativeCache:
+    """A failed restore for a trade is remembered until the trade_id changes."""
+
+    def test_hundred_ticks_without_held_pair_open_event_log_once(self, monitor, monkeypatch):
+        import strategies.futures.monitor as monitor_module
+
+        opened = []
+        real_open = open
+
+        def counting_open(path, *args, **kwargs):
+            if str(path).endswith("mts_spread_events.jsonl"):
+                opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(monitor_module, "open", counting_open, raising=False)
+        strategy = _restarted_strategy()
+
+        for _ in range(100):
+            assert monitor._held_leg_contracts(strategy) is None
+
+        assert len(opened) == 1
+
+    def test_new_trade_id_retries_the_scan(self, monitor, monkeypatch):
+        import strategies.futures.monitor as monitor_module
+
+        opened = []
+        real_open = open
+
+        def counting_open(path, *args, **kwargs):
+            if str(path).endswith("mts_spread_events.jsonl"):
+                opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(monitor_module, "open", counting_open, raising=False)
+        monitor._held_leg_contracts(_restarted_strategy(trade_id="T1"))
+        monitor._held_leg_contracts(_restarted_strategy(trade_id="T2"))
+
+        assert len(opened) == 2
+
+    def test_position_contract_unavailable_recorded_once_per_trade(self, monitor):
+        strategy = _restarted_strategy()
+        signal = SimpleNamespace(action="EXIT", reason="COMBINED_EXIT")
+
+        for _ in range(5):
+            monitor._submit_mts_order_signal(signal, strategy, {}, datetime(2026, 10, 21, 13, 40))
+
+        assert [n for n, _ in monitor.events] == ["POSITION_CONTRACT_UNAVAILABLE"]
+
+
+class TestSettlementGateUnresolved:
+    """In the 13:25-13:30 window a position the gate cannot resolve is surfaced, never ordered."""
+
+    WINDOW = datetime(2026, 10, 21, 13, 26)
+
+    def test_missing_held_pair_in_window_records_unresolved_once(self, monitor):
+        strategy = _restarted_strategy()
+        monitor._emergency_flatten_mts = MagicMock()
+
+        for _ in range(3):
+            assert monitor._mts_risk_gate_settlement(strategy, now=self.WINDOW) is False
+
+        unresolved = [f for n, f in monitor.events if n == "SETTLEMENT_GATE_UNRESOLVED"]
+        assert unresolved == [{"trade_id": ENTRY_TRADE, "reason": "HELD_CONTRACTS_UNKNOWN"}]
+        monitor._emergency_flatten_mts.assert_not_called()
+
+    def test_unparseable_delivery_in_window_records_reason(self, monitor):
+        strategy = _strategy(
+            near=SimpleNamespace(code="TMFJ6", delivery_date=None),
+            far=SimpleNamespace(code="TMFK6", delivery_date="2026/11/18"))
+        monitor._emergency_flatten_mts = MagicMock()
+
+        assert monitor._mts_risk_gate_settlement(strategy, now=self.WINDOW) is False
+
+        assert ("SETTLEMENT_GATE_UNRESOLVED",
+                {"trade_id": ENTRY_TRADE, "reason": "DELIVERY_DATE_UNRESOLVED"}) in monitor.events
+        monitor._emergency_flatten_mts.assert_not_called()
+
+    def test_outside_window_or_flat_records_nothing(self, monitor):
+        monitor._emergency_flatten_mts = MagicMock()
+        monitor._mts_risk_gate_settlement(_restarted_strategy(), now=datetime(2026, 10, 21, 13, 31))
+        monitor._mts_risk_gate_settlement(_strategy(has_position=False, near=None, far=None),
+                                          now=self.WINDOW)
+
+        assert [n for n, _ in monitor.events if n == "SETTLEMENT_GATE_UNRESOLVED"] == []
