@@ -35,6 +35,9 @@ def test_daily_review_groups_trading_days_costs_sessions_reasons_and_holding(
         {"trade_id": "night-2", "fill_type": "ENTRY", "timestamp": "2026-10-20T16:00:00", "session": "night"},
         {"trade_id": "night-2", "fill_type": "RELEASE", "timestamp": "2026-10-20T16:00:30", "session": "night",
          "realized_pnl": 22, "gross_pnl": 25, "fee": 2, "tax": 1},
+        # 2026-10-21 Hermes Agent: RELEASE is partial; EXIT closes this trade_id.
+        {"trade_id": "night-2", "fill_type": "EXIT", "timestamp": "2026-10-20T16:00:45", "session": "night",
+         "realized_pnl": 0, "gross_pnl": 0, "fee": 0, "tax": 0},
         # Legacy closed trade has no entry fill or itemized cost fields.
         {"trade_id": "legacy-1", "fill_type": "EXIT", "timestamp": "2026-10-20T16:05:00", "session": "night",
          "realized_pnl": 15},
@@ -59,13 +62,13 @@ def test_daily_review_groups_trading_days_costs_sessions_reasons_and_holding(
     assert report["sessions"]["night"]["trade_count"] == 3
     assert report["sessions"]["night"]["net_pnl"] == 83
     assert report["exit_reasons"]["policy_j_trigger_path"] == {"GIVEBACK": 1}
-    assert report["exit_reasons"]["fill_type"] == {"EXIT": 1, "RELEASE": 1}
+    assert report["exit_reasons"]["fill_type"] == {"EXIT": 2, "RELEASE": 1}
 
     holds = report["holding_time"]
     assert holds["count"] == 2
-    assert holds["median_seconds"] == 75
-    assert holds["p25_seconds"] == 52.5
-    assert holds["p75_seconds"] == 97.5
+    assert holds["median_seconds"] == 82.5
+    assert holds["p25_seconds"] == 63.75
+    assert holds["p75_seconds"] == 101.25
     assert holds["under_60_seconds"] == 1
 
     legacy = next(row for row in report["trades"] if row["trade_id"] == "legacy-1")
