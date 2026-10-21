@@ -1622,6 +1622,14 @@ def _write_mts_state(
         _expected_revision_val = kwargs.pop("expected_revision", None)
         # 2026-06-26 Gemini CLI: merge extra risk metrics / kwargs
         state.update(kwargs)
+        # N1: the contracts an open position was entered on survive every later
+        # state write (restart hydration reads them back); cleared when flat.
+        for _held_key in ("near_contract", "far_contract",
+                          "near_delivery_date", "far_delivery_date"):
+            if not has_position:
+                state[_held_key] = None
+            elif state.get(_held_key) is None:
+                state[_held_key] = existing.get(_held_key)
         # Identity metadata is part of the canonical state contract.  It is
         # stamped immediately before the existing CAS + atomic replace path;
         # no lifecycle semantics are changed.

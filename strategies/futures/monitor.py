@@ -8235,10 +8235,10 @@ class FuturesMonitor:
                  # 2026-07-09 Hermes Agent: Also match far from far_contract.code
                  # for live mode where real contract codes (e.g. TMFH6) are used.
                  _symbol = str(event.symbol or "")
-                 _contract_code = self.contract.code if self.contract else ""
-                 _far_code = self.far_contract.code if self.far_contract else ""
-                 _is_near_leg = "NEAR" in _symbol or _symbol == _contract_code
-                 _is_far_leg = "FAR" in _symbol or (_far_code and _symbol == _far_code)
+                 # N1: classify against the HELD pair; the subscribed pair rolls.
+                 _leg_class = self._classify_fill_leg(self._mts_registry_strategy(), _symbol)
+                 _is_near_leg = _leg_class == "NEAR"
+                 _is_far_leg = _leg_class == "FAR"
                  
                  if _is_near_leg:
                       # 2026-06-23 Gemini CLI: Determine if this fill is an exit/release/emergency closing transaction
@@ -10259,22 +10259,37 @@ class FuturesMonitor:
         # until Shioaji resolves the rolling contracts.  Submitting orders
         # with placeholder codes like "TMF_NEAR" / "TMF_FAR" would send
         # invalid symbols to the broker or paper_fill_sim.
-        if self.contract is None:
-            console.print(
-                "[red]⛔ [MTS_ORDER_BLOCKED] near contract is None; "
-                "refusing to submit order with placeholder symbol[/red]"
-            )
-            return
-        if self.far_contract is None:
-            console.print(
-                "[red]⛔ [MTS_ORDER_BLOCKED] far_contract is None; "
-                "refusing to submit order with placeholder symbol[/red]"
-            )
-            return
+        # N1: entries open on the subscribed pair; every exit closes the pair
+        # the position was opened on (the subscribed pair rolls at 13:30).
+        if _action in ("BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"):
+            if self.contract is None:
+                console.print(
+                    "[red]⛔ [MTS_ORDER_BLOCKED] near contract is None; "
+                    "refusing to submit order with placeholder symbol[/red]"
+                )
+                return
+            if self.far_contract is None:
+                console.print(
+                    "[red]⛔ [MTS_ORDER_BLOCKED] far_contract is None; "
+                    "refusing to submit order with placeholder symbol[/red]"
+                )
+                return
 
-        # [GSD] Use real contract codes instead of synthetic symbols
-        _near_code = self.contract.code
-        _far_code = self.far_contract.code
+            # [GSD] Use real contract codes instead of synthetic symbols
+            _near_code = self.contract.code
+            _far_code = self.far_contract.code
+        else:
+            _held = self._held_leg_contracts(strategy)
+            if _held is None:
+                console.print(
+                    "[red]⛔ [POSITION_CONTRACT_UNAVAILABLE] position contracts "
+                    f"unknown; refusing {_action} order[/red]"
+                )
+                self._append_mts_event(
+                    "POSITION_CONTRACT_UNAVAILABLE", action=_action,
+                    reason=_reason, trade_id=getattr(strategy, "_trade_id", ""))
+                return
+            _near_code, _far_code = _held[0].code, _held[1].code
 
         # [Snapshot] Capture submission-time OHLC for slippage analysis
         _snap = {
@@ -10575,6 +10590,8 @@ class FuturesMonitor:
             _ce_group_id = f"CE-{_trade_id}-{uuid.uuid4().hex[:8]}"
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting COMBINED_EXIT group={_ce_group_id}: NEAR ({_near_order_side} x{_near_qty}) & FAR ({_far_order_side} x{_far_qty})[/yellow]")
 
+            if self._exit_contract_mismatch(strategy, _near_code, _far_code):
+                return
             _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
             _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
             self._collapse2_bind_exit_order(_near_order)
@@ -10955,6 +10972,8 @@ class FuturesMonitor:
                 "trade_id": _trade_id,
                 "near_contract": _near_code,
                 "far_contract": _far_code,
+                "near_delivery_date": getattr(self.contract, "delivery_date", None),
+                "far_delivery_date": getattr(self.far_contract, "delivery_date", None),
                 "near_side": "SHORT" if _action == "SELL_NEAR_BUY_FAR" else "LONG",
                 "far_side": "LONG" if _action == "SELL_NEAR_BUY_FAR" else "SHORT",
                 "near_price": _near_close,
@@ -11009,6 +11028,11 @@ class FuturesMonitor:
                 )
             except Exception:
                 pass
+
+            # N1: the contracts this position is opened on.  Exits and the
+            # settlement gate read these, never the rolling subscribed pair.
+            strategy._held_near_contract = self.contract
+            strategy._held_far_contract = self.far_contract
 
             # Both live and paper MTS entries use one calendar-spread combo
             # lifecycle.  The paper branch uses the local two-leg fill model
@@ -14457,45 +14481,185 @@ class FuturesMonitor:
     # 2026-07-08 Hermes Agent: MTS risk control gates
     # ═══════════════════════════════════════════════════════════════
 
-    def _mts_risk_gate_settlement(self, strategy) -> bool:
-        """Settlement day force flat: all phases, full close on the contract's last trading day after 13:30.
+    def _held_leg_contracts(self, strategy):
+        """N1: (near, far) contracts the open position was entered on, or None.
 
-        Only triggers when today IS the delivery date AND past 13:30.
-        Does NOT trigger on already-expired contracts (delivery in the past).
-        Idempotent: fires at most once per session.
-
-        Returns True if gate triggered (position force-closed).
+        Set at entry.  After a restart it is restored lazily (state file first,
+        then the trade's ENTRY_AUDIT).  None means the position's contracts are
+        unknown; every caller fails closed on it.
         """
-        if not self.contract:
+        _near = getattr(strategy, "_held_near_contract", None)
+        _far = getattr(strategy, "_held_far_contract", None)
+        if _near is None or _far is None:
+            _pair = self._restore_held_contracts(strategy)
+            if _pair is None:
+                return None
+            _near, _far = _pair
+        return _near, _far
+
+    def _mts_registry_strategy(self):
+        """N1: the registered MTS strategy object, or None."""
+        _name = self.cfg.get("mts", {}).get("strategy", "tmf_spread")
+        return self._registry.get(_name)
+
+    def _held_codes_for_close(self):
+        """N1: held (near, far) codes of the registered MTS strategy, or None."""
+        _held = self._held_leg_contracts(self._mts_registry_strategy())
+        if _held is None:
+            return None
+        return _held[0].code, _held[1].code
+
+    def _mts_event_log_path_for_read(self):
+        """N1: the event log path _append_mts_event writes to (same resolution)."""
+        _dir = runtime_logs()
+        return (mts_runtime_path("logs", "mts_spread_events.jsonl")
+                if os.environ.get("NODE_ENV") == "production" else
+                os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl")))
+
+    def _read_held_from_state(self, trade_id):
+        """N1: (near, far) held contracts from the position state file, or None."""
+        from types import SimpleNamespace
+        try:
+            with open(_mts_position_state_path(), "r", encoding="utf-8") as _f:
+                _state = json.load(_f)
+        except (OSError, ValueError):
+            return None
+        if (_state.get("has_position") is not True
+                or str(_state.get("trade_id") or "") != str(trade_id)
+                or not _state.get("near_contract") or not _state.get("far_contract")):
+            return None
+        return (SimpleNamespace(code=_state["near_contract"],
+                                delivery_date=_state.get("near_delivery_date")),
+                SimpleNamespace(code=_state["far_contract"],
+                                delivery_date=_state.get("far_delivery_date")))
+
+    def _read_held_from_entry_audit(self, trade_id):
+        """N1: (near, far) held contracts from this trade's ENTRY_AUDIT, or None."""
+        from types import SimpleNamespace
+        _found = None
+        try:
+            with open(self._mts_event_log_path_for_read(), "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    try:
+                        _ev = json.loads(_line)
+                    except ValueError:
+                        continue
+                    if (_ev.get("event") == "ENTRY_AUDIT"
+                            and str(_ev.get("trade_id") or "") == str(trade_id)
+                            and _ev.get("near_contract") and _ev.get("far_contract")):
+                        _found = _ev  # last entry audit of this trade wins
+        except OSError:
+            return None
+        if _found is None:
+            return None
+        return (SimpleNamespace(code=_found["near_contract"],
+                                delivery_date=_found.get("near_delivery_date")),
+                SimpleNamespace(code=_found["far_contract"],
+                                delivery_date=_found.get("far_delivery_date")))
+
+    def _restore_held_contracts(self, strategy):
+        """N1: recover the held pair of an open position after a restart.
+
+        Order: position state file, then the trade's ENTRY_AUDIT.  Neither
+        source -> None (caller fails closed).  Restored pairs are cached on
+        the strategy and audited once as HELD_CONTRACTS_RESTORED.
+        """
+        if strategy is None or not getattr(strategy, "_has_position", False):
+            return None
+        _tid = getattr(strategy, "_trade_id", None)
+        if not _tid:
+            return None
+        _source = "POSITION_STATE"
+        _pair = self._read_held_from_state(_tid)
+        if _pair is None:
+            _source = "ENTRY_AUDIT"
+            _pair = self._read_held_from_entry_audit(_tid)
+        if _pair is None:
+            return None
+        strategy._held_near_contract, strategy._held_far_contract = _pair
+        self._append_mts_event(
+            "HELD_CONTRACTS_RESTORED", trade_id=_tid, source=_source,
+            near_contract=_pair[0].code, far_contract=_pair[1].code)
+        return _pair
+
+    def _classify_fill_leg(self, strategy, symbol):
+        """N1: map a fill's symbol to the position's NEAR/FAR leg.
+
+        Compares against the HELD pair, so a fill on the near leg still
+        classifies as NEAR after the subscribed pair has rolled.  With no held
+        pair (no position) it falls back to the subscribed codes.
+        """
+        _symbol = str(symbol or "")
+        _held = self._held_leg_contracts(strategy)
+        if _held is not None:
+            _near_code, _far_code = _held[0].code, _held[1].code
+        else:
+            _near_code = self.contract.code if self.contract else ""
+            _far_code = self.far_contract.code if self.far_contract else ""
+        if "NEAR" in _symbol or (_near_code and _symbol == _near_code):
+            return "NEAR"
+        if "FAR" in _symbol or (_far_code and _symbol == _far_code):
+            return "FAR"
+        return None
+
+    def _exit_contract_mismatch(self, strategy, near_code, far_code) -> bool:
+        """N1 invariant (C): exit order codes must equal the held position codes.
+
+        Returns True (blocked, zero orders, position state untouched) on any
+        mismatch, including an unknown position.
+        """
+        _held = self._held_leg_contracts(strategy)
+        if _held is not None and (near_code, far_code) == (_held[0].code, _held[1].code):
+            return False
+        _held_near = _held[0].code if _held is not None else None
+        _held_far = _held[1].code if _held is not None else None
+        self._append_mts_event(
+            "CONTRACT_MISMATCH_BLOCKED",
+            trade_id=getattr(strategy, "_trade_id", ""),
+            order_near=near_code, order_far=far_code,
+            held_near=_held_near, held_far=_held_far)
+        console.print(
+            f"[bold red]⛔ [CONTRACT_MISMATCH_BLOCKED] order {near_code}/{far_code} "
+            f"!= held {_held_near}/{_held_far}; exit refused[/bold red]")
+        return True
+
+    def _mts_risk_gate_settlement(self, strategy, now=None) -> bool:
+        """N1 settlement force flat: 13:25 <= t < 13:30 on the held near leg's delivery day.
+
+        Keys off the contract the position HOLDS, not self.contract: the
+        subscribed pair rolls at 13:30, so a 13:30+ trigger cannot close the
+        near leg (2026-10-21 incident).  Fires at most once per day, and only
+        while the near leg can still trade.
+
+        Returns True if gate triggered (or already fired today).
+        """
+        if not getattr(strategy, '_has_position', False):
             return False
 
-        # Only trigger on the ACTUAL settlement day, not on long-expired contracts
+        _now = now or datetime.now()
+        if not ((13, 25) <= (_now.hour, _now.minute) < (13, 30)):
+            return False
+
+        _held = self._held_leg_contracts(strategy)
+        if _held is None:
+            return False  # exit path emits POSITION_CONTRACT_UNAVAILABLE
         try:
-            from datetime import datetime as _dt
-            _delivery = _dt.strptime(self.contract.delivery_date, "%Y/%m/%d").date()
-            _today = _dt.now().date()
-            if _delivery != _today:
-                return False  # not today's settlement
+            _delivery = datetime.strptime(_held[0].delivery_date, "%Y/%m/%d").date()
         except Exception:
             return False
+        if _delivery != _now.date():
+            return False  # not the held near leg's settlement day
 
-        if not self._is_contract_expired(self.contract.delivery_date):
-            return False  # before 13:30
-
-        # Idempotency guard: only fire once
-        if getattr(self, '_mts_settlement_flat_done', False):
+        # Idempotency guard: once per day
+        if getattr(self, '_mts_settlement_flat_done', None) == _now.date():
             return True
 
-        _has_pos = bool(getattr(strategy, '_has_position', False))
-        if not _has_pos:
-            return False
-
-        self._mts_settlement_flat_done = True
+        self._mts_settlement_flat_done = _now.date()
         self._mts_force_exit_inflight = True
 
         console.print(
-            f"[bold red]📅 [RISK_SETTLEMENT] Contract {self.contract.code} "
-            f"expired — force closing all positions[/bold red]"
+            f"[bold red]📅 [RISK_SETTLEMENT] Held near {_held[0].code} "
+            f"settles today — force closing all positions[/bold red]"
         )
         # Emergency flatten: close both legs if still held
         self._emergency_flatten_mts(strategy)
@@ -14996,8 +15160,13 @@ class FuturesMonitor:
             if (_snap and (_snap.get("fetch_status") or {})
                     .get("capture") == "OK"):
                 _canon_ok = True
-                _codes = {str(getattr(self.contract, "code", "")),
-                          str(getattr(self.far_contract, "code", ""))}
+                _pair = self._held_codes_for_close()
+                if _pair is None:
+                    console.print(
+                        "[red]⛔ [POSITION_CONTRACT_UNAVAILABLE] close_all: position "
+                        "contracts unknown; refusing to resolve[/red]")
+                    return (False, None, None, None, "mts-emergency", None)
+                _codes = {_pair[0], _pair[1]}
                 _rows = [p for p in (_snap.get("positions") or [])
                          if p.get("account") == "futures"
                          and str(p.get("code") or "") in _codes
@@ -15013,10 +15182,8 @@ class FuturesMonitor:
                         return (False, None, None, None,
                                 "mts-emergency", None)
                     _by_code = {str(p.get("code")): p for p in _rows}
-                    _near = _by_code.get(
-                        str(getattr(self.contract, "code", "")))
-                    _far = _by_code.get(
-                        str(getattr(self.far_contract, "code", "")))
+                    _near = _by_code.get(_pair[0])
+                    _far = _by_code.get(_pair[1])
                     _near_side = _side(_near)
                     _far_side = _side(_far)
                     if _near_side is None and _far_side is None:
@@ -15487,14 +15654,16 @@ class FuturesMonitor:
 
                     # ── Emergency exit fill metadata (safe defaults for both-legs case) ──
                     # 2026-07-07 Hermes Agent: refuse placeholder symbols.
-                    if self.contract is None or self.far_contract is None:
+                    # N1: emergency exit closes the held pair, not the subscribed one.
+                    _emerg_held = self._held_leg_contracts(_strategy_obj)
+                    if _emerg_held is None:
                         console.print(
-                            "[red]❌ [EMERGENCY_BLOCKED] contract unresolved; "
-                            "refusing placeholder emergency exit[/red]"
+                            "[red]❌ [EMERGENCY_BLOCKED] position contracts unknown; "
+                            "refusing emergency exit[/red]"
                         )
                         return
-                    _emerg_near_code = self.contract.code
-                    _emerg_far_code = self.far_contract.code
+                    _emerg_near_code = _emerg_held[0].code
+                    _emerg_far_code = _emerg_held[1].code
                     _rem_leg = "BOTH"
                     _side = "BOTH"
                     _price = max(float(_near_last or 0), float(_far_last or 0))
@@ -16794,7 +16963,12 @@ class FuturesMonitor:
                     far_last=data["far_fill_price"],
                     near_side=data["near_label"], 
                     far_side=data["far_label"],
-                    spread_z=_fill_entry_z, released_leg=None, trade_id=trade_id
+                    spread_z=_fill_entry_z, released_leg=None, trade_id=trade_id,
+                    # N1: persist the held pair so a restart can resume exits.
+                    near_contract=getattr(getattr(_mts_strat, "_held_near_contract", None), "code", None),
+                    far_contract=getattr(getattr(_mts_strat, "_held_far_contract", None), "code", None),
+                    near_delivery_date=getattr(getattr(_mts_strat, "_held_near_contract", None), "delivery_date", None),
+                    far_delivery_date=getattr(getattr(_mts_strat, "_held_far_contract", None), "delivery_date", None),
                 )
 
                 # ADR-010 Sprint 3: submit release OCO bracket after entry confirmed
