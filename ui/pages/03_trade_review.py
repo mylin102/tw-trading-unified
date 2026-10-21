@@ -78,6 +78,7 @@ def _quantile(sorted_values, probability):
 def _fill_costs(rows):
     friction = 0.0
     unitemized = 0
+    itemized_rows = 0
     gross_values = []
     for row in rows:
         gross = _number(row.get("gross_pnl"))
@@ -88,9 +89,11 @@ def _fill_costs(rows):
         if gross is None or fee is None or tax is None:
             unitemized += 1
         else:
+            itemized_rows += 1
             friction += fee + tax
     gross_total = sum(gross_values) if len(gross_values) == len(rows) and rows else None
-    return gross_total, friction, unitemized
+    # 2026-10-21 Hermes Agent: all-legacy costs are unknown, never a zero total.
+    return gross_total, friction if itemized_rows else None, unitemized
 
 
 def build_daily_review(fills, events, selected_day=None, today_trading_day=None):
@@ -154,7 +157,6 @@ def build_daily_review(fills, events, selected_day=None, today_trading_day=None)
             "session": session,
             "gross_pnl": gross_pnl,
             "friction_cost": friction_cost if close_rows and not unitemized_rows else None,
-            "_itemized_friction_cost": friction_cost,
             "unitemized_cost_rows": unitemized_rows,
             "net_pnl": net_pnl,
             "close_rows": close_rows,
@@ -191,11 +193,15 @@ def build_daily_review(fills, events, selected_day=None, today_trading_day=None)
 
     def _session_summary(session_key):
         session_trades = [row for row in selected_trades if row["session"] == session_key]
+        session_close_rows = [
+            fill for trade in session_trades for fill in trade["close_rows"]
+        ]
+        _, session_friction, session_unitemized = _fill_costs(session_close_rows)
         return {
             "trade_count": len(session_trades),
             "net_pnl": sum(row["net_pnl"] or 0.0 for row in session_trades),
-            "friction_cost": sum(row["_itemized_friction_cost"] for row in session_trades),
-            "unitemized_cost_rows": sum(row["unitemized_cost_rows"] for row in session_trades),
+            "friction_cost": session_friction,
+            "unitemized_cost_rows": session_unitemized,
         }
 
     close_rows = [fill for trade in selected_trades for fill in trade["close_rows"]]
@@ -304,7 +310,7 @@ else:
     summary_cols[2].metric(
         "勝率", "N/A" if summary["win_rate"] is None else f"{summary['win_rate']:.1%}"
     )
-    summary_cols[3].metric("摩擦成本合計", f"{summary['friction_cost']:,.0f} TWD")
+    summary_cols[3].metric("摩擦成本合計", f"{_money(summary['friction_cost'])} TWD")
     summary_cols[4].metric("毛利", f"{_money(summary['gross_pnl'])} TWD")
     if summary["unitemized_cost_rows"]:
         st.caption(f"{summary['unitemized_cost_rows']} 列未分列費用；未估算缺失成本。")
@@ -315,7 +321,7 @@ else:
         data = report["sessions"][session_key]
         column.metric(f"{label}筆數", data["trade_count"])
         column.metric(f"{label}淨損益", f"{data['net_pnl']:+,.0f} TWD")
-        column.metric(f"{label}摩擦成本", f"{data['friction_cost']:,.0f} TWD")
+        column.metric(f"{label}摩擦成本", f"{_money(data['friction_cost'])} TWD")
         if data["unitemized_cost_rows"]:
             column.caption(f"{data['unitemized_cost_rows']} 列未分列費用")
 
