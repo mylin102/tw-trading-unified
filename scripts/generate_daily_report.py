@@ -149,6 +149,16 @@ def _fill_pnl_components(fill, entry, point_value=10.0):
         return None, 0.0, 0.0, 0, "ERROR"
 
 
+# 2026-10-21 Hermes Agent: only expose friction when both fee and tax are itemized.
+def _friction_cost(row: dict):
+    fee = row.get("fees") if row.get("fees") is not None else row.get("fee")
+    tax = row.get("tax")
+    if fee is None or tax is None:
+        return None
+    return float(fee) + float(tax)
+
+
+# 2026-10-21 Hermes Agent: keep net, gross, and itemized friction distinct.
 def _compute_trade_pnl(data: dict, fills_path: str = None) -> dict:
     """2026-08-03 P0 fix: canonical realized PnL per trade.
 
@@ -191,13 +201,14 @@ def _compute_trade_pnl(data: dict, fills_path: str = None) -> dict:
         net = settled.get("combined_realized_pnl_net")
         gross = settled.get("combined_realized_pnl_gross")
         if net is not None:
-            return {"net_pnl": float(net), "gross_pnl": float(gross or net),
+            return {"net_pnl": float(net), "gross_pnl": float(gross) if gross is not None else None,
+                    "friction_cost": _friction_cost(settled),
                     "pnl_source": "SETTLEMENT", "settlement_origin": settled.get("settlement_origin", "LIVE"),
                     "price_confidence": settled.get("price_confidence", "EXACT"),
                     "audit_status": "AUDITABLE", "theoretical_pnl": theoretical,
                     "pnl_status": "NET" if net is not None else "GROSS_ONLY"}
         if gross is not None:
-            return {"net_pnl": None, "gross_pnl": float(gross),
+            return {"net_pnl": None, "gross_pnl": float(gross), "friction_cost": None,
                     "pnl_source": "SETTLEMENT", "settlement_origin": settled.get("settlement_origin", "LIVE"),
                     "price_confidence": settled.get("price_confidence", "EXACT"),
                     "audit_status": "AUDITABLE", "theoretical_pnl": theoretical,
@@ -250,7 +261,8 @@ def _compute_trade_pnl(data: dict, fills_path: str = None) -> dict:
                 "audit_status": "PRE_FIX_UNAUDITABLE", "theoretical_pnl": theoretical,
                 "pnl_status": "GROSS_ONLY", "price_confidence": None}
 
-    return {"net_pnl": None, "gross_pnl": round(total, 1), "pnl_source": "FILLS" if canonical_all else "FILLS_BACKFILL",
+    return {"net_pnl": None, "gross_pnl": round(total, 1), "friction_cost": None,
+            "pnl_source": "FILLS" if canonical_all else "FILLS_BACKFILL",
             "settlement_origin": "LIVE" if canonical_all else "BACKFILL",
             "price_confidence": confidence, "audit_status": "AUDITABLE" if confidence else "DERIVED_AUDITABLE" if confidence == "DERIVED" else "PRE_FIX_UNAUDITABLE",
             "theoretical_pnl": theoretical, "pnl_status": "GROSS_ONLY",
@@ -501,16 +513,33 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
             # 2026-08-03 P0 fix: canonical realized PnL. EXPLICIT_EVENT
             # theoretical PnL is NEVER used as realized.
             _pnl = _compute_trade_pnl(data, fills_path)
-            net_pnl = _pnl.get("gross_pnl") if _pnl.get("net_pnl") is None else _pnl.get("net_pnl")
+            net_pnl = _pnl.get("net_pnl")
             gross_pnl = _pnl.get("gross_pnl")
+            friction_cost = _pnl.get("friction_cost")
             theoretical_pnl = _pnl.get("theoretical_pnl", 0.0)
             pnl_source = _pnl.get("pnl_source", "UNAVAILABLE")
             audit_status = _pnl.get("audit_status", "PRE_FIX_UNAUDITABLE")
             price_confidence = _pnl.get("price_confidence")
             pnl_status = _pnl.get("pnl_status", "GROSS_ONLY")
-            if release_fill:
-                # single-leg path: release + remaining-leg exit realized
-                net_pnl = (release_pnl + exit_pnl) or net_pnl
+            if release_fill and pnl_source != "SETTLEMENT":
+                _close_rows = [release_fill] + data["exit_fills"]
+                _realized_rows = [row.get("realized_pnl") for row in _close_rows]
+                if _close_rows and all(value is not None for value in _realized_rows):
+                    _row_costs = [_friction_cost(row) for row in _close_rows]
+                    if all(cost is not None for cost in _row_costs):
+                        gross_pnl = sum(float(value) for value in _realized_rows)
+                        friction_cost = sum(_row_costs)
+                        net_pnl = gross_pnl - friction_cost
+                        pnl_status = "NET"
+                    elif all(row.get("pnl_status") == "NET" for row in _close_rows):
+                        net_pnl = sum(float(value) for value in _realized_rows)
+                        gross_pnl = None
+                        friction_cost = None
+                        pnl_status = "NET"
+                    else:
+                        net_pnl = None
+                        friction_cost = None
+                        pnl_status = "GROSS_ONLY"
             report_data["completed"].append({
                 "trade_id": trade_id,
                 "entry_time": data["entry_ts"],
@@ -536,6 +565,7 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 "exit_reason_source": exit_src,
                 "net_pnl": net_pnl,
                 "gross_pnl": gross_pnl,
+                "friction_cost": friction_cost,
                 "theoretical_pnl": theoretical_pnl,
                 "pnl_source": pnl_source,
                 "audit_status": audit_status,
@@ -583,15 +613,19 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
     completed = report_data["completed"]
     active = report_data["active"]
     
-    # Calculate global metrics
-    total_trades = len(completed)
-    win_trades = sum(1 for t in completed if t["net_pnl"] > 0)
-    loss_trades = sum(1 for t in completed if t["net_pnl"] <= 0)
+    # 2026-10-21 Hermes Agent: GROSS_ONLY history is reported separately from NET KPIs.
+    net_trades = [t for t in completed
+                  if t.get("pnl_status") == "NET" and t.get("net_pnl") is not None]
+    gross_only_count = sum(1 for t in completed
+                           if t.get("pnl_status") == "GROSS_ONLY")
+    total_trades = len(net_trades)
+    win_trades = sum(1 for t in net_trades if t["net_pnl"] > 0)
+    loss_trades = sum(1 for t in net_trades if t["net_pnl"] <= 0)
     win_rate = (win_trades / total_trades) if total_trades > 0 else 0.0
     
-    total_net_pnl = sum(t["net_pnl"] for t in completed)
-    gross_wins = sum(t["net_pnl"] for t in completed if t["net_pnl"] > 0)
-    gross_losses = sum(abs(t["net_pnl"]) for t in completed if t["net_pnl"] <= 0)
+    total_net_pnl = sum(t["net_pnl"] for t in net_trades)
+    gross_wins = sum(t["net_pnl"] for t in net_trades if t["net_pnl"] > 0)
+    gross_losses = sum(abs(t["net_pnl"]) for t in net_trades if t["net_pnl"] <= 0)
     profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else (99.9 if gross_wins > 0 else 0.0)
     avg_net_pnl = (total_net_pnl / total_trades) if total_trades > 0 else 0.0
 
@@ -599,7 +633,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
     sessions = {"day": {"trades": [], "wins": 0, "losses": 0, "net_pnl": 0.0},
                 "night": {"trades": [], "wins": 0, "losses": 0, "net_pnl": 0.0}}
                 
-    for t in completed:
+    for t in net_trades:
         sess = t["session"].lower()
         if sess in sessions:
             sessions[sess]["trades"].append(t)
@@ -616,7 +650,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
         night_pnl = sessions["night"]["net_pnl"]
         if night_pnl < day_pnl and len(sessions["night"]["trades"]) > 0:
             suggestions.append("⚠️ <b>夜盤表現落後日盤</b>：考慮收緊夜盤的 `max_spread_width` (滑價保護)，或微調夜盤移動停利比例以防流動性差時利潤回吐。")
-        if any(t["exit_reason"] == "RELEASE_STOP" for t in completed):
+        if any(t["exit_reason"] == "RELEASE_STOP" for t in net_trades):
             suggestions.append("💡 <b>觸及單腿釋放停損</b>：可考慮評估布林濾網（BB Filter）是否在該時間點正常發揮延遲平倉效果，或適度擴大 ATR 停損倍數。")
         if avg_net_pnl < 100.0:
             suggestions.append("⚠️ <b>平均每筆淨利偏低</b>：目前的移動停利或釋放停損可能太近，容易在小幅震盪中被震出場。可嘗試採用 Sweep 中勝率較佳的 `Stop 2.5x / Trail 2.0x` 參數。")
@@ -830,6 +864,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
                 <span class="kpi-value {pnl_class}">{pnl_symbol}${avg_net_pnl:,.1f} TWD</span>          
             </div>
         </div>
+        <p>未扣費筆數（GROSS_ONLY）: {gross_only_count}（未計入淨額 KPI）</p>
 
         <!-- Session Comparison Card -->
         <div class="section-title">📊 日盤 vs 夜盤 績效對比</div>
@@ -891,6 +926,9 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
                         <th>釋放原因</th>
                         <th>釋放效率</th>
                         <th>淨損益</th>
+                        <th>摩擦成本</th>
+                        <th>毛利</th>
+                        <th>損益狀態</th>
                         <th>風控模式</th>
                         <th>MTF (Entry/Rel/Exit)</th>
                         <th>VWAP (Entry/Rel/Exit)</th>
@@ -900,8 +938,17 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
                 
     if completed:
         for t in completed:
-            net_class = "text-green" if t["net_pnl"] >= 0 else "text-red"
-            net_symbol = "+" if t["net_pnl"] >= 0 else ""
+            _is_net = t.get("pnl_status") == "NET" and t.get("net_pnl") is not None
+            _net = t.get("net_pnl") if _is_net else None
+            net_class = "text-green" if _net is not None and _net >= 0 else "text-red"
+            net_symbol = "+" if _net is not None and _net >= 0 else ""
+            net_cell = f"{net_symbol}${_net:,.1f}" if _net is not None else "N/A"
+            friction_cell = (f"${t['friction_cost']:,.1f}"
+                             if _is_net and t.get("friction_cost") is not None else "N/A")
+            gross_cell = (f"${t['gross_pnl']:,.1f}"
+                          if t.get("gross_pnl") is not None else "N/A")
+            _status_note = ("未扣摩擦成本（舊紀錄）"
+                            if t.get("pnl_status") == "GROSS_ONLY" else "")
             badge_class = "badge-day" if t["session"].lower() == "day" else "badge-night"
             sess_label = "☀️ 日盤" if t["session"].lower() == "day" else "🌙 夜盤"
             
@@ -921,7 +968,10 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
                         <td style="font-size: 0.85rem;">{t.get('trail_duration', '—')}</td>
                         <td><span class="badge badge-reason">{t['exit_reason']}</span></td>
                         <td style="font-size: 0.85rem; font-weight: 600;">{t.get('release_efficiency', '—')}</td>
-                        <td class="{net_class}" style="font-weight: 600;">{net_symbol}${t['net_pnl']:,.1f}</td>
+                        <td class="{net_class}" style="font-weight: 600;">{net_cell}</td>
+                        <td>{friction_cell}</td>
+                        <td>{gross_cell}</td>
+                        <td>{_status_note or t.get('pnl_status', 'N/A')}</td>
                         <td style="font-size: 0.85rem; color: var(--text-muted);"><code>{t['risk_mode']}</code></td>
                         <td style="font-size: 0.85rem;"><code>{mtf_str}</code></td>
                         <td style="font-size: 0.85rem;"><code>{vwap_str}</code></td>
@@ -929,7 +979,7 @@ def generate_html(report_data: dict, target_trading_day: str) -> str:
     else:
         html += """
                     <tr>
-                        <td colspan="14" style="text-align: center; padding: 2rem; color: var(--text-muted);">今日無已完結交易。</td>
+                        <td colspan="17" style="text-align: center; padding: 2rem; color: var(--text-muted);">今日無已完結交易。</td>
                     </tr>"""
 
                     
@@ -1038,7 +1088,8 @@ def main():
     print(f"Daily performance report successfully generated at: {report_file}")
     print("\n--- Daily Summary ---")
     print(f"Total Completed Trades: {len(report_data['completed'])}")
-    total_net = sum(t["net_pnl"] for t in report_data["completed"])
+    total_net = sum(t["net_pnl"] for t in report_data["completed"]
+                    if t.get("pnl_status") == "NET" and t.get("net_pnl") is not None)
     print(f"Net Realized PnL: ${total_net:+,.1f} TWD")
     print(f"Active Positions remaining: {len(report_data['active'])}")
     print("---------------------\n")

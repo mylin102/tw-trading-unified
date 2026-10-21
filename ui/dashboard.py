@@ -6294,6 +6294,9 @@ elif _selected_product == "TMF":
             _total_net = _curr_metrics["total_net"]
             _win_rate = _curr_metrics["win_rate"]
             _pf = _curr_metrics["profit_factor"]
+            # 2026-10-21 Hermes Agent: report excluded gross-only history beside MTS KPIs.
+            st.caption(
+                f"另有 {_curr_metrics['gross_only_count']} 筆舊紀錄未扣費，未計入淨額 KPI")
 
             # ── 2026-08-27 (codex review v2): the FORMAL KPI must reflect
             # VERIFIED_PAPER provenance ONLY.  parse_logs() mixes legacy/
@@ -6469,18 +6472,34 @@ elif _selected_product == "TMF":
                             _near_reason_source = t.get("release_reason_source", "—")
                             _far_reason = t.get("exit_reason", "—")
                             _far_reason_source = t.get("exit_reason_source", "—")
+                        # 2026-10-21 Hermes Agent: label gross-only rows without deriving costs.
+                        _is_net_trade = (t.get("pnl_status") == "NET"
+                                         and t.get("net_pnl") is not None)
+                        _net_display = (f'{t["net_pnl"]:+,.0f}'
+                                        if _is_net_trade else "N/A")
+                        _friction = (t.get("friction_cost")
+                                     if _is_net_trade else None)
+                        _gross = t.get("gross_pnl")
+                        _legacy_note = (
+                            "未扣摩擦成本（舊紀錄）"
+                            if t.get("pnl_status") == "GROSS_ONLY" else "—")
                         _loop_rows.append({
+                            "淨利 (TWD)": _net_display,
+                            "摩擦成本": f"{_friction:,.0f}" if _friction is not None else "N/A",
+                            "毛利": f"{_gross:+,.0f}" if _gross is not None else "N/A",
+                            "近月毛利": (f'{t.get("near_pnl_gross"):+,.0f}'
+                                         if t.get("near_pnl_gross") is not None else "N/A"),
+                            "遠月毛利": (f'{t.get("far_pnl_gross"):+,.0f}'
+                                         if t.get("far_pnl_gross") is not None else "N/A"),
+                            "備註": _legacy_note,
                             "交易 ID": t["trade_id"][-6:],
                             "建倉時段": "☀️ 日盤" if t.get("entry_session", t["session"]).lower() == "day" else "🌙 夜盤",
                             "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
-                            "近月 PnL": f'{t.get("near_pnl_gross", t.get("release_pnl", 0)):+,.0f}',
                             "近月原因": ("— (雙腿同步平倉)" if _is_pj else _fmt_policy_j_reason(_near_reason)),
                             "近月來源": f'{_near_reason_source}',
-                            "遠月 PnL": f'{t.get("far_pnl_gross", t.get("exit_pnl", 0)):+,.0f}',
                             "遠月原因": _fmt_policy_j_reason(_far_reason),
                             "遠月來源": f'{_far_reason_source}',
                             "跨時段": "🔄 跨盤" if t.get("cross_session_trade") else "單盤",
-                            "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
                             "風控": t["risk_mode"]
                         })
                     st.dataframe(pd.DataFrame(_loop_rows), width='stretch', hide_index=True)
