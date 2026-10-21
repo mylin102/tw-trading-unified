@@ -2694,6 +2694,97 @@ class TMFSpread(StrategyBase):
         _w = float(_a) - float(_b)
         return _w <= _max, _w
 
+    # 2026-10-21 Hermes Agent: record a fail-safe, observe-only synchronized-exit counterfactual.
+    def _record_release_counterfactual(
+        self, bar: dict, *, decision_ts, release_path: str,
+        release_leg: str, qty: int,
+    ) -> None:
+        try:
+            _trade_id = getattr(self, "_trade_id", None)
+            if getattr(self, "_release_counterfactual_trade_id", object()) == _trade_id:
+                return
+
+            _near_age_raw = bar.get("near_bidask_age_ms")
+            _far_age_raw = bar.get("far_bidask_age_ms")
+            _quotes = None
+            _status = "OK"
+            try:
+                _near_age = float(_near_age_raw)
+                _far_age = float(_far_age_raw)
+                _near_bid = float(bar.get("near_bid"))
+                _near_ask = float(bar.get("near_ask"))
+                _far_bid = float(bar.get("far_bid"))
+                _far_ask = float(bar.get("far_ask"))
+                _near_entry = float(getattr(self, "_near_entry"))
+                _far_entry = float(getattr(self, "_far_entry"))
+                _qty = float(qty)
+                _near_side = str(getattr(self, "_near_side")).upper()
+                _far_side = str(getattr(self, "_far_side")).upper()
+                _numeric = (
+                    all(value == value and abs(value) != float("inf")
+                        for value in (_near_age, _far_age, _near_bid, _near_ask,
+                                      _far_bid, _far_ask, _near_entry, _far_entry,
+                                      _qty))
+                    and _near_age >= 0 and _far_age >= 0
+                    and _near_bid > 0 and _near_ask >= _near_bid
+                    and _far_bid > 0 and _far_ask >= _far_bid
+                    and _near_entry > 0 and _far_entry > 0 and _qty > 0
+                    and _near_side in ("LONG", "SHORT")
+                    and _far_side in ("LONG", "SHORT")
+                )
+                if not _numeric:
+                    _status = "MISSING"
+                elif _near_age > 500.0 or _far_age > 1500.0:
+                    _status = "STALE"
+                else:
+                    _near_exit = _near_bid if _near_side == "LONG" else _near_ask
+                    _far_exit = _far_bid if _far_side == "LONG" else _far_ask
+                    _quotes = (_near_exit, _far_exit, _near_entry, _far_entry,
+                               _near_side, _far_side, _qty)
+            except (TypeError, ValueError, OverflowError):
+                _status = "MISSING"
+
+            _near_exit = _far_exit = None
+            _gross = _fee = _tax = _net = None
+            if _status == "OK" and _quotes is not None:
+                (_near_exit, _far_exit, _near_entry, _far_entry,
+                 _near_side, _far_side, _qty) = _quotes
+                _gross = (
+                    (_near_exit - _near_entry) * (1 if _near_side == "LONG" else -1)
+                    + (_far_exit - _far_entry) * (1 if _far_side == "LONG" else -1)
+                ) * 10.0 * _qty
+                _fee = 40.0 * _qty * 2.0
+                _tax = ((_near_entry + _near_exit) + (_far_entry + _far_exit)) * 10.0 * _qty * 2e-5
+                _net = _gross - _fee - _tax
+
+            _remaining_leg = "FAR" if release_leg == "NEAR" else "NEAR"
+            self._release_counterfactual_trade_id = _trade_id
+            _append_event(
+                "RELEASE_COUNTERFACTUAL",
+                trade_id=_trade_id,
+                decision_ts=decision_ts,
+                release_path=release_path,
+                release_leg=release_leg,
+                remaining_leg=_remaining_leg,
+                near_side=getattr(self, "_near_side", None),
+                far_side=getattr(self, "_far_side", None),
+                near_entry=getattr(self, "_near_entry", None),
+                far_entry=getattr(self, "_far_entry", None),
+                qty=qty,
+                near_exit_px=_near_exit,
+                far_exit_px=_far_exit,
+                near_bbo_age_ms=bar.get("near_bidask_age_ms"),
+                far_bbo_age_ms=bar.get("far_bidask_age_ms"),
+                cf_gross_twd=_gross,
+                cf_fee_twd=_fee,
+                cf_tax_twd=_tax,
+                cf_net_twd=_net,
+                bbo_status=_status,
+            )
+        except Exception:
+            logger.warning("[RELEASE_COUNTERFACTUAL] observation failed (non-fatal)",
+                           exc_info=True)
+
     def _hvwap_maybe_paper_release(self, bar: dict, now, near_close: float,
                                     far_close: float) -> Signal | None:
         """2026-08-23 Hermes Agent: paper-only direct VWAP release wiring.
@@ -2797,6 +2888,10 @@ class TMFSpread(StrategyBase):
 
             # ── apply the PAPER release intent (existing lifecycle path) ──
             _leg = Leg.NEAR if _rel == "NEAR" else Leg.FAR
+            # 2026-10-21 Hermes Agent: observe before the HVWAP lifecycle/order path.
+            self._record_release_counterfactual(
+                bar, decision_ts=_v.decision_ts, release_path="HVWAP_CANDIDATE",
+                release_leg=_rel, qty=1)
             self._lifecycle = f"RELEASE_{_leg.value}"
             self._release_ts = now
             self._release_mono = time.monotonic()
@@ -5814,6 +5909,10 @@ class TMFSpread(StrategyBase):
                 if _release_leg is None:
                     logger.error("[LIFECYCLE] RELEASE decision missing release_leg — skipping")
                     return None
+                # 2026-10-21 Hermes Agent: observe only after the release decision is confirmed.
+                self._record_release_counterfactual(
+                    bar, decision_ts=now, release_path="BASELINE",
+                    release_leg=_release_leg.value, qty=1)
                 _exit_price = near_close if _release_leg == Leg.NEAR else far_close
                 _pnl_pts = _n_pnl if _release_leg == Leg.NEAR else _f_pnl
                 _turnover = (self._near_entry + _exit_price) * _mult
