@@ -22,8 +22,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+
+# Paper session ids are written by core/mode_transition.py:148 (strftime).
+_PAPER_SESSION_RE = re.compile(r"[0-9]{8}_[0-9]{6}")
+
+
+def paper_context_violations(ctx: dict) -> list:
+    """Paper rules: no live order authority, no audit reasons, bound session."""
+    bad = []
+    if ctx.get("live_order_allowed") is not False:
+        bad.append("LIVE_ORDER_ALLOWED")
+    if ctx.get("audit_reasons"):
+        bad.append("AUDIT_REASONS")
+    sid = ctx.get("session_id")
+    if not isinstance(sid, str) or not _PAPER_SESSION_RE.fullmatch(sid):
+        bad.append("SESSION_ID_UNBOUND")
+    return bad
 
 
 def disk_free_gb(path: str, _statvfs=None) -> float:
@@ -77,7 +94,13 @@ def main() -> int:
     reasons = ctx.get("audit_reasons") or []
     print(f"[VERIFY] requested={requested} effective={effective} "
           f"live_order_allowed={allowed} audit_reasons={reasons}")
-    if requested != "live" or effective != "live_ready" or allowed is not True or reasons:
+    is_paper = requested == "paper" and effective == "paper_active"
+    if is_paper:
+        bad = paper_context_violations(ctx)
+        if bad:
+            print(f"[VERIFY] FAIL paper context is not clean: {', '.join(bad)}")
+            return 3
+    elif requested != "live" or effective != "live_ready" or allowed is not True or reasons:
         print("[VERIFY] FAIL context is not a clean live_ready state")
         return 3
 
@@ -98,7 +121,7 @@ def main() -> int:
             return 4
         print(f"[VERIFY] identity OK (LRC_RELEASE_SHA={running_sha})")
 
-    print("[VERIFY] live context OK")
+    print("[VERIFY] paper context OK" if is_paper else "[VERIFY] live context OK")
     return 0
 
 

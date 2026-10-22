@@ -477,8 +477,24 @@ def guard_quarantine_first_startup(monitor_path: Optional[str]) -> GuardResult:
 _REGISTRY_GEN_RE = re.compile(r"^[0-9a-f]{32}$")   # token_hex(16) format
 
 
+_PAPER_SESSION_RE = re.compile(r"[0-9]{8}_[0-9]{6}")  # core/mode_transition.py:148
+
+
 def guard_session_generation(generation: Optional[int | str],
-                             revoked: bool) -> GuardResult:
+                             revoked: bool,
+                             ctx_data: Optional[dict] = None) -> GuardResult:
+    # Paper (requested=paper, effective=paper_active) binds the ctx session id,
+    # a timestamp (YYYYMMDD_HHMMSS), not a registry generation.  Revocation
+    # still fails; every other context keeps the rules below, unchanged.
+    if _is_paper_active_ctx(ctx_data):
+        _sid = ctx_data.get("session_id")
+        if revoked:
+            return _fail("session_generation", ["GUARD_SESSION_REVOKED"],
+                         f"session={_sid}")
+        if not isinstance(_sid, str) or not _PAPER_SESSION_RE.fullmatch(_sid):
+            return _fail("session_generation", ["GUARD_SESSION_MISSING"],
+                         "paper session id must be bound (YYYYMMDD_HHMMSS)")
+        return _pass("session_generation", f"paper session bound: {_sid}")
     # The live session generation is REGISTRY-BOUND: the session_registry
     # produces token_hex(16) (32-hex str) generations. Standalone preflight
     # identity (sha256(account_id) 16-hex) NEVER passes. Assessed only in
@@ -902,15 +918,16 @@ def check_deployment(
         else os.environ.get("TRADING_RUNTIME_DIR", "")
     expected_sha = expected_sha if expected_sha is not None \
         else os.environ.get("LRC_RELEASE_SHA", "")
+    ctx_snapshot = read_ctx_snapshot(runtime_dir)
     if phase == "post_startup":
         session_result = guard_session_generation(session_generation,
-                                                  session_revoked)
+                                                  session_revoked,
+                                                  ctx_data=ctx_snapshot)
     else:
         session_result = GuardResult(
             guard="session_generation", ok=True,
             detail="not assessed in pre_deploy phase "
                    "(post_startup gate requires registry-bound generation)")
-    ctx_snapshot = read_ctx_snapshot(runtime_dir)
     results = (
         guard_release_head(release_dir, expected_sha),
         guard_clean_tree(release_dir, closure_files),
