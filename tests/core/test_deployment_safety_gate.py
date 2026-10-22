@@ -608,6 +608,103 @@ def test_guard_margin_none_and_invalid():
     assert "GUARD_MARGIN_INVALID" in guard_margin(-1.0).reasons
 
 
+# ── 8b. margin: paper deployments do not use margin (Slice G-margin) ───────
+
+def _live_quarantined_ctx_dict():
+    d = _paper_ctx_dict()
+    d["effective_mode"] = "live_quarantined"
+    return d
+
+
+def test_guard_margin_paper_active_zero_passes():
+    # paper_active + requested paper: margin 0.0 is the correct value
+    from core.deployment_safety_gate import guard_margin
+    r = guard_margin(0.0, ctx_data=_paper_ctx_dict())
+    assert r.ok, r.reasons
+    assert "paper" in r.detail and "available=0.0" in r.detail
+
+
+def test_guard_margin_paper_active_none_passes():
+    from core.deployment_safety_gate import guard_margin
+    r = guard_margin(None, ctx_data=_paper_ctx_dict())
+    assert r.ok, r.reasons
+    assert "paper" in r.detail
+
+
+def test_guard_margin_paper_active_unparseable_fails():
+    from core.deployment_safety_gate import guard_margin
+    r = guard_margin("n/a", ctx_data=_paper_ctx_dict())
+    assert not r.ok and "GUARD_MARGIN_INVALID" in r.reasons
+
+
+def test_guard_margin_paper_active_nonfinite_fails():
+    from core.deployment_safety_gate import guard_margin
+    r = guard_margin(float("nan"), ctx_data=_paper_ctx_dict())
+    assert not r.ok and "GUARD_MARGIN_INVALID" in r.reasons
+
+
+def test_guard_margin_live_zero_still_invalid():
+    from core.deployment_safety_gate import guard_margin
+    r = guard_margin(0.0, ctx_data=_live_ctx_dict())
+    assert not r.ok and "GUARD_MARGIN_INVALID" in r.reasons
+
+
+def test_guard_margin_no_ctx_zero_still_invalid():
+    from core.deployment_safety_gate import guard_margin
+    assert "GUARD_MARGIN_INVALID" in guard_margin(0.0, ctx_data=None).reasons
+    assert "GUARD_MARGIN_INVALID" in guard_margin(0.0).reasons
+
+
+def test_guard_margin_ctx_missing_fields_still_invalid():
+    from core.deployment_safety_gate import guard_margin
+    assert "GUARD_MARGIN_INVALID" in guard_margin(0.0, ctx_data={}).reasons
+
+
+def test_guard_margin_paper_requested_live_quarantined_fails():
+    from core.deployment_safety_gate import guard_margin
+    r = guard_margin(0.0, ctx_data=_live_quarantined_ctx_dict())
+    assert not r.ok and "GUARD_MARGIN_INVALID" in r.reasons
+
+
+def test_guard_margin_live_requested_paper_active_fails():
+    # only requested=paper AND effective=paper_active qualifies
+    from core.deployment_safety_gate import guard_margin
+    d = _paper_ctx_dict()
+    d["requested_mode"] = "live"
+    r = guard_margin(0.0, ctx_data=d)
+    assert not r.ok and "GUARD_MARGIN_INVALID" in r.reasons
+
+
+def test_guard_margin_live_with_margin_and_evidence_regression():
+    from core.deployment_safety_gate import guard_margin
+    ev = {"account_identity_hash": "a" * 64, "scope": "futopt",
+          "captured_at": time.time(), "canonical_input_hash": "b" * 64}
+    r = guard_margin(300_000.0, margin_evidence=ev, ctx_data=_live_ctx_dict())
+    assert r.ok, r.reasons
+
+
+def test_check_deployment_passes_ctx_to_margin_guard(tmp_path, monkeypatch):
+    # aggregator reads the ctx once and hands it to the margin guard
+    import core.deployment_safety_gate as gate
+
+    stubs = ("guard_release_head", "guard_clean_tree", "guard_runtime_paths",
+             "guard_single_process", "guard_flat_no_pending",
+             "guard_quarantine_first_startup", "guard_config_profile",
+             "guard_capture_consistency", "guard_rollback_manifest",
+             "guard_ctx_atomic_health")
+    for name in stubs:
+        monkeypatch.setattr(gate, name, lambda *a, _n=name, **k: gate._pass(_n))
+    monkeypatch.setattr(gate, "read_ctx_snapshot", lambda runtime_dir: _paper_ctx_dict())
+
+    check = gate.check_deployment(
+        release_dir=str(tmp_path), closure_files=(), runtime_dir=str(tmp_path),
+        pid_file=str(tmp_path / "x.pid"), position_state_path=str(tmp_path / "p.json"),
+        margin_available=0.0, expected_sha="")
+
+    margin = next(r for r in check.results if r.guard == "margin")
+    assert margin.ok and "paper" in margin.detail
+
+
 # ── 9. rollback manifest + drift abort (exclude-self tree identity) ─────────
 
 def _tree_hash(repo, exclude_paths=()):
