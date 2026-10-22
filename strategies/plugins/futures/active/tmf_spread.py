@@ -3480,6 +3480,19 @@ class TMFSpread(StrategyBase):
         kw = dict(kwargs)
         for key in ["near_last", "far_last", "spread_z", "release_stop_points", "trail_distance_points", "trail_pts", "atr"]:
             kw.pop(key, None)
+
+        # 2026-10-22 Hermes Agent: persist the contracts this position was
+        # opened on.  N1 restart hydration reads them back; without this the
+        # periodic sync wrote None and left an open position with unknown
+        # contracts (2026-10-22 13:35 trade after the release23 restart).
+        for _field, _attr in (("near_contract", "_held_near_contract"),
+                              ("far_contract", "_held_far_contract")):
+            if not kw.get(_field):
+                kw[_field] = getattr(getattr(self, _attr, None), "code", None)
+        for _field, _attr in (("near_delivery_date", "_held_near_contract"),
+                              ("far_delivery_date", "_held_far_contract")):
+            if not kw.get(_field):
+                kw[_field] = getattr(getattr(self, _attr, None), "delivery_date", None)
         
         _near_last_val = kwargs.get("near_last")
         _far_last_val = kwargs.get("far_last")
