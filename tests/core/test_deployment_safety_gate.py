@@ -540,6 +540,94 @@ def test_guard_session_generation_revoked():
     assert not r.ok and "GUARD_SESSION_REVOKED" in r.reasons
 
 
+# ── 7b. post_startup session generation: paper context (Slice P) ──────────
+
+_PAPER_SID = "20261022_092434"  # core/mode_transition.py:148 strftime format
+
+
+def _paper_bound_ctx(session_id):
+    d = _paper_ctx_dict()
+    d["session_id"] = session_id
+    return d
+
+
+def test_guard_session_paper_bound_timestamp_passes():
+    from core.deployment_safety_gate import guard_session_generation
+    r = guard_session_generation(None, revoked=False,
+                                 ctx_data=_paper_bound_ctx(_PAPER_SID))
+    assert r.ok, r.reasons
+    assert r.detail == f"paper session bound: {_PAPER_SID}"
+
+
+def test_guard_session_paper_missing_or_empty_fails():
+    from core.deployment_safety_gate import guard_session_generation
+    for sid in (None, ""):
+        r = guard_session_generation(None, revoked=False,
+                                     ctx_data=_paper_bound_ctx(sid))
+        assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons, sid
+
+
+def test_guard_session_paper_malformed_id_fails():
+    from core.deployment_safety_gate import guard_session_generation
+    for sid in ("20261022092434", "2026-10-22_09:24:34", "abc"):
+        r = guard_session_generation(None, revoked=False,
+                                     ctx_data=_paper_bound_ctx(sid))
+        assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons, sid
+
+
+def test_guard_session_paper_revoked_still_fails():
+    from core.deployment_safety_gate import guard_session_generation
+    r = guard_session_generation(None, revoked=True,
+                                 ctx_data=_paper_bound_ctx(_PAPER_SID))
+    assert not r.ok and "GUARD_SESSION_REVOKED" in r.reasons
+
+
+def test_guard_session_live_timestamp_id_fails():
+    # a timestamp session id never binds a live deployment
+    from core.deployment_safety_gate import guard_session_generation
+    d = _ready_ctx_dict()
+    d["session_id"] = _PAPER_SID
+    r = guard_session_generation(None, revoked=False, ctx_data=d)
+    assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons
+
+
+def test_guard_session_mixed_mode_timestamp_id_fails():
+    from core.deployment_safety_gate import guard_session_generation
+    d = _paper_bound_ctx(_PAPER_SID)
+    d["effective_mode"] = "live_quarantined"
+    r = guard_session_generation(None, revoked=False, ctx_data=d)
+    assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons
+
+
+def test_guard_session_no_ctx_timestamp_id_fails():
+    from core.deployment_safety_gate import guard_session_generation
+    r = guard_session_generation(None, revoked=False, ctx_data=None)
+    assert not r.ok and "GUARD_SESSION_MISSING" in r.reasons
+
+
+def test_check_deployment_post_startup_paper_session_passes(tmp_path, monkeypatch):
+    import core.deployment_safety_gate as gate
+
+    stubs = ("guard_release_head", "guard_clean_tree", "guard_runtime_paths",
+             "guard_single_process", "guard_flat_no_pending",
+             "guard_quarantine_first_startup", "guard_config_profile",
+             "guard_capture_consistency", "guard_rollback_manifest",
+             "guard_ctx_atomic_health")
+    for name in stubs:
+        monkeypatch.setattr(gate, name, lambda *a, _n=name, **k: gate._pass(_n))
+    monkeypatch.setattr(gate, "read_ctx_snapshot",
+                        lambda runtime_dir: _paper_bound_ctx(_PAPER_SID))
+
+    check = gate.check_deployment(
+        release_dir=str(tmp_path), closure_files=(), runtime_dir=str(tmp_path),
+        pid_file=str(tmp_path / "x.pid"), position_state_path=str(tmp_path / "p.json"),
+        session_generation=None, phase="post_startup",
+        margin_available=0.0, expected_sha="")
+
+    session = next(r for r in check.results if r.guard == "session_generation")
+    assert session.ok and f"paper session bound: {_PAPER_SID}" in session.detail
+
+
 # ── 8. margin ──────────────────────────────────────────────────────────────
 
 def test_guard_margin_ok():
