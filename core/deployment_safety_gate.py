@@ -503,9 +503,30 @@ def guard_session_generation(generation: Optional[int | str],
 
 # ── 8. margin ──────────────────────────────────────────────────────────────
 
+def _is_paper_active_ctx(ctx_data: Optional[dict]) -> bool:
+    return (isinstance(ctx_data, dict)
+            and ctx_data.get("requested_mode") == "paper"
+            and ctx_data.get("effective_mode") == "paper_active")
+
+
 def guard_margin(margin_available: Optional[float],
                  floor: float = MARGIN_FLOOR,
-                 margin_evidence: Optional[dict] = None) -> GuardResult:
+                 margin_evidence: Optional[dict] = None,
+                 ctx_data: Optional[dict] = None) -> GuardResult:
+    # Paper deployments never use margin: only a paper_active context (requested
+    # paper) is exempt, and an unparseable/non-finite value still fails.
+    # Every other context keeps the live rule below, unchanged.
+    if _is_paper_active_ctx(ctx_data):
+        if margin_available is None:
+            return _pass("margin", "paper deployment: margin not required (available=None)")
+        try:
+            _paper_value = float(margin_available)
+        except (TypeError, ValueError):
+            return _fail("margin", ["GUARD_MARGIN_INVALID"])
+        if not math.isfinite(_paper_value):
+            return _fail("margin", ["GUARD_MARGIN_INVALID"], str(_paper_value))
+        return _pass("margin", f"paper deployment: margin not required "
+                               f"(available={margin_available})")
     if margin_available is None:
         return _fail("margin", ["GUARD_MARGIN_UNAVAILABLE"])
     try:
@@ -889,17 +910,19 @@ def check_deployment(
             guard="session_generation", ok=True,
             detail="not assessed in pre_deploy phase "
                    "(post_startup gate requires registry-bound generation)")
+    ctx_snapshot = read_ctx_snapshot(runtime_dir)
     results = (
         guard_release_head(release_dir, expected_sha),
         guard_clean_tree(release_dir, closure_files),
         guard_runtime_paths(runtime_dir),
         guard_single_process(pid_file, phase=phase),
         guard_flat_no_pending(position_state_path,
-                              read_ctx_snapshot(runtime_dir),
+                              ctx_snapshot,
                               allow_existing_mts_position=allow_existing_mts_position),
         guard_quarantine_first_startup(monitor_path),
         session_result,
-        guard_margin(margin_available, margin_evidence=margin_evidence),
+        guard_margin(margin_available, margin_evidence=margin_evidence,
+                     ctx_data=ctx_snapshot),
         guard_config_profile(config_profile_path, config_profile_hash),
         guard_capture_consistency(position_state_path, margin_evidence),
         guard_rollback_manifest(release_dir, manifest_paths, expected_sha,
