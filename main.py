@@ -2183,6 +2183,9 @@ def run_system(dry_run=False, config_name="futures"):
 
     except Exception as exc:
         import traceback
+        # A crash is not a clean stop: the finally block below records this
+        # cause and the process exits via _shutdown_exit_code (1, not 0).
+        _shutdown_reason = "CRITICAL_CRASH"
         console.print(f"[bold red]Critical crash: {exc}[/bold red]")
         console.print(traceback.format_exc())
         # 2026-06-15 Hermes Agent: Enforce 15s cooldown on crash to respect Shioaji API limits
