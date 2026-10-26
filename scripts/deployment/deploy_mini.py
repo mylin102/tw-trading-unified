@@ -574,7 +574,17 @@ class MiniDeployment:
         state_path = self.runtime / "paper/data/state/mts_position_state.json"
         state, ledger = read_json(state_path), self.ledger_snapshot()
         self.check_position(state, ledger)
-        require(state.get("heartbeat_pid") == pid or state.get("writer_identity") == "mts_spread:" + str(pid),
+        # 2026-10-26: heartbeat_pid/writer_identity are only written by the
+        # strategy's telemetry path while a position is OPEN (tmf_spread.py
+        # _write_mts_telemetry() is gated on self._has_position). A genuinely
+        # flat state has no position to misattribute to the wrong writer, so
+        # there is nothing this check protects against when has_position is
+        # False -- requiring it anyway made a flat-state deploy (the SAFEST
+        # state to deploy in) permanently fail observe with no retry able to
+        # ever satisfy it.
+        require(state.get("has_position") is not True
+                or state.get("heartbeat_pid") == pid
+                or state.get("writer_identity") == "mts_spread:" + str(pid),
                 "STATE_WRITER_MISMATCH")
         from core.date_utils import is_taifex_futures_market_open
         market_open = is_taifex_futures_market_open()
