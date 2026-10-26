@@ -10594,10 +10594,22 @@ class FuturesMonitor:
             _ce_group_id = f"CE-{_trade_id}-{uuid.uuid4().hex[:8]}"
             console.print(f"[yellow]📝 [MTS_ORDER] Submitting COMBINED_EXIT group={_ce_group_id}: NEAR ({_near_order_side} x{_near_qty}) & FAR ({_far_order_side} x{_far_qty})[/yellow]")
 
+            # 2026-10-26: 08:45-09:05 opening window — Policy J COMBINED_EXIT
+            # uses a LIMIT order priced at Policy J's own close marks instead
+            # of chasing the open with MKP. If unfilled by 09:05 it is
+            # cancelled (see _mts_0905_cancel_unfilled_exits) and the position
+            # reverts to normal per-tick strategy evaluation — no resubmit.
+            _mts_0905_window = (8, 45) <= (_ts.hour, _ts.minute) < (9, 5)
+            _ce_order_type = OrderType.LIMIT if _mts_0905_window else OrderType.MKP
+
             if self._exit_contract_mismatch(strategy, _near_code, _far_code):
                 return
-            _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=OrderType.MKP, quantity=_near_qty, strategy="MTS_EXIT")
-            _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=OrderType.MKP, quantity=_far_qty, strategy="MTS_EXIT")
+            if _mts_0905_window:
+                _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=_ce_order_type, quantity=_near_qty, strategy="MTS_EXIT", price=_near_close)
+                _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=_ce_order_type, quantity=_far_qty, strategy="MTS_EXIT", price=_far_close)
+            else:
+                _near_order = self.order_mgr.create_order(symbol=_near_code, side=_near_order_side, order_type=_ce_order_type, quantity=_near_qty, strategy="MTS_EXIT")
+                _far_order = self.order_mgr.create_order(symbol=_far_code, side=_far_order_side, order_type=_ce_order_type, quantity=_far_qty, strategy="MTS_EXIT")
             self._collapse2_bind_exit_order(_near_order)
             self._collapse2_bind_exit_order(_far_order)
             _near_order.quarantine_exit_proof = _q_proof  # snapshot-bound exit proof (None outside quarantine)
@@ -10717,14 +10729,20 @@ class FuturesMonitor:
             if self.paper_fill_sim:
                 self.paper_fill_sim.register(_near_order)
                 self.paper_fill_sim.register(_far_order)
-                # Paper exits are local accounting events.  They must not be
-                # stranded by the market-hours gate used to protect live
-                # orders; consume both legs immediately using the latest
-                # validated synthetic prices and the normal fill callback.
-                self.paper_fill_sim.process_tick(
-                    self._make_synthetic_tick(_near_close, _ts, symbol=_near_order.symbol))
-                self.paper_fill_sim.process_tick(
-                    self._make_synthetic_tick(_far_close, _ts, symbol=_far_order.symbol))
+                if not _mts_0905_window:
+                    # Paper exits are local accounting events.  They must not
+                    # be stranded by the market-hours gate used to protect
+                    # live orders; consume both legs immediately using the
+                    # latest validated synthetic prices and the normal fill
+                    # callback.
+                    self.paper_fill_sim.process_tick(
+                        self._make_synthetic_tick(_near_close, _ts, symbol=_near_order.symbol))
+                    self.paper_fill_sim.process_tick(
+                        self._make_synthetic_tick(_far_close, _ts, symbol=_far_order.symbol))
+                # else: 08:45-09:05 LIMIT order stays genuinely pending — the
+                # normal _process_pending_paper_fills tick loop evaluates it
+                # against real near/far prices; _mts_0905_cancel_unfilled_exits
+                # cancels it at 09:05 if still unfilled.
 
             # Persist orders to Dashboard-readable file
             self._save_orders_file_wrapper()
@@ -10741,6 +10759,21 @@ class FuturesMonitor:
                 "completed": False,
                 "created_at": _ts,
             }
+
+            # 2026-10-26: track this group for the 09:05 cancel-if-unfilled
+            # sweep. _claim_key is released there (cancel path only — a
+            # normal fill leaves the existing permanent claim in place,
+            # unchanged pre-existing behavior) so a cancelled attempt can be
+            # re-evaluated by the strategy on a later tick.
+            if _mts_0905_window:
+                if not hasattr(self, "_mts_0905_pending_exits"):
+                    self._mts_0905_pending_exits = {}
+                self._mts_0905_pending_exits[_ce_group_id] = {
+                    "trade_id": _trade_id,
+                    "claim_key": _claim_key,
+                    "near_order_id": _near_order.order_id,
+                    "far_order_id": _far_order.order_id,
+                }
 
             console.print(f"[green]📝 [MTS_ORDER] COMBINED_EXIT submitted: NEAR={_near_order.order_id} FAR={_far_order.order_id} group={_ce_group_id}[/green]")
             return
@@ -14403,6 +14436,12 @@ class FuturesMonitor:
         # stalled evaluator is caught even when the gates skip on_bar.
         self._mts_check_evaluator_lag(strategy, _strat_has_pos)
 
+        # 2026-10-26: 08:45-09:05 LIMIT COMBINED_EXIT cancel sweep — runs
+        # every tick, independent of the signal/gate chain below, so an
+        # unfilled limb is cancelled at 09:05 even if this bar's signal
+        # evaluation is otherwise skipped.
+        self._mts_0905_cancel_unfilled_exits()
+
         if _exit_ok:
             self._record_mts_entry_research_candidate(strategy, _bar_dict, datetime.now())
 
@@ -14691,6 +14730,65 @@ class FuturesMonitor:
         # Emergency flatten: close both legs if still held
         self._emergency_flatten_mts(strategy)
         return True
+
+    def _mts_0905_cancel_unfilled_exits(self, now=None) -> None:
+        """Cancel 08:45-09:05 window Policy J COMBINED_EXIT limbs still
+        unfilled at/after 09:05.
+
+        Runs every tick (cheap no-op when nothing is tracked). Each leg is
+        cancelled individually through the canonical OrderManager.cancel()
+        path (handles PAPER-sim removal and the existing live broker-cancel
+        hook unchanged). After both legs are resolved the idempotency claim
+        for this trade_id is released so the strategy's normal per-tick
+        evaluation can submit a fresh COMBINED_EXIT later if it still wants
+        to exit — no resubmission happens here.
+        """
+        _pending = getattr(self, "_mts_0905_pending_exits", None)
+        if not _pending:
+            return
+        _now = now or datetime.now()
+        if (_now.hour, _now.minute) < (9, 5):
+            return
+
+        from core.order_management.order import OrderStatus
+
+        for _group_id in list(_pending.keys()):
+            _entry = _pending.get(_group_id)
+            if _entry is None:
+                continue
+            _trade_id = _entry["trade_id"]
+            _claim_key = _entry["claim_key"]
+            for _leg, _order_id in (
+                ("NEAR", _entry["near_order_id"]),
+                ("FAR", _entry["far_order_id"]),
+            ):
+                _order = self.order_mgr.active_orders.get(_order_id)
+                if _order is None:
+                    continue  # already terminal (filled/cancelled elsewhere)
+                if _order.status in (OrderStatus.FILLED, OrderStatus.CANCELLED,
+                                      OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                    continue
+                try:
+                    self.order_mgr.cancel(
+                        _order_id, reason="MTS_0905_WINDOW_EXPIRED",
+                        source="MTS_0905_CANCEL")
+                    console.print(
+                        f"[yellow]⏱️ [MTS_0905_CANCEL] trade_id={_trade_id} "
+                        f"leg={_leg} order_id={_order_id} unfilled at 09:05 — cancelled[/yellow]")
+                    self._append_mts_event(
+                        "COMBINED_EXIT_0905_CANCELLED",
+                        trade_id=_trade_id, leg_role=_leg, order_id=_order_id,
+                        combined_exit_group_id=_group_id,
+                    )
+                    self._pending_lifecycle_orders.pop(_order_id, None)
+                except (ValueError, KeyError) as _exc:
+                    # Already terminal/unknown by the time we got here — not
+                    # a reason to leave the claim key stuck.
+                    console.print(
+                        f"[dim][MTS_0905_CANCEL] {_order_id} not cancellable: {_exc}[/dim]")
+
+            self._claimed_execution_keys.discard(_claim_key)
+            _pending.pop(_group_id, None)
 
     def _mts_risk_gate_single_leg_preclose(self, strategy, bar_dict) -> bool:
         """SINGLE_LEG pre-close force flat: exit remaining leg within 5 min of session close.
