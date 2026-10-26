@@ -529,3 +529,93 @@ def test_resume_started_engine_after_start_failure_only_verifies_saves_and_unloc
     value = json.loads(complete.read_text())
     assert value["resumed_from"] == original_id
     assert value["continued_from"] == start_id
+
+
+def test_actual_release_succeeds_when_flat_state_omits_writer_identity(mini, monkeypatch):
+    """2026-10-26: a genuinely flat mts_position_state.json never carries
+    heartbeat_pid/writer_identity in production (tmf_spread.py only writes
+    them via _write_mts_telemetry() while a position is OPEN). The earlier
+    unconditional require() made a flat-state deploy -- the safest state to
+    deploy in -- fail observe with STATE_WRITER_MISMATCH and no way to ever
+    retry past it. This test strips the fixture's synthetic writer fields
+    (present only because the test harness fabricates them) to reproduce
+    the real shape and asserts the release still completes."""
+    import hashlib
+    import json
+
+    state_path = mini.runtime / "paper/data/state/mts_position_state.json"
+    original_command = mini.deploy.MiniDeployment.command
+
+    def command(self, argv, *, root=None, env=None, body=None):
+        result = original_command(self, argv, root=root, env=env, body=body)
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if state.get("has_position") is False:
+                state.pop("heartbeat_pid", None)
+                state.pop("writer_identity", None)
+                state_path.write_text(json.dumps(state))
+        return result
+
+    monkeypatch.setattr(mini.deploy.MiniDeployment, "command", command)
+
+    candidates = {}
+    for name, root in mini.roots.items():
+        (root / "version.txt").write_text("new release")
+        mini.git(root, "add", "version.txt")
+        mini.git(root, "commit", "-qm", "candidate")
+        tree = mini.git(root, "ls-tree", "-r", "HEAD")
+        (root / "PHASE1_FINAL_FREEZE.md").write_text(
+            "frozen_tree_hash: " + hashlib.sha256(tree.encode()).hexdigest() + "\n")
+        mini.git(root, "add", "PHASE1_FINAL_FREEZE.md")
+        mini.git(root, "commit", "-qm", "freeze")
+        candidates[name] = mini.git(root, "rev-parse", "HEAD")
+        mini.git(root, "switch", "--detach", mini.heads[name])
+
+    assert state_path.exists()
+    pre_state = json.loads(state_path.read_text())
+    assert pre_state.get("has_position") is False
+
+    assert mini.deploy.main(["--site", str(mini.site), "--apply", "release", "--maintenance-approved",
+                             "--mts-sha", candidates["trading-system"],
+                             "--dashboard-sha", candidates["dashboard"]]) == 0
+    assert list((mini.runtime / "logs/deployments").glob("*/complete.json"))
+
+
+def test_actual_release_still_refuses_writer_mismatch_when_position_open(mini, monkeypatch):
+    """The relaxation must stay scoped to has_position=False: a genuine
+    writer-identity mismatch while a position IS open must still refuse."""
+    import hashlib
+
+    state_path = mini.runtime / "paper/data/state/mts_position_state.json"
+    original_command = mini.deploy.MiniDeployment.command
+
+    def command(self, argv, *, root=None, env=None, body=None):
+        result = original_command(self, argv, root=root, env=env, body=body)
+        if state_path.exists():
+            import json as _json
+            state = _json.loads(state_path.read_text())
+            state["has_position"] = True
+            state["heartbeat_pid"] = 999999
+            state["writer_identity"] = "mts_spread:999999"
+            state_path.write_text(_json.dumps(state))
+        return result
+
+    monkeypatch.setattr(mini.deploy.MiniDeployment, "command", command)
+
+    candidates = {}
+    for name, root in mini.roots.items():
+        (root / "version.txt").write_text("new release")
+        mini.git(root, "add", "version.txt")
+        mini.git(root, "commit", "-qm", "candidate")
+        tree = mini.git(root, "ls-tree", "-r", "HEAD")
+        (root / "PHASE1_FINAL_FREEZE.md").write_text(
+            "frozen_tree_hash: " + hashlib.sha256(tree.encode()).hexdigest() + "\n")
+        mini.git(root, "add", "PHASE1_FINAL_FREEZE.md")
+        mini.git(root, "commit", "-qm", "freeze")
+        candidates[name] = mini.git(root, "rev-parse", "HEAD")
+        mini.git(root, "switch", "--detach", mini.heads[name])
+
+    assert mini.deploy.main(["--site", str(mini.site), "--apply", "release", "--maintenance-approved",
+                             "--mts-sha", candidates["trading-system"],
+                             "--dashboard-sha", candidates["dashboard"]]) == 1
+    assert not list((mini.runtime / "logs/deployments").glob("*/complete.json"))
