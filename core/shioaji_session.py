@@ -245,6 +245,11 @@ _STATUS_FILE = _PROJECT_ROOT / "logs" / "system_status.tmp"
 
 def _system_status_path() -> Path:
     """Helper for tests to mock the status file path."""
+    # 2026-10-28 Hermes Agent: Resolve the IPC status path from the shared
+    # runtime directory on every call, retaining the project-local fallback.
+    runtime_dir = os.getenv("TRADING_RUNTIME_DIR")
+    if runtime_dir:
+        return Path(runtime_dir) / "logs" / "system_status.tmp"
     return _STATUS_FILE
 
 
@@ -545,8 +550,9 @@ def set_system_status(status: SystemReadiness):
     
     # Persist to file for cross-process communication (Dashboard)
     try:
-        _STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(_STATUS_FILE, "w") as f:
+        status_file = _system_status_path()
+        status_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(status_file, "w") as f:
             f.write(status.name)
     except Exception as e:
         logger.error(f"❌ Failed to write system status file: {e}")
@@ -557,12 +563,13 @@ def get_system_status() -> SystemReadiness:
 
 def get_shared_system_status() -> SystemReadiness:
     """Get status from shared file (for cross-process Dashboard)."""
-    if not _STATUS_FILE.exists():
-        logger.debug(f"[session] Status file not found at {_STATUS_FILE}")
+    status_file = _system_status_path()
+    if not status_file.exists():
+        logger.debug(f"[session] Status file not found at {status_file}")
         return _system_status
     
     try:
-        with open(_STATUS_FILE, "r") as f:
+        with open(status_file, "r") as f:
             val = f.read().strip()
             status = SystemReadiness[val]
             logger.debug(f"[session] Read shared status: {status.name}")
