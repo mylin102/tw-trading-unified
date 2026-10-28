@@ -2714,6 +2714,24 @@ class TMFSpread(StrategyBase):
 
             _near_age_raw = bar.get("near_bidask_age_ms")
             _far_age_raw = bar.get("far_bidask_age_ms")
+            _age_source = "bidask_age_ms"
+            # 2026-10-28 Hermes Agent: the MTS tick/bar path publishes quote
+            # age as *_tick_age_ms (monitor.py:3001/3205); *_bidask_age_ms is
+            # only produced by the entry-BBO payload. Reading one name only
+            # made every RELEASE_COUNTERFACTUAL MISSING (11/11 in the PAPER
+            # ledger) even when bid/ask were present. Fall back to the tick
+            # age name and record which one was used. Bid/ask presence is
+            # still REQUIRED -- this never substitutes a last-trade mark.
+            if _near_age_raw is None or _far_age_raw is None:
+                _alt_near = bar.get("near_tick_age_ms")
+                _alt_far = bar.get("far_tick_age_ms")
+                if _alt_near is not None or _alt_far is not None:
+                    if _near_age_raw is None:
+                        _near_age_raw = _alt_near
+                    if _far_age_raw is None:
+                        _far_age_raw = _alt_far
+                    _age_source = "tick_age_ms"
+            _near_age = _far_age = None
             _quotes = None
             _status = "OK"
             try:
@@ -2781,8 +2799,9 @@ class TMFSpread(StrategyBase):
                 qty=qty,
                 near_exit_px=_near_exit,
                 far_exit_px=_far_exit,
-                near_bbo_age_ms=bar.get("near_bidask_age_ms"),
-                far_bbo_age_ms=bar.get("far_bidask_age_ms"),
+                near_bbo_age_ms=_near_age,
+                far_bbo_age_ms=_far_age,
+                bbo_age_source=_age_source,
                 cf_gross_twd=_gross,
                 cf_fee_twd=_fee,
                 cf_tax_twd=_tax,
