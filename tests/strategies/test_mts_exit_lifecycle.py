@@ -981,3 +981,72 @@ def test_release_near_other_leg_string_blocks(strategy):
         signal = strategy.on_bar(ctx)
     assert signal is None, "a malformed other-leg quote must block, not crash"
 
+
+
+# ── 2026-10-28: the MTS tick/bar path publishes *_tick_age_ms, not
+# *_bidask_age_ms. Reading only the latter made every production
+# RELEASE_COUNTERFACTUAL MISSING (11/11 in the PAPER ledger) even when the
+# bid/ask were present, so the shadow arm produced no numbers at all.
+
+def test_release_counterfactual_falls_back_to_tick_age_keys(strategy):
+    strategy._trade_id = "cf-tick-age"
+    strategy._near_entry = 100.0
+    strategy._far_entry = 200.0
+    strategy._near_side = "LONG"
+    strategy._far_side = "SHORT"
+    bar = {
+        "near_bid": 110.0, "near_ask": 112.0,
+        "far_bid": 188.0, "far_ask": 190.0,
+        # production shape: tick ages only, no *_bidask_age_ms
+        "near_tick_age_ms": 120.0, "far_tick_age_ms": 480.0,
+    }
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event:
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision", release_path="BASELINE",
+            release_leg="NEAR", qty=1)
+    append_event.assert_called_once()
+    fields = append_event.call_args.kwargs
+    assert fields["bbo_status"] == "OK"
+    assert fields["cf_net_twd"] == pytest.approx(119.88)
+    assert fields["bbo_age_source"] == "tick_age_ms"
+    assert fields["near_bbo_age_ms"] == 120.0
+    assert fields["far_bbo_age_ms"] == 480.0
+
+
+def test_release_counterfactual_stays_missing_without_any_age_key(strategy):
+    strategy._trade_id = "cf-no-age"
+    strategy._near_entry = 100.0
+    strategy._far_entry = 200.0
+    strategy._near_side = "LONG"
+    strategy._far_side = "SHORT"
+    bar = {"near_bid": 110.0, "near_ask": 112.0,
+           "far_bid": 188.0, "far_ask": 190.0}
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event:
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision", release_path="BASELINE",
+            release_leg="NEAR", qty=1)
+    fields = append_event.call_args.kwargs
+    assert fields["bbo_status"] == "MISSING"
+    assert fields["cf_net_twd"] is None
+    assert fields["near_exit_px"] is None
+    assert fields["far_exit_px"] is None
+
+
+def test_release_counterfactual_marks_stale_tick_age_as_stale(strategy):
+    strategy._trade_id = "cf-stale"
+    strategy._near_entry = 100.0
+    strategy._far_entry = 200.0
+    strategy._near_side = "LONG"
+    strategy._far_side = "SHORT"
+    bar = {
+        "near_bid": 110.0, "near_ask": 112.0,
+        "far_bid": 188.0, "far_ask": 190.0,
+        "near_tick_age_ms": 900.0, "far_tick_age_ms": 100.0,   # near > 500ms
+    }
+    with patch("strategies.plugins.futures.active.tmf_spread._append_event") as append_event:
+        strategy._record_release_counterfactual(
+            bar, decision_ts="decision", release_path="BASELINE",
+            release_leg="NEAR", qty=1)
+    fields = append_event.call_args.kwargs
+    assert fields["bbo_status"] == "STALE"
+    assert fields["cf_net_twd"] is None
