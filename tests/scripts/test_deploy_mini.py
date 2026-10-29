@@ -619,3 +619,57 @@ def test_actual_release_still_refuses_writer_mismatch_when_position_open(mini, m
                              "--mts-sha", candidates["trading-system"],
                              "--dashboard-sha", candidates["dashboard"]]) == 1
     assert not list((mini.runtime / "logs/deployments").glob("*/complete.json"))
+
+
+def test_actual_release_survives_log_rotation_during_observe(mini, monkeypatch):
+    """2026-10-29: PM2 can rename-then-recreate pm_out_log_path mid-observe
+    (log rotation). The normal (non-resume) observe path previously only
+    ever read self.log by its saved pre-restart inode+offset -- once
+    rotation swaps in a fresh, different-inode file at that path, the
+    pre-rotation startup-ack content (written to the OLD inode, now living
+    under an archived filename) became invisible, and observe falsely
+    raised PAPER_STARTUP_ACK_MISSING even though the engine started
+    cleanly. Simulate the rotation right after the healthy startup body is
+    written (mirroring the real Mini incident) and assert release still
+    completes by locating the archive via its preserved inode."""
+    import hashlib
+
+    log_path = mini.runtime / "out.log"
+    original_command = mini.deploy.MiniDeployment.command
+    rotated = []
+
+    def command(self, argv, *, root=None, env=None, body=None):
+        result = original_command(self, argv, root=root, env=env, body=body)
+        # The fixture shares ONE log path across every app's restart/start
+        # call (unlike real PM2, which gives each app its own log). Rotate
+        # only after the LAST app-touching call in the release flow (the
+        # dashboard restart), so no later fixture write refills log_path
+        # and masks the very blind-spot this test exists to catch.
+        if (argv[0] == "/pm2fake" and len(argv) > 2 and argv[1] == "restart"
+                and argv[2] == "dashboard" and not rotated):
+            archive = log_path.parent / (log_path.stem + "__rotated.log")
+            log_path.rename(archive)
+            log_path.write_text("")  # fresh file PM2 recreates at the original path
+            rotated.append(archive)
+        return result
+
+    monkeypatch.setattr(mini.deploy.MiniDeployment, "command", command)
+
+    candidates = {}
+    for name, root in mini.roots.items():
+        (root / "version.txt").write_text("new release")
+        mini.git(root, "add", "version.txt")
+        mini.git(root, "commit", "-qm", "candidate")
+        tree = mini.git(root, "ls-tree", "-r", "HEAD")
+        (root / "PHASE1_FINAL_FREEZE.md").write_text(
+            "frozen_tree_hash: " + hashlib.sha256(tree.encode()).hexdigest() + "\n")
+        mini.git(root, "add", "PHASE1_FINAL_FREEZE.md")
+        mini.git(root, "commit", "-qm", "freeze")
+        candidates[name] = mini.git(root, "rev-parse", "HEAD")
+        mini.git(root, "switch", "--detach", mini.heads[name])
+
+    assert mini.deploy.main(["--site", str(mini.site), "--apply", "release", "--maintenance-approved",
+                             "--mts-sha", candidates["trading-system"],
+                             "--dashboard-sha", candidates["dashboard"]]) == 0
+    assert list((mini.runtime / "logs/deployments").glob("*/complete.json"))
+    assert rotated, "fixture must have actually rotated the log for this test to be meaningful"
