@@ -637,10 +637,38 @@ class MiniDeployment:
                 body = "\n".join(path.read_text(errors="replace") for path in log_paths
                                    if path.is_file() and not path.is_symlink())
             else:
-                with self.log.open("rb") as handle:
-                    if self.log.stat().st_ino == self.log_inode:
+                if self.log.stat().st_ino == self.log_inode:
+                    with self.log.open("rb") as handle:
                         handle.seek(self.log_offset)
-                    body = handle.read().decode(errors="replace")
+                        body = handle.read().decode(errors="replace")
+                else:
+                    # 2026-10-29 Hermes Agent: PM2 rotated this process's log
+                    # during the observe window (rename-then-recreate). The
+                    # pre-rotation content -- including any startup ack
+                    # written before the rotation -- now lives in an
+                    # archived file sharing the OLD inode, not at self.log's
+                    # path anymore (which is now a fresh, different-inode
+                    # file). Locate the archive by INODE (preserved across a
+                    # rename, deterministic) rather than guessing a
+                    # timestamp window. Read from the saved offset in the
+                    # archive (pre-deploy content already consumed), then
+                    # append the full current file (post-rotation writes).
+                    archive_pattern = self.log.stem + "*.log"
+                    rotated = None
+                    for candidate in self.log.parent.glob(archive_pattern):
+                        if (candidate != self.log and candidate.is_file()
+                                and not candidate.is_symlink()
+                                and candidate.stat().st_ino == self.log_inode):
+                            rotated = candidate
+                            break
+                    parts = []
+                    if rotated is not None:
+                        with rotated.open("rb") as handle:
+                            handle.seek(self.log_offset)
+                            parts.append(handle.read().decode(errors="replace"))
+                    with self.log.open("rb") as handle:
+                        parts.append(handle.read().decode(errors="replace"))
+                    body = "\n".join(parts)
             if self.resume_verify_only:
                 if not self.resume_startup_verified:
                     lines = body.splitlines()
