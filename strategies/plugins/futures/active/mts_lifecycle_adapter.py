@@ -68,6 +68,7 @@ class LifecycleAction(Enum):
 class PolicyJTriggerPath(Enum):
     """Authoritative source of a Policy J-owned exit decision."""
     SPREAD_GIVEBACK = "POLICY_J_SPREAD_GIVEBACK"
+    FIXED_TARGET = "POLICY_J_FIXED_TARGET"
     RELEASE_INTERCEPT = "POLICY_J_RELEASE_INTERCEPT"
     SINGLE_LEG = "POLICY_J_SINGLE_LEG"
 
@@ -183,6 +184,12 @@ class LifecycleContext:
     enable_combined_upl_trail: bool = False
     combined_upl_activation_net_pnl_twd: float = 300.0
     combined_upl_giveback_twd: float = 100.0
+    # 2026-10-29 Hermes Agent: selectable combined-exit mechanism. "giveback"
+    # (default, unchanged) waits for a retrace from peak before exiting;
+    # "fixed_target" exits the instant total_net_pnl_twd first reaches
+    # activation, with no retrace wait. Unset/unknown values keep the
+    # existing giveback behaviour -- no caller is forced to opt in.
+    combined_upl_exit_mode: str = "giveback"
     peak_net_exit_pnl_twd: float = 0.0
     combined_exit_execution_enabled: bool = True
     policy_j_guard_just_completed: bool = False  # 2026-08-04: baseline tick, skip giveback eval
@@ -321,7 +328,27 @@ def _check_combined_upl_trail_candidate(
     # Calculate net exit PnL TWD (1pt = 10 TWD for TMF, minus friction 92 TWD)
     # In SINGLE_LEG phase, (near_pnl_pts + far_pnl_pts) equals realized PnL of released leg + floating UPL of remaining leg
     total_net_pnl_twd = (ctx.near_pnl_pts + ctx.far_pnl_pts) * 10.0 - 92.0
-    if ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd:
+    # 2026-10-29 Hermes Agent: fixed_target exits the instant the target is
+    # first reached -- no retrace wait, no peak dependency. Mathematically
+    # mutually exclusive with giveback at the SAME threshold (giveback's own
+    # precondition, peak>=activation, is already satisfied the moment this
+    # fires, so giveback can never get a later tick to evaluate). Keep this
+    # a config-selected EITHER/OR, never both for the same ctx.
+    if ctx.combined_upl_exit_mode == "fixed_target":
+        if total_net_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd:
+            logger.info(
+                "[POLICY_J_TRIGGERED] Net Exit PnL TWD phase=%s current=%.1f "
+                "target=%.1f -> EXIT (fixed_target, no giveback wait)",
+                _phase_val, total_net_pnl_twd, ctx.combined_upl_activation_net_pnl_twd,
+            )
+            if _phase_val == "SINGLE_LEG":
+                return [LifecycleDecision(action=LifecycleAction.TRAIL,
+                                          winner=PolicyJTriggerPath.FIXED_TARGET.value)]
+            return [LifecycleDecision(
+                action=LifecycleAction.COMBINED_EXIT,
+                winner=PolicyJTriggerPath.FIXED_TARGET.value,
+            )]
+    elif ctx.peak_net_exit_pnl_twd >= ctx.combined_upl_activation_net_pnl_twd:
         if total_net_pnl_twd <= (ctx.peak_net_exit_pnl_twd - ctx.combined_upl_giveback_twd):
             logger.info(
                 "[POLICY_J_TRIGGERED] Net Exit PnL TWD phase=%s peak=%.1f current=%.1f giveback=%.1f -> EXIT",

@@ -164,6 +164,11 @@ mts:
     pending_order_stall_secs: 120
     combined_upl_activation_net_pnl_twd: 200.0
     combined_upl_giveback_twd: 50.0
+    # 2026-10-29 Hermes Agent: PAPER-only experiment, see R-005 follow-up.
+    # Exit immediately on first touch of the activation target instead of
+    # waiting for a giveback retrace. futures_live.yaml is untouched and
+    # defaults to "giveback" (unchanged behaviour) if this key is absent.
+    combined_upl_exit_mode: fixed_target
     entry_peak_guard_ms: 15000
     atr_cap: 250.0
     confirm_ticks: 2

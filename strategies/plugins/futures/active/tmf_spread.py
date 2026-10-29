@@ -5423,6 +5423,7 @@ class TMFSpread(StrategyBase):
                     "enable_combined_upl_trail": self._params.get("enable_combined_upl_trail", False),
                     "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
                     "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
+                    "combined_upl_exit_mode": str(self._params.get("combined_upl_exit_mode", "giveback")),
                     "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
                     "trend_release_enabled": (_trend_enabled, _trend_snap)[0],
                     "trend_confirmed": (_trend_enabled, _trend_snap)[1],
