@@ -1,9 +1,11 @@
 # R-006：TMF 布林通道均值回歸 —— 負向結論（Gate 1 未通過）
 
 狀態：`CLOSED — NEGATIVE RESULT`（未建立 shadow、未改動任何程式）
+
+> **2026-10-30 修正（見 R-007 §7）**：下方 §1 把失敗理由寫成「每筆回歸幅度蓋不過 7.9 點成本」，這只對 2023–2025 成立（成本佔 5 分 K ATR 由 2023H1 的 94% 降到 2026H1 的 12%）。正確理由是**訊號扣成本前就沒有優勢**（P2 毛利以 ATR 計：-0.02／-0.04／+0.04），且 2026/7–10 低成本環境下仍全部虧損。結論不變。
 作者：Hermes（2026-10-29）
 資料：`data/historical/TXFR1_5m.parquet`（實為 **1 分 K**，885,032 根，2023-04-12 ~ 2026-06-30）
-回測程式：`~/.hermes/cache/scratch/bbmr/`（`bt_bbmr.py`、`bt_controls.py`、`bt_regime.py`、`bt_mtf.py`；非 repo 檔，未部署）
+回測程式：`scripts/research/r007_single_tmf/`（`bt_bbmr.py`、`bt_controls.py`、`bt_regime.py`、`bt_mtf.py`；純研究腳本，未部署；原放在 scratch，已隨 R-007 納入版控）
 
 本文件取代 `~/Downloads/mts_to_tmf_bb_mean_reversion_spec.md` 的 Gate 1 階段。
 

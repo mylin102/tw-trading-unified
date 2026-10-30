@@ -1,0 +1,89 @@
+OOS2 1m rows: 36509 sessions: 97 2026-07-01 00:00:00 2026-10-30 04:59:00
+/Users/mylin/.hermes/cache/scratch/bbmr/bt_atrnorm.py:85: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  x.loc[(x.bs != x.sess) | ~x.warm.fillna(False).astype(bool), "atr"] = np.nan
+done TX
+/Users/mylin/.hermes/cache/scratch/bbmr/bt_atrnorm.py:85: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  x.loc[(x.bs != x.sess) | ~x.warm.fillna(False).astype(bool), "atr"] = np.nan
+done TX_closeonly
+/Users/mylin/.hermes/cache/scratch/bbmr/bt_atrnorm.py:85: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  x.loc[(x.bs != x.sess) | ~x.warm.fillna(False).astype(bool), "atr"] = np.nan
+done OOS2_closeonly
+          data                  strat split    n      net  gross_atr  net_atr  se_atr  net_per_sess  t_sess
+            TX                  BB_P2  oos1 1205   -60522      0.002   -0.112   0.048           NaN     NaN
+            TX                  BB_P2 train 4847  -400548     -0.207   -0.729   0.026           NaN     NaN
+            TX                  BB_P2 valid 2787  -241989     -0.146   -0.475   0.033           NaN     NaN
+            TX     GRID K1 g0.25 none train  846 -1109220        NaN      NaN     NaN       -1311.1  -38.45
+            TX     GRID K1 g0.25 none valid  487  -697011        NaN      NaN     NaN       -1431.2  -24.99
+            TX     GRID K1 g0.25 none  oos1  231  -217412        NaN      NaN     NaN        -941.2   -1.71
+            TX GRID K1 g0.25 beyond2G train  846  -249718        NaN      NaN     NaN        -295.2  -89.82
+            TX GRID K1 g0.25 beyond2G valid  487  -151870        NaN      NaN     NaN        -311.8  -56.39
+            TX GRID K1 g0.25 beyond2G  oos1  231   -77119        NaN      NaN     NaN        -333.8   -4.82
+            TX      GRID K1 g0.5 none train  846  -674729        NaN      NaN     NaN        -797.6  -21.18
+            TX      GRID K1 g0.5 none valid  487  -419893        NaN      NaN     NaN        -862.2  -13.22
+            TX      GRID K1 g0.5 none  oos1  231   251774        NaN      NaN     NaN        1089.9    1.28
+            TX  GRID K1 g0.5 beyond2G train  846  -257512        NaN      NaN     NaN        -304.4  -52.58
+            TX  GRID K1 g0.5 beyond2G valid  487  -170912        NaN      NaN     NaN        -350.9  -29.21
+            TX  GRID K1 g0.5 beyond2G  oos1  231   266862        NaN      NaN     NaN        1155.2    2.10
+            TX      GRID K1 g1.0 none train  846  -374092        NaN      NaN     NaN        -442.2  -11.05
+            TX      GRID K1 g1.0 none valid  487  -235750        NaN      NaN     NaN        -484.1   -6.75
+            TX      GRID K1 g1.0 none  oos1  231   265377        NaN      NaN     NaN        1148.8    1.24
+            TX  GRID K1 g1.0 beyond2G train  846  -235135        NaN      NaN     NaN        -277.9  -19.93
+            TX  GRID K1 g1.0 beyond2G valid  487  -146853        NaN      NaN     NaN        -301.5  -10.75
+            TX  GRID K1 g1.0 beyond2G  oos1  231   376752        NaN      NaN     NaN        1631.0    1.88
+            TX     GRID K2 g0.25 none train  846 -2148536        NaN      NaN     NaN       -2539.6  -37.49
+            TX     GRID K2 g0.25 none valid  487 -1366675        NaN      NaN     NaN       -2806.3  -24.45
+            TX     GRID K2 g0.25 none  oos1  231  -418666        NaN      NaN     NaN       -1812.4   -1.73
+            TX GRID K2 g0.25 beyond2G train  846  -552465        NaN      NaN     NaN        -653.0  -85.53
+            TX GRID K2 g0.25 beyond2G valid  487  -345979        NaN      NaN     NaN        -710.4  -58.92
+            TX GRID K2 g0.25 beyond2G  oos1  231   -91616        NaN      NaN     NaN        -396.6   -1.41
+            TX      GRID K2 g0.5 none train  846 -1296994        NaN      NaN     NaN       -1533.1  -20.72
+            TX      GRID K2 g0.5 none valid  487  -815597        NaN      NaN     NaN       -1674.7  -13.04
+            TX      GRID K2 g0.5 none  oos1  231   448196        NaN      NaN     NaN        1940.2    1.30
+            TX  GRID K2 g0.5 beyond2G train  846  -576048        NaN      NaN     NaN        -680.9  -51.17
+            TX  GRID K2 g0.5 beyond2G valid  487  -365322        NaN      NaN     NaN        -750.1  -27.97
+            TX  GRID K2 g0.5 beyond2G  oos1  231   623916        NaN      NaN     NaN        2700.9    2.40
+            TX      GRID K2 g1.0 none train  846  -700467        NaN      NaN     NaN        -828.0  -10.96
+            TX      GRID K2 g1.0 none valid  487  -439606        NaN      NaN     NaN        -902.7   -6.64
+            TX      GRID K2 g1.0 none  oos1  231   296939        NaN      NaN     NaN        1285.5    1.06
+            TX  GRID K2 g1.0 beyond2G train  846  -469919        NaN      NaN     NaN        -555.5  -19.14
+            TX  GRID K2 g1.0 beyond2G valid  487  -294284        NaN      NaN     NaN        -604.3   -9.21
+            TX  GRID K2 g1.0 beyond2G  oos1  231   469609        NaN      NaN     NaN        2032.9    1.87
+  TX_closeonly                  BB_P2  oos1 1237    -7661      0.108   -0.046   0.059           NaN     NaN
+  TX_closeonly                  BB_P2 valid 1518  -105476     -0.088   -0.551   0.054           NaN     NaN
+  TX_closeonly     GRID K1 g0.25 none valid  256  -401371        NaN      NaN     NaN       -1567.9  -23.30
+  TX_closeonly     GRID K1 g0.25 none  oos1  231  -443409        NaN      NaN     NaN       -1919.5   -3.71
+  TX_closeonly GRID K1 g0.25 beyond2G valid  256   -70426        NaN      NaN     NaN        -275.1  -53.26
+  TX_closeonly GRID K1 g0.25 beyond2G  oos1  231   -88873        NaN      NaN     NaN        -384.7   -7.62
+  TX_closeonly      GRID K1 g0.5 none valid  256  -311697        NaN      NaN     NaN       -1217.6  -17.03
+  TX_closeonly      GRID K1 g0.5 none  oos1  231   -46758        NaN      NaN     NaN        -202.4   -0.25
+  TX_closeonly  GRID K1 g0.5 beyond2G valid  256   -88534        NaN      NaN     NaN        -345.8  -37.06
+  TX_closeonly  GRID K1 g0.5 beyond2G  oos1  231   152851        NaN      NaN     NaN         661.7    1.78
+  TX_closeonly      GRID K1 g1.0 none valid  256  -221248        NaN      NaN     NaN        -864.3  -10.93
+  TX_closeonly      GRID K1 g1.0 none  oos1  231    12433        NaN      NaN     NaN          53.8    0.06
+  TX_closeonly  GRID K1 g1.0 beyond2G valid  256   -99130        NaN      NaN     NaN        -387.2  -19.83
+  TX_closeonly  GRID K1 g1.0 beyond2G  oos1  231   278518        NaN      NaN     NaN        1205.7    1.43
+  TX_closeonly     GRID K2 g0.25 none valid  256  -788396        NaN      NaN     NaN       -3079.7  -22.89
+  TX_closeonly     GRID K2 g0.25 none  oos1  231  -874236        NaN      NaN     NaN       -3784.6   -3.82
+  TX_closeonly GRID K2 g0.25 beyond2G valid  256  -158074        NaN      NaN     NaN        -617.5  -49.83
+  TX_closeonly GRID K2 g0.25 beyond2G  oos1  231  -157536        NaN      NaN     NaN        -682.0   -4.24
+  TX_closeonly      GRID K2 g0.5 none valid  256  -606571        NaN      NaN     NaN       -2369.4  -16.56
+  TX_closeonly      GRID K2 g0.5 none  oos1  231  -116484        NaN      NaN     NaN        -504.3   -0.35
+  TX_closeonly  GRID K2 g0.5 beyond2G valid  256  -200474        NaN      NaN     NaN        -783.1  -35.80
+  TX_closeonly  GRID K2 g0.5 beyond2G  oos1  231   483881        NaN      NaN     NaN        2094.7    1.92
+  TX_closeonly      GRID K2 g1.0 none valid  256  -420575        NaN      NaN     NaN       -1642.9  -10.68
+  TX_closeonly      GRID K2 g1.0 none  oos1  231  -153620        NaN      NaN     NaN        -665.0   -0.52
+  TX_closeonly  GRID K2 g1.0 beyond2G valid  256  -211827        NaN      NaN     NaN        -827.4  -17.14
+  TX_closeonly  GRID K2 g1.0 beyond2G  oos1  231   333603        NaN      NaN     NaN        1444.2    1.26
+OOS2_closeonly                  BB_P2  oos2  501   -53143     -0.008   -0.148   0.110           NaN     NaN
+OOS2_closeonly     GRID K1 g0.25 none  oos2   94  -309892        NaN      NaN     NaN       -3296.7   -7.53
+OOS2_closeonly GRID K1 g0.25 beyond2G  oos2   94   -43154        NaN      NaN     NaN        -459.1   -9.35
+OOS2_closeonly      GRID K1 g0.5 none  oos2   94  -230247        NaN      NaN     NaN       -2449.4   -4.06
+OOS2_closeonly  GRID K1 g0.5 beyond2G  oos2   94   -44287        NaN      NaN     NaN        -471.1   -2.30
+OOS2_closeonly      GRID K1 g1.0 none  oos2   94  -158407        NaN      NaN     NaN       -1685.2   -2.34
+OOS2_closeonly  GRID K1 g1.0 beyond2G  oos2   94   -46803        NaN      NaN     NaN        -497.9   -1.56
+OOS2_closeonly     GRID K2 g0.25 none  oos2   94  -610313        NaN      NaN     NaN       -6492.7   -7.62
+OOS2_closeonly GRID K2 g0.25 beyond2G  oos2   94  -100097        NaN      NaN     NaN       -1064.9  -10.78
+OOS2_closeonly      GRID K2 g0.5 none  oos2   94  -443257        NaN      NaN     NaN       -4715.5   -4.16
+OOS2_closeonly  GRID K2 g0.5 beyond2G  oos2   94  -100977        NaN      NaN     NaN       -1074.2   -2.57
+OOS2_closeonly      GRID K2 g1.0 none  oos2   94  -319131        NaN      NaN     NaN       -3395.0   -2.99
+OOS2_closeonly  GRID K2 g1.0 beyond2G  oos2   94  -125254        NaN      NaN     NaN       -1332.5   -2.43

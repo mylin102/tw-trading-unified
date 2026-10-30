@@ -1,0 +1,12 @@
+ K   G  cycles  cycle_pnl forced_n  forced_pnl       net  cyc_win%
+ 1  10    2868     117875       92     -147739    -29864    100.0%
+ 1  20    2498     352468      266     -347337      5130    100.0%
+ 2  20    4599     648919      533     -649144      -225    100.0%
+ 2  15    5041     459235      369     -493394    -34159    100.0%
+ 3  20    6403     903463      747     -889828     13635    100.0%
+ 5  20    9289    1310678     1114    -1250475     60203    100.0%
+Traceback (most recent call last):
+  File "/Users/mylin/.hermes/cache/scratch/bbmr/bt_grid_decomp.py", line 51, in <module>
+    print("\nnote: cyc_win% = share of COMPLETED cycles that are +%.0f (always 100 by construction)" % (G*PV-RT))
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~
+ValueError: unsupported format character '=' (0x3d) at index 16

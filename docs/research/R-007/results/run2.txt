@@ -1,0 +1,27 @@
+dropped 1m rows with NaN O/H/L: 82
+dropped 1m rows with NaN O/H/L: 82
+               cfg bars  slip split    n  gross_pts_per_trade       net   pf
+                P2   5m   0.0 train 4791                -0.35       NaN  NaN
+                P2   5m   0.0 valid 2769                -0.85       NaN  NaN
+                P2   5m   0.0   oos 1208                 2.80       NaN  NaN
+                P2   5m   1.0 train 4845                -2.37       NaN  NaN
+                P2   5m   1.0 valid 2784                -2.82       NaN  NaN
+                P2   5m   1.0   oos 1210                 0.89       NaN  NaN
+         P3 adx<20   5m   0.0 train  810                 0.40       NaN  NaN
+         P3 adx<20   5m   0.0 valid  493                -2.74       NaN  NaN
+         P3 adx<20   5m   0.0   oos  193                21.13       NaN  NaN
+         P3 adx<20   5m   1.0 train  818                -1.59       NaN  NaN
+         P3 adx<20   5m   1.0 valid  495                -5.13       NaN  NaN
+         P3 adx<20   5m   1.0   oos  193                19.37       NaN  NaN
+       P2 REVERSED   5m   0.0 train 4791                 0.35       NaN  NaN
+       P2 REVERSED   5m   0.0 valid 2769                 0.85       NaN  NaN
+       P2 REVERSED   5m   0.0   oos 1208                -2.80       NaN  NaN
+P3 adx<20 REVERSED   5m   0.0 train  810                -0.40       NaN  NaN
+P3 adx<20 REVERSED   5m   0.0 valid  493                 2.74       NaN  NaN
+P3 adx<20 REVERSED   5m   0.0   oos  193               -21.13       NaN  NaN
+                P2  15m   1.0 train 1673                -4.35 -171316.0 0.58
+                P2  15m   1.0 valid  931                -2.09  -74309.0 0.74
+                P2  15m   1.0   oos  431                 2.63  -14054.0 0.95
+         P3 adx<20  15m   1.0 train  245                -7.02  -31640.0 0.44
+         P3 adx<20  15m   1.0 valid  136                 0.54   -7280.0 0.78
+         P3 adx<20  15m   1.0   oos   67                43.02   24880.0 1.80

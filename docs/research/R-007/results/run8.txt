@@ -1,0 +1,31 @@
+dropped 1m rows with NaN O/H/L: 82
+/Users/mylin/.hermes/cache/scratch/bbmr/bt_grid_bbstop.py:33: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  ok = (one.bsess == one.sess) & one.warm.fillna(False).astype(bool)
+configs: 24
+split                  train      valid        oos
+K G  stop   rearm                                 
+1 30 touch  False  -101749.0   -53863.0   228178.0
+2 30 touch  False  -109634.0   -64827.0   397543.0
+1 30 close5 False  -118595.0   -78474.0   432842.0
+  20 touch  False  -127850.0   -67184.0   109388.0
+2 30 close5 False  -129836.0  -105063.0   766176.0
+  20 touch  False  -161540.0   -88180.0   212548.0
+1 20 close5 False  -165027.0   -99365.0   240214.0
+  10 touch  False  -204153.0  -136159.0   -98935.0
+2 20 close5 False  -210227.0  -141093.0   473333.0
+1 10 close5 False  -274255.0  -200722.0   -96051.0
+2 10 touch  False  -319242.0  -226881.0  -185233.0
+1 30 close5 True   -362218.0  -237718.0   904081.0
+2 10 close5 False  -440503.0  -344968.0  -170728.0
+  30 close5 True   -457650.0  -349902.0  1715451.0
+1 20 close5 True   -579709.0  -392843.0   333719.0
+  30 touch  True   -650648.0  -502446.0   261092.0
+2 20 close5 True   -823530.0  -604238.0   759587.0
+  30 touch  True   -851156.0  -723446.0   532809.0
+1 20 touch  True  -1025981.0  -761473.0  -351828.0
+  10 close5 True  -1227885.0  -903368.0  -671370.0
+2 20 touch  True  -1471840.0 -1174990.0  -530631.0
+1 10 touch  True  -1969685.0 -1422639.0 -1469317.0
+2 10 close5 True  -2076095.0 -1594883.0 -1251867.0
+     touch  True  -3291034.0 -2506763.0 -2785162.0
+positive in BOTH train and valid: 0
