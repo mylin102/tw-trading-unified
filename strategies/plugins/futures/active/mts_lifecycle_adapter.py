@@ -727,6 +727,7 @@ class MtsLifecycleAdapter:
         enable_combined = bool(state.get("enable_combined_upl_trail", False))
         activation_twd = float(state.get("combined_upl_activation_net_pnl_twd", 300.0))
         giveback_twd = float(state.get("combined_upl_giveback_twd", 100.0))
+        exit_mode = str(state.get("combined_upl_exit_mode", "giveback"))
         peak_net_exit_pnl = float(state.get("peak_net_exit_pnl_twd", 0.0))
         guard_just_completed = bool(state.get("policy_j_guard_just_completed", False))
         # MTS 2.0 trend-release seam (2026-08-22): surfaced from strategy_state.
@@ -785,6 +786,7 @@ class MtsLifecycleAdapter:
             enable_combined_upl_trail=enable_combined,
             combined_upl_activation_net_pnl_twd=activation_twd,
             combined_upl_giveback_twd=giveback_twd,
+            combined_upl_exit_mode=exit_mode,
             peak_net_exit_pnl_twd=peak_net_exit_pnl,
             policy_j_guard_just_completed=guard_just_completed,
             trend_release_enabled=trend_enabled,
