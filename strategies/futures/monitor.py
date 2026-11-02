@@ -1385,12 +1385,8 @@ class FuturesMonitor:
 
     def _resolve_contracts(self):
         """[Safe Mode] Get front/far month contracts to prevent deadlock during login."""
-        # 💡 Gemini CLI: Import datetime and date at top of function to prevent UnboundLocalError in warm-up block
+        # 2026-11-02 Codex: keep date/time imports local for contract delivery parsing.
         from datetime import datetime, date
-        try:
-            self._warmup_from_local_storage()
-        except Exception as e:
-            console.print(f"[dim][FuturesMonitor] Warm-up failed: {e}[/dim]")
 
         # 獲取TMF/MTX合約
         # 💡 Gemini CLI: Added symbol mapping (MTX -> MXF) and type-safe delivery_date handling (datetime.date vs str)
