@@ -2664,6 +2664,20 @@ class TMFSpread(StrategyBase):
             "micro_conflict": True,
         }
 
+    @staticmethod
+    def _hvwap_verdict_bar_start_epoch(decision_ts) -> float | None:
+        """2026-10-30 Hermes Agent: epoch start of the NEWEST completed 5m bar a
+        verdict could have used. Buckets close at multiples of 300s, and only
+        bars with close <= decision_ts are complete, so the newest usable bar
+        starts at (floor(decision_ts/300) - 1) * 300. None -> unparseable."""
+        try:
+            _d = float(decision_ts)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(_d) or _d <= 0:
+            return None
+        return (math.floor(_d / 300.0) - 1) * 300.0
+
     def _hvwap_release_quote_age_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
         """Defensive parity with the baseline freshness gate (decoupled-leg
         semantics: only the RELEASED leg's quote age matters)."""
@@ -2863,6 +2877,27 @@ class TMFSpread(StrategyBase):
             _v = getattr(self, "_hvwap_last_verdict", None)
             if (_v is None or HvwapStatus is None
                     or _v.status != HvwapStatus.ALIGNED_PASS):
+                return None
+            # 2026-10-30 Hermes Agent: the verdict's newest completed 5m bar must
+            # START after this position was entered. Otherwise the "trend
+            # confirmed" information predates the entry and the release is decided
+            # on stale context (Mini PAPER: 53/53 split exits HVWAP-sourced,
+            # median hold 12s, net -7,581 TWD vs +12,247 for combined exits).
+            _entry_ts = getattr(self, "_entry_ts", None)
+            _verdict_bar_start = self._hvwap_verdict_bar_start_epoch(_v.decision_ts)
+            try:
+                _entry_epoch = _entry_ts.timestamp() if _entry_ts is not None else None
+            except (AttributeError, ValueError, OSError):
+                _entry_epoch = None
+            if (_entry_epoch is None or _verdict_bar_start is None
+                    or _verdict_bar_start < _entry_epoch):
+                _append_event("HVWAP_RELEASE_BLOCKED", source="HVWAP_CANDIDATE",
+                              reason="VERDICT_BAR_PREDATES_ENTRY",
+                              decision_ts=_v.decision_ts,
+                              verdict_bar_start=_verdict_bar_start,
+                              entry_ts=(_entry_ts.isoformat()
+                                        if _entry_ts is not None else None),
+                              trade_id=getattr(self, "_trade_id", None))
                 return None
             if not getattr(self, "_hvwap_armed", False):
                 return None
