@@ -161,3 +161,27 @@ def test_route_entry_signal_blocks_when_working_order_exists():
     assert decision.action == "BLOCKED"
     assert "working order" in decision.reason
     assert spring.init_calls == 1
+
+
+def test_resolve_contracts_does_not_emit_failure_for_removed_warmup(capsys, monkeypatch):
+    # 2026-11-02 Codex: exercise the real resolver and catch the swallowed dead-method AttributeError.
+    from core.broker import shioaji_compat
+
+    calls = []
+    monkeypatch.setattr(
+        shioaji_compat,
+        "get_contracts_list",
+        lambda api, security_type, symbol: calls.append((security_type, symbol)) or [],
+    )
+    monitor = FuturesMonitor.__new__(FuturesMonitor)
+    monitor.ticker = "TMF"
+    monitor.api = None
+    monitor.dry_run = True
+    monitor.contract = None
+    monitor.far_contract = None
+    monitor._fetch_today_kbars = lambda: None
+    monitor._append_mts_event = lambda *args, **kwargs: None
+
+    assert monitor._resolve_contracts() is True
+    assert calls == [("Futures", "TMF")]
+    assert "Warm-up failed" not in capsys.readouterr().out
