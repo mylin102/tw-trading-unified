@@ -3131,6 +3131,46 @@ class TMFSpread(StrategyBase):
             return (self._pnl_near(near_close), self._pnl_far(far_close), "MARK_FALLBACK")
         return (n, f, "EXIT_SIDE_BBO")
 
+    def _record_exit_px(self, bar: dict, n_mark: float, f_mark: float,
+                        n_exec, f_exec, basis: str, now_mono: float | None = None) -> None:
+        """2026-11-03 Hermes Agent: keep evidence for the executable-price
+        profit target. Stores the latest snapshot (read by
+        POLICY_J_LIVE_TRIGGERED via _exec_px_fields) and, in fixed_target mode,
+        emits POLICY_J_TARGET_EXEC_GAP when the mark clears the target but the
+        executable value does not -- at most once per trade per 60s.
+        Observability only: never changes a decision."""
+        try:
+            mark_net = (float(n_mark) + float(f_mark)) * 10.0 - 92.0
+            exec_net = ((float(n_exec) + float(f_exec)) * 10.0 - 92.0
+                        if n_exec is not None and f_exec is not None else None)
+        except (TypeError, ValueError):
+            return
+        snap = {
+            "mark_net_twd": round(mark_net, 2),
+            "exec_net_twd": round(exec_net, 2) if exec_net is not None else None,
+            "exit_px_basis": basis,
+            "near_bid": bar.get("near_bid"), "near_ask": bar.get("near_ask"),
+            "far_bid": bar.get("far_bid"), "far_ask": bar.get("far_ask"),
+        }
+        self._last_exit_px = snap
+        params = getattr(self, "_params", {}) or {}
+        if str(params.get("combined_upl_exit_mode", "giveback")) != "fixed_target":
+            return
+        target = float(params.get("combined_upl_activation_net_pnl_twd", 300.0))
+        if exec_net is None or not (mark_net >= target > exec_net):
+            return
+        now_mono = time.monotonic() if now_mono is None else now_mono
+        tid = getattr(self, "_trade_id", None)
+        last = getattr(self, "_pj_exec_gap_last", None)
+        if last is not None and last[0] == tid and now_mono - last[1] < 60.0:
+            return
+        self._pj_exec_gap_last = (tid, now_mono)
+        _append_event("POLICY_J_TARGET_EXEC_GAP", trade_id=tid, target_twd=target, **snap)
+
+    def _exec_px_fields(self) -> dict:
+        """Latest executable-price snapshot for event payloads ({} if none)."""
+        return dict(getattr(self, "_last_exit_px", None) or {})
+
     def _pnl_near(self, near_close: float) -> float:
         if self._near_side == "LONG":
             return near_close - self._near_entry
@@ -5372,6 +5412,11 @@ class TMFSpread(StrategyBase):
             # profit target (close LONG at bid / SHORT at ask).
             _n_pnl_exit, _f_pnl_exit, _exit_basis = self._exit_side_pnl(
                 bar, near_close, far_close)
+            if self._lifecycle_oca.phase == PositionPhase.SPREAD:
+                try:  # observability only: must never break the decision path
+                    self._record_exit_px(bar, _n_pnl, _f_pnl, _n_pnl_exit, _f_pnl_exit, _exit_basis)
+                except Exception:
+                    logger.debug("[EXIT_PX] telemetry failed (non-fatal)", exc_info=True)
             _trailing_side = None
             _peak = self._peak
             _nadir = self._nadir
@@ -6247,6 +6292,7 @@ class TMFSpread(StrategyBase):
                     current_net_exit_pnl_twd=round(_pj_current, 2),
                     peak_net_exit_pnl_twd=(round(float(_pj_peak), 2)
                                            if _pj_peak is not None else None),
+                    **self._exec_px_fields(),
                 )
                 _append_event(
                     "COMBINED_EXIT_SUBMITTED",
