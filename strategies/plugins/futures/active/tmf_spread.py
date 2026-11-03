@@ -3102,6 +3102,35 @@ class TMFSpread(StrategyBase):
                         return max(5.0, trail_dist * _tighten_ratio)
         return trail_dist
 
+    def _exit_side_pnl(self, bar: dict, near_close: float,
+                       far_close: float) -> tuple[float | None, float | None, str]:
+        """2026-11-03 Hermes Agent: leg PnL at the price a close would actually
+        get — a LONG is closed by selling at the bid, a SHORT by buying at the
+        ask. Returns (near_pts, far_pts, basis); basis is MARK_FALLBACK with
+        mark-based pts when either leg lacks a usable BBO, so callers can log
+        how often the target had to be judged on a mark.
+        """
+        def _one(leg: str, mark: float, entry, side) -> float | None:
+            try:
+                bid = float(bar.get(f"{leg}_bid"))
+                ask = float(bar.get(f"{leg}_ask"))
+            except (TypeError, ValueError):
+                return None
+            if not (bid > 0 and ask > 0 and ask >= bid):
+                return None
+            _side = str(side or "").upper()
+            if _side == "LONG":
+                return bid - float(entry)
+            if _side == "SHORT":
+                return float(entry) - ask
+            return None
+
+        n = _one("near", near_close, self._near_entry, self._near_side)
+        f = _one("far", far_close, self._far_entry, self._far_side)
+        if n is None or f is None:
+            return (self._pnl_near(near_close), self._pnl_far(far_close), "MARK_FALLBACK")
+        return (n, f, "EXIT_SIDE_BBO")
+
     def _pnl_near(self, near_close: float) -> float:
         if self._near_side == "LONG":
             return near_close - self._near_entry
@@ -5339,6 +5368,10 @@ class TMFSpread(StrategyBase):
             _release_stop, _trail_dist, _single_decision = self._evaluate_risk(near_close, far_close, current_pnl, bar)
             _n_pnl = self._pnl_near(near_close)
             _f_pnl = self._pnl_far(far_close)
+            # 2026-11-03 Hermes Agent: executable-side PnL for the combined
+            # profit target (close LONG at bid / SHORT at ask).
+            _n_pnl_exit, _f_pnl_exit, _exit_basis = self._exit_side_pnl(
+                bar, near_close, far_close)
             _trailing_side = None
             _peak = self._peak
             _nadir = self._nadir
@@ -5443,6 +5476,9 @@ class TMFSpread(StrategyBase):
                     ),
                     "near_pnl_pts": _n_pnl,
                     "far_pnl_pts": _f_pnl,
+                    "near_exit_pnl_pts": _n_pnl_exit,
+                    "far_exit_pnl_pts": _f_pnl_exit,
+                    "exit_px_basis": _exit_basis,
                     "floating_pnl_pts": current_pnl,
                     "entry_age_secs": _entry_age,
                     "release_stop_threshold": _release_stop,

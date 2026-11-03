@@ -190,6 +190,13 @@ class LifecycleContext:
     # activation, with no retrace wait. Unset/unknown values keep the
     # existing giveback behaviour -- no caller is forced to opt in.
     combined_upl_exit_mode: str = "giveback"
+    # 2026-11-03 Hermes Agent: executable-side leg PnL (close a LONG at bid,
+    # a SHORT at ask). Used ONLY by the combined profit target so the number
+    # judged at trigger time matches what the fills will actually realise.
+    # None -> caller supplied no BBO, fall back to the mark pnl_pts fields.
+    near_exit_pnl_pts: float | None = None
+    far_exit_pnl_pts: float | None = None
+    exit_px_basis: str = "MARK"
     peak_net_exit_pnl_twd: float = 0.0
     combined_exit_execution_enabled: bool = True
     policy_j_guard_just_completed: bool = False  # 2026-08-04: baseline tick, skip giveback eval
@@ -327,7 +334,12 @@ def _check_combined_upl_trail_candidate(
 
     # Calculate net exit PnL TWD (1pt = 10 TWD for TMF, minus friction 92 TWD)
     # In SINGLE_LEG phase, (near_pnl_pts + far_pnl_pts) equals realized PnL of released leg + floating UPL of remaining leg
-    total_net_pnl_twd = (ctx.near_pnl_pts + ctx.far_pnl_pts) * 10.0 - 92.0
+    # 2026-11-03 Hermes Agent: judge the target on executable prices when the
+    # caller supplies them; the mark-based sum overstated the realised result
+    # by ~12.5 pts on average (Mini PAPER 2026-11-02 night).
+    _near_exit = ctx.near_exit_pnl_pts if ctx.near_exit_pnl_pts is not None else ctx.near_pnl_pts
+    _far_exit = ctx.far_exit_pnl_pts if ctx.far_exit_pnl_pts is not None else ctx.far_pnl_pts
+    total_net_pnl_twd = (_near_exit + _far_exit) * 10.0 - 92.0
     # 2026-10-29 Hermes Agent: fixed_target exits the instant the target is
     # first reached -- no retrace wait, no peak dependency. Mathematically
     # mutually exclusive with giveback at the SAME threshold (giveback's own
@@ -787,6 +799,8 @@ class MtsLifecycleAdapter:
             combined_upl_activation_net_pnl_twd=activation_twd,
             combined_upl_giveback_twd=giveback_twd,
             combined_upl_exit_mode=exit_mode,
+            near_exit_pnl_pts=state.get("near_exit_pnl_pts"),
+            far_exit_pnl_pts=state.get("far_exit_pnl_pts"),
             peak_net_exit_pnl_twd=peak_net_exit_pnl,
             policy_j_guard_just_completed=guard_just_completed,
             trend_release_enabled=trend_enabled,
