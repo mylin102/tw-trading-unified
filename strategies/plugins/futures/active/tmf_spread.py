@@ -3102,6 +3102,19 @@ class TMFSpread(StrategyBase):
                         return max(5.0, trail_dist * _tighten_ratio)
         return trail_dist
 
+    @staticmethod
+    def _entry_price_sources_live(bar: dict) -> tuple[bool, str | None]:
+        """2026-11-03 Hermes Agent: a spread entry needs BOTH legs priced from
+        live ticks. A BAR_CLOSE leg (e.g. the warm-up bar right after a
+        restart) mixed with a live leg fabricates spread_z (mts-auto-151203-918:
+        z 15.86 vs true ~ -1.6). Missing fields stay permissive (backtest/legacy
+        bars), matching marks_live."""
+        n = str(bar.get("near_price_source") or "")
+        f = str(bar.get("far_price_source") or "")
+        if n == "BAR_CLOSE" or f == "BAR_CLOSE":
+            return False, f"STALE_LEG_PRICE_SOURCE:near={n or 'NA'},far={f or 'NA'}"
+        return True, None
+
     def _exit_side_pnl(self, bar: dict, near_close: float,
                        far_close: float) -> tuple[float | None, float | None, str]:
         """2026-11-03 Hermes Agent: leg PnL at the price a close would actually
@@ -5050,6 +5063,20 @@ class TMFSpread(StrategyBase):
 
         if abs(spread_z_f) < self._entry_z:
             self._set_eval(skip_reason="SPREAD_Z_NOT_EXTREME", spread_z=round(spread_z_f, 2))
+            return None
+
+        # 2026-11-03 Hermes Agent: refuse a z computed from a stale/live mix.
+        _src_ok, _src_reason = self._entry_price_sources_live(bar)
+        if not _src_ok:
+            _now_src = time.monotonic()
+            if _now_src - float(getattr(self, "_entry_src_block_log_mono", -1e9)) >= 60.0:
+                self._entry_src_block_log_mono = _now_src
+                _append_event("ENTRY_BLOCKED", reason=_src_reason,
+                              spread_z=round(spread_z_f, 2),
+                              near_price=near_close, far_price=far_close,
+                              near_price_source=bar.get("near_price_source"),
+                              far_price_source=bar.get("far_price_source"))
+            self._set_eval(skip_reason=_src_reason, spread_z=round(spread_z_f, 2))
             return None
 
         if context.position.size != 0:
