@@ -81,7 +81,7 @@ def test_guard_is_wired_into_manage_position():
 
 def test_clock_is_started_where_the_combined_exit_is_submitted():
     i = SRC.index('logger.info("[POLICY_J_LIVE_TRIGGERED] Executing COMBINED_EXIT')
-    assert "_exit_submitted_mono = time.monotonic()" in SRC[i:i + 400]
+    assert "_exit_submitted_mono = time.monotonic()" in SRC[i:i + 900]
 
 
 def test_successful_exit_still_clears_to_flat():

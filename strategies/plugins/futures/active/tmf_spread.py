@@ -5305,6 +5305,38 @@ class TMFSpread(StrategyBase):
             
         return release_stop, trail_dist, single_decision
 
+    def _maybe_rearm_stalled_exit(self, now_mono: float | None = None) -> bool:
+        """2026-11-04 Hermes Agent: a combined exit that never fills must not
+        freeze position management forever. _lifecycle=="EXITING" skips every
+        lifecycle evaluation and is only cleared by an exit FILL, so a lost
+        order leaves the position unmanaged (Mini PAPER: COMBINED_EXIT_SUBMITTED
+        at 15:12:12, zero fills, position unmanaged for 17h).
+
+        PAPER only: LIVE needs order-state-aware reconciliation, not a timer.
+        Returns True when the EXITING latch was released this tick."""
+        if getattr(self, "_lifecycle", None) != "EXITING":
+            return False
+        if getattr(self, "live_trading", False):
+            return False
+        started = getattr(self, "_exit_submitted_mono", None)
+        if started is None:
+            return False
+        timeout = float((getattr(self, "_params", {}) or {}).get("exit_fill_timeout_secs", 30.0))
+        now_mono = time.monotonic() if now_mono is None else now_mono
+        elapsed = now_mono - float(started)
+        if elapsed < timeout:
+            return False
+        self._lifecycle = "OPEN"
+        self._combined_exit_in_flight = False
+        self._exit_submitted_mono = None
+        _append_event("COMBINED_EXIT_STALLED_REARMED",
+                      trade_id=getattr(self, "_trade_id", None),
+                      elapsed_s=round(elapsed, 1), timeout_s=timeout)
+        logger.warning(
+            "[MTS_EXIT_WATCHDOG] COMBINED_EXIT not filled after %.1fs -> rearmed for re-evaluation trade_id=%s",
+            elapsed, getattr(self, "_trade_id", None))
+        return True
+
     def _manage_position(
         self, near_close: float, far_close: float, spread_z: Any, now: datetime,
         bar: dict,
@@ -5318,8 +5350,9 @@ class TMFSpread(StrategyBase):
         self._hvwap_baseline_clear_tick = False
         # 2026-05-27 Gemini CLI: Order in-flight guard (Contract 3)
         if self._lifecycle == "EXITING":
-            self._set_eval(skip_reason="EXIT_ALREADY_SUBMITTED")
-            return None
+            if not self._maybe_rearm_stalled_exit():
+                self._set_eval(skip_reason="EXIT_ALREADY_SUBMITTED")
+                return None
 
         # ── ADR-011 Phase 5: Count remaining-leg fresh ticks for warmup ──
         # Move tick counting logic here to prevent deadlock where early returns (e.g. TRAIL_WARMUP)
@@ -6299,6 +6332,8 @@ class TMFSpread(StrategyBase):
                 self._lifecycle = "EXITING"
                 self._log_exit_decision(exit_reason=_exit_reason, pnl=current_pnl, bar=bar)
                 self._combined_exit_in_flight = True
+                # 2026-11-04 Hermes Agent: start the stalled-exit watchdog clock.
+                self._exit_submitted_mono = time.monotonic()
                 # Persist the actual Policy J decision evidence.  Without this,
                 # replay cannot distinguish a confirmed giveback from a rejected
                 # transient quote spike.
@@ -6835,6 +6870,7 @@ class TMFSpread(StrategyBase):
         self._has_position = False
         self._lifecycle = "FLAT"
         self._combined_exit_in_flight = False
+        self._exit_submitted_mono = None
         self._peak_net_exit_pnl_twd = 0.0
         for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
                    "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
