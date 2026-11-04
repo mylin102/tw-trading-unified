@@ -8954,8 +8954,11 @@ class FuturesMonitor:
         self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts, symbol=order.symbol))
         return order.order_id
 
-    def _make_synthetic_tick(self, price, ts, symbol=None):
-        """Create a synthetic tick object from price/timestamp for PaperFillSimulator."""
+    def _make_synthetic_tick(self, price, ts, symbol=None, bid=None, ask=None, book=False):
+        """Create a synthetic tick object from price/timestamp for PaperFillSimulator.
+
+        2026-11-03 Hermes Agent: book=True attaches bid/ask (None when unknown
+        or stale) so combo entries fill at the executable side."""
         tick = type("Tick", (), {})()
         tick.code = symbol or self.ticker
         tick.datetime = ts if hasattr(ts, "strftime") else datetime.now()
@@ -8964,7 +8967,25 @@ class FuturesMonitor:
         tick.high = price
         tick.low = price
         tick.volume = 0
+        if book:
+            tick.bid = bid
+            tick.ask = ask
         return tick
+
+    def _fresh_leg_book(self, bbo, leg: str):
+        """(bid, ask) for a leg from the bar's bbo_* keys, or (None, None) when
+        missing, invalid, or older than mts.params.max_quote_age_ms."""
+        if not isinstance(bbo, dict):
+            return None, None
+        bid, ask, age = (bbo.get(f"bbo_{leg}_bid"), bbo.get(f"bbo_{leg}_ask"),
+                         bbo.get(f"bbo_{leg}_age_ms"))
+        limit = float((getattr(self, "cfg", {}) or {}).get("mts", {}).get(
+            "params", {}).get("max_quote_age_ms", 30000.0))
+        ok = all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                 and math.isfinite(v) for v in (bid, ask, age))
+        if not ok or not (0 < bid <= ask) or not (0 <= age <= limit):
+            return None, None
+        return float(bid), float(ask)
 
     # ── Paper Fill Polling (ADR-010 OCO) ──
 
@@ -9143,7 +9164,8 @@ class FuturesMonitor:
         if self.order_mgr:
             self.order_mgr.reindex_orders()
 
-    def _process_pending_paper_fills(self, near_price: float, far_price: float, ts) -> None:
+    def _process_pending_paper_fills(self, near_price: float, far_price: float, ts,
+                                     bbo: dict | None = None) -> None:
         """Poll paper fill simulator with live near/far prices during MTS tick.
         
         ADR-010 OCO release bracket orders are registered with paper_fill_sim
@@ -9184,7 +9206,20 @@ class FuturesMonitor:
         # below continues to serve independent OCO/combined-exit orders.
         if hasattr(self.paper_fill_sim, "process_combo_ticks"):
             try:
-                self.paper_fill_sim.process_combo_ticks(ticks[0], ticks[1])
+                # 2026-11-03 Hermes Agent: combo entries get the fresh book so
+                # they fill at bid/ask, not at the (possibly stale) close.
+                # Distinguish "no book source at all" (backtest/legacy callers ->
+                # keep close behaviour) from "book known but stale/invalid"
+                # (fail closed, stay pending).
+                _book_known = isinstance(bbo, dict) and any(
+                    k in bbo for k in ("bbo_near_bid", "bbo_far_bid"))
+                _nb, _na = self._fresh_leg_book(bbo, "near")
+                _fb, _fa = self._fresh_leg_book(bbo, "far")
+                self.paper_fill_sim.process_combo_ticks(
+                    self._make_synthetic_tick(near_price, ts, symbol=_near_symbol,
+                                              bid=_nb, ask=_na, book=_book_known),
+                    self._make_synthetic_tick(far_price, ts, symbol=_far_symbol,
+                                              bid=_fb, ask=_fa, book=_book_known))
             except Exception as exc:
                 import logging
                 logging.getLogger("FuturesMonitor").exception(
@@ -14507,6 +14542,7 @@ class FuturesMonitor:
         if _n_close > 0 and _f_close > 0:
             self._process_pending_paper_fills(
                 near_price=_n_close, far_price=_f_close, ts=datetime.now(),
+                bbo=_bar_dict,
             )
 
         if signal:

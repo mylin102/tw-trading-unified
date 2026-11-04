@@ -79,6 +79,25 @@ class PaperFillSimulator:
             "metadata": metadata if isinstance(metadata, dict) else {},
         }
 
+    @staticmethod
+    def _combo_leg_price(tick, *, buy: bool):
+        """Executable price for one combo leg: ask when buying, bid when selling.
+        Returns None (stay pending) when the tick carries book attributes that
+        are not a valid book; legacy ticks without book attributes use close."""
+        if not (hasattr(tick, "bid") or hasattr(tick, "ask")):
+            try:
+                return float(tick.close)
+            except (TypeError, ValueError, AttributeError):
+                return None
+        try:
+            bid = float(getattr(tick, "bid", None))
+            ask = float(getattr(tick, "ask", None))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
+            return None
+        return ask if buy else bid
+
     def process_combo_ticks(self, near_tick, far_tick) -> None:
         """Fill a combo only when both legs have valid current prices."""
         from core.order_management.order import OrderStatus
@@ -95,10 +114,16 @@ class PaperFillSimulator:
             far_symbol = getattr(far_tick, "symbol", getattr(far_tick, "code", None))
             if near_symbol != record["near_symbol"] or far_symbol != record["far_symbol"]:
                 continue
-            try:
-                near_price = float(near_tick.close)
-                far_price = float(far_tick.close)
-            except (TypeError, ValueError, AttributeError):
+            metadata = record["metadata"]
+            action = str(metadata.get("spread_side") or metadata.get("action") or "")
+            # 2026-11-03 Hermes Agent: a SOLD leg fills at bid, a BOUGHT leg at
+            # ask (same rule PAPER exits already use). A tick that carries book
+            # attributes but no valid book keeps the combo pending (fail closed);
+            # ticks with no book attributes at all keep the legacy close fill.
+            near_buys = action == "BUY_NEAR_SELL_FAR"
+            near_price = self._combo_leg_price(near_tick, buy=near_buys)
+            far_price = self._combo_leg_price(far_tick, buy=not near_buys)
+            if near_price is None or far_price is None:
                 continue
             if not (math.isfinite(near_price) and math.isfinite(far_price)
                     and near_price > 0 and far_price > 0):
@@ -110,10 +135,8 @@ class PaperFillSimulator:
                 self.consumed_order_ids.add(order_id)
                 continue
             fill_qty = 1 if remaining >= 2 else remaining
-            metadata = record["metadata"]
             metadata["near_fill_price"] = near_price
             metadata["far_fill_price"] = far_price
-            action = str(metadata.get("spread_side") or metadata.get("action") or "")
             net_price = (near_price - far_price
                          if action == "BUY_NEAR_SELL_FAR"
                          else far_price - near_price)

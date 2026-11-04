@@ -88,8 +88,13 @@ def test_legacy_ticks_without_book_attributes_keep_close_behaviour():
 
 
 def _monitor():
-    from tests.strategies.test_policy_j_combined_exit_execution import make_mock_monitor
-    mon = make_mock_monitor()
+    from unittest.mock import patch
+    from strategies.futures.monitor import FuturesMonitor
+    with patch.object(FuturesMonitor, "__init__", lambda self: None):
+        mon = FuturesMonitor()
+    mon.contract = SimpleNamespace(code="TMFK6")
+    mon.far_contract = SimpleNamespace(code="TMFL6")
+    mon.ticker = "TMF"
     mon.paper_fill_sim = MagicMock()
     mon.paper_fill_sim.get_pending_count.return_value = 1
     mon.cfg = {"mts": {"params": {"max_quote_age_ms": 30000}}}
@@ -114,6 +119,13 @@ def test_monitor_stale_bbo_becomes_none():
     near, far = mon.paper_fill_sim.process_combo_ticks.call_args.args
     assert (near.bid, near.ask) == (None, None)
     assert (far.bid, far.ask) == (43207.0, 43220.0)
+
+
+def test_monitor_without_any_book_keeps_close_behaviour():
+    mon = _monitor()
+    mon._process_pending_paper_fills(43230.0, 43220.0, ts=None)
+    near, far = mon.paper_fill_sim.process_combo_ticks.call_args.args
+    assert not hasattr(near, "bid") and not hasattr(far, "ask")
 
 
 def test_live_callsite_passes_the_bar_book():
