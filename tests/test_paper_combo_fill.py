@@ -146,9 +146,14 @@ def _submit_real_combo(monitor, action="BUY_NEAR_SELL_FAR", far_price=49770.0):
     return orders[0]
 
 
-@pytest.mark.parametrize("action,net", [
-    ("BUY_NEAR_SELL_FAR", -178.0), ("SELL_NEAR_BUY_FAR", 178.0)])
-def test_real_paper_submit_gateway_to_simulated_combo_fill(real_paper_monitor, monkeypatch, action, net):
+# 2026-11-04 Hermes Agent: PAPER combo entries fill at the executable book
+# (buy@ask, sell@bid), not the signal price.  Book here: near 49591/49595,
+# far 49759/49768 (the old far signal 49770 was above the far ask -- unfillable).
+@pytest.mark.parametrize("action,net,near_px,far_px", [
+    ("BUY_NEAR_SELL_FAR", -164.0, 49595.0, 49759.0),
+    ("SELL_NEAR_BUY_FAR", 177.0, 49591.0, 49768.0)])
+def test_real_paper_submit_gateway_to_simulated_combo_fill(real_paper_monitor, monkeypatch, action,
+                                                           net, near_px, far_px):
     monitor = real_paper_monitor
 
     def forbidden_broker_read(*args, **kwargs):
@@ -163,8 +168,8 @@ def test_real_paper_submit_gateway_to_simulated_combo_fill(real_paper_monitor, m
     assert order.fills[0].deal_id.startswith("PAPER-")
     assert order.truth_source == "paper_strategy"
     metadata = monitor._mts_pending_fills["REGRESSION-PAPER"]
-    assert metadata["near_fill_price"] == 49592.0
-    assert metadata["far_fill_price"] == 49770.0
+    assert metadata["near_fill_price"] == near_px
+    assert metadata["far_fill_price"] == far_px
     assert len(monitor.callbacks) == 1
     assert monitor.paper_fill_sim.get_pending_count() == 0
     names = [name for name, _ in monitor.events]
