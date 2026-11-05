@@ -4,6 +4,7 @@ Handles breaking changes in attribute naming and error imports.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 import re
@@ -87,6 +88,27 @@ except (ImportError, AttributeError):
     # 3. Fallback to built-in
     SjTimeoutError = TimeoutError
 
+_LOGIN_ACCEPTS_CONTRACTS_TIMEOUT: Optional[bool] = None
+
+
+def _login_accepts_contracts_timeout(api: Any) -> bool:
+    """2026-11-05 Hermes Agent: shioaji 1.7.x removed login(contracts_timeout=,
+    fetch_contract=, contracts_cb=). Passing the kwarg blind raises TypeError,
+    so every login would first FAIL and only then retry without it -- in LIVE
+    that is an extra failed authentication attempt per start/reconnect.
+    Decide from the installed signature instead (cached: one probe per process)."""
+    global _LOGIN_ACCEPTS_CONTRACTS_TIMEOUT
+    if _LOGIN_ACCEPTS_CONTRACTS_TIMEOUT is None:
+        try:
+            _params = inspect.signature(api.login).parameters
+            _accepts = ("contracts_timeout" in _params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in _params.values()))
+            _LOGIN_ACCEPTS_CONTRACTS_TIMEOUT = _accepts
+        except (TypeError, ValueError):     # pragma: no cover - C ext w/o signature
+            _LOGIN_ACCEPTS_CONTRACTS_TIMEOUT = True   # keep pre-1.7 behaviour
+    return _LOGIN_ACCEPTS_CONTRACTS_TIMEOUT
+
+
 def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
     """
     Safely logins using parameters compatible with the installed version.
@@ -107,13 +129,22 @@ def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
         # Futures order/deal callbacks are part of the live truth channel;
         # keep Shioaji's documented default explicit across reconnects.
         _login_kwargs.setdefault("subscribe_trade", True)
-        # [rshioaji 1.5.9+] login with contracts_timeout returns True if contracts loaded
-        res = api.login(
-            api_key=api_key,
-            secret_key=secret_key,
-            contracts_timeout=_login_kwargs.pop("contracts_timeout", 10000),
-            **_login_kwargs
-        )
+        _contracts_timeout = _login_kwargs.pop("contracts_timeout", 10000)
+        if _login_accepts_contracts_timeout(api):
+            # [rshioaji 1.5.9+] login with contracts_timeout returns True if contracts loaded
+            res = api.login(
+                api_key=api_key,
+                secret_key=secret_key,
+                contracts_timeout=_contracts_timeout,
+                **_login_kwargs
+            )
+        else:
+            # 1.7.x: the kwarg is gone; contracts are fetched separately.
+            res = api.login(
+                api_key=api_key,
+                secret_key=secret_key,
+                **_login_kwargs
+            )
         if res:                        # round-11 #2: a falsey login return
             # is treated as failure (fail-closed) even though Shioaji's
             # documented failure mode is exceptions (AuthError/TokenError…)

@@ -3,14 +3,14 @@ name = "tw-trading-unified"
 version = "0.1.0"
 description = "Taiwan futures + options trading system (Shioaji)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 # 2026-11-05 Hermes Agent: this list must match requirements.txt. It used to
 # declare only shioaji + ruamel.yaml while requirements.txt installed
 # pandas/numpy/pydantic/..., so an environment built from pyproject alone
 # could not import the MTS/dashboard modules at all.
 # tests/test_dependency_declaration_sync.py enforces the two agree.
 dependencies = [
-    "shioaji==1.5.5",
+    "shioaji==1.7.10",
     "pandas",
     "numpy",
     "scipy",

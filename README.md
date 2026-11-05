@@ -11,6 +11,41 @@ This repository central docs landing page. Canonical docs are in /docs.
 
 Branch scope: branch-scoped canonical docs include a "Scope: branch <name>" line when required (e.g., mac-m1).
 
+## Environment
+
+`venv/` is **not** in version control (it was, until 2026-11-05; 14k files).
+A fresh checkout has no interpreter — create one:
+
+```bash
+./scripts/mac-mini-setup.sh          # full setup on a new machine
+# or, minimally:
+/usr/local/bin/python3.12 -m venv venv
+uv pip install --python venv/bin/python -r requirements.txt
+```
+
+`requirements.txt` is the single install source; `pyproject.toml` mirrors it and
+`tests/test_dependency_declaration_sync.py` fails if the two drift. `uv.lock` is
+regenerated from `pyproject.toml` (`uv lock`) and pins the full set.
+
+> **shioaji 1.5.5 -> 1.7.10 (2026-11-05).** 1.5.5 is no longer published on
+> PyPI (or the tuna/aliyun mirrors), so the environment could not be rebuilt
+> from a clean machine. 1.7.x removed `login(contracts_timeout=,
+> fetch_contract=, contracts_cb=)` and the top-level `TickFOPv` /
+> `ContractAction` / `ContractUpdateEvent*` names; `core/broker/shioaji_compat.
+> safe_login` now checks the installed signature instead of relying on a
+> TypeError retry (that retry cost one failed authentication per login).
+> `tests/test_shioaji_login_kwargs_compat.py` pins it. Deployments must install
+> 1.7.10 into the interpreter PM2 pins (`release15/.venv`) before restarting —
+> the repo pin alone does not change a running process.
+
+**Always run tests with the project interpreter.** The system `python3` loads
+`~/Library/Python/3.12/site-packages`, where third-party wheels (py_vollib,
+kaleido, ultralytics) install a top-level `tests` package that shadows this
+repo's `tests/`, and where scipy fails to load — collection and results differ
+by interpreter (50 vs 0 errors). `./scripts/pytest-quick.sh` now selects
+`venv/bin/python` automatically; use `venv/bin/python -m pytest` for anything
+else, or set `PYTEST_PYTHON` to override.
+
 ## Testing
 
 ### Fast feedback loop (local development)

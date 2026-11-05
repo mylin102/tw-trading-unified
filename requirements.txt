@@ -1,5 +1,5 @@
 # Core Dependencies
-shioaji==1.5.5
+shioaji==1.7.10
 pandas
 numpy
 scipy
