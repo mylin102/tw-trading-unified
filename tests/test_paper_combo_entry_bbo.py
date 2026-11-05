@@ -133,3 +133,67 @@ def test_live_callsite_passes_the_bar_book():
     src = Path(mod.__file__).read_text()
     i = src.index("self._process_pending_paper_fills(\n                near_price=_n_close")
     assert "bbo=_bar_dict" in src[i:i + 250]
+
+
+# ── 2026-11-04 Hermes Agent: the IMMEDIATE fill at submit time ──────────────
+# Incident mts-auto-112954-494 (Mini PAPER 11:29:54, running 1f2a629d which
+# already fixed the per-tick pending path): SELL_NEAR_BUY_FAR filled near
+# @42538 (book 42535/42538) and far @42594 -- BELOW the far bid 42604 (book
+# 42604/42613). _submit_mts_combo_entry fills the PAPER combo on the spot with
+# synthetic ticks that carry no book, so the pending-path fix never ran.
+from datetime import datetime as _dt  # noqa: E402
+
+from test_paper_combo_fill import real_paper_monitor  # noqa: E402,F401  (tests/ is on sys.path)
+
+INCIDENT_BAR = {"spread": 56.0, "spread_z": 3.16,
+                "bbo_near_bid": 42535.0, "bbo_near_ask": 42538.0, "bbo_near_age_ms": 40.0,
+                "bbo_far_bid": 42604.0, "bbo_far_ask": 42613.0, "bbo_far_age_ms": 40.0}
+
+
+def _submit_entry(mon, tmp_path, monkeypatch, bar, action="SELL_NEAR_BUY_FAR"):
+    import json
+    import strategies.plugins.futures.active.tmf_spread as mod
+    from core.order_management.order import OrderSide
+    from core.strategy_context import MarketData, PositionView, StrategyContext
+    monkeypatch.setattr(mod, "_MTS_FILL_LOG", str(tmp_path / "fills.jsonl"))
+    monkeypatch.setattr(mod, "_MTS_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    monkeypatch.setattr(mod, "_get_state_file_path", lambda: tmp_path / "state.json")
+    monkeypatch.setattr(mod, "_PENDING_STATE_REWRITE", None)
+    monkeypatch.delenv("MTS_BACKTEST", raising=False)
+    strategy = mod.TMFSpread()
+    strategy.init(StrategyContext(market=MarketData(last_bar={}, ticker="TMF"),
+                                  position=PositionView(size=0), config={"ticker": "TMF"}))
+    mon.ticker = "TMF"
+    mon.cfg = {"ticker": "TMF"}
+    mon._registry = {"tmf_spread": strategy}
+    mon.order_mgr.register_callback("on_fill", lambda ev:
+        mon._check_mts_multi_leg_fill(ev.order_id, ev.fill_price))
+    sell_near = action == "SELL_NEAR_BUY_FAR"
+    mon._submit_mts_combo_entry(
+        trade_id="BBO-AUDIT", action=action, reason="entry bbo regression",
+        near_code="TMFK6", far_code="TMFL6",
+        near_side=OrderSide.SELL if sell_near else OrderSide.BUY,
+        far_side=OrderSide.BUY if sell_near else OrderSide.SELL,
+        near_price=42538.0, far_price=42594.0,          # the incident's signal prices
+        ts=_dt(2026, 11, 4, 11, 29, 54), snapshot={}, bar_dict=bar)
+    p = tmp_path / "fills.jsonl"
+    rows = [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+    return {r["leg"]: r["price"] for r in rows if r.get("fill_type") == "ENTRY"}
+
+
+def test_submit_time_fill_uses_executable_book_incident(real_paper_monitor, tmp_path, monkeypatch):
+    fills = _submit_entry(real_paper_monitor, tmp_path, monkeypatch, INCIDENT_BAR)
+    assert fills == {"NEAR": 42535.0, "FAR": 42613.0}    # sell@bid, buy@ask
+
+
+def test_submit_time_fill_buy_near_sell_far(real_paper_monitor, tmp_path, monkeypatch):
+    fills = _submit_entry(real_paper_monitor, tmp_path, monkeypatch, INCIDENT_BAR,
+                          action="BUY_NEAR_SELL_FAR")
+    assert fills == {"NEAR": 42538.0, "FAR": 42604.0}    # buy@ask, sell@bid
+
+
+def test_submit_time_stale_book_does_not_fill_at_signal_price(real_paper_monitor, tmp_path,
+                                                              monkeypatch):
+    bar = dict(INCIDENT_BAR, bbo_far_age_ms=999999.0)
+    fills = _submit_entry(real_paper_monitor, tmp_path, monkeypatch, bar)
+    assert fills == {}                                   # stays pending, fail closed
