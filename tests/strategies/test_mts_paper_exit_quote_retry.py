@@ -57,10 +57,16 @@ def test_hvwap_unsent_quote_rejection_retries_same_trade(held_paper, paper_exit)
     strategy, bar, _, _ = held_paper
     strategy._hvwap_armed = True
     strategy._hvwap_baseline_clear_tick = True
+    # 2026-11-05 Hermes Agent: 073ed47d requires a parseable verdict
+    # decision_ts whose 5m bar starts after entry (fail closed otherwise); the
+    # old "incident-fixture" string silently blocked the release here.
+    import time as _time
+    from datetime import timedelta as _td
+    strategy._entry_ts = datetime.now() - _td(hours=1)
     strategy._hvwap_last_verdict = SimpleNamespace(
         status=HvwapStatus.ALIGNED_PASS, regime_60m=Regime60m.RANGING,
         signal_15m=Signal15m.CONFIRMED_CONTINUATION,
-        hypothetical_release_leg="NEAR", decision_ts="incident-fixture",
+        hypothetical_release_leg="NEAR", decision_ts=_time.time(),
         session_label="2026-10-13", retained_direction="BULLISH",
         consecutive_confirmed_bars=2,
     )

@@ -21,11 +21,25 @@ class _Strategy:
     _has_position = True
     _released_leg = None
     _side = None
+    # 2026-11-05 Hermes Agent: 908354f3 makes exits use the HELD contracts and
+    # fail closed (POSITION_CONTRACT_UNAVAILABLE) when unknown; this stub
+    # predates it and was masked by the CSV-loader startup error.
+    _held_near_contract = _Contract("TMFH6")
+    _held_far_contract = _Contract("TMFI6")
 
 
 def _monitor(tmp_path):
     api = MagicMock()
-    mon = FuturesMonitor(api, "config/futures_night.yaml", dry_run=True)
+    # 2026-11-05 Hermes Agent: conftest isolates TRADING_RUNTIME_DIR to an empty
+    # tmp dir, so the real SpreadLoader finds no CSV and FuturesMonitor's
+    # tmf_spread fail-closed startup guard raises. These tests exercise leg
+    # locks, not data loading -> offline loader fixture (as in
+    # tests/core/test_mts_mode_data_isolation.py).
+    loader = MagicMock()
+    loader.load_latest_csv.return_value = True
+    loader.status.return_value = "offline fixture"
+    with patch("strategies.futures.monitor.get_spread_loader", return_value=loader):
+        mon = FuturesMonitor(api, "config/futures_night.yaml", dry_run=True)
     mon.ticker = "TMF"
     mon.contract = _Contract("TMFH6")
     mon.far_contract = _Contract("TMFI6")
@@ -37,6 +51,10 @@ def _monitor(tmp_path):
     mon.dry_run = False
     mon._leg_lock_store = str(tmp_path / "mts_leg_locks.json")
     mon._claimed_execution_keys = set()
+    # 2026-11-05 Hermes Agent: b4f4176a added a LIVE release premise guard that
+    # needs a fresh broker snapshot (MagicMock api -> fail closed, silent
+    # return).  Leg-lock wiring is the subject here, so the premise passes.
+    mon._release_pre_submit_guard = lambda **_kw: {"premise": "stubbed-pass"}
     return mon
 
 
