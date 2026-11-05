@@ -89,6 +89,14 @@ class PaperFillSimulator:
                 return float(tick.close)
             except (TypeError, ValueError, AttributeError):
                 return None
+        # 2026-11-04 Hermes Agent: an invalid leg price is a data fault even
+        # when a book is present -- keep the combo pending, never fill around it.
+        try:
+            close = float(getattr(tick, "close", None))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(close) and close > 0):
+            return None
         try:
             bid = float(getattr(tick, "bid", None))
             ask = float(getattr(tick, "ask", None))

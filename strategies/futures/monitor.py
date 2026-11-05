@@ -9164,6 +9164,17 @@ class FuturesMonitor:
         if self.order_mgr:
             self.order_mgr.reindex_orders()
 
+    def _combo_book_ticks(self, near_price, far_price, ts, near_symbol, far_symbol, bbo):
+        """Synthetic near/far ticks for a PAPER combo fill, carrying the fresh
+        bid/ask from the bar's bbo_* keys.  Used by BOTH combo fill call sites
+        (submit-time and per-tick pending).  No book source at all keeps the
+        legacy close behaviour; a known-but-stale book yields bid/ask None."""
+        book = isinstance(bbo, dict) and any(k in bbo for k in ("bbo_near_bid", "bbo_far_bid"))
+        nb, na = self._fresh_leg_book(bbo, "near")
+        fb, fa = self._fresh_leg_book(bbo, "far")
+        return (self._make_synthetic_tick(near_price, ts, symbol=near_symbol, bid=nb, ask=na, book=book),
+                self._make_synthetic_tick(far_price, ts, symbol=far_symbol, bid=fb, ask=fa, book=book))
+
     def _process_pending_paper_fills(self, near_price: float, far_price: float, ts,
                                      bbo: dict | None = None) -> None:
         """Poll paper fill simulator with live near/far prices during MTS tick.
@@ -9211,15 +9222,8 @@ class FuturesMonitor:
                 # Distinguish "no book source at all" (backtest/legacy callers ->
                 # keep close behaviour) from "book known but stale/invalid"
                 # (fail closed, stay pending).
-                _book_known = isinstance(bbo, dict) and any(
-                    k in bbo for k in ("bbo_near_bid", "bbo_far_bid"))
-                _nb, _na = self._fresh_leg_book(bbo, "near")
-                _fb, _fa = self._fresh_leg_book(bbo, "far")
-                self.paper_fill_sim.process_combo_ticks(
-                    self._make_synthetic_tick(near_price, ts, symbol=_near_symbol,
-                                              bid=_nb, ask=_na, book=_book_known),
-                    self._make_synthetic_tick(far_price, ts, symbol=_far_symbol,
-                                              bid=_fb, ask=_fa, book=_book_known))
+                self.paper_fill_sim.process_combo_ticks(*self._combo_book_ticks(
+                    near_price, far_price, ts, _near_symbol, _far_symbol, bbo))
             except Exception as exc:
                 import logging
                 logging.getLogger("FuturesMonitor").exception(
@@ -11475,9 +11479,10 @@ class FuturesMonitor:
                 self.paper_fill_sim.register_combo(
                     _order, near_symbol=near_code, far_symbol=far_code,
                     metadata=self._mts_pending_fills[trade_id])
-                self.paper_fill_sim.process_combo_ticks(
-                    self._make_synthetic_tick(near_price, ts, symbol=near_code),
-                    self._make_synthetic_tick(far_price, ts, symbol=far_code))
+                # 2026-11-04 Hermes Agent: the submit-time fill must see the
+                # book too (mts-auto-112954-494 filled far below its bid).
+                self.paper_fill_sim.process_combo_ticks(*self._combo_book_ticks(
+                    near_price, far_price, ts, near_code, far_code, bar_dict))
             console.print(
                 f"[green]✅ [MTS_ORDER] PAPER COMBO ENTRY: "
                 f"{near_code}/{far_code} {action} price={_combo_price}[/green]")
