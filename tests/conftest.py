@@ -13,26 +13,10 @@ initialization failures. Production code remains unchanged.
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
-import types
 
 import numba as nb
 import pytest
-
-# 2026-11-05 Hermes Agent: repo ``tests/`` has no __init__.py (namespace
-# package).  Third-party wheels (py_vollib, kaleido, ultralytics) install a
-# REGULAR top-level ``tests`` package into site-packages, and a regular package
-# always beats a namespace one -- so ``from tests.strategies.x import ...``
-# resolved to site-packages and collection failed with
-# ModuleNotFoundError: No module named 'tests.strategies'.
-# Bind ``tests`` to this directory before any test module is imported.
-_REPO_TESTS = os.path.dirname(os.path.abspath(__file__))
-_loaded = sys.modules.get("tests")
-if _loaded is None or _REPO_TESTS not in list(getattr(_loaded, "__path__", []) or []):
-    _pkg = types.ModuleType("tests")
-    _pkg.__path__ = [_REPO_TESTS]
-    sys.modules["tests"] = _pkg
 
 
 def _strip_cache_flag(decorator):
