@@ -76,7 +76,7 @@ def test_parse_logs_active_trade_without_exit_is_renderable(tmp_path):
     assert report["active"][0]["far_pnl_gross"] == 0.0
 
 
-# 2026-10-05 Codex: real parser -> actual dashboard closed-loop row regression.
+# 2026-10-21 Hermes Agent: closed-loop net/friction presentation and mixed-ledger regression.
 def _render_closed_loop_callsite(fills, events):
     import ast
     from pathlib import Path
@@ -98,7 +98,9 @@ def _render_closed_loop_callsite(fills, events):
 
 
 def _write_closed_loop_fixture(tmp_path, near_pnl, far_pnl, reverse=False,
-                               partial=False, single_release=False):
+                               partial=False, single_release=False,
+                               settled_net=None, fees=None, tax=None,
+                               close_costs=None, close_status=None):
     import json
 
     trade_id = "mts-paper-real-shape"
@@ -124,6 +126,10 @@ def _write_closed_loop_fixture(tmp_path, near_pnl, far_pnl, reverse=False,
                            "position_effect": "CLOSE",
                            "position_side_before_exit": "LONG" if leg == "NEAR" else "SHORT",
                            "paper_fill_id": f"PF-{leg}-{part}", "execution_source": "PAPER_EXIT_FILL"})
+            if close_costs is not None:
+                closes[-1]["fee"], closes[-1]["tax"] = close_costs[part if partial else len(closes) - 1]
+            if close_status is not None:
+                closes[-1]["pnl_status"] = close_status
     if partial:
         for entry in entries:
             entry["qty"] = 2
@@ -137,7 +143,11 @@ def _write_closed_loop_fixture(tmp_path, near_pnl, far_pnl, reverse=False,
                "price": 0.0, "realized_pnl": None, "fill_type": "COMBINED_EXIT_SETTLED",
                "event_type": "COMBINED_EXIT_SETTLED", "near_realized_pnl_gross": near_pnl,
                "far_realized_pnl_gross": far_pnl, "combined_realized_pnl_gross": near_pnl + far_pnl,
-               "combined_realized_pnl_net": None, "pnl_status": "GROSS_ONLY"}
+               "combined_realized_pnl_net": settled_net, "pnl_status": "NET" if settled_net is not None else "GROSS_ONLY"}
+    if fees is not None:
+        settled["fees"] = fees
+    if tax is not None:
+        settled["tax"] = tax
     marker = {"timestamp": "2026-10-05T11:14:42.704246", "trade_id": trade_id,
               "session": "day", "mode": "paper", "leg": "NEAR", "qty": 0,
               "price": 0.0, "realized_pnl": None, "fill_type": "COMBINED_EXIT_COMPLETED"}
@@ -159,13 +169,17 @@ def test_combined_exit_all_legs_reach_real_dashboard_rows(tmp_path, near_pnl, fa
     fills, events = _write_closed_loop_fixture(tmp_path, near_pnl, far_pnl, reverse=reverse)
     original = fills.read_bytes(), events.read_bytes()
     trade, row = _render_closed_loop_callsite(fills, events)
-    # Total remains canonical; the omitted losing NEAR leg must not become +0.
-    assert trade["gross_pnl"] == trade["net_pnl"] == near_pnl + far_pnl
+    # 2026-10-21 Hermes Agent: legacy gross must never be presented as net.
+    assert trade["gross_pnl"] == near_pnl + far_pnl
+    assert trade["net_pnl"] is None
     assert trade["pnl_status"] == "GROSS_ONLY"
     assert trade["near_pnl_gross"] == near_pnl
     assert trade["far_pnl_gross"] == far_pnl
-    assert row["近月 PnL"] == f"{near_pnl:+,.0f}"
-    assert row["遠月 PnL"] == f"{far_pnl:+,.0f}"
+    assert row["淨利 (TWD)"] == "N/A"
+    assert row["摩擦成本"] == "N/A"
+    assert row["備註"] == "未扣摩擦成本（舊紀錄）"
+    assert row["近月毛利"] == f"{near_pnl:+,.0f}"
+    assert row["遠月毛利"] == f"{far_pnl:+,.0f}"
     assert (fills.read_bytes(), events.read_bytes()) == original
 
 
@@ -177,8 +191,9 @@ def test_partial_combined_exits_keep_every_leg_fill(tmp_path, reverse):
     assert trade["gross_pnl"] == -370.0
     assert trade["near_pnl_gross"] == -1370.0
     assert trade["far_pnl_gross"] == 1000.0
-    assert row["近月 PnL"] == "-1,370"
-    assert row["遠月 PnL"] == "+1,000"
+    assert row["淨利 (TWD)"] == "N/A"
+    assert row["近月毛利"] == "-1,370"
+    assert row["遠月毛利"] == "+1,000"
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -189,5 +204,76 @@ def test_single_release_leg_mapping_remains_unchanged(tmp_path, reverse):
     assert trade["gross_pnl"] == -370.0
     assert trade["near_pnl_gross"] == -1370.0
     assert trade["far_pnl_gross"] == 1000.0
-    assert row["近月 PnL"] == "-1,370"
-    assert row["遠月 PnL"] == "+1,000"
+    assert row["淨利 (TWD)"] == "N/A"
+    assert row["近月毛利"] == "-1,370"
+    assert row["遠月毛利"] == "+1,000"
+
+
+def test_settled_net_carries_explicit_friction_cost(tmp_path):
+    fills, events = _write_closed_loop_fixture(
+        tmp_path, 80.0, 20.0, settled_net=85.0, fees=10.0, tax=5.0)
+    trade, row = _render_closed_loop_callsite(fills, events)
+    assert trade["gross_pnl"] == 100.0
+    assert trade["net_pnl"] == 85.0
+    assert trade["friction_cost"] == 15.0
+    assert trade["pnl_status"] == "NET"
+    assert row["淨利 (TWD)"] == "+85"
+    assert row["摩擦成本"] == "15"
+    assert row["毛利"] == "+100"
+    assert list(row)[:5] == ["淨利 (TWD)", "摩擦成本", "毛利", "近月毛利", "遠月毛利"]
+
+
+def test_single_release_net_requires_itemized_costs_on_both_rows(tmp_path):
+    fills, events = _write_closed_loop_fixture(
+        tmp_path, 80.0, 20.0, single_release=True,
+        close_costs=[(4.0, 1.0), (6.0, 2.0)])
+    trade, row = _render_closed_loop_callsite(fills, events)
+    assert trade["gross_pnl"] == 100.0
+    assert trade["net_pnl"] == 87.0
+    assert trade["friction_cost"] == 13.0
+    assert trade["pnl_status"] == "NET"
+    assert row["淨利 (TWD)"] == "+87"
+
+
+def test_single_release_net_requires_both_rows_to_be_marked_net(tmp_path):
+    fills, events = _write_closed_loop_fixture(
+        tmp_path, 80.0, 20.0, single_release=True, close_status="NET")
+    trade, row = _render_closed_loop_callsite(fills, events)
+    assert trade["pnl_status"] == "NET"
+    assert trade["net_pnl"] == 100.0
+    assert trade["gross_pnl"] is None
+    assert trade["friction_cost"] is None
+    assert row["淨利 (TWD)"] == "+100"
+    assert row["毛利"] == "N/A"
+
+
+def test_single_release_mixed_itemization_stays_gross_only(tmp_path):
+    fills, events = _write_closed_loop_fixture(
+        tmp_path, 80.0, 20.0, single_release=True,
+        close_costs=[(4.0, 1.0), (None, None)])
+    trade, row = _render_closed_loop_callsite(fills, events)
+    assert trade["pnl_status"] == "GROSS_ONLY"
+    assert trade["net_pnl"] is None
+    assert trade["friction_cost"] is None
+    assert row["淨利 (TWD)"] == "N/A"
+    assert row["摩擦成本"] == "N/A"
+
+
+def test_daily_report_kpis_use_only_net_trades_and_count_gross_only():
+    from scripts.generate_daily_report import generate_html
+
+    base = {
+        "trade_id": "net-trade", "session": "day", "entry_time": "2026-10-05T09:00:00",
+        "action": "spread", "release_pnl": 0.0, "exit_pnl": 80.0,
+        "exit_reason": "COMBINED_EXIT", "release_efficiency": "—",
+        "risk_mode": "NORMAL", "net_pnl": 80.0, "gross_pnl": 100.0,
+        "friction_cost": 20.0, "pnl_status": "NET",
+    }
+    legacy = dict(base, trade_id="legacy-trade", net_pnl=None, gross_pnl=1000.0,
+                  friction_cost=None, pnl_status="GROSS_ONLY")
+    html = generate_html({"completed": [base, legacy], "active": []}, "2026-10-05")
+
+    assert "本日淨損益" in html
+    assert "$80.0 TWD" in html
+    assert "未扣費筆數（GROSS_ONLY）: 1" in html
+    assert "N/A" in html

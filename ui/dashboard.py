@@ -239,6 +239,83 @@ def _to_num(val, default=0.0):
     except Exception:
         return float(default)
 
+
+def build_mts_fills_display(fills):
+    """Build the MTS fills table without inferring missing legacy costs."""
+    rows = []
+    net_total = 0.0
+    friction_total = 0.0
+    friction_na = 0
+
+    def _number(value):
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _fmt(value, signed=False):
+        if value is None:
+            return "N/A"
+        return f"{value:+.1f}" if signed else f"{value:.1f}"
+
+    for fill in fills:
+        realized = _number(fill.get("realized_pnl"))
+        gross = _number(fill.get("gross_pnl"))
+        fee = _number(fill.get("fee"))
+        tax = _number(fill.get("tax"))
+        has_costs = gross is not None and fee is not None and tax is not None
+        friction = fee + tax if has_costs else None
+        if realized is not None:
+            net_total += realized
+        if has_costs:
+            friction_total += friction
+        else:
+            friction_na += 1
+
+        fill_type = fill.get("fill_type", "?")
+        status = {
+            "COMBINED_EXIT": "未扣摩擦成本",
+            "EXIT": "已扣費(未分列)",
+            "RELEASE": "已扣費(未分列)",
+        }.get(fill_type, "") if not has_costs else ""
+        ts = fill.get("timestamp", "")
+        try:
+            ts = ts[:19].replace("T", " ") if ts else "?"
+        except (TypeError, AttributeError):
+            ts = str(ts)
+        ticker = fill.get("ticker", "?")
+        leg = fill.get("leg", "?")
+        contract = fill.get("contract", "")
+        ticker_display = (f"{ticker}_{contract}" if contract in ("NEAR", "FAR")
+                          else f"{ticker}{contract}" if contract
+                          else f"{ticker}_{leg}")
+        qty = _number(fill.get("qty"))
+        price = _number(fill.get("price"))
+        rows.append({
+            "時間": ts,
+            "腿": leg,
+            "類型": fill_type,
+            "淨損益": _fmt(realized, signed=True) if realized is not None else "",
+            "摩擦成本": _fmt(friction) if friction is not None else "N/A",
+            "毛利": _fmt(gross),
+            "手續費": _fmt(fee),
+            "稅": _fmt(tax),
+            "Ticker": ticker_display,
+            "Side": fill.get("side", "?"),
+            "Qty": int(qty) if qty is not None and qty.is_integer() else qty,
+            "Price": _fmt(price) if price is not None else fill.get("price", ""),
+            "Trade ID": fill.get("trade_id", "?"),
+            "狀態": status,
+        })
+
+    summary = {
+        "淨損益": f"{net_total:+.1f}",
+        "摩擦成本": f"{friction_total:.1f} (N/A: {friction_na} 列)",
+    }
+    return rows, summary
+
 # ── Custom CSS ──
 st.markdown("""
     <style>
@@ -1857,6 +1934,75 @@ def load_active_runtime_truth(base):
         except OSError:
             known_profile_hashes[identity] = None
     return summarize_execution_context(read_execution_context(), known_profile_hashes)
+
+
+# 2026-10-15 Hermes Agent: display actual running versions without PM2 commands.
+def _running_program_version(pid, expected_root, runtime_root, entry_name):
+    import datetime
+    from pathlib import Path
+    import re
+    import subprocess
+    from zoneinfo import ZoneInfo
+    import psutil
+
+    unknown = {"sha": "無法確認", "commit_date": "—", "started_at": "—"}
+    try:
+        if int(pid) <= 0:
+            return unknown
+        process = psutil.Process(int(pid))
+        root = Path(process.cwd()).resolve()
+        environment = process.environ()
+        sha = environment.get("LRC_RELEASE_SHA", "")
+        if (root != Path(expected_root).resolve()
+                or not environment.get("TRADING_RUNTIME_DIR")
+                or Path(environment["TRADING_RUNTIME_DIR"]).resolve() != Path(runtime_root).resolve()
+                or not re.fullmatch(r"[0-9a-f]{40}", sha)
+                or not any(Path(arg).name == entry_name for arg in process.cmdline())):
+            return unknown
+        taipei = ZoneInfo("Asia/Taipei")
+        started = datetime.datetime.fromtimestamp(process.create_time(), taipei).strftime("%Y-%m-%d %H:%M:%S")
+        commit_date = "無法確認"
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "show", "-s", "--format=%cI", sha],
+                capture_output=True, text=True, check=True, timeout=2,
+            )
+            commit_date = datetime.datetime.fromisoformat(result.stdout.strip()).astimezone(taipei).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        if not process.is_running():
+            return unknown
+        return {"sha": sha[:8], "commit_date": commit_date, "started_at": started}
+    except (OSError, ValueError, TypeError, OverflowError, psutil.Error):
+        return unknown
+
+
+# 2026-10-15 Hermes Agent: saved PM2 metadata locates a PID; process inspection
+# supplies its live SHA/start time. Never execute PM2 or trust a saved SHA.
+@st.cache_data(ttl=10)
+def get_running_program_versions(dashboard_root, runtime_root):
+    import json
+    import os
+    from pathlib import Path
+
+    unknown = {"sha": "無法確認", "commit_date": "—", "started_at": "—"}
+    versions = {"MTS": dict(unknown)}
+    try:
+        home = Path(os.environ.get("PM2_HOME") or Path.home() / ".pm2")
+        rows = json.loads((home / "dump.pm2").read_text())
+        engines = ([row for row in rows if isinstance(row, dict)
+                    and row.get("name") == "trading-system"]
+                   if isinstance(rows, list) else [])
+        if len(engines) == 1:
+            engine = engines[0]
+            pid = int(Path(engine["pm_pid_path"]).read_text().strip())
+            versions["MTS"] = _running_program_version(
+                pid, engine["pm_cwd"], runtime_root, "main.py")
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    versions["Dashboard"] = _running_program_version(
+        os.getpid(), dashboard_root, runtime_root, "dashboard.py")
+    return versions
 
 # 2026-06-23 Gemini CLI: 快取策略註冊表探索流程，避免在每次頁面重整（每 10 秒）都重新掃描並載入 21 個策略 plugin，藉此降低 CPU 使用率
 @st.cache_resource(ttl=300)
@@ -4242,6 +4388,15 @@ st.caption(
     f"context version={active_runtime_truth['context_version']} | "
     f"updated={active_runtime_truth['context_freshness']}"
 )
+# 2026-10-15 Hermes Agent: version dates/start times are explicitly Taipei-local.
+for _program_name, _program_version in get_running_program_versions(
+    str(BASE), str(_Path(runtime_path("execution_context.json")).parent)
+).items():
+    st.caption(
+        f"{_program_name} 程式版本：{_program_version['sha']} | "
+        f"版本日期={_program_version['commit_date']} | "
+        f"啟動時間={_program_version['started_at']}（台北時間）"
+    )
 if active_runtime_truth["audit_reasons"]:
     st.caption("期貨執行稽核原因：" + ", ".join(active_runtime_truth["audit_reasons"]))
 if active_runtime_truth["warning"]:
@@ -5446,6 +5601,7 @@ elif _selected_product == "TMF":
     from core.performance_provenance import (
         classify_mts_evidence, scope_mts_performance, upl_presentation, broker_snapshot_live_upl, live_upl_presented_reason,
         select_mts_reporting_day)
+    from core.date_utils import get_trading_day as _mts_exchange_trading_day
     _exit_only_dashboard = active_runtime_truth.get("is_exit_only_runtime")
     _events_path_scope = mts_runtime_path("logs", "mts_spread_events.jsonl")  # 2026-10-02 Codex: selected-mode scope.
     if _exit_only_dashboard:
@@ -5545,7 +5701,17 @@ elif _selected_product == "TMF":
                            "reason": "RECONCILED_EXIT_ONLY"}
     else:
         _fills_path_scope = mts_runtime_path("logs", "mts_trade_fills.jsonl")  # 2026-10-02 Codex: selected-mode scope.
-        _scope_current_day = f"{TRADE_DATE_STR[:4]}-{TRADE_DATE_STR[4:6]}-{TRADE_DATE_STR[6:]}"
+        # 2026-10-16 Hermes Agent: use the SAME trading-day boundary the
+        # ledger itself buckets by (TAIFEX 15:00 night-session rollover,
+        # core.date_utils.get_trading_day) -- NOT TRADE_DATE_STR, which is
+        # get_trade_day's 08:00 continuous-session boundary used only for
+        # trade-record filename matching (see L355-358). Using the wrong
+        # boundary pinned the MTS panel to the previous trading day for the
+        # entire 00:00-07:59 tail of the night session.
+        _scope_current_day_dt = _mts_exchange_trading_day(datetime.datetime.now())
+        _scope_current_day = (_scope_current_day_dt.strftime("%Y-%m-%d")
+                               if hasattr(_scope_current_day_dt, "strftime")
+                               else str(_scope_current_day_dt))
         _scope_trading_day = select_mts_reporting_day(
             _fills_path_scope, _events_path_scope, _scope_current_day)
         _mts_perf_scope = scope_mts_performance(
@@ -6128,6 +6294,9 @@ elif _selected_product == "TMF":
             _total_net = _curr_metrics["total_net"]
             _win_rate = _curr_metrics["win_rate"]
             _pf = _curr_metrics["profit_factor"]
+            # 2026-10-21 Hermes Agent: report excluded gross-only history beside MTS KPIs.
+            st.caption(
+                f"另有 {_curr_metrics['gross_only_count']} 筆舊紀錄未扣費，未計入淨額 KPI")
 
             # ── 2026-08-27 (codex review v2): the FORMAL KPI must reflect
             # VERIFIED_PAPER provenance ONLY.  parse_logs() mixes legacy/
@@ -6303,18 +6472,34 @@ elif _selected_product == "TMF":
                             _near_reason_source = t.get("release_reason_source", "—")
                             _far_reason = t.get("exit_reason", "—")
                             _far_reason_source = t.get("exit_reason_source", "—")
+                        # 2026-10-21 Hermes Agent: label gross-only rows without deriving costs.
+                        _is_net_trade = (t.get("pnl_status") == "NET"
+                                         and t.get("net_pnl") is not None)
+                        _net_display = (f'{t["net_pnl"]:+,.0f}'
+                                        if _is_net_trade else "N/A")
+                        _friction = (t.get("friction_cost")
+                                     if _is_net_trade else None)
+                        _gross = t.get("gross_pnl")
+                        _legacy_note = (
+                            "未扣摩擦成本（舊紀錄）"
+                            if t.get("pnl_status") == "GROSS_ONLY" else "—")
                         _loop_rows.append({
+                            "淨利 (TWD)": _net_display,
+                            "摩擦成本": f"{_friction:,.0f}" if _friction is not None else "N/A",
+                            "毛利": f"{_gross:+,.0f}" if _gross is not None else "N/A",
+                            "近月毛利": (f'{t.get("near_pnl_gross"):+,.0f}'
+                                         if t.get("near_pnl_gross") is not None else "N/A"),
+                            "遠月毛利": (f'{t.get("far_pnl_gross"):+,.0f}'
+                                         if t.get("far_pnl_gross") is not None else "N/A"),
+                            "備註": _legacy_note,
                             "交易 ID": t["trade_id"][-6:],
                             "建倉時段": "☀️ 日盤" if t.get("entry_session", t["session"]).lower() == "day" else "🌙 夜盤",
                             "進場時間": t["entry_time"].split("T")[1][:8] if "T" in t["entry_time"] else t["entry_time"],
-                            "近月 PnL": f'{t.get("near_pnl_gross", t.get("release_pnl", 0)):+,.0f}',
                             "近月原因": ("— (雙腿同步平倉)" if _is_pj else _fmt_policy_j_reason(_near_reason)),
                             "近月來源": f'{_near_reason_source}',
-                            "遠月 PnL": f'{t.get("far_pnl_gross", t.get("exit_pnl", 0)):+,.0f}',
                             "遠月原因": _fmt_policy_j_reason(_far_reason),
                             "遠月來源": f'{_far_reason_source}',
                             "跨時段": "🔄 跨盤" if t.get("cross_session_trade") else "單盤",
-                            "淨利 (TWD)": f'{t["net_pnl"]:+,.0f}',
                             "風控": t["risk_mode"]
                         })
                     st.dataframe(pd.DataFrame(_loop_rows), width='stretch', hide_index=True)
@@ -6803,60 +6988,13 @@ elif _selected_product == "TMF":
                         if _fills:
                             _fills = _fills[-40:][::-1]  # Show last 40 for more history
                             st.markdown("**MTS Trade Fills**")
-                            _fill_rows = []
-                            for _fl in _fills:
-                                try:
-                                    _fl_ts = _fl.get("timestamp", "")
-                                    if _fl_ts:
-                                        try: _fl_ts = _fl_ts[:19].replace("T", " ")
-                                        except: pass
-                                    else:
-                                        _fl_ts = "?"
-                                    
-                                    _fl_ticker = _fl.get("ticker", "?")
-                                    _fl_leg = _fl.get("leg", "?")
-                                    _fl_contract = _fl.get("contract", "")
-                                    
-                                    # Build readable ticker — V-model: display raw log fields
-                                    _fl_ticker_display = _fl_ticker
-                                    if _fl_contract and _fl_contract not in ("NEAR", "FAR"):
-                                        _fl_ticker_display = f"{_fl_ticker}{_fl_contract}"
-                                    elif _fl_contract:
-                                        _fl_ticker_display = f"{_fl_ticker}_{_fl_contract}"
-                                    else:
-                                        _fl_ticker_display = f"{_fl_ticker}_{_fl_leg}"
-                                    
-                                    _fl_side = _fl.get("side", "?")
-                                    _fl_qty = _fl.get("qty", 0)
-                                    _fl_price = _fl.get("price", 0)
-                                    _fl_pnl = _fl.get("realized_pnl")
-                                    
-                                    # Robust numeric conversion
-                                    try:
-                                        if isinstance(_fl_qty, str): _fl_qty = float(_fl_qty)
-                                        if isinstance(_fl_price, str): _fl_price = float(_fl_price)
-                                        if isinstance(_fl_pnl, str): _fl_pnl = float(_fl_pnl)
-                                    except: pass
-
-                                    _fl_type = _fl.get("fill_type", "?")
-                                    _fl_tid = _fl.get("trade_id", "?")
-                                    
-                                    _fill_rows.append({
-                                        "時間": _fl_ts,
-                                        "Ticker": _fl_ticker_display,
-                                        "Leg": _fl_leg,
-                                        "Side": _fl_side,
-                                        "Qty": int(_fl_qty) if isinstance(_fl_qty, (int, float)) else _fl_qty,
-                                        "Price": f"{_fl_price:.1f}" if isinstance(_fl_price, (int, float)) else _fl_price,
-                                        "Type": _fl_type,
-                                        "損益": f"{_fl_pnl:+.1f}" if isinstance(_fl_pnl, (int, float)) else "",
-                                        "Trade ID": _fl_tid,
-                                    })
-                                except Exception:
-                                    continue
-                                    
+                            _fill_rows, _fill_summary = build_mts_fills_display(_fills)
                             if _fill_rows:
                                 st.dataframe(pd.DataFrame(_fill_rows), width='stretch', hide_index=True)
+                                st.caption(
+                                    f"淨損益合計 {_fill_summary['淨損益']} | "
+                                    f"摩擦成本合計 {_fill_summary['摩擦成本']}"
+                                )
                     except Exception:
                         pass
         else:

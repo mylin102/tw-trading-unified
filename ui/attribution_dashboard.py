@@ -534,20 +534,25 @@ if __name__ == "__main__":
         print("\nNo alerts")
 
 # 2026-08-04 Gemini CLI: Session performance breakdown calculator (DAY vs NIGHT vs ALL)
+# 2026-10-21 Hermes Agent: MTS session KPIs exclude gross-only records.
 def compute_session_breakdown(completed_trades: list) -> dict:
-    """Compute realized PnL, trade counts, win rate, and profit factor broken down by trading session (DAY / NIGHT / ALL)."""
+    """Compute NET-only KPIs and separately count GROSS_ONLY trades by session."""
     def _calc_metrics(trades: list) -> dict:
-        realized = [
+        eligible = [
             t for t in trades
-            if t.get("is_realized") and t.get("gross_pnl") is not None and t.get("guard_period") != "PRE_GUARD"
+            if t.get("is_realized") and t.get("guard_period") != "PRE_GUARD"
         ]
+        realized = [t for t in eligible
+                    if t.get("pnl_status") == "NET" and t.get("net_pnl") is not None]
+        gross_only_count = sum(1 for t in eligible
+                               if t.get("pnl_status") == "GROSS_ONLY")
         total_trades = len(realized)
-        total_net = sum((t.get("gross_pnl") or 0.0) for t in realized)
-        wins = sum(1 for t in realized if (t.get("gross_pnl") or 0.0) > 0)
+        total_net = sum((t.get("net_pnl") or 0.0) for t in realized)
+        wins = sum(1 for t in realized if (t.get("net_pnl") or 0.0) > 0)
         win_rate = (wins / total_trades) if total_trades > 0 else 0.0
 
-        gross_wins = sum((t.get("gross_pnl") or 0.0) for t in realized if (t.get("gross_pnl") or 0.0) > 0)
-        gross_losses = sum(abs(t.get("gross_pnl") or 0.0) for t in realized if (t.get("gross_pnl") or 0.0) <= 0)
+        gross_wins = sum((t.get("net_pnl") or 0.0) for t in realized if (t.get("net_pnl") or 0.0) > 0)
+        gross_losses = sum(abs(t.get("net_pnl") or 0.0) for t in realized if (t.get("net_pnl") or 0.0) <= 0)
         pf = (gross_wins / gross_losses) if gross_losses > 0 else (99.9 if gross_wins > 0 else 0.0)
 
         return {
@@ -557,6 +562,7 @@ def compute_session_breakdown(completed_trades: list) -> dict:
             "win_rate": win_rate,
             "profit_factor": pf,
             "realized_trades": realized,
+            "gross_only_count": gross_only_count,
         }
 
     all_metrics = _calc_metrics(completed_trades)
