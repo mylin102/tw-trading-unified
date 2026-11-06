@@ -50,7 +50,9 @@ if (isProduction && (PROJECT_ROOT.startsWith('/tmp/')
 const pythonBin = process.env.TRADING_PYTHON_BIN;
 // Shared dependency venv fallback (dev/paper only — the main repo's venv
 // holds the dependencies the candidate tree imports).
-const SHARED_VENV = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release15/.venv/bin/python3';
+// 2026-11-05 Hermes Agent: consolidation moved the single runtime interpreter
+// into the canonical release tree; release15 is being retired.
+const SHARED_VENV = '/Users/myllin_mini/Documents/mylin102/tw-trading-unified-release21/.venv/bin/python3';
 let pythonPath = null;
 if (pythonBin) {
   pythonPath = pythonBin;
