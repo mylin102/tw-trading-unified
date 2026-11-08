@@ -67,7 +67,13 @@ def calculate_futures_squeeze(
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(-1)
-    df.columns = [c.capitalize() for c in df.columns]
+    # 2026-11-08 Hermes Agent: do not capitalise trading_day. The column is
+    # added lower-case above and groupby consumers below require that exact
+    # spelling; capitalising it produced BOTH 'Trading_day' and 'trading_day',
+    # which made multi_timeframe raise STOCK_OHLCV_SCHEMA_DUPLICATE for every
+    # ticker (stock-runner: zero entries for 10+ trading days).
+    df.columns = [c if str(c).lower() == "trading_day" else c.capitalize()
+                  for c in df.columns]
 
     sqz = df.ta.squeeze(
         bb_length=bb_length,
