@@ -959,7 +959,10 @@ class StockMonitor:
                 from core.broker_health import classify_broker_error, BrokerErrorClass
                 if classify_broker_error(e) == BrokerErrorClass.SDK_SESSION_CLOSED:
                     raise  # propagate to the run_iteration caller
-                pass
+                # 2026-11-08 Hermes Agent: never swallow silently. stock-runner
+                # made zero entries for 10 trading days because this branch was
+                # a bare `pass`; the round summary now names the tickers.
+                self._record_analysis_failure(ticker, e)
 
         self._finish_analysis_round()
 
