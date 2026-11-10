@@ -9,6 +9,7 @@ import logging
 import os
 import ast
 import json
+import fcntl
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -37,6 +38,20 @@ _session_generation = 0
 _session_records: dict[int, int] = {}
 _last_successful_login_generation: int | None = None
 _instrument_lock = threading.Lock()
+
+# 2026-11-10 Hermes Agent: cross-process single-owner enforcement.
+# trading-system and stock-runner are separate processes that each call
+# get_api() with the SAME SHIOAJI_API_KEY/SECRET_KEY. The broker/SDK only
+# tolerates one effective session per credential; evidence from
+# shioaji-session-death-diagnosis (2026-09-23, reconfirmed 2026-11-10) is
+# that an in-process re-login can NOT recover from the resulting
+# SessionNotEstablished loop -- only a fresh process logging in after the
+# other one logged out succeeds. A plain threading.Lock only protects
+# against two callers inside the SAME process; it does nothing across
+# processes. This fd is held for this process's entire ownership period
+# (acquired before login, released in logout()) so a crash releases it via
+# the kernel -- no stale-lock-file problem.
+_session_lock_fd = None
 
 
 def _safe_session_account(api):
@@ -280,6 +295,68 @@ def _activate_futopt_ca(api: sj.Shioaji, ca_path: str,
                     person_id=person_id)
 
 
+def _session_lock_path() -> Path:
+    """Shared across processes via TRADING_RUNTIME_DIR (both trading-system
+    and stock-runner set this env var to the same runtime directory)."""
+    runtime_dir = os.getenv("TRADING_RUNTIME_DIR") or str(Path.cwd())
+    return Path(runtime_dir) / "locks" / "shioaji_session.lock"
+
+
+def _acquire_session_lock(timeout_s: float = 30.0) -> None:
+    """Non-blocking OS exclusive lock, polled up to timeout_s.
+
+    A short poll window tolerates ordinary restart overlap (old process
+    still releasing while the new one starts); anything longer than that is
+    a genuine second owner and must fail closed rather than proceed to log
+    in and silently contend for the broker's single session slot.
+    """
+    global _session_lock_fd
+    if _session_lock_fd is not None:
+        return  # already held by this process
+    lock_path = _session_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "a+")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                fd.close()
+                raise RuntimeError(
+                    "SHIOAJI_SESSION_LOCK_CONTENDED: another process already "
+                    f"holds the Shioaji login lock at {lock_path} after "
+                    f"{timeout_s:.0f}s. Refusing to log in -- the broker "
+                    "tolerates only one effective session per credential, "
+                    "and an in-process re-login cannot recover from the "
+                    "resulting SessionNotEstablished loop (see "
+                    "shioaji-session-death-diagnosis skill)."
+                )
+            time.sleep(0.5)
+    fd.seek(0)
+    fd.truncate()
+    fd.write(json.dumps({"pid": os.getpid(), "acquired_at":
+                          datetime.now(timezone.utc).isoformat()}))
+    fd.flush()
+    _session_lock_fd = fd
+
+
+def _release_session_lock() -> None:
+    global _session_lock_fd
+    if _session_lock_fd is None:
+        return
+    try:
+        fcntl.flock(_session_lock_fd.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        _session_lock_fd.close()
+    except OSError:
+        pass
+    _session_lock_fd = None
+
+
 def get_api() -> sj.Shioaji:
     """Get or create the singleton Shioaji API instance."""
     from core.deployment_role_gate import assert_broker_access_allowed
@@ -288,6 +365,7 @@ def get_api() -> sj.Shioaji:
     global _api
     with _lock:
         if _api is None:
+            _acquire_session_lock()
             candidate = sj.Shioaji()
             observe_api_created(candidate, source="core.shioaji_session.get_api")
             try:
@@ -296,6 +374,7 @@ def get_api() -> sj.Shioaji:
                 # Do not let a failed login leave an unauthenticated
                 # singleton that startup retries would silently reuse.
                 _api = None
+                _release_session_lock()
                 raise
             _api = candidate
         return _api
@@ -542,6 +621,7 @@ def logout():
             except Exception as e:
                 logger.error(f"[session] Logout error: {e}")
             _api = None
+    _release_session_lock()
 
 def set_system_status(status: SystemReadiness):
     global _system_status
