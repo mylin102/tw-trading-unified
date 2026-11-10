@@ -1490,6 +1490,29 @@ class FuturesMonitor:
         except Exception as e:
             console.print(f"[red][FuturesMonitor] Error selecting {self.ticker} contract: {e}[/red]")
 
+        # 2026-11-10 Hermes Agent: FAIL CLOSED on unresolved contracts.
+        # Both paths above (empty contract list, and any exception during
+        # selection) leave self.contract = None and then let setup() return
+        # normally, so the monitor entered its run() loop with no contract.
+        # _strategy_tick() then raised, on every single tick:
+        #     AttributeError: 'NoneType' object has no attribute 'delivery_date'
+        # at the settlement-day check, killing the monitor thread. The
+        # process then finished "cleanly" (exit 0), and PM2's
+        # stop_exit_codes: [0] treats a clean exit as a deliberate stop, so
+        # it never restarted -- the system sat dead (observed twice on
+        # 2026-11-07 and 2026-11-10) until a human noticed.
+        # Raising here routes into main.py's existing CRITICAL_CRASH handling,
+        # which exits non-zero (1) and therefore triggers a supervised
+        # restart. A process that cannot identify its instrument must not
+        # run: running blind is strictly worse than restarting.
+        if self.contract is None and not self.dry_run:
+            raise RuntimeError(
+                f"CONTRACT_RESOLUTION_FAILED: no {getattr(self, 'ticker', '?')} "
+                f"contract resolved at startup (session not established, or the "
+                f"broker returned no contracts). Refusing to run without an "
+                f"instrument."
+            )
+
         # [Bug Fix] Add contract rollover check
         self._last_contract_code = self.contract.code if self.contract else None
 
