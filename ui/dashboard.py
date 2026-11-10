@@ -1344,7 +1344,10 @@ def latest_mts_terminal_event(events_path: str | os.PathLike,
     """Return confirmed terminal state, excluding pre-fill exit intents."""
     if not trade_id or not events_path:
         return None
-    _terminal_events = {"COMBINED_EXIT_SETTLED", "TRADE_CLOSED"}
+    # 2026-11-10 Hermes Agent: TRADE_CLOSED had zero production writers
+    # (grep-verified) -- the only terminal event any codepath actually
+    # emits is COMBINED_EXIT_SETTLED.
+    _terminal_events = {"COMBINED_EXIT_SETTLED"}
     _latest = None
     try:
         with open(events_path, encoding="utf-8") as _ef:

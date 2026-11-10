@@ -43,7 +43,7 @@ PROVENANCE_KEYS = ("mode", "execution_source", "paper_fill_id",
                    "fill_price", "fill_timestamp", "attribution_key",
                    "session_id", "generation_id", "release_group_id")
 
-TERMINAL_FILL_TYPES = {"COMBINED_EXIT_SETTLED", "TRADE_CLOSED"}
+TERMINAL_FILL_TYPES = {"COMBINED_EXIT_SETTLED"}  # 2026-11-10 Hermes Agent: TRADE_CLOSED had zero production writers (grep-verified).
 EXIT_FILL_TYPES = {"EXIT", "COMBINED_EXIT", "COMBINED_EXIT_SETTLED"}
 
 
