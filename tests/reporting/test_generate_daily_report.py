@@ -54,6 +54,47 @@ def test_parse_logs_buckets_night_trades(tmp_path, monkeypatch):
     assert "t-day-1" in day_ids
     assert "t-night-1" not in day_ids
 
+
+# Case 3: a trade that ENTERS before the 15:00 night rollover but EXITS after
+# it must bucket by ENTRY time, matching both the active-trade branch above
+# (which already uses entry_ts) and core.paper_performance_reconstruction's
+# reconstruct_paper_daily (keys off entries[0]). Before the 2026-11-10 fix
+# this trade landed on 2026-08-04 here (exit_ts-based) while the formal
+# reconstruction put it on 2026-08-03 (entry_ts-based) -- same trade, two
+# different trading days in two dashboard widgets reading the same ledger.
+def test_parse_logs_completed_trade_buckets_by_entry_not_exit(tmp_path):
+    import json as _json
+    fills = tmp_path / "fills.jsonl"
+    events = tmp_path / "events.jsonl"
+    events.write_text("")
+    rows = [
+        {"timestamp": "2026-08-03T14:55:00.0", "trade_id": "t-cross-rollover",
+         "leg": "NEAR", "side": "SHORT", "qty": 1, "price": 43840.0,
+         "fill_type": "ENTRY", "session": "day", "realized_pnl": None},
+        {"timestamp": "2026-08-03T14:55:00.0", "trade_id": "t-cross-rollover",
+         "leg": "FAR", "side": "LONG", "qty": 1, "price": 43831.0,
+         "fill_type": "ENTRY", "session": "day", "realized_pnl": None},
+        # exits after the 15:00 night rollover
+        {"timestamp": "2026-08-03T15:10:00.0", "trade_id": "t-cross-rollover",
+         "leg": "NEAR", "side": "BUY", "qty": 1, "price": 43751.0,
+         "fill_type": "COMBINED_EXIT", "session": "night", "realized_pnl": 60.0},
+        {"timestamp": "2026-08-03T15:10:00.0", "trade_id": "t-cross-rollover",
+         "leg": "FAR", "side": "SELL", "qty": 1, "price": 43895.0,
+         "fill_type": "COMBINED_EXIT", "session": "night", "realized_pnl": 380.0},
+    ]
+    with open(fills, "w") as f:
+        for r in rows:
+            f.write(_json.dumps(r) + "\n")
+
+    from scripts.generate_daily_report import parse_logs
+    # Entry at 14:55 is still "day" trading-day 2026-08-03.
+    d_entry_day = parse_logs(str(fills), str(events), "2026-08-03")
+    assert "t-cross-rollover" in [t["trade_id"] for t in d_entry_day["completed"]]
+    # It must NOT also appear under the exit's own session/day bucketing.
+    d_next = parse_logs(str(fills), str(events), "2026-08-04")
+    assert "t-cross-rollover" not in [t["trade_id"] for t in d_next["completed"]]
+
+
 def test_parse_logs_active_trade_without_exit_is_renderable(tmp_path):
     import json
     fills = tmp_path / "fills.jsonl"
@@ -128,6 +169,15 @@ def _write_closed_loop_fixture(tmp_path, near_pnl, far_pnl, reverse=False,
                            "paper_fill_id": f"PF-{leg}-{part}", "execution_source": "PAPER_EXIT_FILL"})
             if close_costs is not None:
                 closes[-1]["fee"], closes[-1]["tax"] = close_costs[part if partial else len(closes) - 1]
+                # 2026-11-10 Hermes Agent: once a row carries fee/tax, real
+                # production writers (tmf_spread.py RELEASE/EXIT fills) ALWAYS
+                # store realized_pnl net of that fee+tax -- gross lives in a
+                # separate gross_pnl field. Keeping this row's realized_pnl at
+                # the raw `amount` modeled an impossible shape (itemized costs
+                # with a still-gross realized_pnl) that masked the double-
+                # deduction bug in generate_daily_report.py.
+                if closes[-1]["fee"] is not None and closes[-1]["tax"] is not None:
+                    closes[-1]["realized_pnl"] = amount - closes[-1]["fee"] - closes[-1]["tax"]
             if close_status is not None:
                 closes[-1]["pnl_status"] = close_status
     if partial:
@@ -257,6 +307,31 @@ def test_single_release_mixed_itemization_stays_gross_only(tmp_path):
     assert trade["friction_cost"] is None
     assert row["淨利 (TWD)"] == "N/A"
     assert row["摩擦成本"] == "N/A"
+
+
+def test_single_release_net_not_double_charged_friction(tmp_path):
+    """2026-11-10 Hermes Agent: regression for the 2026-11-09 night-session
+    incident. Real tmf_spread.py RELEASE/EXIT writers store realized_pnl
+    ALREADY net of fee+tax (gross lives in a separate gross_pnl field —
+    verified against the live mts_trade_fills.jsonl ledger). The old code
+    summed those already-net realized_pnl rows, mislabeled the sum "gross",
+    then subtracted friction_cost a second time -- silently inflating every
+    single-leg (release+trail) exit's loss by ~113 TWD and its gain by the
+    same amount in the wrong direction.
+
+    mts-auto-214006-762 (2026-11-09 21:40 night session): near SHORT
+    41465->41429 (+36pt), far LONG 41520->41560 (+40pt), 10 TWD/pt ->
+    gross=+760, fee 40*2=80, tax ~33.2 -> net=+646.8 (ledger-verified).
+    """
+    fills, events = _write_closed_loop_fixture(
+        tmp_path, 760.0, 0.0, single_release=True,
+        close_costs=[(40.0, 16.6), (40.0, 16.6)])
+    trade, row = _render_closed_loop_callsite(fills, events)
+    assert trade["pnl_status"] == "NET"
+    assert trade["friction_cost"] == 113.2
+    assert trade["net_pnl"] == pytest.approx(646.8, abs=0.05)
+    assert trade["gross_pnl"] == pytest.approx(760.0, abs=0.05)
+    assert row["淨利 (TWD)"] == "+647"
 
 
 def test_daily_report_kpis_use_only_net_trades_and_count_gross_only():

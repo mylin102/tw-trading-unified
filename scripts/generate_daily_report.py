@@ -485,7 +485,14 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
         elif len(data["entries"]) > 0 and data["exit"]:
             exit_ts = data["exit_ts"]
             session = data["session"]
-            trading_day = get_trading_day(exit_ts, session)
+            # 2026-11-10 Hermes Agent: bucket completed trades by ENTRY
+            # timestamp, matching the active-trade branch above (line ~458)
+            # and core.paper_performance_reconstruction.reconstruct_paper_daily
+            # (keys off entries[0]). Using exit_ts here let a trade that
+            # entered before 15:00 and exited after the night rollover land
+            # on a different trading_day in this report than in the formal
+            # reconstruction -- same trade, two different days.
+            trading_day = get_trading_day(data["entry_ts"], session)
             
             if target_date and trading_day != target_date:
                 continue
@@ -529,9 +536,15 @@ def parse_logs(fills_path: str, events_path: str, target_date: str = None) -> di
                 if _close_rows and all(value is not None for value in _realized_rows):
                     _row_costs = [_friction_cost(row) for row in _close_rows]
                     if all(cost is not None for cost in _row_costs):
-                        gross_pnl = sum(float(value) for value in _realized_rows)
+                        # 2026-11-10 Hermes Agent: each row's realized_pnl is
+                        # ALREADY net of fee+tax (written by
+                        # monitor.py:_calculate_combined_exit_leg_costs as
+                        # `_gross - _fee - _tax`). Treating that sum as gross
+                        # and subtracting friction_cost again double-charged
+                        # every single-leg (release+trail) exit ~113 TWD.
                         friction_cost = sum(_row_costs)
-                        net_pnl = gross_pnl - friction_cost
+                        net_pnl = sum(float(value) for value in _realized_rows)
+                        gross_pnl = net_pnl + friction_cost
                         pnl_status = "NET"
                     elif all(row.get("pnl_status") == "NET" for row in _close_rows):
                         net_pnl = sum(float(value) for value in _realized_rows)
