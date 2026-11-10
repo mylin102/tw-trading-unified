@@ -18199,7 +18199,12 @@ class FuturesMonitor:
                 return
             
             # [GSD Upgrade] Apply Dynamic Position Scaling
-            signal.quantity = max(1, round(lots * edge_res["pos_scale"]))
+            # 2026-11-10 Hermes Agent: `lots` was never defined anywhere in
+            # this function -- every entry where edge_model returned a
+            # pos_scale (i.e. every entry that reached this far) raised
+            # NameError. The base quantity to scale is signal.quantity
+            # (set by the strategy plugin in decision.signal).
+            signal.quantity = max(1, round(signal.quantity * edge_res["pos_scale"]))
             signal.reason = f"{signal.reason} ({edge_res['rank']})"
             if edge_res["pos_scale"] != 1.0:
                 console.print(f"[bold cyan]⚖️ Position Scaled: {edge_res['rank']} (x{edge_res['pos_scale']}) -> {signal.quantity} lots[/bold cyan]")
