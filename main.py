@@ -303,6 +303,15 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
     elif not isinstance(futures_mons, (list, tuple)):
         futures_mons = [futures_mons]
     _seen = set()
+    # 2026-11-10 Hermes Agent: separate set for the "already warned as
+    # unmatched" log dedup (see on_bidask below). `_seen` tracks "have we
+    # ever logged the initial '📥 New bidask' line for this code" and gets
+    # populated UNCONDITIONALLY the first time a code arrives -- reusing it
+    # to gate the OTM-skew fallback branch meant `code not in _seen` was
+    # ALREADY False by the time that check ran (the add happens earlier in
+    # the very same call), permanently disabling OTM-skew dispatch AND the
+    # unmatched-warning log for every code, from its first tick onward.
+    _fallback_warned = set()
     _lock = threading.Lock()
     _last_mtx_update_log_at = {"ts": 0.0}
     _mtx_update_log_interval_secs = 5.0
@@ -424,9 +433,24 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                         matched = True
                         break
 
-            if not matched and code not in _seen:
+            if not matched:
                 # [Skew Integration] Check if code is an OTM skew contract
-                otm_cons = getattr(futures_mon, '_skew_otm_contracts', {})
+                # 2026-11-10 Hermes Agent: `futures_mon` (singular) was never
+                # defined in this scope -- this NameError was silently
+                # swallowed by the enclosing `except Exception` at the
+                # bottom of on_bidask(), so EVERY OTM-option bidask callback
+                # fell through to the "bidask unmatched" warning and
+                # skew_engine.on_quote() was never invoked. Aggregate each
+                # monitor's OTM contracts (there can be more than one
+                # FuturesMonitor in futures_mons). Also: this branch used to
+                # be additionally gated on `code not in _seen`, which was
+                # unconditionally False by this point in the same call (see
+                # `_fallback_warned` comment above) -- dropped, since OTM
+                # matching must run on every unmatched tick, not just a
+                # code's first-ever appearance.
+                otm_cons = {}
+                for _otm_mon in futures_mons:
+                    otm_cons.update(getattr(_otm_mon, '_skew_otm_contracts', {}) or {})
                 if skew_engine is not None and otm_cons:
                     for otm_key, otm_con in otm_cons.items():
                         if code == getattr(otm_con, "code", None):
@@ -455,7 +479,8 @@ def bidask_dispatcher(futures_mons, options_mon, skew_engine=None):
                                 console.print(f"[dim][skew otm on_quote err] {e}[/dim]")
                             matched = True
                             break
-                if not matched:
+                if not matched and code not in _fallback_warned:
+                    _fallback_warned.add(code)
                     console.print(f"[yellow]bidask unmatched: {code}, contracts={list(mon.active_contracts.keys())}[/yellow]")
         except Exception as e:
             console.print(f"[red][bidask dispatch err] {e}[/red]")
