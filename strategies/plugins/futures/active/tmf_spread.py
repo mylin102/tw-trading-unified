@@ -2680,13 +2680,32 @@ class TMFSpread(StrategyBase):
 
     def _hvwap_release_quote_age_ok(self, bar: dict, rel_leg: str) -> tuple[bool, float]:
         """Defensive parity with the baseline freshness gate (decoupled-leg
-        semantics: only the RELEASED leg's quote age matters)."""
+        semantics: only the RELEASED leg's quote age matters).
+
+        2026-11-10 Hermes Agent: this previously did NOT have parity with
+        the baseline gate (_restart_baseline_quote, same file) despite the
+        docstring's claim. `float(_age or 0.0)` silently turned a MISSING
+        age (key absent from bar, e.g. the heartbeat/5-min bar path which
+        lacks *_tick_age_ms entirely) into "age=0ms" -- the freshest
+        possible reading -- so a release could fire with zero evidence the
+        quote was fresh. The baseline gate's own contract (see its
+        docstring) is explicit: "an unprovable age fails closed". Found via
+        _record_release_counterfactual (added 2026-10-21) disagreeing with
+        this gate on the exact same bars: it correctly returns MISSING when
+        the age key is absent, while this gate silently passed the release.
+        An absent age is not evidence of freshness; it is an absence of
+        evidence, and must fail closed like every other leg in this file.
+        """
         _key = "near_tick_age_ms" if rel_leg == "NEAR" else "far_tick_age_ms"
         _age = bar.get(_key)
+        if _age is None:
+            return False, float("nan")
         try:
-            _age_f = float(_age or 0.0)
+            _age_f = float(_age)
         except (TypeError, ValueError):
-            _age_f = 0.0
+            return False, float("nan")
+        if isinstance(_age, bool) or not math.isfinite(_age_f) or _age_f < 0:
+            return False, float("nan")
         _max = float(getattr(self, "_max_quote_age_ms", 10000.0))
         return _age_f <= _max, _age_f
 
