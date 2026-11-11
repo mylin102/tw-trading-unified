@@ -334,3 +334,70 @@ def test_recoverable_session_loss_uses_distinct_code():
     from main import _shutdown_exit_code
     assert _shutdown_exit_code("RECOVERABLE_SESSION_LOSS") == 75
     assert _shutdown_exit_code("CRITICAL_CRASH") == 1
+
+
+# ── I1 EVENT-SCHEMA ──
+
+def _schema_scan(tmp_path):
+    import importlib
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "ci"))
+    mod = importlib.import_module("check_event_schema")
+    return mod.check(tmp_path)
+
+
+def test_event_schema_flags_drift(tmp_path):
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "emitter.py").write_text(
+        "def a(self):\n"
+        "    self._append_mts_event('ORDER_SUBMITTED', trade_id=1, contract='X')\n"
+        "def b(self):\n"
+        "    self._append_mts_event('ORDER_SUBMITTED', trade_id=1)\n"
+    )
+    found = _schema_scan(tmp_path)
+    kinds = {v["kind"] for v in found}
+    assert "SCHEMA_DRIFT" in kinds
+    drift = [v for v in found if v["kind"] == "SCHEMA_DRIFT"][0]
+    assert drift["event"] == "ORDER_SUBMITTED"
+
+
+def test_event_schema_accepts_one_shape(tmp_path):
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "emitter.py").write_text(
+        "def a(self):\n"
+        "    self._append_mts_event('ORDER_SUBMITTED', trade_id=1, contract='X')\n"
+        "def b(self):\n"
+        "    self._append_mts_event('ORDER_SUBMITTED', contract='Y', trade_id=2)\n"
+    )
+    assert _schema_scan(tmp_path) == []
+
+
+def test_event_schema_flattens_static_dict_splat(tmp_path):
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "emitter.py").write_text(
+        "def a(self):\n"
+        "    self._append_mts_event('ORDER_SUBMITTED', **{'trade_id': 1, 'qty': 2})\n"
+        "def b(self):\n"
+        "    self._append_mts_event('ORDER_SUBMITTED', trade_id=3, qty=4)\n"
+    )
+    assert _schema_scan(tmp_path) == []
+
+
+def test_event_schema_flags_non_literal_name(tmp_path):
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "emitter.py").write_text(
+        "def a(self, name):\n"
+        "    self._append_mts_event(name, trade_id=1)\n"
+    )
+    found = _schema_scan(tmp_path)
+    assert any(v["kind"] == "NON_LITERAL_EVENT_NAME" for v in found)
+
+
+def test_event_schema_flags_unverifiable_splat(tmp_path):
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "emitter.py").write_text(
+        "def a(self, payload):\n"
+        "    self._append_mts_event('ORDER_SUBMITTED', **payload)\n"
+    )
+    found = _schema_scan(tmp_path)
+    assert any(v["kind"] == "UNVERIFIABLE_FIELDS" for v in found)
