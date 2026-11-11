@@ -233,6 +233,76 @@ def test_gate_flags_unknown_that_only_logs(tmp_path):
     assert "neither raises nor refuses" in found[0]["problem"]
 
 
+def test_gate_allows_sentinel_default_refusal(tmp_path):
+    """A tick-local decision sentinel left at its None default IS a refusal:
+    the tick performs no action. Verified structurally, not asserted."""
+    (tmp_path / "ok.py").write_text(
+        "def tick(self, order):\n"
+        "    decision = None\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "        decision = self.adapter.evaluate()\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=LIFECYCLE_EVAL_FAILED refusal=sentinel-default(decision)\n"
+        "        logger.exception('eval failed')\n"
+        "    if decision is not None:\n"
+        "        return decision.action\n"
+    )
+    assert _scan(tmp_path) == []
+
+
+def test_gate_flags_sentinel_default_when_handler_assigns_it(tmp_path):
+    """Claiming 'left at default' while overwriting it is a false claim."""
+    (tmp_path / "bad.py").write_text(
+        "def tick(self, order):\n"
+        "    decision = None\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "        decision = self.adapter.evaluate()\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=LIFECYCLE_EVAL_FAILED refusal=sentinel-default(decision)\n"
+        "        decision = self.adapter.evaluate()\n"
+        "        logger.exception('retry')\n"
+    )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert "handler assigns it" in found[0]["problem"]
+
+
+def test_gate_flags_sentinel_default_without_none_init(tmp_path):
+    """If the sentinel is not initialised before the try it could hold a
+    value from an earlier tick, so 'no action' is not guaranteed."""
+    (tmp_path / "bad.py").write_text(
+        "def tick(self, order):\n"
+        "    decision = self.last_decision\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "        decision = self.adapter.evaluate()\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=LIFECYCLE_EVAL_FAILED refusal=sentinel-default(decision)\n"
+        "        logger.exception('eval failed')\n"
+    )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert "not initialised to None" in found[0]["problem"]
+
+
+def test_gate_flags_sentinel_default_without_log(tmp_path):
+    (tmp_path / "bad.py").write_text(
+        "def tick(self, order):\n"
+        "    decision = None\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "        decision = self.adapter.evaluate()\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=LIFECYCLE_EVAL_FAILED refusal=sentinel-default(decision)\n"
+        "        pass\n"
+    )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert "not logged" in found[0]["problem"]
+
+
 def test_exit_code_contract():
     from main import _shutdown_exit_code
 

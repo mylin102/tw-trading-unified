@@ -119,7 +119,14 @@ I3-FAILPATH: an `except` that wraps an order/exit/session operation
   # FAILPATH: RECOVERABLE reason=<CODE>   -> may continue, needs log/event
   # FAILPATH: UNKNOWN     reason=<CODE>   -> must refuse (raise, falsy
                                             return, named status, reject(),
-                                            or explicit state transition)
+                                            or explicit state transition).
+                                            For a tick-local decision that
+                                            defaults to None, declare the
+                                            shape instead:
+                                            refusal=sentinel-default(<name>)
+                                            (the gate proves the handler does
+                                            not assign it and that it is
+                                            initialised to None before the try)
   # FAILPATH: FATAL       reason=<CODE>   -> must raise
 
 A handler that re-raises needs no annotation. A silent body (pass/continue/

@@ -107,11 +107,13 @@ FAILPATH_REASONS = {
     "MANUAL_FLAG_RESTORE_FAILED",
     "RELEASE_ARM_SETUP_FAILED",
     "POST_FILL_SYNC_FAILED",
+    "LIFECYCLE_EVAL_FAILED",
 }
 
 _ANN = re.compile(
     r"FAILPATH:\s*(?P<kind>RECOVERABLE|FATAL|UNKNOWN)"
     r"\s+reason=(?P<reason>[A-Z][A-Z0-9_]*)"
+    r"(?:\s+refusal=sentinel-default\((?P<sentinel>\w+)\))?"
 )
 
 EVIDENCE_NAMES = {"warning", "error", "exception", "critical", "info", "debug",
@@ -192,9 +194,9 @@ def _annotation_for(handler: ast.ExceptHandler, comments: dict[int, str]):
         if text and "FAILPATH:" in text:
             m = _ANN.search(text)
             if m:
-                return m.group("kind"), m.group("reason")
-            return "MALFORMED", None
-    return None, None
+                return m.group("kind"), m.group("reason"), m.group("sentinel")
+            return "MALFORMED", None, None
+    return None, None, None
 
 
 REFUSAL_CALLS = ("reject", "invalidate_all", "put")  # explicit failure channel
@@ -245,7 +247,52 @@ def _refuses(handler: ast.ExceptHandler) -> bool:
     return False
 
 
-def check_handler(handler: ast.ExceptHandler, comments) -> tuple[str, str] | None:
+def _enclosing_function(node: ast.AST, parents: dict) -> ast.AST | None:
+    cur = parents.get(node)
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return cur
+        cur = parents.get(cur)
+    return None
+
+
+def _sentinel_default_refusal(handler: ast.ExceptHandler, sentinel: str,
+                              try_node: ast.Try, parents: dict) -> str | None:
+    """Verify the declared refusal shape: a tick-local decision sentinel that
+    the handler leaves untouched, so the tick simply performs no action.
+
+    Requires BOTH:
+      (a) the handler never assigns the sentinel, and
+      (b) the enclosing function initialises it to None before the try.
+    Otherwise the annotation is claiming a refusal that isn't there.
+    """
+    for n in ast.walk(handler):
+        if isinstance(n, (ast.Assign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id == sentinel:
+                    return (f"refusal=sentinel-default({sentinel}) but the "
+                            f"handler assigns it")
+    func = _enclosing_function(try_node, parents)
+    if func is None:
+        return (f"refusal=sentinel-default({sentinel}) outside a function")
+    for n in ast.walk(func):
+        if not isinstance(n, (ast.Assign, ast.AnnAssign)):
+            continue
+        if getattr(n, "lineno", 0) >= try_node.lineno:
+            continue
+        targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+        for t in targets:
+            if isinstance(t, ast.Name) and t.id == sentinel:
+                value = getattr(n, "value", None)
+                if isinstance(value, ast.Constant) and value.value is None:
+                    return None
+    return (f"refusal=sentinel-default({sentinel}) but it is not initialised "
+            f"to None before the try")
+
+
+def check_handler(handler: ast.ExceptHandler, comments,
+                  try_node=None, parents=None) -> tuple[str, str] | None:
     """Return (severity, problem), or None when compliant.
 
     ERROR = violates the invariant as written (silent swallow, or a declared
@@ -264,7 +311,7 @@ def check_handler(handler: ast.ExceptHandler, comments) -> tuple[str, str] | Non
     """
     if _has_raise(handler):
         return None  # nothing is hidden
-    kind, reason = _annotation_for(handler, comments)
+    kind, reason, sentinel = _annotation_for(handler, comments)
     if kind is None:
         if is_silent(handler):
             return ("ERROR", "silent handler with no FAILPATH annotation")
@@ -276,6 +323,16 @@ def check_handler(handler: ast.ExceptHandler, comments) -> tuple[str, str] | Non
     if kind == "FATAL":
         return ("ERROR", "FAILPATH: FATAL but handler does not raise")
     if kind == "UNKNOWN":
+        if sentinel:
+            problem = _sentinel_default_refusal(handler, sentinel, try_node,
+                                                parents or {})
+            if problem:
+                return ("ERROR", problem)
+            if not _has_evidence(handler):
+                return ("ERROR",
+                        f"refusal=sentinel-default({sentinel}) but the failure "
+                        f"is not logged")
+            return None
         if not _refuses(handler):
             return ("ERROR",
                     "FAILPATH: UNKNOWN but handler neither raises nor refuses")
@@ -297,6 +354,8 @@ def scan_tree(root: Path) -> list[dict]:
         except (SyntaxError, OSError):
             continue
         comments = _comments_by_line(source)
+        parents = {child: parent for parent in ast.walk(tree)
+                   for child in ast.iter_child_nodes(parent)}
         for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
                 continue
@@ -304,7 +363,7 @@ def scan_tree(root: Path) -> list[dict]:
             if verb is None:
                 continue
             for handler in node.handlers:
-                result = check_handler(handler, comments)
+                result = check_handler(handler, comments, node, parents)
                 if result:
                     severity, problem = result
                     findings.append({

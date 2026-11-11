@@ -5749,6 +5749,14 @@ class TMFSpread(StrategyBase):
             # at this location (removed) created state-file/broker divergence by writing
             # TRIGGERED before pre-order guards completed.
         except Exception:
+            # FAILPATH: UNKNOWN reason=LIFECYCLE_EVAL_FAILED refusal=sentinel-default(_decision)
+            #   why: `_decision` starts as None for every tick and is only
+            #        assigned when the adapter returns a decision, so leaving
+            #        it untouched means this tick performs NO lifecycle action
+            #        (every later use is guarded by `if _decision is not None`).
+            #        Refusing is therefore the existing safe default; failing
+            #        closed would turn one evaluation error into a process
+            #        exit, which is exactly the 11/7 and 11/10 failure mode.
             logger.exception("[LIFECYCLE_EVAL_FAILED]")
 
         # ── ADR-011 Phase 2: Action-scoped timeout timers (2026-07-16) ──
