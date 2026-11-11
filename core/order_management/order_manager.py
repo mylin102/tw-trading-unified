@@ -733,6 +733,10 @@ class OrderManager:
         try:
             result = submit_combo(order)
         except Exception as exc:
+            # FAILPATH: UNKNOWN reason=ADAPTER_SUBMIT_REJECTED
+            #   why: the adapter raised, so no broker receipt exists. The
+            #        order is explicitly rejected locally (not treated as
+            #        submitted) so no watchdog will try to cancel it.
             _code = getattr(exc, "code", None)
             _reason = (_code if isinstance(_code, str)
                        and (_code.startswith("ADAPTER_COMBO_")
@@ -783,6 +787,10 @@ class OrderManager:
             else:
                 result = self.broker_adapter.place_order(order)
         except Exception as exc:
+            # FAILPATH: UNKNOWN reason=ADAPTER_SUBMIT_REJECTED
+            #   why: same contract as the combo path -- no receipt means the
+            #        order must be treated as a local terminal rejection,
+            #        never as a submitted order awaiting a cancel.
             # No broker receipt means this is a local terminal rejection, not
             # a submitted order that a watchdog may later cancel.  Preserve
             # only a stable adapter code for operator diagnosis; never emit

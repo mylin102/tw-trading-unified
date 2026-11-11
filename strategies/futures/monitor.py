@@ -725,6 +725,9 @@ class FuturesMonitor:
                         _rel_ok, _rel_reasons = verify_release_identity(
                             _rel_dir)
                     except Exception:
+                        # FAILPATH: UNKNOWN reason=RELEASE_IDENTITY_UNAVAILABLE
+                        #   why: the git identity check failed, so release provenance is unproven; the
+                    #   result is refused rather than assumed valid.
                         _rel_ok = False
                         _rel_reasons = ["RELEASE_IDENTITY_GIT_FAILED"]
                     if not _rel_ok:
@@ -884,6 +887,9 @@ class FuturesMonitor:
                 else:
                     self._execution_context = paper_context()
             except ImportError:
+                # FAILPATH: RECOVERABLE reason=EXEC_CTX_MODULE_MISSING
+                #   why: mode_transition is optional at import time; the hard gate degrades to
+                #   disabled and says so, which is visible in the startup log.
                 self._execution_context = None
                 print("[MTS_EXEC_CTX] core.mode_transition not available — hard gate disabled")
 
@@ -5330,6 +5336,9 @@ class FuturesMonitor:
                 box["rows"] = list(rows)
                 box["state"] = "REFRESH_SUCCEEDED"
             except Exception as exc:
+                # FAILPATH: RECOVERABLE reason=TRADE_REFRESH_FAILED
+                #   why: a failed trade refresh is recorded on the box and a session reconnect
+                #   is requested; the next refresh cycle retries.
                 box["state"] = "REFRESH_EXCEPTION"
                 box["error"] = type(exc).__name__
                 self._request_session_reconnect(
@@ -7336,6 +7345,9 @@ class FuturesMonitor:
             else:
                 console.print("[red]Safety stop failed to place[/red]")
         except Exception as e:
+            # FAILPATH: RECOVERABLE reason=SAFETY_STOP_FAILED
+            #   why: the safety stop is best-effort here and the failure is printed; the
+            #   caller still proceeds to the guarded exit path.
             console.print(f" [yellow]Safety stop error: {e}[/yellow] ")
 
     def _cancel_safety_stop(self):
@@ -7355,6 +7367,9 @@ class FuturesMonitor:
             self.api.cancel_order(self._safety_stop_trade)
             console.print("[dim]🛡️ Safety stop cancelled[/dim]")
         except Exception as e:
+            # FAILPATH: UNKNOWN reason=SAFETY_STOP_CANCEL_FAILED
+            #   why: if the protective stop cannot be cancelled the exit must
+            #        not proceed; the handler returns an explicit blocked result.
             # [exit failure-side] NEVER swallow: the caller (ordinary EXIT)
             # must not silently place the exit — structured failure
             console.print(f" [yellow]🛡️ Safety stop cancel error: {e}[/yellow] ")
@@ -8100,6 +8115,9 @@ class FuturesMonitor:
                     lifecycle=lifecycle_to_dict(_strategy._lifecycle_oca),
                 )
             except (ValueError, RuntimeError) as _e:
+                # FAILPATH: UNKNOWN reason=OCO_CANCEL_FAILED
+                #   why: a failed OCO cancel leaves the sibling order in an unproven state, so
+                #   the release group is marked FAILED instead of continuing.
                 _rg.sibling_cancel_status = CancelStatus.REJECTED
                 _rg.status = ReleaseGroupStatus.FAILED
                 console.print(
@@ -8959,6 +8977,9 @@ class FuturesMonitor:
                 trade = self.client.place_order(self.contract, action=action,
                                                 quantity=lots)
             except AdapterOrderError as e:
+                # FAILPATH: UNKNOWN reason=ADAPTER_ORDER_REJECTED
+                #   why: the adapter raised, so no receipt exists; the order is durably rejected
+                #   and None is returned (never treated as submitted).
                 # P0: structured durable failure — never swallowed
                 self._clear_pending_lifecycle_order(order.order_id)
                 self.order_mgr.reject(order.order_id,
@@ -10093,6 +10114,9 @@ class FuturesMonitor:
                 qty=1, premise=premise)
             decision = evaluate_release_precondition(intent, snapshot)
         except Exception as exc:
+            # FAILPATH: UNKNOWN reason=BROKER_QUERY_UNAVAILABLE
+            #   why: without a broker position query the order must not be placed; an
+            #   ORDER_INTENT_BLOCKED event is emitted and None returned.
             self._append_mts_event(
                 "ORDER_INTENT_BLOCKED", action=action,
                 reason="BROKER_QUERY_UNAVAILABLE",
@@ -10718,10 +10742,16 @@ class FuturesMonitor:
                 _ilog.submit_leg(_iid, "NEAR", self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_near_order, raise_on_failure=True))
             except _MTSDupSubmit:
+                # FAILPATH: UNKNOWN reason=DUPLICATE_SUBMIT_SUPPRESSED
+                #   why: a duplicate exit decision is refused on purpose so the same leg is
+                #   never submitted twice.
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} NEAR already submitted — suppressing duplicate[/yellow]")
                 return
             except _MTSGWFail as _gwe:
+                # FAILPATH: UNKNOWN reason=EXIT_LEG_SUBMIT_FAILED
+                #   why: the near-leg submission failed, so the spread state is unknown; the
+                #   trade is quarantined for reconciliation and FAR never submits.
                 # [S0] failed near leg: force LIVE_QUARANTINED + persist
                 # (reconciliation-required); the FAR leg must never
                 # submit after a near failure.
@@ -10738,9 +10768,14 @@ class FuturesMonitor:
                 _ilog.submit_leg(_iid, "FAR", self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_far_order, raise_on_failure=True))
             except _MTSDupSubmit:
+                # FAILPATH: UNKNOWN reason=DUPLICATE_SUBMIT_SUPPRESSED
+                #   why: same dedup contract as the NEAR leg: refuse the repeat submit.
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} FAR already submitted — suppressing duplicate[/yellow]")
                 return
             except _MTSGWFail as _gwe:
+                # FAILPATH: UNKNOWN reason=EXIT_LEG_SUBMIT_FAILED
+                #   why: the far-leg submission failed; the trade is quarantined and no retry
+                #   or cancel is attempted.
                 # [S0] failed far leg: force LIVE_QUARANTINED + persist
                 # (reconciliation-required); no retry, no cancel.
                 self._quarantine_mts_exit_leg_failure(
@@ -10977,10 +11012,15 @@ class FuturesMonitor:
                 _ilog.submit_leg(_iid, _leg_label, self.order_mgr,
                                  submit_fn=lambda cid, leg: self._submit_via_gateway(_order, raise_on_failure=True))
             except _MTSDupSubmit:
+                # FAILPATH: UNKNOWN reason=DUPLICATE_SUBMIT_SUPPRESSED
+                #   why: generic single-leg dedup: the repeat submit is refused.
                 # P1-2 dedup: a repeated exit decision must NOT re-send
                 console.print(f"[yellow]⛔ [P1B_DUP_SUBMIT] {_trade_id} {_leg_label} already submitted — suppressing duplicate[/yellow]")
                 return
             except _MTSGWFail as _gwe:
+                # FAILPATH: UNKNOWN reason=EXIT_LEG_SUBMIT_FAILED
+                #   why: gateway submit failed; the failure is recorded as ORDER_SUBMIT_FAILED,
+                #   the leg is quarantined, and the handler returns.
                 self._append_mts_event(
                     "ORDER_SUBMIT_FAILED", action=_action,
                     trade_id=_trade_id, contract=_symbol,
@@ -10992,6 +11032,9 @@ class FuturesMonitor:
                     self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                 return
             except Exception as _submit_exc:
+                # FAILPATH: UNKNOWN reason=SUBMIT_STATUS_UNKNOWN
+                #   why: an unexpected submit exception leaves the order outcome unknown; the leg
+                #   lock is marked terminal and ORDER_SUBMIT_FAILED is emitted.
                 if _leg_key is not None:
                     self._leg_lock_mark_terminal(_leg_key, "SUBMIT_FAILED")
                 self._append_mts_event(
@@ -11985,6 +12028,9 @@ class FuturesMonitor:
                 leg_role="RELEASED", exit_stage="SECOND_LEG_RELEASE")
             return "OK"
         except Exception:
+            # FAILPATH: UNKNOWN reason=SUBMIT_STATUS_UNKNOWN
+            #   why: the submit outcome cannot be determined; the named status SUBMIT_ERROR is
+            #   returned so the caller never treats it as sent.
             return "SUBMIT_ERROR"
 
     def _leg_lock_release(self, key: dict,
@@ -12101,6 +12147,9 @@ class FuturesMonitor:
                 trade = self.client.place_order(self.contract, action=action,
                                                 quantity=lots)
             except AdapterOrderError as e:
+                # FAILPATH: UNKNOWN reason=ADAPTER_ORDER_REJECTED
+                #   why: the adapter raised, so no receipt exists; the order
+                #        is audited as rejected and never treated as sent.
                 # P0: structured durable failure — never swallowed
                 console.print(
                     f"[red][FuturesMonitor] Live order failed: {e.code} "
@@ -12937,12 +12986,18 @@ class FuturesMonitor:
                         console.print(f" [yellow]✓ Cancelled pending order {order.order_id}[/yellow] ")
                         cancelled_count += 1
                     except Exception as e:
+                        # FAILPATH: RECOVERABLE reason=WATCHDOG_CANCEL_FAILED
+                        #   why: one order failing to cancel must not abort the rest of the sweep; the
+                        #   failure is printed and the next sweep retries.
                         console.print(f"[red]Failed to cancel order {order.order_id}: {e}[/red]")
             else:
                 # Fallback: direct API cancellation for futures orders
                 # This is a simplistic implementation - may need enhancement
                 console.print(" [yellow]⚠️ Order manager not enabled; manual API cancellation not implemented yet[/yellow] ")
         except Exception as e:
+            # FAILPATH: RECOVERABLE reason=WATCHDOG_CANCEL_FAILED
+            #   why: a sweep-level failure is printed; pending orders remain tracked and the
+            #   next watchdog pass retries.
             console.print(f"[red]Error in _cancel_all_pending_orders: {e}[/red]")
         
         if cancelled_count == 0:
@@ -13234,6 +13289,9 @@ class FuturesMonitor:
                 self._mts_stale_order_cancels.add(order_id)
                 self.order_mgr.cancel(order_id)
             except Exception as e:
+                # FAILPATH: RECOVERABLE reason=WATCHDOG_CANCEL_FAILED
+                #   why: the stale-order cancel is retried on the next watchdog tick; the failure
+                #   is printed so repeated failures are visible.
                 console.print(f"[red]❌ [WATCHDOG] Stale order cancel failed: {e}[/red]")
 
         # 2026-06-08 JVS Claw: Cancel + notify for ENTRY/MANUAL timeouts
@@ -13245,6 +13303,8 @@ class FuturesMonitor:
                 self._append_mts_event("ORDER_TIMEOUT", order_id=order_id)
                 console.print(f"[bold red]🚨 [MTS_TIMEOUT] Order {order_id} cancelled — exceeded 30/60s timeout[/bold red]")
             except Exception as e:
+                # FAILPATH: RECOVERABLE reason=WATCHDOG_CANCEL_FAILED
+                #   why: the entry-timeout cancel is retried on the next watchdog tick.
                 console.print(f"[red]❌ [WATCHDOG] Entry timeout cancel failed: {e}[/red]")
 
         # 1.2 EXITING State Lock (15s)
@@ -14851,6 +14911,9 @@ class FuturesMonitor:
                     )
                     self._pending_lifecycle_orders.pop(_order_id, None)
                 except (ValueError, KeyError) as _exc:
+                    # FAILPATH: RECOVERABLE reason=CANCEL_NOT_APPLICABLE
+                    #   why: the order is already terminal, so there is nothing to cancel; the claim
+                    #   key is still released so it cannot stick.
                     # Already terminal/unknown by the time we got here — not
                     # a reason to leave the claim key stuck.
                     console.print(
@@ -16455,6 +16518,9 @@ class FuturesMonitor:
                         os.remove(_processing_path)
             return True
         except Exception as _e:
+            # FAILPATH: RECOVERABLE reason=MANUAL_FLAG_RESTORE_FAILED
+            #   why: the flag is renamed back to .flag so the next tick retries the manual
+            #   trade request instead of losing it.
             self._manual_trade_status = f"ERROR: {str(_e)[:20]}"
             console.print(f"[red][MANUAL_TRADE_FLAG] Failed: {_e}[/red]")
             # 2026-06-05 JVS Claw: C1 crash recovery — rename .processing back
@@ -17258,8 +17324,14 @@ class FuturesMonitor:
                                 f"(rstop={_rstop:.0f}) — waiting for trigger[/bold green]"
                             )
                         except RuntimeError as _e:
+                            # FAILPATH: RECOVERABLE reason=RELEASE_ARM_SETUP_FAILED
+                            #   why: arming the release bracket failed; it is printed and the next evaluation
+                            #   re-attempts arming rather than assuming ARMED.
                             console.print(f"[red]⚠️ [RELEASE_ARMED] Setup failed: {_e}[/red]")
         except Exception as e:
+            # FAILPATH: RECOVERABLE reason=POST_FILL_SYNC_FAILED
+            #   why: the fill already happened; a failed strategy sync is printed and the next
+            #   tick reconciles from broker state.
             console.print(f"[red]⚠️ [MANUAL_TRADE] Post-fill strategy sync failed: {e}[/red]")
 
     # 2026-05-22 Gemini CLI: Removed _maybe_close_selftest() method from here.

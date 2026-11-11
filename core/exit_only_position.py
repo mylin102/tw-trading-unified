@@ -126,6 +126,12 @@ class ReconciledPositionHydration:
         try:
             ok = bool(submit_callable())
         except Exception:
+            # FAILPATH: UNKNOWN reason=EXIT_SUBMIT_FAILED
+            #   why: the broker call raised, so it is unknown whether the
+            #        order reached the exchange. Not submitting again would
+            #        be wrong (it may have filled) and pretending success
+            #        would be worse, so the intent is refused here and left
+            #        in PENDING_RECONCILE for the reconciler to resolve.
             ok = False
         rec["state"] = "SUBMITTED" if ok else "PENDING_RECONCILE"
         return ok
@@ -169,6 +175,11 @@ class ReconciledPositionHydration:
         try:
             ok = bool(submit_callable())
         except Exception:
+            # FAILPATH: UNKNOWN reason=EXIT_SUBMIT_FAILED
+            #   why: same contract as the first-entry path above -- the
+            #        broker call's outcome is unknowable, so the retry is
+            #        refused and the intent is parked for reconciliation
+            #        instead of being counted as sent.
             ok = False
         rec["state"] = "SUBMITTED" if ok else "PENDING_RECONCILE"
         return ok

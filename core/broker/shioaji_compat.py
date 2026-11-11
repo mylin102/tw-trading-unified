@@ -151,6 +151,13 @@ def safe_login(api: sj.Shioaji, api_key: str, secret_key: str, **kwargs) -> Any:
             session_registry.register(api)
         return res
     except TypeError:
+        # FAILPATH: RECOVERABLE reason=SDK_KWARG_INCOMPATIBLE
+        #   why: older shioaji (1.3.3) rejects the newer login kwargs; the
+        #        documented fallback is to retry with the base signature.
+        #        If that retry fails it raises, so nothing is hidden.
+        logger.warning(
+            "[SDK_KWARG_INCOMPATIBLE] retrying login without extended kwargs",
+            exc_info=True)
         # Fallback for 1.3.3
         _login_kwargs.pop("contracts_timeout", None)
         _login_kwargs.pop("subscribe_trade", None)

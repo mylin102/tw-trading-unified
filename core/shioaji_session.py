@@ -241,6 +241,11 @@ class SessionReconnectController:
                     self._exhausted = False
                     return candidate
                 except Exception as reconnect_exc:
+                    # FAILPATH: RECOVERABLE reason=SESSION_RECONNECT_RETRY
+                    #   why: a failed reconnect attempt is expected and is
+                    #        retried with backoff up to max_attempts; the
+                    #        attempt is recorded as an event and the loop
+                    #        gives up (raises) once attempts are exhausted.
                     emit("SESSION_RECONNECT_FAILED", attempt=_attempt,
                          max_attempts=self.max_attempts,
                          error_type=type(reconnect_exc).__name__)
@@ -472,6 +477,10 @@ def _sync_worker(api_key: str, secret_key: str, ca_path: str, ca_passwd: str, q)
         api.fetch_contracts()
         q.put(True)
     except Exception:
+        # FAILPATH: UNKNOWN reason=SUBPROCESS_LOGIN_FAILED
+        #   why: this worker cannot raise into the parent, so the failure is
+        #        propagated through the queue as False and the parent treats
+        #        it as a hard login failure (no session is registered).
         # Do not send certificate paths, account identity, or provider error
         # text over the IPC queue.
         q.put(False)
@@ -619,6 +628,11 @@ def logout():
                 _api.logout()
                 logger.info("[session] Logged out cleanly")
             except Exception as e:
+                # FAILPATH: RECOVERABLE reason=SESSION_LOGOUT_FAILED
+                #   why: the session is already being torn down and the lock
+                #        is released below; a failed broker-side logout only
+                #        means the slot may expire server-side instead. It is
+                #        logged so a recurring failure is visible.
                 logger.error(f"[session] Logout error: {e}")
             _api = None
     _release_session_lock()

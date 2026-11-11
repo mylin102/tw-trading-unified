@@ -1901,6 +1901,10 @@ class TMFSpread(StrategyBase):
         try:
             self._release_mode = ReleaseMode(_rel_mode_str)
         except (ValueError, TypeError):
+            # FAILPATH: RECOVERABLE reason=CONFIG_VALUE_INVALID
+            #   why: an unknown release_mode degrades to the documented
+            #        default (triggered_market) and the value is logged, so
+            #        the operator can see the config was not honoured.
             self._release_mode = ReleaseMode.TRIGGERED_MARKET
             logger.warning("[MTS] Invalid release_mode=%r, falling back to triggered_market", _rel_mode_str)
 
@@ -2505,6 +2509,10 @@ class TMFSpread(StrategyBase):
                 except Exception:
                     logger.warning("[HVWAP_ADAPTIVE_AB] shadow evaluation unavailable", exc_info=True)
         except Exception as _hvwap_exc:
+            # FAILPATH: RECOVERABLE reason=HVWAP_EVAL_FAILED
+            #   why: the candidate pipeline is fail-closed by design (the
+            #        baseline is never disturbed) and an explicit diagnostic
+            #        event is emitted below, so the degradation is recorded.
             # 2026-08-24: fail-closed for the candidate only — NEVER disturb
             # the baseline, but record an EXPLICIT diagnostic event (the
             # previous warning-only path left the production ledger with zero
@@ -3020,6 +3028,10 @@ class TMFSpread(StrategyBase):
                 _rel, _exit_price, _v.decision_ts, _reason)
             return Signal("PARTIAL_EXIT", f"TMF_RELEASE_{_leg.value}", confidence=0.4)
         except Exception:
+            # FAILPATH: UNKNOWN reason=HVWAP_EVAL_FAILED
+            #   why: the evaluation itself failed, so whether a release is
+            #        warranted cannot be proven. Refusing (return None) keeps
+            #        the baseline path intact and never invents a release.
             # fail-closed for the candidate only: never blocks the baseline
             logger.warning("[HVWAP_RELEASE] eval failed (fail-closed)", exc_info=True)
             return None
@@ -3957,6 +3969,10 @@ class TMFSpread(StrategyBase):
         try:
             release_gate = bool(self._mts_atr_release_trend_gate()[0])
         except Exception:
+            # FAILPATH: UNKNOWN reason=TREND_GATE_UNAVAILABLE
+            #   why: the gate could not be evaluated, so confirmation is
+            #        unproven. It resolves to False (refuse the release)
+            #        rather than defaulting to "confirmed".
             release_gate = False
         trend = getattr(self, "_trend_confirmed_snapshot", None)
         try:
