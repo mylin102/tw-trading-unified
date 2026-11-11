@@ -448,3 +448,61 @@ def test_normalize_fills_declared_fields_and_drops_undeclared():
     assert "not_a_field" not in out
     for field in declared:
         assert field in out, f"{field} missing from the normalised record"
+
+
+# ── EMISSION THROTTLING ──
+
+def _throttle_mod():
+    import core.event_schema as m
+    m.reset_throttle()
+    return m
+
+
+def test_throttle_first_emission_always_written():
+    m = _throttle_mod()
+    f = {"trade_id": "T1", "reason": "VERDICT_BAR_PREDATES_ENTRY"}
+    emit, extra = m.throttle("HVWAP_RELEASE_BLOCKED", f, 0.0)
+    assert emit is True and extra == {}
+
+
+def test_throttle_suppresses_repeats_within_window():
+    m = _throttle_mod()
+    f = {"trade_id": "T1", "reason": "R"}
+    m.throttle("HVWAP_RELEASE_BLOCKED", f, 0.0)
+    for t in (1.0, 2.0, 30.0):
+        assert m.throttle("HVWAP_RELEASE_BLOCKED", f, t) == (False, {})
+
+
+def test_throttle_emits_summary_after_window():
+    m = _throttle_mod()
+    f = {"trade_id": "T1", "reason": "R"}
+    m.throttle("HVWAP_RELEASE_BLOCKED", f, 0.0)
+    for t in (1.0, 2.0, 3.0):
+        m.throttle("HVWAP_RELEASE_BLOCKED", f, t)
+    emit, extra = m.throttle("HVWAP_RELEASE_BLOCKED", f, 61.0)
+    assert emit is True
+    assert extra["suppressed_count"] == 3
+    assert extra["first_ts"] and extra["last_ts"]
+
+
+def test_throttle_is_per_reason_and_per_trade():
+    m = _throttle_mod()
+    base = {"trade_id": "T1", "reason": "A"}
+    m.throttle("HVWAP_RELEASE_BLOCKED", base, 0.0)
+    # different reason -> new condition, written immediately
+    assert m.throttle("HVWAP_RELEASE_BLOCKED",
+                      {"trade_id": "T1", "reason": "B"}, 1.0)[0] is True
+    # different trade -> written immediately
+    assert m.throttle("HVWAP_RELEASE_BLOCKED",
+                      {"trade_id": "T2", "reason": "A"}, 1.0)[0] is True
+
+
+def test_discrete_actions_are_never_throttled():
+    """Three ORDER_SUBMITTED events mean three submissions. Suppressing one
+    would be a lie about the broker."""
+    m = _throttle_mod()
+    f = {"trade_id": "T1", "order_id": "O1"}
+    for t in (0.0, 0.1, 0.2):
+        assert m.throttle("ORDER_SUBMITTED", f, t)[0] is True
+    for t in (0.0, 0.1):
+        assert m.throttle("LEG_FILLED", f, t)[0] is True

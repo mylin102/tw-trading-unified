@@ -4,7 +4,7 @@ Accepts an injected Shioaji API instance (no internal login).
 """
 import sys
 import os
-from core.event_schema import normalize  # I1 event schema
+from core.event_schema import normalize, throttle  # I1 event schema
 import glob
 import hashlib
 import time
@@ -9736,6 +9736,11 @@ class FuturesMonitor:
                     os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl")))
             # 2026-10-02 Codex: create the selected namespace before the first event.
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+            _emit, _extra = throttle(event_type, kwargs, time.monotonic())
+            if not _emit:
+                return True          # suppressed inside the throttle window
+            if _extra:
+                kwargs = {**kwargs, **_extra}
             event = {"event": event_type, "ts": datetime.now().isoformat()}
             # I1 schema lock: every declared key is present (missing -> None).
             # Additive only; unknown events pass through and are counted.
@@ -9762,6 +9767,11 @@ class FuturesMonitor:
                     os.getenv("MTS_EVENT_LOG_PATH", os.path.join(_dir, "mts_spread_events.jsonl")))
             # 2026-10-02 Codex: same first-write behavior as the checked writer.
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+            _emit, _extra = throttle(event_type, kwargs, time.monotonic())
+            if not _emit:
+                return               # suppressed inside the throttle window
+            if _extra:
+                kwargs = {**kwargs, **_extra}
             event = {"event": event_type, "ts": datetime.now().isoformat()}
             # I1 schema lock: every declared key is present (missing -> None).
             # Additive only; unknown events pass through and are counted.

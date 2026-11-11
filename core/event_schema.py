@@ -18,6 +18,8 @@ scripts/ci/check_event_schema.py --emit-registry and review the diff.
 """
 from __future__ import annotations
 
+import threading
+from datetime import datetime
 from collections import Counter
 
 EVENT_FIELDS: dict[str, frozenset[str]] = {
@@ -133,5 +135,69 @@ def normalize(event: str, fields: dict) -> dict:
     # (ORDER_SUBMITTED does) would otherwise make this return {"event": None},
     # and event.update() would erase the event name -- observed on 2026-11-11
     # as two records with "event": null.
-    return {key: fields.get(key) for key in declared
+    allowed = declared
+    if event in THROTTLED_EVENTS:
+        allowed = declared | THROTTLE_FIELDS
+    return {key: fields.get(key) for key in allowed
             if key not in RESERVED_KEYS}
+
+
+# ── Emission throttling ──────────────────────────────────────────────────
+# A standing condition is not a discrete action. HVWAP_RELEASE_BLOCKED was
+# emitted 9,581 times in 13.5 minutes for ONE trade on 2026-11-11 -- 48% of the
+# day's ledger -- because the same unchanged state was re-asserted every tick.
+# Any analysis that counts events ("how often was a release blocked?") then
+# measures the tick rate, not the phenomenon.
+#
+# Only state-assertion events are listed here. Discrete actions (orders,
+# fills, settlements, failures) are NEVER throttled: three ORDER_SUBMITTED
+# events mean three submissions, and suppressing one would be a lie.
+THROTTLED_EVENTS = frozenset({
+    "HVWAP_RELEASE_BLOCKED",
+    "ENTRY_BLOCKED_STALE_QUOTE",
+    "POLICY_J_GUARD_QUARANTINE",
+})
+
+THROTTLE_FIELDS = frozenset({"suppressed_count", "first_ts", "last_ts"})
+THROTTLE_WINDOW_S = 60.0
+
+_throttle_state: dict = {}
+_throttle_lock = threading.Lock()
+
+
+def _throttle_key(event: str, fields: dict) -> tuple:
+    return (event, fields.get("trade_id"), fields.get("leg"),
+            fields.get("reason"))
+
+
+def throttle(event: str, fields: dict, now: float) -> tuple[bool, dict]:
+    """Decide whether this emission is written, and what to add to it.
+
+    Returns (emit, extra). The FIRST occurrence of a standing condition is
+    always written immediately, so a crash can never erase the fact that it
+    happened -- only the suppressed counter is lost. Repeats inside the window
+    are counted; when the window rolls over, one record is written carrying
+    suppressed_count/first_ts/last_ts.
+    """
+    if event not in THROTTLED_EVENTS:
+        return True, {}
+    key = _throttle_key(event, fields)
+    ts = datetime.now().isoformat()
+    with _throttle_lock:
+        state = _throttle_state.get(key)
+        if state is None:
+            _throttle_state[key] = {"last": now, "count": 0, "first_ts": ts}
+            return True, {}
+        if now - state["last"] < THROTTLE_WINDOW_S:
+            state["count"] += 1
+            return False, {}
+        extra = {"suppressed_count": state["count"], "first_ts": state["first_ts"],
+                 "last_ts": ts}
+        _throttle_state[key] = {"last": now, "count": 0, "first_ts": ts}
+        return True, extra
+
+
+def reset_throttle() -> None:
+    """Test seam."""
+    with _throttle_lock:
+        _throttle_state.clear()

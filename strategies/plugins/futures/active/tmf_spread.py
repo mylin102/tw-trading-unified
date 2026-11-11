@@ -41,7 +41,7 @@ _UNSET_SENTINEL = object()
 
 import logging
 import os
-from core.event_schema import normalize  # I1 event schema
+from core.event_schema import normalize, throttle  # I1 event schema
 import json
 import math
 import time
@@ -682,6 +682,11 @@ def _append_event(event_type: str, **kwargs) -> None:
         _dir = os.path.dirname(_MTS_EVENT_LOG)
         if _dir and not os.path.exists(_dir):
             os.makedirs(_dir, exist_ok=True)
+        _emit, _extra = throttle(event_type, kwargs, time.monotonic())
+        if not _emit:
+            return                   # suppressed inside the throttle window
+        if _extra:
+            kwargs = {**kwargs, **_extra}
         event = {"event": event_type, "ts": datetime.now().isoformat()}
         # I1 schema lock: every declared key is present (missing -> None).
         # Additive only; unknown events pass through and are counted.
