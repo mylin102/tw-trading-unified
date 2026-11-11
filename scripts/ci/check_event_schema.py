@@ -95,15 +95,18 @@ def _static_dict_keys(node: ast.AST) -> set[str] | None:
     return keys
 
 
-def _dict_literal_keys(node: ast.AST) -> set[str] | None:
-    """Keys of a dict LITERAL, recursing through nested **splats that are
-    themselves dict literals. Returns None if any splat is not literal."""
+def _dict_literal_keys(node: ast.AST, tree: ast.AST | None = None) -> set[str] | None:
+    """Keys of a dict LITERAL, recursing through nested **splats. A splat that
+    is itself a resolved literal, a same-file helper call, or a variable bound
+    to a dict literal is included; anything else makes the whole thing
+    unverifiable."""
     if not isinstance(node, ast.Dict):
         return None
     keys: set[str] = set()
     for k, v in zip(node.keys, node.values):
         if k is None:
-            inner = _dict_literal_keys(v)
+            inner = (_splat_keys(v, tree) if tree is not None
+                     else _dict_literal_keys(v))
             if inner is None:
                 return None
             keys |= inner
@@ -123,7 +126,7 @@ def _helper_keys(tree: ast.AST, name: str) -> set[str] | None:
             found = False
             for n in ast.walk(node):
                 if isinstance(n, ast.Dict):
-                    inner = _dict_literal_keys(n)
+                    inner = _dict_literal_keys(n, tree)
                     if inner:
                         keys |= inner
                         found = True
@@ -136,14 +139,14 @@ def _assigned_dict_keys(tree: ast.AST, name: str) -> set[str] | None:
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id == name:
-                    inner = _dict_literal_keys(node.value)
+                    inner = _dict_literal_keys(node.value, tree)
                     if inner:
                         return inner
     return None
 
 
 def _splat_keys(value: ast.AST, tree: ast.AST) -> set[str] | None:
-    literal = _dict_literal_keys(value)
+    literal = _dict_literal_keys(value, tree)
     if literal is not None:
         return literal
     if isinstance(value, ast.Name):
