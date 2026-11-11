@@ -177,6 +177,62 @@ def test_gate_ignores_silent_handler_around_non_order_call(tmp_path):
 
 # ── EXIT-CODE CONTRACT ──
 
+def test_gate_allows_unknown_with_refusal_return(tmp_path):
+    (tmp_path / "ok.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=SUBMIT_STATUS_UNKNOWN\n"
+        "        return None\n"
+    )
+    assert _scan(tmp_path) == []
+
+
+def test_gate_allows_unknown_with_falsy_sentinel(tmp_path):
+    """`ok = False` then `return ok` is the refusal shape used by the
+    exit-intent submit paths."""
+    (tmp_path / "ok.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=EXIT_SUBMIT_FAILED\n"
+        "        ok = False\n"
+        "    return ok\n"
+    )
+    assert _scan(tmp_path) == []
+
+
+def test_gate_allows_unknown_with_reject_call(tmp_path):
+    (tmp_path / "ok.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=ADAPTER_SUBMIT_REJECTED\n"
+        "        self.reject(order.order_id, reason='X')\n"
+        "        return False\n"
+    )
+    assert _scan(tmp_path) == []
+
+
+def test_gate_flags_unknown_that_only_logs(tmp_path):
+    """Declaring UNKNOWN while merely logging is the contradiction the
+    classification exists to expose."""
+    (tmp_path / "bad.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: UNKNOWN reason=SUBMIT_STATUS_UNKNOWN\n"
+        "        logger.warning('unknown submit state')\n"
+    )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert "neither raises nor refuses" in found[0]["problem"]
+
+
 def test_exit_code_contract():
     from main import _shutdown_exit_code
 

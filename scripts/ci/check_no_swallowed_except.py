@@ -79,6 +79,34 @@ FAILPATH_REASONS = {
     "ORDER_STATE_RACE",
     "QUOTE_SOURCE_UNAVAILABLE",
     "POSITION_STATE_UNREADABLE",
+    # session / broker layer
+    "SDK_KWARG_INCOMPATIBLE",
+    "SESSION_RECONNECT_RETRY",
+    "SESSION_LOGOUT_FAILED",
+    "SUBPROCESS_LOGIN_FAILED",
+    "EXIT_SUBMIT_FAILED",
+    "ADAPTER_SUBMIT_REJECTED",
+    # strategy evaluation layer
+    "CONFIG_VALUE_INVALID",
+    "HVWAP_EVAL_FAILED",
+    "TREND_GATE_UNAVAILABLE",
+    # monitor / execution layer
+    "RELEASE_IDENTITY_UNAVAILABLE",
+    "EXEC_CTX_MODULE_MISSING",
+    "TRADE_REFRESH_FAILED",
+    "SAFETY_STOP_FAILED",
+    "SAFETY_STOP_CANCEL_FAILED",
+    "OCO_CANCEL_FAILED",
+    "ADAPTER_ORDER_REJECTED",
+    "BROKER_QUERY_UNAVAILABLE",
+    "DUPLICATE_SUBMIT_SUPPRESSED",
+    "EXIT_LEG_SUBMIT_FAILED",
+    "SUBMIT_STATUS_UNKNOWN",
+    "WATCHDOG_CANCEL_FAILED",
+    "CANCEL_NOT_APPLICABLE",
+    "MANUAL_FLAG_RESTORE_FAILED",
+    "RELEASE_ARM_SETUP_FAILED",
+    "POST_FILL_SYNC_FAILED",
 }
 
 _ANN = re.compile(
@@ -134,7 +162,7 @@ def _has_evidence(handler: ast.ExceptHandler) -> bool:
         if isinstance(n, ast.Call):
             name = _call_name(n)
             if (name in EVIDENCE_NAMES or name.endswith("_event")
-                    or name.startswith("_log")):
+                    or name.startswith("_log") or name.startswith("_request_")):
                 return True
     return False
 
@@ -169,15 +197,70 @@ def _annotation_for(handler: ast.ExceptHandler, comments: dict[int, str]):
     return None, None
 
 
+REFUSAL_CALLS = ("reject", "invalidate_all", "put")  # explicit failure channel
+
+
+def _returns_falsy(handler: ast.ExceptHandler) -> bool:
+    """A refusal is either a falsy return or a named status constant
+    (e.g. `return "SUBMIT_ERROR"`)."""
+    for n in ast.walk(handler):
+        if isinstance(n, ast.Return):
+            if n.value is None:
+                return True          # bare return = do not proceed
+            if isinstance(n.value, ast.Constant):
+                if not n.value.value:
+                    return True
+                if isinstance(n.value.value, str):
+                    return True
+            # a structured result (dict) is an explicit refusal channel,
+            # e.g. {"blocked": True, "reason": ...}
+            if isinstance(n.value, (ast.Dict, ast.Tuple)):
+                return True
+    return False
+
+
+def _refuses(handler: ast.ExceptHandler) -> bool:
+    """A refusal must be observable: raise, a falsy return, a falsy sentinel
+    assignment (`ok = False`) that the following code acts on, or an explicit
+    failure-channel call (reject()/invalidate_all()/queue put(False))."""
+    if _has_raise(handler):
+        return True
+    if _returns_falsy(handler):
+        return True
+    for n in ast.walk(handler):
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) \
+                and not n.value.value:
+            return True
+        # explicit state transition (e.g. `rg.status = FAILED`) is a refusal
+        if isinstance(n, (ast.Assign, ast.AnnAssign)) and isinstance(n.targets[0] if isinstance(n, ast.Assign) else n.target, ast.Attribute):
+            return True
+        if isinstance(n, ast.Call):
+            name = _call_name(n)
+            if name in REFUSAL_CALLS:
+                return True
+            if name == "put" and any(
+                    isinstance(a, ast.Constant) and a.value is False
+                    for a in n.args):
+                return True
+    return False
+
+
 def check_handler(handler: ast.ExceptHandler, comments) -> tuple[str, str] | None:
     """Return (severity, problem), or None when compliant.
 
     ERROR = violates the invariant as written (silent swallow, or a declared
-            FATAL/UNKNOWN that does not actually stop).
+            FATAL/UNKNOWN that does not actually stop or refuse).
     WARN  = missing annotation on a handler that DOES record or return
             something. Classifying those needs per-site risk review, so they
             are reported and enforced under --strict rather than fabricated
             here.
+
+    States:
+      RECOVERABLE -- the code continues on a deliberate fallback; needs
+                     log/event evidence so the degradation is visible.
+      UNKNOWN     -- the state cannot be proven; must refuse and surface it
+                     (raise, falsy return, or reject()/invalidate/put(False)).
+      FATAL       -- unrecoverable; must raise.
     """
     if _has_raise(handler):
         return None  # nothing is hidden
@@ -190,8 +273,13 @@ def check_handler(handler: ast.ExceptHandler, comments) -> tuple[str, str] | Non
         return ("ERROR", "malformed FAILPATH annotation")
     if reason not in FAILPATH_REASONS:
         return ("ERROR", f"unregistered reason={reason}")
-    if kind in ("FATAL", "UNKNOWN"):
-        return ("ERROR", f"FAILPATH: {kind} but handler does not raise")
+    if kind == "FATAL":
+        return ("ERROR", "FAILPATH: FATAL but handler does not raise")
+    if kind == "UNKNOWN":
+        if not _refuses(handler):
+            return ("ERROR",
+                    "FAILPATH: UNKNOWN but handler neither raises nor refuses")
+        return None
     if not _has_evidence(handler):
         return ("ERROR", "FAILPATH: RECOVERABLE but no log/event evidence")
     return None

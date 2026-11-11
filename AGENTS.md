@@ -114,9 +114,19 @@ The deployed release worktree is immutable while `trading-system` is running.
 
 I3-FAILPATH: an `except` that wraps an order/exit/session operation
 (`submit`/`cancel`/`release`/`_execute_trade`/`close_position`/`login`/
-`logout`/`activate_ca`/...) must record evidence or re-raise. Silent
-`pass`/`continue`/bare `return` is forbidden.
-  Verify: `python scripts/ci/check_no_swallowed_except.py` (must exit 0)
+`logout`/`activate_ca`/...) must DECLARE its failure classification:
+
+  # FAILPATH: RECOVERABLE reason=<CODE>   -> may continue, needs log/event
+  # FAILPATH: UNKNOWN     reason=<CODE>   -> must refuse (raise, falsy
+                                            return, named status, reject(),
+                                            or explicit state transition)
+  # FAILPATH: FATAL       reason=<CODE>   -> must raise
+
+A handler that re-raises needs no annotation. A silent body (pass/continue/
+bare return) with no annotation is always a violation. Unregistered reason
+codes fail: adding one is a review decision that this failure is survivable.
+  Verify: `python scripts/ci/check_no_swallowed_except.py` (must exit 0;
+          `--strict` also fails on handlers whose classification is pending)
   Contract: `pytest tests/contracts/test_production_invariants.py -q`
 
 EXIT-CODE: only an operator stop or `SIGNAL_<NAME>` may map to exit 0.
