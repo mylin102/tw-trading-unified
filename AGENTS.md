@@ -109,3 +109,21 @@ The deployed release worktree is immutable while `trading-system` is running.
 - Start trading-system only from the canonical `ecosystem.config.js`; `ecosystem.config.cjs` is compatibility-only. Do not use ad-hoc `pm2 start main.py` commands.
 - After a deployment, verify exactly one trading process, the intended commit/cwd/interpreter/args, near/far Tick+BidAsk subscriptions, and 120 seconds of stable observe-only operation before `pm2 save`. Confirm `dump.pm2` contains `trading-system` and uses the same `PM2_HOME` as launchd.
 - If broker health is unknown while a position may be open: block new entries, preserve strategy state, alarm, and reconcile. Do not autonomously stop/restart the process.
+
+## Production Invariants (mechanically gated — do not restate, run them)
+
+I3-FAILPATH: an `except` that wraps an order/exit/session operation
+(`submit`/`cancel`/`release`/`_execute_trade`/`close_position`/`login`/
+`logout`/`activate_ca`/...) must record evidence or re-raise. Silent
+`pass`/`continue`/bare `return` is forbidden.
+  Verify: `python scripts/ci/check_no_swallowed_except.py` (must exit 0)
+  Contract: `pytest tests/contracts/test_production_invariants.py -q`
+
+EXIT-CODE: only an operator stop or `SIGNAL_<NAME>` may map to exit 0.
+Every other shutdown reason must exit non-zero, because PM2's
+`stop_exit_codes:[0]` reads a clean exit as a deliberate operator stop and
+will not restart. A process that cannot do its job must terminate non-zero.
+  Contract: `tests/contracts/test_production_invariants.py::test_exit_code_contract`
+
+When adding a rule here, it must name its verification command. A rule with
+no gate is documentation, not an invariant.
