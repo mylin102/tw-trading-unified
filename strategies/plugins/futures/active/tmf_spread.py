@@ -4763,7 +4763,15 @@ class TMFSpread(StrategyBase):
                             else:
                                 logger.warning("[MTS_RESTORE_REJECTED] reason=POLLUTED_DATA_PEAK_ZERO side=%s", _rem_side)
                     except:
-                        pass
+                        # FAILPATH: RECOVERABLE reason=MTS_STATE_RESTORE_FAILED
+                        #   why: JSON state restore failed, so control falls
+                        #        through to the secondary reconstruction from
+                        #        the fill log below. The fallback is the
+                        #        intended recovery, but a silent bare-except
+                        #        hides WHY the primary source was rejected.
+                        logger.warning(
+                            "[MTS_RESTORE_FALLBACK] primary JSON restore failed; "
+                            "using fill-log reconstruction", exc_info=True)
         
         # 2. Secondary Source: Fallback reconstruction from Fill Log
         # 2026-06-02 Gemini CLI: Enhanced with timestamp expiration to prevent "Ghost Trade" loops
@@ -6218,7 +6226,16 @@ class TMFSpread(StrategyBase):
                     if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
                         _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
                 except Exception:
-                    pass  # intent log unavailable → legacy behavior
+                    # FAILPATH: RECOVERABLE reason=EXIT_INTENT_LOG_UNAVAILABLE
+                    #   why: the P1-B durable-intent log is unavailable, so
+                    #        this emission falls back to legacy behaviour
+                    #        (no intent record). It still emits the signal,
+                    #        but the crash-window guarantee is absent -- that
+                    #        must be visible in the log, not silent.
+                    logger.warning(
+                        "[EXIT_INTENT_LOG_UNAVAILABLE] trade_id=%s — emitting "
+                        "without a durable exit intent",
+                        getattr(self, "_trade_id", "?"), exc_info=True)
                 return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
             elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
                 # ── ADR-011 Phase 4: Post-fill warmup guard ──
@@ -6274,7 +6291,16 @@ class TMFSpread(StrategyBase):
                     if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
                         _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
                 except Exception:
-                    pass  # intent log unavailable → legacy behavior
+                    # FAILPATH: RECOVERABLE reason=EXIT_INTENT_LOG_UNAVAILABLE
+                    #   why: the P1-B durable-intent log is unavailable, so
+                    #        this emission falls back to legacy behaviour
+                    #        (no intent record). It still emits the signal,
+                    #        but the crash-window guarantee is absent -- that
+                    #        must be visible in the log, not silent.
+                    logger.warning(
+                        "[EXIT_INTENT_LOG_UNAVAILABLE] trade_id=%s — emitting "
+                        "without a durable exit intent",
+                        getattr(self, "_trade_id", "?"), exc_info=True)
                 _pj_event = None
                 if getattr(_decision, "winner", None) == "POLICY_J_SINGLE_LEG":
                     try:
@@ -6403,7 +6429,16 @@ class TMFSpread(StrategyBase):
                     if not _ilog.has_inflight_exit_intent(getattr(self, "_trade_id", "")):
                         _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT")
                 except Exception:
-                    pass  # intent log unavailable → legacy behavior
+                    # FAILPATH: RECOVERABLE reason=EXIT_INTENT_LOG_UNAVAILABLE
+                    #   why: the P1-B durable-intent log is unavailable, so
+                    #        this emission falls back to legacy behaviour
+                    #        (no intent record). It still emits the signal,
+                    #        but the crash-window guarantee is absent -- that
+                    #        must be visible in the log, not silent.
+                    logger.warning(
+                        "[EXIT_INTENT_LOG_UNAVAILABLE] trade_id=%s — emitting "
+                        "without a durable exit intent",
+                        getattr(self, "_trade_id", "?"), exc_info=True)
                 return Signal("EXIT", "TMF_COMBINED_EXIT", confidence=1.0, stop_loss=0)
             elif _decision.action == LifecycleAction.MANUAL:
                 # MANUAL: full flatten — same as STOPLOSS/TIMEOUT

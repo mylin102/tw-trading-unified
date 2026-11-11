@@ -1193,6 +1193,13 @@ class OrderManager:
                 else:
                     continue
             except ValueError:
+                # FAILPATH: RECOVERABLE reason=ORDER_STATE_RACE
+                #   why: a concurrent callback may have made this order
+                #        terminal; the authoritative terminal state is left
+                #        untouched and the loop continues to the next order.
+                logging.getLogger("OrderManager").debug(
+                    "[ORDER_STATE_RACE] skipping terminal transition for %s",
+                    getattr(order, "order_id", "?"))
                 # A concurrent callback may have made this order terminal;
                 # leave that authoritative terminal state untouched.
                 continue

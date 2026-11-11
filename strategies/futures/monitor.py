@@ -6191,6 +6191,15 @@ class FuturesMonitor:
                     event_time=_ev_time)
                 _closed += 1
             except Exception:
+                # FAILPATH: RECOVERABLE reason=RELEASE_SYNC_FAILED
+                #   why: this is a per-fill reconciliation loop; one fill
+                #        that fails to sync must not abort the remaining
+                #        fills, but the failure must be visible because the
+                #        strategy's release state can then lag the broker.
+                logger.warning(
+                    "[RELEASE_SYNC_FAILED] leg=%s order_id=%s trade_id=%s",
+                    _leg, _r.get("order_id"), getattr(_strat, "_trade_id", "?"),
+                    exc_info=True)
                 continue
         return _closed
 

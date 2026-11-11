@@ -67,15 +67,88 @@ def test_gate_flags_bare_except_around_execute_trade(tmp_path):
     assert len(_scan(tmp_path)) == 1
 
 
-def test_gate_allows_evidenced_handler(tmp_path):
-    (tmp_path / "ok.py").write_text(
+def test_gate_requires_annotation_even_when_logging(tmp_path):
+    """Logging alone is not the standard: the handler must declare whether
+    the failure is survivable (agent_engineering_governance I3)."""
+    (tmp_path / "bad.py").write_text(
         "def f(order):\n"
         "    try:\n"
         "        broker.submit(order)\n"
         "    except Exception:\n"
         "        logger.warning('submit failed', exc_info=True)\n"
     )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert found[0]["severity"] == "WARN"
+    assert found[0]["problem"].startswith("no FAILPATH annotation")
+
+
+def test_gate_allows_annotated_recoverable_handler(tmp_path):
+    (tmp_path / "ok.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception as exc:\n"
+        "        # FAILPATH: RECOVERABLE reason=ORDER_STATE_RACE\n"
+        "        logger.warning('submit failed: %s', exc)\n"
+    )
     assert _scan(tmp_path) == []
+
+
+def test_gate_flags_annotated_recoverable_without_evidence(tmp_path):
+    (tmp_path / "bad.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: RECOVERABLE reason=ORDER_STATE_RACE\n"
+        "        pass\n"
+    )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert "no log/event evidence" in found[0]["problem"]
+
+
+def test_gate_flags_fatal_annotation_without_raise(tmp_path):
+    """Declaring FATAL while silently continuing is the exact contradiction
+    the annotation exists to expose."""
+    (tmp_path / "bad.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: FATAL reason=POSITION_STATE_UNREADABLE\n"
+        "        logger.error('submit failed')\n"
+    )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert "does not raise" in found[0]["problem"]
+
+
+def test_gate_allows_fatal_annotation_with_raise(tmp_path):
+    (tmp_path / "ok.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: FATAL reason=POSITION_STATE_UNREADABLE\n"
+        "        raise\n"
+    )
+    assert _scan(tmp_path) == []
+
+
+def test_gate_flags_unregistered_reason(tmp_path):
+    (tmp_path / "bad.py").write_text(
+        "def f(order):\n"
+        "    try:\n"
+        "        broker.submit(order)\n"
+        "    except Exception:\n"
+        "        # FAILPATH: RECOVERABLE reason=MADE_UP_REASON\n"
+        "        logger.warning('x')\n"
+    )
+    found = _scan(tmp_path)
+    assert len(found) == 1
+    assert "unregistered reason" in found[0]["problem"]
 
 
 def test_gate_allows_reraise(tmp_path):
