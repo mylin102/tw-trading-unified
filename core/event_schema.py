@@ -156,6 +156,11 @@ THROTTLED_EVENTS = frozenset({
     "HVWAP_RELEASE_BLOCKED",
     "ENTRY_BLOCKED_STALE_QUOTE",
     "POLICY_J_GUARD_QUARANTINE",
+    # 2026-11-11: of 64 POLICY_J_PEAK_CONFIRMED events, 57 were followed by
+    # another PEAK_CANDIDATE for the same trade -- the same peak re-confirmed
+    # on the next tick, not 57 decisions. Counting them overstates how often
+    # the trigger condition fired.
+    "POLICY_J_PEAK_CONFIRMED",
 })
 
 THROTTLE_FIELDS = frozenset({"suppressed_count", "first_ts", "last_ts"})
