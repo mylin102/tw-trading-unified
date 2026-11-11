@@ -401,3 +401,27 @@ def test_event_schema_flags_unverifiable_splat(tmp_path):
     )
     found = _schema_scan(tmp_path)
     assert any(v["kind"] == "UNVERIFIABLE_FIELDS" for v in found)
+
+
+def test_event_schema_reads_name_from_second_arg_for_ilog(tmp_path):
+    """_ilog.append_event(intent_id, name, **fields): the name is argument 1,
+    not 0. Treating arg 0 as the name produced false NON_LITERAL reports."""
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "emitter.py").write_text(
+        "def a(self, log, iid):\n"
+        "    log.append_event(iid, 'POLICY_J_SINGLE_LEG_TRIGGERED', trade_id=1)\n"
+        "def b(self, log, iid):\n"
+        "    log.append_event(iid, 'POLICY_J_SINGLE_LEG_TRIGGERED', trade_id=2)\n"
+    )
+    assert _schema_scan(tmp_path) == []
+
+
+def test_event_schema_ignores_object_based_append_event(tmp_path):
+    """lifecycle_provenance._append_event(event_obj) takes an object, not a
+    name; it is not a name-based API and must not be schema-checked."""
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "emitter.py").write_text(
+        "def a(self, event):\n"
+        "    self._append_event(event)\n"
+    )
+    assert _schema_scan(tmp_path) == []

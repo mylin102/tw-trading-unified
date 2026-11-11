@@ -54,11 +54,30 @@ EVENT_FUNCS = ("append_event",)
 EVENT_SCHEMA: dict[str, list[list[str]]] = {}
 
 
-def _is_event_call(node: ast.Call) -> bool:
+# Writer signatures differ, so the event-name argument position does too.
+#   _append_mts_event(<name>, **fields)                -> name at 0
+#   _ilog.append_event(<intent_id>, <name>, **fields)  -> name at 1
+#   lifecycle_provenance._append_event(<event_obj>)    -> not name-based
+NAME_ARG_INDEX = {
+    "_append_mts_event": 0,
+    "_append_mts_event_checked": 0,
+    "append_event": 1,
+}
+NOT_NAME_BASED = {"_append_event"}
+
+
+def _writer_kind(node: ast.Call) -> str:
     fn = node.func
     name = fn.attr if isinstance(fn, ast.Attribute) else (
         fn.id if isinstance(fn, ast.Name) else "")
-    return "append_event" in name or name.startswith("_append_mts_event")
+    return name
+
+
+def _is_event_call(node: ast.Call) -> bool:
+    name = _writer_kind(node)
+    if name in NOT_NAME_BASED:
+        return False
+    return name in NAME_ARG_INDEX or "append_mts_event" in name
 
 
 def _static_dict_keys(node: ast.AST) -> set[str] | None:
@@ -168,9 +187,10 @@ def collect(root: Path) -> tuple[dict, list[dict]]:
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call) or not _is_event_call(node):
                     continue
-                if not node.args:
+                idx = NAME_ARG_INDEX.get(_writer_kind(node), 0)
+                if len(node.args) <= idx:
                     continue
-                first = node.args[0]
+                first = node.args[idx]
                 if not (isinstance(first, ast.Constant)
                         and isinstance(first.value, str)):
                     unnamed.append({"file": str(path), "line": node.lineno})
