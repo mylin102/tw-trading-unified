@@ -109,6 +109,8 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
 undeclared_events: Counter[str] = Counter()
 undeclared_fields: Counter[str] = Counter()
 
+RESERVED_KEYS = frozenset({"event", "ts"})
+
 
 def normalize(event: str, fields: dict) -> dict:
     """Return `fields` with every declared key present (missing -> None).
@@ -126,4 +128,10 @@ def normalize(event: str, fields: dict) -> dict:
         # The registry is the contract: a field nobody declared must not enter
         # the ledger, or the shape drifts again through this very writer.
         undeclared_fields[event] += len(extra)
-    return {key: fields.get(key) for key in declared}
+    # RESERVED: "event" and "ts" are the envelope, written by the caller before
+    # this runs. A call site that passes `event=` as a payload field
+    # (ORDER_SUBMITTED does) would otherwise make this return {"event": None},
+    # and event.update() would erase the event name -- observed on 2026-11-11
+    # as two records with "event": null.
+    return {key: fields.get(key) for key in declared
+            if key not in RESERVED_KEYS}

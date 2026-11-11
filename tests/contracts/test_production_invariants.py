@@ -425,3 +425,26 @@ def test_event_schema_ignores_object_based_append_event(tmp_path):
         "    self._append_event(event)\n"
     )
     assert _schema_scan(tmp_path) == []
+
+
+# ── RESERVED ENVELOPE KEYS ──
+
+def test_normalize_never_returns_envelope_keys():
+    """ORDER_SUBMITTED passes `event=` as a payload field. If normalize()
+    echoed it back, event.update() would overwrite the event name with the
+    payload value -- observed in production on 2026-11-11 as two records with
+    "event": null right after the schema lock shipped."""
+    from core.event_schema import normalize
+    out = normalize("ORDER_SUBMITTED", {"contract": "TMF", "event": "X", "ts": "Y"})
+    assert "event" not in out
+    assert "ts" not in out
+
+
+def test_normalize_fills_declared_fields_and_drops_undeclared():
+    from core.event_schema import EVENT_FIELDS, normalize
+    declared = [f for f in sorted(EVENT_FIELDS["ORDER_SUBMITTED"])
+                if f not in ("event", "ts")]
+    out = normalize("ORDER_SUBMITTED", {"contract": "TMF", "not_a_field": 1})
+    assert "not_a_field" not in out
+    for field in declared:
+        assert field in out, f"{field} missing from the normalised record"
