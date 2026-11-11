@@ -3203,6 +3203,18 @@ class TMFSpread(StrategyBase):
             "exit_px_basis": basis,
             "near_bid": bar.get("near_bid"), "near_ask": bar.get("near_ask"),
             "far_bid": bar.get("far_bid"), "far_ask": bar.get("far_ask"),
+            # 2026-11-11 Hermes Agent: the observable mark-vs-executable gap was
+            # ~6x the quoted bid-ask cost (40 pts of gap against 13 pts of
+            # spread), so the gap is NOT explained by crossing the spread. The
+            # suspects are a stale or wrong-leg BBO feeding the exec side. These
+            # four fields make that decidable from the ledger instead of by
+            # reading code: if the residual tracks quote age, the exec basis was
+            # built on stale quotes; if the price source is BAR_CLOSE, the two
+            # sides measured different things.
+            "near_quote_age_ms": bar.get("near_tick_age_ms"),
+            "far_quote_age_ms": bar.get("far_tick_age_ms"),
+            "near_price_source": bar.get("near_price_source"),
+            "far_price_source": bar.get("far_price_source"),
         }
         self._last_exit_px = snap
         params = getattr(self, "_params", {}) or {}
