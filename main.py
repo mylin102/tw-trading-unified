@@ -1812,6 +1812,7 @@ def run_system(dry_run=False, config_name="futures"):
             def _session_event(event, **payload):
                 for _mon in futures_mons:
                     try:
+                        # EVENT_SCHEMA: dynamic(SESSION_RECONNECT_TRIGGERED, SESSION_RECONNECT_FAILED, SESSION_RECONNECT_READY)
                         _mon._append_mts_event(event, **payload)
                     except Exception:
                         pass

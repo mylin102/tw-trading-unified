@@ -4,6 +4,7 @@ Accepts an injected Shioaji API instance (no internal login).
 """
 import sys
 import os
+from core.event_schema import normalize  # I1 event schema
 import glob
 import hashlib
 import time
@@ -3568,6 +3569,7 @@ class FuturesMonitor:
                     getattr(_ctx, "audit_reasons", ()) or ()))
             self._persist_execution_context()
 
+        # EVENT_SCHEMA: dynamic(MTS_ENTRY_PARTIAL_SUBMISSION)
         self._append_mts_event(
             _reason,
             trade_id=trade_id,
@@ -4846,6 +4848,7 @@ class FuturesMonitor:
                 _ctx, ModeTransitionState.LIVE_QUARANTINED.value,
                 live_order_allowed=False, audit_reasons=(_reason,))
             self._persist_execution_context()
+            # EVENT_SCHEMA: dynamic(EXIT_ONLY_TERMINAL_AMBIGUITY)
             self._append_mts_event(_reason, reconciliation_id=_rid)
             return None, _reason
         if not capability_exit_completed(_ctx, _matching):
@@ -5429,6 +5432,7 @@ class FuturesMonitor:
     def _record_refresh_telemetry(self, result):
         self._last_futures_refresh = dict(result, rows=None)
         try:
+            # EVENT_SCHEMA: dynamic(REFRESH_EXCEPTION, REFRESH_SKIPPED_DISCONNECTED, REFRESH_SKIPPED_INFLIGHT, REFRESH_STARTED, REFRESH_SUCCEEDED, REFRESH_TIMEOUT_UNCERTAIN)
             self._append_mts_event(result.get("state", "REFRESH_EXCEPTION"),
                                    snapshot_generation=result.get("snapshot_generation"),
                                    account_type="futures",
@@ -8555,6 +8559,7 @@ class FuturesMonitor:
         setattr(self, ("_last_fdeal_callback_at" if is_futures_deal
                        else "_last_order_callback_at"), _callback_at)
         try:
+            # EVENT_SCHEMA: dynamic(FDEAL_CALLBACK, FORDER_CALLBACK)
             self._append_mts_event(
                 _callback_observation,
                 observation_type=_callback_observation,
@@ -9732,7 +9737,9 @@ class FuturesMonitor:
             # 2026-10-02 Codex: create the selected namespace before the first event.
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             event = {"event": event_type, "ts": datetime.now().isoformat()}
-            event.update(kwargs)
+            # I1 schema lock: every declared key is present (missing -> None).
+            # Additive only; unknown events pass through and are counted.
+            event.update(normalize(event_type, kwargs))
             with open(path, "a") as f:
                 f.write(json.dumps(event, default=str) + "\n")
             return True
@@ -9756,7 +9763,9 @@ class FuturesMonitor:
             # 2026-10-02 Codex: same first-write behavior as the checked writer.
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             event = {"event": event_type, "ts": datetime.now().isoformat()}
-            event.update(kwargs)
+            # I1 schema lock: every declared key is present (missing -> None).
+            # Additive only; unknown events pass through and are counted.
+            event.update(normalize(event_type, kwargs))
             with open(path, "a") as f:
                 f.write(json.dumps(event, default=str) + "\n")
         except Exception:

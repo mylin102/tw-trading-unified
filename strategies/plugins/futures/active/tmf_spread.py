@@ -41,6 +41,7 @@ _UNSET_SENTINEL = object()
 
 import logging
 import os
+from core.event_schema import normalize  # I1 event schema
 import json
 import math
 import time
@@ -682,7 +683,9 @@ def _append_event(event_type: str, **kwargs) -> None:
         if _dir and not os.path.exists(_dir):
             os.makedirs(_dir, exist_ok=True)
         event = {"event": event_type, "ts": datetime.now().isoformat()}
-        event.update(kwargs)
+        # I1 schema lock: every declared key is present (missing -> None).
+        # Additive only; unknown events pass through and are counted.
+        event.update(normalize(event_type, kwargs))
         with open(_MTS_EVENT_LOG, "a") as f:
             f.write(json.dumps(event, default=str) + "\n")
     except Exception:

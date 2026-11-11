@@ -36,12 +36,15 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import json
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 SCOPE = ["core", "strategies", "main.py"]
+
+REGISTRY_PATH = Path("core/event_schema.py")
 
 SKIP_PARTS = ("__pycache__", "/.venv/", "node_modules", "/tests/", "/archive",
               "/archive_orphaned", "/data/", "/logs/")
@@ -172,6 +175,24 @@ def _fields(node: ast.Call, tree: ast.AST) -> tuple[set[str], list[str]]:
     return fields, problems
 
 
+_DYNAMIC = re.compile(r"#\s*EVENT_SCHEMA:\s*dynamic\((?P<names>[^)]*)\)")
+
+
+def _declared_dynamic_names(path: Path, line: int) -> list[str]:
+    """The closed set a dynamic emitter declares, from a comment on or within
+    three lines above the call."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for candidate in range(max(0, line - 4), min(len(lines), line + 1)):
+        m = _DYNAMIC.search(lines[candidate])
+        if m:
+            return [n.strip().strip('"\'') for n in m.group("names").split(",")
+                    if n.strip()]
+    return []
+
+
 def collect(root: Path) -> tuple[dict, list[dict]]:
     by_event: dict[str, list[dict]] = defaultdict(list)
     unnamed: list[dict] = []
@@ -196,7 +217,21 @@ def collect(root: Path) -> tuple[dict, list[dict]]:
                 first = node.args[idx]
                 if not (isinstance(first, ast.Constant)
                         and isinstance(first.value, str)):
-                    unnamed.append({"file": str(path), "line": node.lineno})
+                    declared_names = _declared_dynamic_names(path, node.lineno)
+                    if declared_names:
+                        # Attribute this call's fields to every name the site
+                        # declares it may emit, so those events get a schema.
+                        dyn_fields, dyn_problems = _fields(node, tree)
+                        for dyn in declared_names:
+                            by_event[dyn].append({
+                                "file": str(path), "line": node.lineno,
+                                "fields": sorted(dyn_fields),
+                                "unverifiable": dyn_problems,
+                            })
+                    unnamed.append({
+                        "file": str(path), "line": node.lineno,
+                        "dynamic_names": declared_names,
+                    })
                     continue
                 fields, problems = _fields(node, tree)
                 by_event[first.value].append({
@@ -206,18 +241,84 @@ def collect(root: Path) -> tuple[dict, list[dict]]:
     return by_event, unnamed
 
 
+def load_registry(root: Path) -> dict:
+    """Load EVENT_FIELDS from <root>/core/event_schema.py, by path.
+
+    Loaded by path rather than by import so scanning a temp tree cannot pick
+    up the real repo's registry out of sys.modules. No registry -> {} and the
+    gate falls back to drift-only checking.
+    """
+    path = root / REGISTRY_PATH
+    if not path.is_file():
+        return {}
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_event_schema_%s" % abs(hash(str(path))), path)
+    if spec is None or spec.loader is None:
+        return {}
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        return {}
+    return dict(getattr(module, "EVENT_FIELDS", {}))
+
+
 def check(root: Path) -> list[dict]:
+    EVENT_FIELDS = load_registry(root)
+
     by_event, unnamed = collect(root)
     violations: list[dict] = []
 
     for item in unnamed:
-        violations.append({
-            "kind": "NON_LITERAL_EVENT_NAME",
-            "event": "?",
-            **item,
-        })
+        # A dynamic name is allowed only when the site enumerates the closed
+        # set it may emit, and every name in that set is registered. Enumerating
+        # is not a waiver: an unlisted name escapes the schema entirely.
+        declared_names = item.get("dynamic_names") or []
+        unregistered = [n for n in declared_names if n not in EVENT_FIELDS]
+        if not declared_names:
+            violations.append({
+                "kind": "NON_LITERAL_EVENT_NAME",
+                "event": "?",
+                "file": item["file"],
+                "line": item["line"],
+                "detail": "no '# EVENT_SCHEMA: dynamic(A, B)' enumeration",
+            })
+        elif unregistered:
+            violations.append({
+                "kind": "NON_LITERAL_EVENT_NAME",
+                "event": "?",
+                "file": item["file"],
+                "line": item["line"],
+                "detail": f"unregistered names {unregistered}",
+            })
 
     for event, sites in sorted(by_event.items()):
+        # A registered event is normalised at write time (missing -> None),
+        # so N call-site shapes are one record shape. The contract then is:
+        # the registry declares exactly the fields emitters actually supply --
+        # a new field or a stale entry is a violation, not a silent drift.
+        if event in EVENT_FIELDS:
+            union = set()
+            for site in sites:
+                union |= set(site["fields"])
+            declared = set(EVENT_FIELDS[event])
+            if union - declared:
+                violations.append({
+                    "kind": "UNDECLARED_FIELD",
+                    "event": event,
+                    "detail": sorted(union - declared),
+                })
+            elif declared - union:
+                violations.append({
+                    "kind": "STALE_REGISTRY",
+                    "event": event,
+                    "detail": sorted(declared - union),
+                })
+            # Registered events are normalised at write time, so a payload the
+            # gate cannot see statically is still cut to the declared schema.
+            continue
+
         for site in sites:
             if site["unverifiable"]:
                 violations.append({
@@ -233,6 +334,14 @@ def check(root: Path) -> list[dict]:
             if not site["unverifiable"]:
                 shapes[tuple(site["fields"])].append(site)
         if len(shapes) <= 1:
+            # A repo with no registry yet still gets drift checking; asking for
+            # registration only makes sense once core/event_schema.py exists.
+            if EVENT_FIELDS:
+                violations.append({
+                    "kind": "UNREGISTERED_EVENT",
+                    "event": event,
+                    "count": len(sites),
+                })
             continue
         declared = {tuple(sorted(s)) for s in EVENT_SCHEMA.get(event, [])}
         for shape, members in sorted(shapes.items(), key=lambda kv: -len(kv[1])):
@@ -271,6 +380,10 @@ def main(argv: list[str] | None = None) -> int:
             elif v["kind"] == "UNVERIFIABLE_FIELDS":
                 print(f"  [UNVERIFIABLE] {v['file']}:{v['line']} {v['event']}"
                       f"  **{v['detail']}")
+            elif v["kind"] in ("UNDECLARED_FIELD", "STALE_REGISTRY"):
+                print(f"  [{v['kind']}] {v['event']} fields={v['detail']}")
+            elif v["kind"] == "UNREGISTERED_EVENT":
+                print(f"  [UNREGISTERED] {v['event']} calls={v['count']}")
             else:
                 print(f"  [DRIFT] {v['event']} shape={v['shape']} "
                       f"count={v['count']}")
