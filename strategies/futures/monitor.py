@@ -15239,6 +15239,41 @@ class FuturesMonitor:
             ),
         )
 
+def _mts_gap_is_fully_trading(start, end) -> bool:
+    """True only if every sampled instant between start and end is in a TAIFEX
+    trading session.
+
+    WHY: 47 of 47 historical MTS_EVALUATOR_LAG events fell on 08:45:0x or
+    15:00:0x with lag_secs equal to the closed period (4,440-13,504 s). The SLO
+    was measuring the calendar, not slowness, and an alert that fires at every
+    open and close trains people to ignore it.
+
+    Endpoint checks are not enough: 04:59 -> 08:45 has both ends OPEN while the
+    entire middle is closed. Sampling is bounded (only reached when lag > SLO,
+    a couple of times a day).
+
+    Any failure to judge returns True (keep the alert): losing a real stall
+    alert is worse than one extra line.
+    """
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        from core.date_utils import is_taifex_futures_market_open as _open
+        if isinstance(start, str):
+            start = _dt.fromisoformat(start)
+        if isinstance(end, str):
+            end = _dt.fromisoformat(end)
+        if start is None or end is None or end < start:
+            return True
+        t = start
+        while t <= end:
+            if not _open(t):
+                return False
+            t += _td(seconds=300)
+        return True
+    except Exception:
+        return True
+
+
     def _mts_slo_alert(
         self, clock: str, cfg_key: str, default: float,
         lag: float, now: float, tid, first_eval: bool, last_wall,
@@ -15246,6 +15281,16 @@ class FuturesMonitor:
         """Emit a rate-limited MTS_EVALUATOR_LAG alert when lag > SLO."""
         _slo = self._mts_evaluator_lag_slo(cfg_key, default)
         if lag <= _slo:
+            return
+        # A gap that spans a market closure is not lag. See
+        # _mts_gap_is_fully_trading for the measurement behind this.
+        # Window from lag_secs, not from last_wall: for the tick_loop clock the
+        # logged last_eval_at is the loop's wake time (6 ms before ts) while lag
+        # is 4,476 s, so judging the gap from that field sees a 6 ms "gap" and
+        # keeps alerting. lag_secs is the authoritative measure of the gap.
+        _now_wall = datetime.now()
+        if not _mts_gap_is_fully_trading(
+                _now_wall - timedelta(seconds=float(lag)), _now_wall):
             return
         if now - self._last_slo_alert_mono.get(clock, 0.0) < 60.0:
             return  # rate limit: at most one alert per minute per clock

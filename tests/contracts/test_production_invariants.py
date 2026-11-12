@@ -538,3 +538,29 @@ def test_no_pnl_field_defaults_to_zero_on_emit():
                     and v.args[1].value == 0):
                 offenders.append((kw.arg, v.lineno))
     assert not offenders, f"PnL field defaulted to 0 at {offenders}"
+
+
+# ── EVALUATOR LAG MUST NOT FIRE ON THE CALENDAR ──
+
+def test_evaluator_lag_closed_window_is_not_lag():
+    """04:59 -> 08:45: both ends are OPEN, the whole middle is closed. An
+    endpoint check would keep alerting; sampling must not."""
+    from strategies.futures.monitor import _mts_gap_is_fully_trading as f
+    assert f("2026-11-12T08:23:17", "2026-11-12T08:45:02") is False
+
+
+def test_evaluator_lag_inside_session_still_alerts():
+    """A 90 s silence at 13:31 on a trading day is a REAL stall."""
+    from strategies.futures.monitor import _mts_gap_is_fully_trading as f
+    assert f("2026-10-21T13:29:59", "2026-10-21T13:31:29") is True
+
+
+def test_evaluator_lag_overnight_gap_is_not_lag():
+    from strategies.futures.monitor import _mts_gap_is_fully_trading as f
+    assert f("2026-11-11T04:59:59", "2026-11-11T08:45:04") is False
+
+
+def test_evaluator_lag_unparseable_keeps_alerting():
+    """Judging failed -> keep the alert. Losing a real stall is worse."""
+    from strategies.futures.monitor import _mts_gap_is_fully_trading as f
+    assert f("not-a-timestamp", "2026-11-12T10:00:00") is True
