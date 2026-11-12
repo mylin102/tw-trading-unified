@@ -16854,6 +16854,15 @@ class FuturesMonitor:
                     _set["near_realized_pnl_net"] + _set["far_realized_pnl_net"], 1)
                 _combined_fees = _set["near_fee"] + _set["far_fee"]
                 _combined_tax = _set["near_tax"] + _set["far_tax"]
+                # 2026-11-12 Hermes Agent: publish the computed settlement to
+                # the tracker. The TRADE_SETTLED emitter read
+                # tracker["net_pnl"] / ["near_realized_pnl"] /
+                # ["far_realized_pnl"], keys that NOTHING ever wrote, so all
+                # 264 settled records carried net_pnl=0. The real figures were
+                # already computed here, one line above, under different names.
+                tracker["net_pnl"] = _combined_net
+                tracker["near_realized_pnl"] = _set["near_realized_pnl_net"]
+                tracker["far_realized_pnl"] = _set["far_realized_pnl_net"]
                 _effective_mode = getattr(
                     getattr(self, "_execution_context", None),
                     "effective_mode", "")
@@ -16993,9 +17002,11 @@ class FuturesMonitor:
                     session=tracker.get("entry_session", "day"),
                     entry_price=tracker.get("entry_price", 0),
                     exit_price=price,
-                    net_pnl=tracker.get("net_pnl", 0),
-                    near_pnl=tracker.get("near_realized_pnl", 0),
-                    far_pnl=tracker.get("far_realized_pnl", 0),
+                    # Fail-closed: an unknown PnL is None, never 0. A zero
+                    # reads as "this trade made nothing", which is a claim.
+                    net_pnl=tracker.get("net_pnl"),
+                    near_pnl=tracker.get("near_realized_pnl"),
+                    far_pnl=tracker.get("far_realized_pnl"),
                     exit_reason="COMBINED_EXIT",
                     risk_mode="COMBINED_EXIT",
                 )

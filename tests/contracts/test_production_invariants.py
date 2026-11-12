@@ -506,3 +506,35 @@ def test_discrete_actions_are_never_throttled():
         assert m.throttle("ORDER_SUBMITTED", f, t)[0] is True
     for t in (0.0, 0.1):
         assert m.throttle("LEG_FILLED", f, t)[0] is True
+
+
+# ── PNL MUST NOT DEFAULT TO ZERO ──
+
+def test_no_pnl_field_defaults_to_zero_on_emit():
+    """2026-11-12: TRADE_SETTLED emitted net_pnl=0 for all 264 records because
+    the emitter read tracker["net_pnl"], a key nothing ever wrote, through
+    .get(key, 0). The real figures were computed one line away under different
+    names. A missing PnL must surface as None, never as a zero that reads like
+    "this trade made nothing"."""
+    import ast
+    from pathlib import Path as _P
+    src = _P("strategies/futures/monitor.py").read_text()
+    tree = ast.parse(src)
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+        if "append_event" not in name:
+            continue
+        for kw in node.keywords:
+            if not kw.arg or "pnl" not in kw.arg.lower():
+                continue
+            v = kw.value
+            if (isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "get" and len(v.args) == 2
+                    and isinstance(v.args[1], ast.Constant)
+                    and v.args[1].value == 0):
+                offenders.append((kw.arg, v.lineno))
+    assert not offenders, f"PnL field defaulted to 0 at {offenders}"
