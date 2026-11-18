@@ -352,3 +352,34 @@ def test_daily_report_kpis_use_only_net_trades_and_count_gross_only():
     assert "$80.0 TWD" in html
     assert "未扣費筆數（GROSS_ONLY）: 1" in html
     assert "N/A" in html
+
+
+# ── Regression: main() must resolve log paths through TRADING_RUNTIME_DIR ──
+# 2026-11-18 Hermes Agent: fills_path/events_path were hardcoded cwd-relative
+# strings ("logs/mts_trade_fills.jsonl" etc.), missing the mts_runtime_path()
+# resolution (including the PAPER-mode "paper/" prefix) that every other
+# durable artifact uses. This made main() silently find no data in
+# production. Lock in the correct resolution so it cannot regress.
+
+def test_main_resolves_paths_via_mts_runtime_path(monkeypatch, tmp_path):
+    import scripts.generate_daily_report as gdr_module
+
+    monkeypatch.setenv("TRADING_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("NODE_ENV", "production")
+    monkeypatch.chdir(tmp_path)
+
+    captured = {}
+
+    def _fake_parse_logs(fills_path, events_path, target_date):
+        captured["fills_path"] = fills_path
+        captured["events_path"] = events_path
+        return {"completed": [], "active": []}
+
+    monkeypatch.setattr(gdr_module, "parse_logs", _fake_parse_logs)
+    monkeypatch.setattr(gdr_module.sys, "argv", ["generate_daily_report.py", "2026-11-18"])
+
+    gdr_module.main()
+
+    from core.runtime_paths import mts_runtime_path
+    assert captured["fills_path"] == mts_runtime_path("logs", "mts_trade_fills.jsonl")
+    assert captured["events_path"] == mts_runtime_path("logs", "mts_spread_events.jsonl")
