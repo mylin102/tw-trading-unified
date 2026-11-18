@@ -1403,7 +1403,8 @@ class OrderManager:
 
     @staticmethod
     def _order_id_audit_path() -> str:
-        return os.path.join("exports", "trades", "order_id_audit.jsonl")
+        from core.runtime_paths import mts_runtime_path
+        return mts_runtime_path("exports", "trades", "order_id_audit.jsonl")
 
     def _append_order_id_audit(self, order_id: str) -> None:
         """Keep append-only local identity history independent of daily exports."""
