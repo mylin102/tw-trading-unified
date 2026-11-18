@@ -538,3 +538,28 @@ class TestEdgeCases:
         # Negative price should be allowed (data error, not logic error)
         paper_mgr.on_fill(order.order_id, -1, 1, partial=False)
         assert order.avg_fill_price == -1
+
+
+# ── Regression: order_id_audit path must route through TRADING_RUNTIME_DIR ──
+# 2026-11-18 Hermes Agent: _order_id_audit_path() previously hardcoded a
+# cwd-relative path, so order ID audit records silently diverged from every
+# other durable artifact (which all resolve via mts_runtime_path /
+# TRADING_RUNTIME_DIR). Lock in the correct resolution so it cannot regress.
+
+class TestOrderIdAuditPath:
+    def test_audit_path_uses_mts_runtime_path(self, paper_mgr, monkeypatch):
+        import core.order_management.order_manager as om_module
+
+        monkeypatch.setenv("TRADING_RUNTIME_DIR", "/tmp/fake_runtime_dir")
+        monkeypatch.delenv("MTS_DATA_MODE", raising=False)
+
+        from core.runtime_paths import mts_runtime_path
+        expected = mts_runtime_path("exports", "trades", "order_id_audit.jsonl")
+
+        actual = om_module.OrderManager._order_id_audit_path()
+
+        assert actual == expected
+        assert "fake_runtime_dir" in actual, (
+            "order_id_audit path must be rooted at TRADING_RUNTIME_DIR, "
+            f"got: {actual}"
+        )
