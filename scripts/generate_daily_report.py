@@ -1081,8 +1081,9 @@ def main():
     if len(sys.argv) > 1:
         target_date = sys.argv[1]
         
-    fills_path = "logs/mts_trade_fills.jsonl"
-    events_path = "logs/mts_spread_events.jsonl"
+    from core.runtime_paths import mts_runtime_path
+    fills_path = mts_runtime_path("logs", "mts_trade_fills.jsonl")
+    events_path = mts_runtime_path("logs", "mts_spread_events.jsonl")
     report_dir = "reports"
     os.makedirs(report_dir, exist_ok=True)
     
