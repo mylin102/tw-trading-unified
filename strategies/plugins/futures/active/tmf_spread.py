@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 # or runtime toggle by design. Changing it is a code change + redeploy,
 # same as any other strategy behavior change; gated by R-008 evidence
 # before ever being flipped to False in production.
-RELEASE_ENABLED = True
+RELEASE_ENABLED = False
 
 # ── Policy J entry peak guard config (2026-08-04 contract alignment) ──
 # Canonical key: entry_peak_guard_ms — the quarantine window AFTER both legs
