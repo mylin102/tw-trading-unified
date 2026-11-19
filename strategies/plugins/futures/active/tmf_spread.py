@@ -2892,6 +2892,12 @@ class TMFSpread(StrategyBase):
           * DEFENSIVE PARITY: quote age and bid/ask validity/width are
             re-checked so a stale/invalid/wide quote cannot be bypassed.
         """
+        # 2026-11-19 Hermes Agent: user-directed kill switch — when
+        # release_enabled is False, keep only Policy J COMBINED_EXIT; the
+        # HVWAP-sourced RELEASE path must never fire. Default True = no
+        # behavior change (quick-task: add-release-enabled-config-flag).
+        if not bool(getattr(self, "_params", {}).get("release_enabled", True)):
+            return None
         try:
             from strategies.plugins.futures.active.mts_hvwap_candidate import (
                 HvwapStatus,
@@ -5684,6 +5690,14 @@ class TMFSpread(StrategyBase):
                 self._pj_guard_just_completed = False  # consumed once
             _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
             _decision = _adapter_res.decision
+            # 2026-11-19 Hermes Agent: user-directed kill switch — when
+            # release_enabled is False, neutralize an ATR/adapter-sourced
+            # RELEASE decision into a no-op (hold, continue SPREAD phase).
+            # COMBINED_EXIT and every other action type pass through
+            # unchanged. Default True = no behavior change.
+            if (_decision is not None and _decision.action == LifecycleAction.RELEASE
+                    and not bool(getattr(self, "_params", {}).get("release_enabled", True))):
+                _decision = None
             # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
             # baseline-clear marker: the candidate may act only when the
             # baseline lifecycle evaluation produced NO exit decision (risk
