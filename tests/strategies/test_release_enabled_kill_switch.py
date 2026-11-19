@@ -1,14 +1,17 @@
-"""2026-11-19 Hermes Agent: quick-task 261119-ll7 — release_enabled kill switch.
+"""2026-11-19 Hermes Agent: quick-task 261119-ll7 — RELEASE_ENABLED kill switch.
 
 User decision: keep MTS spread trading only via Policy J COMBINED_EXIT when
-the operator wants it; add a flag that, when False, neutralizes BOTH known
-RELEASE-decision sources in tmf_spread.py:
+the operator wants it; RELEASE_ENABLED is a static module-level constant
+(no #ifdef in Python, so a constant is the equivalent — deliberately NOT
+wired to config/params/a flag file/dashboard; changing it requires a code
+change + redeploy). When False it neutralizes BOTH known RELEASE-decision
+sources in tmf_spread.py:
 
   1. HVWAP-candidate path: _hvwap_maybe_paper_release() (tmf_spread.py:2897)
   2. ATR/adapter path: `_decision = _adapter_res.decision` consumer in
      on_bar() (tmf_spread.py:5686)
 
-Default True: behavior must be byte-identical to before this flag existed.
+Default True: behavior must be byte-identical to before this switch existed.
 """
 from datetime import datetime
 from types import SimpleNamespace
@@ -27,7 +30,7 @@ from core.strategy_context import MarketData, PositionView, StrategyContext
 
 # ── Part A: HVWAP-candidate path (the dominant real-world release source) ──
 # Reuses the exact fixture shape from test_hvwap_release_entry_bar_guard.py
-# (proven to reach a real PARTIAL_EXIT signal when the flag is absent).
+# (proven to reach a real PARTIAL_EXIT signal when the switch is True).
 
 def _verdict(decision_ts: float):
     return SimpleNamespace(
@@ -42,7 +45,7 @@ def _verdict(decision_ts: float):
     )
 
 
-def _hvwap_strategy(release_enabled):
+def _hvwap_strategy():
     s = object.__new__(TMFSpread)
     lc = SimpleNamespace(phase=PositionPhase.SPREAD,
                          release_group=SimpleNamespace(status=ReleaseGroupStatus.ARMED),
@@ -73,8 +76,6 @@ def _hvwap_strategy(release_enabled):
     s._near_side = "SELL"
     s._far_side = "BUY"
     s._ticker = "TMF"
-    if release_enabled is not None:
-        s._params = {"release_enabled": release_enabled}
     return s
 
 
@@ -85,23 +86,26 @@ def _no_side_effects(monkeypatch):
     monkeypatch.setattr(tmf, "_write_mts_state", lambda *a, **k: None, raising=False)
 
 
-def test_hvwap_release_blocked_when_release_enabled_false():
-    s = _hvwap_strategy(release_enabled=False)
+def test_hvwap_release_blocked_when_release_switch_off(monkeypatch):
+    monkeypatch.setattr(tmf, "RELEASE_ENABLED", False)
+    s = _hvwap_strategy()
     sig = s._hvwap_maybe_paper_release({}, datetime(2026, 10, 30, 10, 20), 46000.0, 46100.0)
     assert sig is None
 
 
-def test_hvwap_release_allowed_when_release_enabled_true():
-    s = _hvwap_strategy(release_enabled=True)
+def test_hvwap_release_allowed_when_release_switch_on(monkeypatch):
+    monkeypatch.setattr(tmf, "RELEASE_ENABLED", True)
+    s = _hvwap_strategy()
     sig = s._hvwap_maybe_paper_release({}, datetime(2026, 10, 30, 10, 20), 46000.0, 46100.0)
     assert sig is not None
     assert sig.action == "PARTIAL_EXIT"
 
 
-def test_hvwap_release_allowed_when_release_enabled_absent_default():
-    # No self._params at all — matches the lightweight test harness shape
-    # AND the pre-flag production default (no behavior change).
-    s = _hvwap_strategy(release_enabled=None)
+def test_hvwap_release_allowed_at_module_default():
+    # Does not touch the switch at all — proves the shipped default (True)
+    # reproduces pre-switch production behavior with zero wiring changes.
+    assert tmf.RELEASE_ENABLED is True
+    s = _hvwap_strategy()
     sig = s._hvwap_maybe_paper_release({}, datetime(2026, 10, 30, 10, 20), 46000.0, 46100.0)
     assert sig is not None
     assert sig.action == "PARTIAL_EXIT"
@@ -131,9 +135,9 @@ def _strategy_for_adapter_path():
     return s
 
 
-def test_adapter_release_decision_neutralized_when_disabled(_strategy_for_adapter_path):
+def test_adapter_release_decision_neutralized_when_switch_off(_strategy_for_adapter_path, monkeypatch):
+    monkeypatch.setattr(tmf, "RELEASE_ENABLED", False)
     s = _strategy_for_adapter_path
-    s._params["release_enabled"] = False
     s._has_position = True
     s._near_side = "LONG"
     s._far_side = "SHORT"
