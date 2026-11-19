@@ -61,6 +61,16 @@ from strategies.futures.squeeze_futures.engine.constants import get_point_value
 
 logger = logging.getLogger(__name__)
 
+# ── 2026-11-19 Hermes Agent: RELEASE (split-leg) kill switch ──
+# Static, compile-time-style switch (no #ifdef in Python, so a module
+# constant is the equivalent). To disable the RELEASE/split-leg mechanism
+# (keep only Policy J COMBINED_EXIT), flip this to False and redeploy.
+# DELIBERATELY NOT wired to config/params/a flag file/dashboard — no live
+# or runtime toggle by design. Changing it is a code change + redeploy,
+# same as any other strategy behavior change; gated by R-008 evidence
+# before ever being flipped to False in production.
+RELEASE_ENABLED = True
+
 # ── Policy J entry peak guard config (2026-08-04 contract alignment) ──
 # Canonical key: entry_peak_guard_ms — the quarantine window AFTER both legs
 # settle, during which Policy J durable peaks are suppressed (opening-spike
@@ -2896,7 +2906,7 @@ class TMFSpread(StrategyBase):
         # release_enabled is False, keep only Policy J COMBINED_EXIT; the
         # HVWAP-sourced RELEASE path must never fire. Default True = no
         # behavior change (quick-task: add-release-enabled-config-flag).
-        if not bool(getattr(self, "_params", {}).get("release_enabled", True)):
+        if not RELEASE_ENABLED:
             return None
         try:
             from strategies.plugins.futures.active.mts_hvwap_candidate import (
@@ -5696,7 +5706,7 @@ class TMFSpread(StrategyBase):
             # COMBINED_EXIT and every other action type pass through
             # unchanged. Default True = no behavior change.
             if (_decision is not None and _decision.action == LifecycleAction.RELEASE
-                    and not bool(getattr(self, "_params", {}).get("release_enabled", True))):
+                    and not RELEASE_ENABLED):
                 _decision = None
             # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
             # baseline-clear marker: the candidate may act only when the
