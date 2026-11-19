@@ -2,9 +2,21 @@
 import pytest
 from datetime import datetime
 from types import SimpleNamespace
+import strategies.plugins.futures.active.tmf_spread as tmf
 from tests.strategies.test_mts_crossday_policy_j import held_paper
 from tests.strategies.test_mts_paper_exit_width import run_release
 from tests.strategies.test_mts_paper_exit_bbo import paper_exit
+
+
+@pytest.fixture(autouse=True)
+def _release_enabled_for_retry_tests(monkeypatch):
+    # 2026-11-19 Hermes Agent: RELEASE_ENABLED is now a static kill switch
+    # (default False in production as of this commit — user decision,
+    # pending R-008 evidence). This file tests paper-order retry behavior
+    # for a RELEASE signal via run_release(), so it must force the switch
+    # on to remain meaningful.
+    monkeypatch.setattr(tmf, "RELEASE_ENABLED", True)
+
 
 
 def test_unsent_paper_release_retries_when_quote_recovers(held_paper, paper_exit, monkeypatch):

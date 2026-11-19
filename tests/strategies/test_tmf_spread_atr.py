@@ -15,11 +15,21 @@ import pytest
 from unittest.mock import patch, PropertyMock
 from datetime import datetime
 
+import strategies.plugins.futures.active.tmf_spread as tmf
 from strategies.plugins.futures.active.tmf_spread import (
     TMFSpread, Leg, PositionPhase, PositionLifecycle, ReleaseGroup,
     ReleaseGroupStatus, TrailGroup, TrailGroupStatus,
 )
 from core.strategy_context import StrategyContext, MarketData, PositionView
+
+
+@pytest.fixture(autouse=True)
+def _release_enabled_for_adr014_tests(monkeypatch):
+    # 2026-11-19 Hermes Agent: RELEASE_ENABLED is now a static kill switch
+    # (default False in production as of this commit — user decision,
+    # pending R-008 evidence). This file is specifically about release-
+    # decision correctness (ADR-014), so it must force the switch on.
+    monkeypatch.setattr(tmf, "RELEASE_ENABLED", True)
 
 
 def _make_bar(near_close=45500, far_close=45800, atr=10.0, **kw):

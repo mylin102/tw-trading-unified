@@ -102,13 +102,11 @@ def test_hvwap_release_allowed_when_release_switch_on(monkeypatch):
 
 
 def test_hvwap_release_allowed_at_module_default():
-    # Does not touch the switch at all — proves the shipped default (True)
-    # reproduces pre-switch production behavior with zero wiring changes.
-    assert tmf.RELEASE_ENABLED is True
-    s = _hvwap_strategy()
-    sig = s._hvwap_maybe_paper_release({}, datetime(2026, 10, 30, 10, 20), 46000.0, 46100.0)
-    assert sig is not None
-    assert sig.action == "PARTIAL_EXIT"
+    # 2026-11-19: production default flipped to False (user decision,
+    # pending R-008 evidence). This test now only documents that the
+    # switch is a real module attribute with a known current value —
+    # it does not assert what that value should be.
+    assert tmf.RELEASE_ENABLED is False
 
 
 # ── Part B: ATR/adapter path — neutralize a RELEASE decision from

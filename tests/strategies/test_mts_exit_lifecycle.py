@@ -1,9 +1,21 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from datetime import datetime
+import strategies.plugins.futures.active.tmf_spread as tmf
 from strategies.plugins.futures.active.tmf_spread import TMFSpread
 from core.strategy_context import StrategyContext, MarketData, PositionView
 from core.order_management.order import OrderSide, OrderStatus
+
+
+@pytest.fixture(autouse=True)
+def _release_enabled_for_legacy_tests(monkeypatch):
+    # 2026-11-19 Hermes Agent: RELEASE_ENABLED is now a static kill switch
+    # (default False in production as of this commit — user decision,
+    # pending R-008 evidence). Every pre-existing test in this file was
+    # written assuming release fires normally (True), so force it on here
+    # to preserve that regression coverage unchanged.
+    monkeypatch.setattr(tmf, "RELEASE_ENABLED", True)
+
 
 @pytest.fixture
 def strategy():

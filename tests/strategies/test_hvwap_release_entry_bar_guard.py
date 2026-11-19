@@ -20,6 +20,17 @@ import strategies.plugins.futures.active.tmf_spread as tmf
 from strategies.plugins.futures.active.mts_hvwap_candidate import HvwapStatus
 
 
+@pytest.fixture(autouse=True)
+def _release_enabled_for_mechanism_tests(monkeypatch):
+    # 2026-11-19 Hermes Agent: RELEASE_ENABLED is now a static kill switch
+    # (default False in production as of this commit — user decision,
+    # pending R-008 evidence). This file tests the HVWAP entry-bar guard
+    # INSIDE the release mechanism itself, so it must force the switch on
+    # to remain meaningful; it is not asserting anything about the
+    # production default.
+    monkeypatch.setattr(tmf, "RELEASE_ENABLED", True)
+
+
 def _verdict(decision_ts: float):
     return SimpleNamespace(
         status=HvwapStatus.ALIGNED_PASS,
