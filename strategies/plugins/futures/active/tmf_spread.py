@@ -71,6 +71,21 @@ logger = logging.getLogger(__name__)
 # before ever being flipped to False in production.
 RELEASE_ENABLED = False
 
+# ── 2026-11-20 Hermes Agent: per-leg fixed-point bracket exit switch ──
+# User-directed PAPER experiment (see .hermes/plans/2026-11-20_090000-
+# oco-bracket-exit-evaluation.md §9). Static module constant, same
+# discipline as RELEASE_ENABLED above: code change + redeploy to flip, no
+# live/dashboard/config-file toggle. When True, BOTH legs run fully
+# independent fixed-point TP/SL brackets (no coupling between legs — user
+# explicit: "兩腿是同時獨立跑同時監測, 沒有誰等誰的問題"), evaluated
+# tick-by-tick against the live mark (no resting broker orders — whichever
+# level is crossed first gets its MKP+IOC exit submitted; the other was
+# never armed, so nothing needs cancelling). Mutually exclusive with
+# Policy J COMBINED_EXIT while True. Default False = zero behavior change.
+PER_LEG_BRACKET_EXIT_ENABLED = False
+PER_LEG_BRACKET_TP_POINTS = 50.0
+PER_LEG_BRACKET_SL_POINTS = 15.0
+
 # ── Policy J entry peak guard config (2026-08-04 contract alignment) ──
 # Canonical key: entry_peak_guard_ms — the quarantine window AFTER both legs
 # settle, during which Policy J durable peaks are suppressed (opening-spike
@@ -2014,6 +2029,10 @@ class TMFSpread(StrategyBase):
         self._trail_exit_ticks = 0
         self._trail_exit_start_time = 0.0
 
+        # 2026-11-20 Gemini CLI: per-leg bracket exit status (quick-task 261120-d57)
+        self._bracket_near_status: str | None = None
+        self._bracket_far_status: str | None = None
+
         # ADR-009 v1.1: Position Lifecycle OCA
         self._lifecycle_oca: PositionLifecycle = PositionLifecycle()
 
@@ -3060,6 +3079,119 @@ class TMFSpread(StrategyBase):
             logger.warning("[HVWAP_RELEASE] eval failed (fail-closed)", exc_info=True)
             return None
 
+    def _check_per_leg_bracket_exit(self, bar: dict) -> Signal | None:
+        """2026-11-20 Gemini CLI: per-leg fixed-point TP/SL bracket exit evaluator
+        (quick-task 261120-d57). Evaluates both legs independently against live tick
+        marks (never stale BAR_CLOSE). Gated by PER_LEG_BRACKET_EXIT_ENABLED.
+        """
+        if not PER_LEG_BRACKET_EXIT_ENABLED:
+            return None
+        if not getattr(self, "_has_position", False):
+            return None
+
+        # Elapsed ms since entry for telemetry
+        _elapsed_ms = 0.0
+        _entry_ts = getattr(self, "_entry_ts", None)
+        if _entry_ts is not None:
+            _ts_now = bar.get("timestamp") or datetime.now()
+            if isinstance(_ts_now, datetime) and isinstance(_entry_ts, datetime):
+                _elapsed_ms = max(0.0, (_ts_now - _entry_ts).total_seconds() * 1000.0)
+
+        # ── 1. Evaluate NEAR leg independently ──
+        if getattr(self, "_bracket_near_status", None) == "ARMED":
+            _near_src = str(bar.get("near_price_source") or "")
+            # Reusing 1e9f53be fix: BAR_CLOSE-only mark must NOT fire bracket exit
+            if _near_src != "BAR_CLOSE":
+                _near_val = bar.get("near_close_rt") if "near_close_rt" in bar else bar.get("near_close")
+                try:
+                    _near_mark = float(_near_val) if _near_val is not None else 0.0
+                except (TypeError, ValueError):
+                    _near_mark = 0.0
+
+                if _near_mark > 0.0 and getattr(self, "_near_entry", 0.0) > 0.0:
+                    _entry = float(self._near_entry)
+                    _side = str(getattr(self, "_near_side", "") or "").upper()
+                    _hit_type = None
+
+                    if _side in ("LONG", "BUY"):
+                        _tp_px = _entry + PER_LEG_BRACKET_TP_POINTS
+                        _sl_px = _entry - PER_LEG_BRACKET_SL_POINTS
+                        if _near_mark >= _tp_px:
+                            _hit_type = "BRACKET_TP"
+                        elif _near_mark <= _sl_px:
+                            _hit_type = "BRACKET_SL"
+                    elif _side in ("SHORT", "SELL"):
+                        _tp_px = _entry - PER_LEG_BRACKET_TP_POINTS
+                        _sl_px = _entry + PER_LEG_BRACKET_SL_POINTS
+                        if _near_mark <= _tp_px:
+                            _hit_type = "BRACKET_TP"
+                        elif _near_mark >= _sl_px:
+                            _hit_type = "BRACKET_SL"
+
+                    if _hit_type is not None:
+                        self._bracket_near_status = "EXITED"
+                        _other_status = getattr(self, "_bracket_far_status", None)
+                        _append_event(
+                            "PER_LEG_BRACKET_EXIT",
+                            trade_id=getattr(self, "_trade_id", "") or "",
+                            leg="NEAR",
+                            hit_type=_hit_type,
+                            entry_price=_entry,
+                            exit_price=_near_mark,
+                            elapsed_ms=round(_elapsed_ms, 1),
+                            other_leg_status=_other_status,
+                        )
+                        _action = "PARTIAL_EXIT" if _other_status == "ARMED" else "EXIT"
+                        return Signal(action=_action, reason=_hit_type, confidence=1.0, stop_loss=0)
+
+        # ── 2. Evaluate FAR leg independently ──
+        if getattr(self, "_bracket_far_status", None) == "ARMED":
+            _far_src = str(bar.get("far_price_source") or "")
+            if _far_src != "BAR_CLOSE":
+                _far_val = bar.get("far_close_rt") if "far_close_rt" in bar else bar.get("far_close")
+                try:
+                    _far_mark = float(_far_val) if _far_val is not None else 0.0
+                except (TypeError, ValueError):
+                    _far_mark = 0.0
+
+                if _far_mark > 0.0 and getattr(self, "_far_entry", 0.0) > 0.0:
+                    _entry = float(self._far_entry)
+                    _side = str(getattr(self, "_far_side", "") or "").upper()
+                    _hit_type = None
+
+                    if _side in ("LONG", "BUY"):
+                        _tp_px = _entry + PER_LEG_BRACKET_TP_POINTS
+                        _sl_px = _entry - PER_LEG_BRACKET_SL_POINTS
+                        if _far_mark >= _tp_px:
+                            _hit_type = "BRACKET_TP"
+                        elif _far_mark <= _sl_px:
+                            _hit_type = "BRACKET_SL"
+                    elif _side in ("SHORT", "SELL"):
+                        _tp_px = _entry - PER_LEG_BRACKET_TP_POINTS
+                        _sl_px = _entry + PER_LEG_BRACKET_SL_POINTS
+                        if _far_mark <= _tp_px:
+                            _hit_type = "BRACKET_TP"
+                        elif _far_mark >= _sl_px:
+                            _hit_type = "BRACKET_SL"
+
+                    if _hit_type is not None:
+                        self._bracket_far_status = "EXITED"
+                        _other_status = getattr(self, "_bracket_near_status", None)
+                        _append_event(
+                            "PER_LEG_BRACKET_EXIT",
+                            trade_id=getattr(self, "_trade_id", "") or "",
+                            leg="FAR",
+                            hit_type=_hit_type,
+                            entry_price=_entry,
+                            exit_price=_far_mark,
+                            elapsed_ms=round(_elapsed_ms, 1),
+                            other_leg_status=_other_status,
+                        )
+                        _action = "PARTIAL_EXIT" if _other_status == "ARMED" else "EXIT"
+                        return Signal(action=_action, reason=_hit_type, confidence=1.0, stop_loss=0)
+
+        return None
+
     def _ensure_lifecycle_adapter_initialized(self, source: str = "NORMAL") -> None:
         """
         Deterministic initialization boundary for MtsLifecycleAdapter.
@@ -3306,6 +3438,13 @@ class TMFSpread(StrategyBase):
         self._release_far_start_time = 0.0
         self._trail_exit_ticks = 0
         self._trail_exit_start_time = 0.0
+
+        # 2026-11-20 Hermes Agent: per-leg bracket exit status reset on new
+        # entry (quick-task 261120-d57). ARMED only when the switch is on
+        # at entry time; a mid-trade flip of the module constant must not
+        # retroactively arm/disarm an in-flight trade.
+        self._bracket_near_status = "ARMED" if PER_LEG_BRACKET_EXIT_ENABLED else None
+        self._bracket_far_status = "ARMED" if PER_LEG_BRACKET_EXIT_ENABLED else None
 
         # [GSD] Log confirmed fills and ENTRY event
         _append_fill(self._ticker, "NEAR", "NEAR", self._near_side, 1, near_entry, "ENTRY", trade_id,
@@ -5708,6 +5847,16 @@ class TMFSpread(StrategyBase):
             if (_decision is not None and _decision.action == LifecycleAction.RELEASE
                     and not RELEASE_ENABLED):
                 _decision = None
+            # 2026-11-20 Gemini CLI: per-leg bracket exit wiring (quick-task 261120-d57).
+            # When PER_LEG_BRACKET_EXIT_ENABLED is True, this path runs INSTEAD of
+            # Policy J COMBINED_EXIT (mutual exclusion). Neutralize COMBINED_EXIT from
+            # the adapter and evaluate the independent per-leg bracket exits.
+            if PER_LEG_BRACKET_EXIT_ENABLED:
+                if _decision is not None and _decision.action == LifecycleAction.COMBINED_EXIT:
+                    _decision = None
+                _bracket_sig = self._check_per_leg_bracket_exit(bar)
+                if _bracket_sig is not None:
+                    return _bracket_sig
             # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
             # baseline-clear marker: the candidate may act only when the
             # baseline lifecycle evaluation produced NO exit decision (risk
@@ -6996,7 +7145,8 @@ class TMFSpread(StrategyBase):
         self._peak_net_exit_pnl_twd = 0.0
         for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
                    "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
-                   "_pj_last_upl", "_pj_exit_event_id", "_pj_exit_winner"):
+                   "_pj_last_upl", "_pj_exit_event_id", "_pj_exit_winner",
+                   "_bracket_near_status", "_bracket_far_status"):
             if hasattr(self, _a):
                 setattr(self, _a, None)
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill
