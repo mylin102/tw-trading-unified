@@ -82,7 +82,7 @@ RELEASE_ENABLED = False
 # level is crossed first gets its MKP+IOC exit submitted; the other was
 # never armed, so nothing needs cancelling). Mutually exclusive with
 # Policy J COMBINED_EXIT while True. Default False = zero behavior change.
-PER_LEG_BRACKET_EXIT_ENABLED = False
+PER_LEG_BRACKET_EXIT_ENABLED = True
 PER_LEG_BRACKET_TP_POINTS = 50.0
 PER_LEG_BRACKET_SL_POINTS = 15.0
 
