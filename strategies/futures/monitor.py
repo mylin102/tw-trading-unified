@@ -18022,6 +18022,22 @@ class FuturesMonitor:
                 _mts_bar["far_close_rt"] = self._far_current_bar["close"]
                 _mts_bar["far_high_rt"] = self._far_current_bar.get("high", _mts_bar["far_close_rt"])
                 _mts_bar["far_low_rt"] = self._far_current_bar.get("low", _mts_bar["far_close_rt"])
+            # 2026-11-20 Hermes Agent: [NEAR_PRICE_FIX] symmetric near-leg
+            # injection. Without it the heartbeat path handed the strategy a
+            # near mark = last closed 5m bar while the far mark was a live
+            # tick (observed 221/237 Policy J evaluations =
+            # BAR_CLOSE/LIVE_TICK, 2026-11-19). The mismatched pair made the
+            # combined upl oscillate (+798 -> -152 within 12ms), so 117 of
+            # 235 peak candidates were rejected as CANDIDATE_NORMALIZED and
+            # the durable peak was understated (228 vs ~798), firing the
+            # giveback exit far too late. market_data[self.ticker] is written
+            # on every near-month primary tick (on_tick ~2978).
+            _near_slot = self.market_data.get(self.ticker, {}) or {}
+            _near_rt = float(_near_slot.get("close", 0) or 0)
+            if _near_rt > 0:
+                _mts_bar["near_close_rt"] = _near_rt
+                _mts_bar.setdefault("near_high_rt", _near_rt)
+                _mts_bar.setdefault("near_low_rt", _near_rt)
             self._mts_tag_bar_session(_mts_bar)
             self._mts_tick(enriched_bar=_mts_bar)
             if _save_mts_bar:
