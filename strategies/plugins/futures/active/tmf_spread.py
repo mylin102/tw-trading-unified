@@ -2032,6 +2032,11 @@ class TMFSpread(StrategyBase):
         # 2026-11-20 Gemini CLI: per-leg bracket exit status (quick-task 261120-d57)
         self._bracket_near_status: str | None = None
         self._bracket_far_status: str | None = None
+        # 2026-11-20 Hermes Agent: anchor price for TP/SL math — entry price
+        # for a normally-armed leg, current live mark for a retroactively
+        # armed leg (switch flipped mid-trade).
+        self._bracket_near_anchor: float | None = None
+        self._bracket_far_anchor: float | None = None
 
         # ADR-009 v1.1: Position Lifecycle OCA
         self._lifecycle_oca: PositionLifecycle = PositionLifecycle()
@@ -3098,6 +3103,33 @@ class TMFSpread(StrategyBase):
                 _elapsed_ms = max(0.0, (_ts_now - _entry_ts).total_seconds() * 1000.0)
 
         # ── 1. Evaluate NEAR leg independently ──
+        # 2026-11-20 Hermes Agent: retroactive-arm for in-flight positions
+        # that predate this switch being flipped to True (entered while
+        # PER_LEG_BRACKET_EXIT_ENABLED was False, so sync_position() never
+        # set this leg to "ARMED"). User-directed special case: anchor this
+        # leg's TP/SL to the CURRENT live mark at the moment of arming, NOT
+        # the original entry price — the bracket semantics only make sense
+        # measured from here forward for a trade this mechanism never saw
+        # at entry time.
+        if (getattr(self, "_bracket_near_status", None) is None
+                and getattr(self, "_near_entry", 0.0) > 0.0):
+            _near_src0 = str(bar.get("near_price_source") or "")
+            if _near_src0 != "BAR_CLOSE":
+                _near_val0 = bar.get("near_close_rt") if "near_close_rt" in bar else bar.get("near_close")
+                try:
+                    _near_now = float(_near_val0) if _near_val0 is not None else 0.0
+                except (TypeError, ValueError):
+                    _near_now = 0.0
+                if _near_now > 0.0:
+                    self._bracket_near_anchor = _near_now
+                    self._bracket_near_status = "ARMED"
+                    _append_event(
+                        "PER_LEG_BRACKET_RETROACTIVE_ARM",
+                        trade_id=getattr(self, "_trade_id", "") or "",
+                        leg="NEAR",
+                        anchor_price=_near_now,
+                        original_entry_price=float(self._near_entry),
+                    )
         if getattr(self, "_bracket_near_status", None) == "ARMED":
             _near_src = str(bar.get("near_price_source") or "")
             # Reusing 1e9f53be fix: BAR_CLOSE-only mark must NOT fire bracket exit
@@ -3108,8 +3140,11 @@ class TMFSpread(StrategyBase):
                 except (TypeError, ValueError):
                     _near_mark = 0.0
 
-                if _near_mark > 0.0 and getattr(self, "_near_entry", 0.0) > 0.0:
-                    _entry = float(self._near_entry)
+                _near_anchor = getattr(self, "_bracket_near_anchor", None)
+                if _near_anchor is None:
+                    _near_anchor = getattr(self, "_near_entry", 0.0)
+                if _near_mark > 0.0 and float(_near_anchor) > 0.0:
+                    _entry = float(_near_anchor)
                     _side = str(getattr(self, "_near_side", "") or "").upper()
                     _hit_type = None
 
@@ -3145,6 +3180,25 @@ class TMFSpread(StrategyBase):
                         return Signal(action=_action, reason=_hit_type, confidence=1.0, stop_loss=0)
 
         # ── 2. Evaluate FAR leg independently ──
+        if (getattr(self, "_bracket_far_status", None) is None
+                and getattr(self, "_far_entry", 0.0) > 0.0):
+            _far_src0 = str(bar.get("far_price_source") or "")
+            if _far_src0 != "BAR_CLOSE":
+                _far_val0 = bar.get("far_close_rt") if "far_close_rt" in bar else bar.get("far_close")
+                try:
+                    _far_now = float(_far_val0) if _far_val0 is not None else 0.0
+                except (TypeError, ValueError):
+                    _far_now = 0.0
+                if _far_now > 0.0:
+                    self._bracket_far_anchor = _far_now
+                    self._bracket_far_status = "ARMED"
+                    _append_event(
+                        "PER_LEG_BRACKET_RETROACTIVE_ARM",
+                        trade_id=getattr(self, "_trade_id", "") or "",
+                        leg="FAR",
+                        anchor_price=_far_now,
+                        original_entry_price=float(self._far_entry),
+                    )
         if getattr(self, "_bracket_far_status", None) == "ARMED":
             _far_src = str(bar.get("far_price_source") or "")
             if _far_src != "BAR_CLOSE":
@@ -3154,8 +3208,11 @@ class TMFSpread(StrategyBase):
                 except (TypeError, ValueError):
                     _far_mark = 0.0
 
-                if _far_mark > 0.0 and getattr(self, "_far_entry", 0.0) > 0.0:
-                    _entry = float(self._far_entry)
+                _far_anchor = getattr(self, "_bracket_far_anchor", None)
+                if _far_anchor is None:
+                    _far_anchor = getattr(self, "_far_entry", 0.0)
+                if _far_mark > 0.0 and float(_far_anchor) > 0.0:
+                    _entry = float(_far_anchor)
                     _side = str(getattr(self, "_far_side", "") or "").upper()
                     _hit_type = None
 
@@ -3445,6 +3502,8 @@ class TMFSpread(StrategyBase):
         # retroactively arm/disarm an in-flight trade.
         self._bracket_near_status = "ARMED" if PER_LEG_BRACKET_EXIT_ENABLED else None
         self._bracket_far_status = "ARMED" if PER_LEG_BRACKET_EXIT_ENABLED else None
+        self._bracket_near_anchor = float(self._near_entry) if PER_LEG_BRACKET_EXIT_ENABLED else None
+        self._bracket_far_anchor = float(self._far_entry) if PER_LEG_BRACKET_EXIT_ENABLED else None
 
         # [GSD] Log confirmed fills and ENTRY event
         _append_fill(self._ticker, "NEAR", "NEAR", self._near_side, 1, near_entry, "ENTRY", trade_id,
@@ -7146,7 +7205,8 @@ class TMFSpread(StrategyBase):
         for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
                    "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
                    "_pj_last_upl", "_pj_exit_event_id", "_pj_exit_winner",
-                   "_bracket_near_status", "_bracket_far_status"):
+                   "_bracket_near_status", "_bracket_far_status",
+                   "_bracket_near_anchor", "_bracket_far_anchor"):
             if hasattr(self, _a):
                 setattr(self, _a, None)
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill
