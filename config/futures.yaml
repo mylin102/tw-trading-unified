@@ -202,6 +202,15 @@ mts:
       force_lock_after_atr: 3.0
     enable_renko_exit: true
     renko_brick_multiplier: 0.5
+    # 2026-11-20 Hermes Agent: independent per-leg fixed bracket (paper
+    # observation only) — bypasses Policy J / ATR release+trail entirely.
+    # Each leg (near, far) is watched against its OWN entry price; hitting
+    # one leg's TP/SL closes only that leg, the other keeps running its
+    # own bracket independently. See tmf_spread._check_independent_leg_bracket.
+    independent_leg_bracket:
+      enabled: true
+      take_profit_pts: 100.0
+      stop_loss_pts: 30.0
   paper:
     allow_synthetic_price: true
     synthetic_near_price: 41000.0
