@@ -4964,6 +4964,59 @@ class TMFSpread(StrategyBase):
             
         return release_stop, trail_dist, single_decision
 
+    def _check_independent_leg_bracket(
+        self, near_pnl: float, far_pnl: float, released_leg,
+    ):
+        """2026-11-20 Hermes Agent: paper-only independent per-leg bracket.
+
+        Each leg is watched against ITS OWN entry price only — a fixed
+        take-profit / stop-loss in points, completely decoupled from
+        Policy J, the ATR release/trail engines and the combined-exit
+        giveback machinery. Hitting one leg's bracket closes ONLY that
+        leg; the other leg keeps running its own bracket independently
+        until it also hits. Gated by
+        params["independent_leg_bracket"]["enabled"] (default False —
+        zero change to Policy J / 拆腿 (ATR release+trail) unless this is
+        explicitly turned on in config).
+        """
+        from strategies.plugins.futures.active.mts_lifecycle_adapter import (
+            LifecycleDecision,
+        )
+        _cfg = self._params.get("independent_leg_bracket") or {}
+        _tp = float(_cfg.get("take_profit_pts", 100.0))
+        _sl = float(_cfg.get("stop_loss_pts", 30.0))
+
+        if released_leg is None:
+            # SPREAD phase: both legs still held — check each leg's own
+            # entry independently; NEAR checked first for a deterministic
+            # tie-break on a same-tick double breach.
+            if near_pnl <= -_sl or near_pnl >= _tp:
+                _reason = "STOP_LOSS" if near_pnl <= -_sl else "TAKE_PROFIT"
+                return LifecycleDecision(
+                    action=LifecycleAction.RELEASE, release_leg=Leg.NEAR,
+                    winner=f"INDEPENDENT_LEG_BRACKET_{_reason}",
+                )
+            if far_pnl <= -_sl or far_pnl >= _tp:
+                _reason = "STOP_LOSS" if far_pnl <= -_sl else "TAKE_PROFIT"
+                return LifecycleDecision(
+                    action=LifecycleAction.RELEASE, release_leg=Leg.FAR,
+                    winner=f"INDEPENDENT_LEG_BRACKET_{_reason}",
+                )
+            return None
+
+        # SINGLE_LEG phase: one leg already released — bracket the
+        # REMAINING leg only, against its OWN entry (never the combined
+        # trade PnL, which would mix in the already-closed leg's realized
+        # PnL and violate the "each leg independent" contract).
+        _rem_pnl = far_pnl if released_leg == Leg.NEAR else near_pnl
+        if _rem_pnl <= -_sl or _rem_pnl >= _tp:
+            _reason = "STOP_LOSS" if _rem_pnl <= -_sl else "TAKE_PROFIT"
+            return LifecycleDecision(
+                action=LifecycleAction.STOPLOSS,
+                winner=f"INDEPENDENT_LEG_BRACKET_{_reason}",
+            )
+        return None
+
     def _manage_position(
         self, near_close: float, far_close: float, spread_z: Any, now: datetime,
         bar: dict,
@@ -5320,6 +5373,19 @@ class TMFSpread(StrategyBase):
             # TRIGGERED before pre-order guards completed.
         except Exception:
             logger.exception("[LIFECYCLE_EVAL_FAILED]")
+
+        # ── Independent Leg Bracket override (2026-11-20, paper-only) ──
+        # When enabled, this REPLACES the adapter's decision wholesale —
+        # Policy J / ATR release+trail / trend-release never run for this
+        # tick. See _check_independent_leg_bracket() docstring.
+        _ilb_cfg = self._params.get("independent_leg_bracket") or {}
+        if _ilb_cfg.get("enabled", False):
+            _ilb_released_leg = self._lifecycle_oca.release_group.filled_leg
+            if _ilb_released_leg is None and self._released_leg:
+                _ilb_released_leg = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+            _decision = self._check_independent_leg_bracket(
+                self._pnl_near(near_close), self._pnl_far(far_close), _ilb_released_leg,
+            )
 
         # ── ADR-011 Phase 2: Action-scoped timeout timers (2026-07-16) ──
         # Each action has its own pending timer, preventing RELEASE timeout
@@ -5838,7 +5904,17 @@ class TMFSpread(StrategyBase):
                         )
                         return None
                 # TRAIL / STOPLOSS / TIMEOUT: full exit of remaining leg
-                _exit_reason = _decision.action.name
+                # 2026-11-22 Hermes Agent: an independent-leg-bracket exit
+                # reuses the STOPLOSS action label for BOTH its stop-loss
+                # and take-profit triggers (see
+                # _check_independent_leg_bracket) — surface the real winner
+                # tag here so telemetry/dashboard never mislabels a
+                # take-profit exit as a stop-loss.
+                _ilb_winner = getattr(_decision, "winner", None) or ""
+                if _ilb_winner.startswith("INDEPENDENT_LEG_BRACKET_"):
+                    _exit_reason = _ilb_winner
+                else:
+                    _exit_reason = _decision.action.name
                 _tg = self._lifecycle_oca.trail_group
                 _rem_leg = _tg.remaining_leg
                 if _rem_leg is None:
@@ -6274,7 +6350,12 @@ class TMFSpread(StrategyBase):
         # add to LifecycleContext / evaluate_lifecycle_actions in a separate change.
 
         # Re-evaluate lifecycle after peak/nadir + breakeven adjustments
-        if _decision is None:
+        # 2026-11-22 Hermes Agent: skip this ATR/Policy-J fallback re-eval
+        # entirely when the independent leg bracket is active — otherwise a
+        # tick where the bracket found no breach (_decision stays None)
+        # would fall through to the ATR TRAIL engine and leak Policy J/ATR
+        # behavior back in, breaking the "completely independent" contract.
+        if _decision is None and not _ilb_cfg.get("enabled", False):
             try:
                 trail_dist = self._apply_vwap_exit(bar, trail_dist)
                 _ctx2 = LifecycleContext(
