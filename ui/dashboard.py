@@ -169,6 +169,127 @@ def _quick_mts_summary_presentation(
     }
 
 
+# ── 2026-11-22 Hermes Agent: unified MTS spread exit panel (plan: ──
+# .hermes/plans/2026-11-22_tmf-leg-bracket-dashboard-and-performance-review.md).
+# Replaces the duplicated "quick summary" block. Resolves the plan's open
+# layout questions with these defaults for this first template pass:
+#   - KPI row sits BEFORE the per-leg cards (agy's "3-second scan" order).
+#   - Near/far price chart is left exactly where it already renders today
+#     (its manual-load + st.session_state cache is untouched — do not
+#     rebuild it here; rebuilding costs 155-198s per the existing code
+#     comment near the chart call site).
+#   - Debug fields collapse into a single expander for this first pass.
+def _mts_leg_bracket_config(futures_cfg: dict) -> dict:
+    """Read params.independent_leg_bracket with safe defaults (never guess enabled=True)."""
+    try:
+        _params = (futures_cfg.get("mts") or {}).get("params") or {}
+    except Exception:
+        _params = {}
+    _cfg = _params.get("independent_leg_bracket") or {}
+    return {
+        "enabled": bool(_cfg.get("enabled", False)),
+        "take_profit_pts": float(_cfg.get("take_profit_pts", 100.0)),
+        "stop_loss_pts": float(_cfg.get("stop_loss_pts", 30.0)),
+    }
+
+
+def _mts_leg_metrics(state: dict, leg: str, tp: float, sl: float) -> dict:
+    """Pure per-leg derived values. Sign convention matches settle_mts_trade:
+    LONG -> exit-entry, SHORT -> entry-exit."""
+    entry = float(state.get(f"{leg}_entry", 0) or 0)
+    last = float(state.get(f"{leg}_last", 0) or 0)
+    side = state.get(f"{leg}_side") or "LONG"
+    status = state.get(f"{leg}_status") or "OPEN"
+    upl_twd = float(state.get(f"{leg}_upl", 0) or 0)
+    realized_twd = float(state.get(f"{leg}_realized_pnl", 0) or 0)
+    sign = 1.0 if side == "LONG" else -1.0
+    is_closed = status not in ("OPEN", None)
+    pnl_pts = (last - entry) * sign if not is_closed else None
+    dist_to_tp = (tp - pnl_pts) if pnl_pts is not None else None
+    dist_to_sl = (pnl_pts + sl) if pnl_pts is not None else None
+    bracket_pos = None
+    if pnl_pts is not None and (tp + sl) > 0:
+        bracket_pos = min(max((pnl_pts + sl) / (tp + sl), 0.0), 1.0)
+    return {
+        "entry": entry, "last": last, "side": side, "status": status,
+        "is_closed": is_closed, "upl_twd": upl_twd, "realized_twd": realized_twd,
+        "pnl_pts": pnl_pts, "dist_to_tp": dist_to_tp, "dist_to_sl": dist_to_sl,
+        "bracket_pos": bracket_pos,
+    }
+
+
+def render_leg_bracket(leg: str, title: str, state: dict, tp: float, sl: float) -> None:
+    """Render one leg's card. Called twice (near, far) so both are structurally identical."""
+    m = _mts_leg_metrics(state, leg, tp, sl)
+    _side_label = "LONG" if m["side"] == "LONG" else "SHORT"
+    if m["is_closed"]:
+        st.markdown(f"**{title} · {_side_label}**  ⚫ 已平倉")
+        c1, c2 = st.columns(2)
+        c1.metric("進場", f"{m['entry']:.0f}")
+        c2.metric("已實現損益", f"{m['realized_twd']:+,.0f} TWD")
+        st.caption("距停損 / 距停利：— (已結算)")
+        return
+    st.markdown(f"**{title} · {_side_label}**  🟢 持倉中")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("進場", f"{m['entry']:.0f}")
+    c2.metric("現價", f"{m['last']:.0f}")
+    c3.metric("PnL", f"{m['pnl_pts']:+.1f} 點", delta=f"{m['upl_twd']:+,.0f} TWD")
+    st.progress(m["bracket_pos"] if m["bracket_pos"] is not None else 0.0)
+    st.caption(f"停損 -{sl:.0f}　·　進場 {m['entry']:.0f}　·　停利 +{tp:.0f}")
+    _dtp = m["dist_to_tp"]
+    _dsl = m["dist_to_sl"]
+    _tp_txt = "已觸發" if (_dtp is not None and _dtp <= 0) else f"剩 {_dtp:.1f} 點"
+    _sl_txt = "已觸發" if (_dsl is not None and _dsl <= 0) else f"剩 {_dsl:.1f} 點"
+    st.markdown(f":green[→停利 {_tp_txt}]　　:red[→停損 {_sl_txt}]")
+
+
+def render_mts_spread_exit_panel(state: dict, futures_cfg: dict) -> None:
+    """Unified MTS spread exit panel: mode banner + KPI row + symmetric
+    near/far leg cards + collapsed raw-state expander. Does NOT render the
+    price chart (left in its existing position/caching mechanism)."""
+    _bracket_cfg = _mts_leg_bracket_config(futures_cfg)
+    _mode = "INDEPENDENT_LEG_BRACKET" if _bracket_cfg["enabled"] else "POLICY_J_ATR"
+    _phase = ((state.get("lifecycle") or {}).get("phase")) or ("SPREAD" if state.get("has_position") else "FLAT")
+
+    # Row 0: exit-mode banner (always visible, even when FLAT)
+    if _mode == "INDEPENDENT_LEG_BRACKET":
+        st.info(
+            f"🎯 出場模式：獨立腿位固定停利停損　"
+            f"(停利 +{_bracket_cfg['take_profit_pts']:.0f} 點 / 停損 -{_bracket_cfg['stop_loss_pts']:.0f} 點，各腿依自身進場價獨立判斷)"
+        )
+    else:
+        st.info("🛡️ 出場模式：Policy J 組合停利 + ATR 拆腿追蹤 (legacy)")
+
+    if not state.get("has_position"):
+        st.caption(f"持倉階段：{_phase} · 目前無持倉 (FLAT)")
+        return
+
+    # Row 1 (KPI first, per agy's 3-second-scan ordering): spread-level totals
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("持倉階段", _phase)
+    k2.metric("近月 UPL", f"{float(state.get('near_upl', 0) or 0):+,.0f} TWD")
+    k3.metric("遠月 UPL", f"{float(state.get('far_upl', 0) or 0):+,.0f} TWD")
+    k4.metric("總計 UPL", f"{float(state.get('total_upl', 0) or 0):+,.0f} TWD")
+
+    # Row 2: symmetric near/far leg cards (same helper, called twice)
+    col_near, col_far = st.columns(2, gap="medium")
+    with col_near:
+        render_leg_bracket("near", "近月 NEAR", state,
+                            _bracket_cfg["take_profit_pts"], _bracket_cfg["stop_loss_pts"])
+    with col_far:
+        render_leg_bracket("far", "遠月 FAR", state,
+                            _bracket_cfg["take_profit_pts"], _bracket_cfg["stop_loss_pts"])
+
+    # Row 3: collapsed debug expander (single, first-pass per the plan)
+    with st.expander("原始狀態 / Raw state", expanded=False):
+        _debug_keys = [
+            "trade_id", "state", "reason", "release_state", "released_leg",
+            "near_entry", "far_entry", "near_last", "far_last", "near_side",
+            "far_side", "near_status", "far_status", "entry_spread_z", "_updated",
+        ]
+        st.json({k: state.get(k) for k in _debug_keys if k in state})
+
+
 # ── [weak_bear_trend Monitor] Import auto_select monitoring panel ──
 def render_weak_bear_panel():
     """Render weak_bear_trend and auto_select monitoring panel."""
@@ -5309,16 +5430,9 @@ elif _selected_product == "TMF":
     if _quick_presentation["level"] == "info":
         st.info(_quick_presentation["message"])
     elif isinstance(_quick_mts_state, dict):
-        _quick_has_pos = bool(_quick_mts_state.get("has_position"))
-        _q1, _q2, _q3, _q4 = st.columns(4)
-        _q1.metric("狀態", _quick_mts_state.get("state", "UNKNOWN"))
-        _q2.metric("近月 UPL", f'{float(_quick_mts_state.get("near_upl", 0) or 0):+,.0f} TWD')
-        _q3.metric("遠月 UPL", f'{float(_quick_mts_state.get("far_upl", 0) or 0):+,.0f} TWD')
-        _q4.metric("總 UPL", f'{float(_quick_mts_state.get("total_upl", 0) or 0):+,.0f} TWD')
-        st.caption(
-            f"trade_id={_quick_mts_state.get('trade_id', 'N/A')} · "
-            f"{'雙腿持倉' if _quick_has_pos else 'FLAT'} · "
-            f"state_path={_quick_mts_path}")
+        # 2026-11-22 Hermes Agent: unified panel replaces the old 4-metric
+        # quick summary (consolidation per the dashboard redesign plan).
+        render_mts_spread_exit_panel(_quick_mts_state, futures_cfg)
     else:
         st.error(_quick_presentation["message"])
 
