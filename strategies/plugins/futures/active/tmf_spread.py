@@ -1294,6 +1294,7 @@ def settle_mts_trade(
             except Exception:
                 pass
         if _state is not None:
+            _existing_state = dict(_state)
             _state["settlement_status"] = _settlement_status
             _state["settled_from"] = settlement_source
             _state["exit_type"] = exit_type
@@ -1302,6 +1303,8 @@ def settle_mts_trade(
             _state["total_realized_pnl"] = round(_gross, 1)
             _state["near_realized_pnl"] = round(_near_gross, 1)
             _state["far_realized_pnl"] = round(_far_gross, 1)
+            # 2026-11-22 Gemini CLI: stamp runtime identity metadata before settlement state write
+            stamp_runtime_state(_state, _existing_state)
             _tmp = f"{_target}.settle.{os.getpid()}.{id(_state) & 0xFFFF}"
             with open(_tmp, "w") as _f:
                 json.dump(_state, _f, default=str)
@@ -1729,6 +1732,8 @@ def _write_mts_telemetry(
             _snap = dict(_PENDING_STATE_REWRITE)
             _snap["state_revision"] = _disk_rev + 1
             _snap["_updated"] = datetime.now().isoformat()
+            # 2026-11-22 Gemini CLI: stamp runtime identity metadata before pending rewrite replay
+            stamp_runtime_state(_snap, _disk)
             _tmpf = f"{_pp}.tmp.retry.{os.getpid()}"
             with open(_tmpf, "w") as _f:
                 _json.dump(_snap, _f, default=str)

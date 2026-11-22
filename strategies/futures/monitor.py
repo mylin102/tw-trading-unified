@@ -42,7 +42,11 @@ from squeeze_futures.data.data_storage import save_trade
 
 # GSD: Pluggable Strategy Integration
 from core.strategy_registry import StrategyRegistry
-from core.runtime_paths import runtime_logs, runtime_path, mts_position_state_path, mts_runtime_path, bind_mts_data_mode
+# 2026-11-22 Gemini CLI: import stamp_runtime_state so direct MTS state writes preserve runtime identity
+from core.runtime_paths import (
+    runtime_logs, runtime_path, mts_position_state_path, mts_runtime_path,
+    bind_mts_data_mode, stamp_runtime_state,
+)
 from core.strategy_context import StrategyContext, PositionView, MarketData
 from core.signal import Signal
 from core.futures_bar_regime import classify_futures_bar_regime
@@ -12998,6 +13002,8 @@ class FuturesMonitor:
                 return
 
             _hb_state.update(_manual_order_info)
+            # 2026-11-22 Gemini CLI: stamp runtime identity metadata before heartbeat write so dashboard validate_runtime_state() passes
+            stamp_runtime_state(_hb_state, existing)
             
             # 2026-06-23 Gemini CLI: Use unique temporary filename to avoid race conditions with other writers
             import random
@@ -13397,6 +13403,7 @@ class FuturesMonitor:
             _state = json.loads(_path.read_text()) if _path.exists() else {}
             if not isinstance(_state, dict):
                 _state = {}
+            _existing = dict(_state)
             _state.update({
                 "has_position": False,
                 "state": "FLAT",
@@ -13408,6 +13415,8 @@ class FuturesMonitor:
                          "near_last", "far_last", "released_leg",
                          "remaining_side"):
                 _state.pop(_key, None)
+            # 2026-11-22 Gemini CLI: stamp runtime identity metadata before clearing unconfirmed combo state
+            stamp_runtime_state(_state, _existing)
             _path.parent.mkdir(parents=True, exist_ok=True)
             _path.write_text(json.dumps(_state, default=str))
         except Exception as _exc:
