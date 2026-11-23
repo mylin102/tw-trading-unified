@@ -290,6 +290,140 @@ def render_mts_spread_exit_panel(state: dict, futures_cfg: dict) -> None:
         st.json({k: state.get(k) for k in _debug_keys if k in state})
 
 
+# ── 2026-11-23 Hermes Agent: MTS trade history / performance review table ──
+# Per the plan (.hermes/plans/2026-11-22_tmf-leg-bracket-dashboard-and-
+# performance-review.md §3, codex's design): mts_trade_fills.jsonl is the
+# ONLY ledger with real MTS fills, but nothing in this file ever read it for
+# display -- the "今日累計 PnL" widget reads an unrelated, long-stale CSV
+# (TMF_<date>_trades.csv, last written 2026-10-21, a different legacy
+# strategy). This adds the missing read path.
+def _load_mts_trade_fills(max_lines: int = 20000) -> list[dict]:
+    """Read mts_trade_fills.jsonl (read-only). Tolerates partial/bad lines."""
+    try:
+        _path = mts_runtime_path("logs", "mts_trade_fills.jsonl")
+    except Exception:
+        return []
+    if not os.path.exists(_path):
+        return []
+    _rows: list[dict] = []
+    try:
+        with open(_path, encoding="utf-8") as _f:
+            _lines = _f.readlines()[-max_lines:]
+        for _line in _lines:
+            _line = _line.strip()
+            if not _line:
+                continue
+            try:
+                _rows.append(json.loads(_line))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return _rows
+
+
+def _build_mts_trade_summary(fills: list[dict]) -> list[dict]:
+    """Group fills by trade_id, pair each leg's ENTRY vs its closing fill
+    (RELEASE/EXIT), classify exit mode from the real fill_type tag (never
+    guessed), and compute net realized PnL. One row per trade_id."""
+    _by_trade: dict[str, dict] = {}
+    for _f in fills:
+        _tid = _f.get("trade_id")
+        if not _tid:
+            continue
+        _rec = _by_trade.setdefault(_tid, {"trade_id": _tid, "legs": {}})
+        _leg = (_f.get("leg") or _f.get("contract") or "").upper()
+        if _leg not in ("NEAR", "FAR"):
+            continue
+        _leg_rec = _rec["legs"].setdefault(_leg, {})
+        _ft = _f.get("fill_type")
+        if _ft == "ENTRY":
+            _leg_rec["entry_price"] = _f.get("fill_price", _f.get("price"))
+            _leg_rec["entry_ts"] = _f.get("fill_timestamp", _f.get("timestamp"))
+            _leg_rec["side"] = _f.get("side")
+        elif _ft in ("RELEASE", "EXIT"):
+            _leg_rec["exit_price"] = _f.get("fill_price", _f.get("price"))
+            _leg_rec["exit_ts"] = _f.get("fill_timestamp", _f.get("timestamp"))
+            _leg_rec["exit_fill_type"] = _ft
+            if _f.get("realized_pnl") is not None:
+                _leg_rec["realized_pnl"] = _f.get("realized_pnl")
+            _settlement = _f.get("settlement_status")
+            if _settlement:
+                _leg_rec["settlement_status"] = _settlement
+                _leg_rec["settled_from"] = _f.get("settled_from")
+
+    _rows = []
+    for _tid, _rec in _by_trade.items():
+        _legs = _rec["legs"]
+        _near = _legs.get("NEAR", {})
+        _far = _legs.get("FAR", {})
+        _near_pnl = _near.get("realized_pnl")
+        _far_pnl = _far.get("realized_pnl")
+        _net = None
+        if _near_pnl is not None or _far_pnl is not None:
+            _net = (_near_pnl or 0.0) + (_far_pnl or 0.0)
+        _both_closed = ("exit_price" in _near) and ("exit_price" in _far)
+        _exit_ts_candidates = [t for t in (_near.get("exit_ts"), _far.get("exit_ts")) if t]
+        _last_exit_ts = max(_exit_ts_candidates) if _exit_ts_candidates else None
+        _rows.append({
+            "trade_id": _tid,
+            "near_entry": _near.get("entry_price"), "near_exit": _near.get("exit_price"),
+            "near_side": _near.get("side"), "near_realized": _near_pnl,
+            "far_entry": _far.get("entry_price"), "far_exit": _far.get("exit_price"),
+            "far_side": _far.get("side"), "far_realized": _far_pnl,
+            "net_realized": _net,
+            "status": "已完成" if _both_closed else ("未完成/部分已實現" if (_near_pnl or _far_pnl) else "進場中"),
+            "settled_from": _near.get("settled_from") or _far.get("settled_from"),
+            "last_exit_ts": _last_exit_ts,
+        })
+    _rows.sort(key=lambda r: r.get("last_exit_ts") or "", reverse=True)
+    return _rows
+
+
+def render_mts_trade_history_table(limit: int = 15) -> None:
+    """Today's recent MTS trades + simple aggregate stats. Read-only, no
+    writes, no fallback on failure (empty state shown, not a fabricated one)."""
+    _fills = _load_mts_trade_fills()
+    if not _fills:
+        st.caption("📋 MTS 交易紀錄：目前沒有資料 (mts_trade_fills.jsonl 空或不存在)")
+        return
+    _trades = _build_mts_trade_summary(_fills)
+    if not _trades:
+        st.caption("📋 MTS 交易紀錄：有 fills 但無法配對出完整交易")
+        return
+
+    with st.expander(f"📋 MTS 交易紀錄 (最近 {min(limit, len(_trades))} / 共 {len(_trades)} 筆)", expanded=True):
+        _completed = [t for t in _trades if t["net_realized"] is not None]
+        if _completed:
+            _net_sum = sum(t["net_realized"] for t in _completed)
+            _wins = sum(1 for t in _completed if t["net_realized"] > 0)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("已結算筆數", len(_completed))
+            k2.metric("淨損益合計", f"{_net_sum:+,.0f} TWD")
+            k3.metric("勝率", f"{_wins / len(_completed):.0%}")
+            k4.metric("平均損益", f"{_net_sum / len(_completed):+,.0f} TWD")
+            if any(t.get("settled_from") for t in _completed):
+                st.caption("⚠️ 含人工補結算紀錄 (settled_from 非空)，口徑可能與自動結算不同")
+
+        _display_rows = []
+        for t in _trades[:limit]:
+            _display_rows.append({
+                "trade_id": t["trade_id"],
+                "狀態": t["status"],
+                "近月 (進場→出場)": (f"{t['near_entry']}→{t['near_exit']}"
+                                     if t["near_exit"] is not None else f"{t['near_entry']}→—"),
+                "遠月 (進場→出場)": (f"{t['far_entry']}→{t['far_exit']}"
+                                     if t["far_exit"] is not None else f"{t['far_entry']}→—"),
+                "淨損益 (TWD)": (f"{t['net_realized']:+,.0f}" if t["net_realized"] is not None else "—"),
+                "最後出場時間": t["last_exit_ts"] or "—",
+            })
+        st.dataframe(pd.DataFrame(_display_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "口徑：淨損益=近遠月 realized_pnl 加總（已含手續費/稅）；"
+            "settled_from 非空代表人工補結算，不是自動 fill 判定的真實出場價。"
+        )
+
+
 # ── [weak_bear_trend Monitor] Import auto_select monitoring panel ──
 def render_weak_bear_panel():
     """Render weak_bear_trend and auto_select monitoring panel."""
@@ -5433,6 +5567,7 @@ elif _selected_product == "TMF":
         # 2026-11-22 Hermes Agent: unified panel replaces the old 4-metric
         # quick summary (consolidation per the dashboard redesign plan).
         render_mts_spread_exit_panel(_quick_mts_state, futures_cfg)
+        render_mts_trade_history_table()
     else:
         st.error(_quick_presentation["message"])
 
