@@ -50,6 +50,11 @@ class OIEstimator:
     加入 OI 信號作為「籌碼強度」的輸入
     """
 
+    # 2026-11-23 Gemini CLI: Reverse-chunk tail-read constants to bound memory/CPU
+    # regardless of total mts_spread_events.jsonl file size.
+    _TAIL_CHUNK_BYTES = 256 * 1024
+    _OUT_OF_ORDER_GRACE_SECS = 60.0
+
     def __init__(self, events_log_path: str):
         """
         Args:
@@ -58,31 +63,102 @@ class OIEstimator:
         self.log_path = events_log_path
         self._event_cache: Optional[List[Dict]] = None
         self._cache_mtime: Optional[float] = None
+        self._cache_key: Optional[tuple] = None
 
-    def _load_events(self) -> List[Dict]:
-        """讀取並快取事件日誌"""
-        if not os.path.exists(self.log_path):
-            return []
-
-        # 檢查檔案是否更新
-        current_mtime = os.path.getmtime(self.log_path)
-        if self._event_cache is not None and self._cache_mtime == current_mtime:
-            return self._event_cache
-
-        events = []
+    def _read_tail_window(
+        self,
+        min_ts: float,
+        max_ts: Optional[float] = None,
+    ) -> List[Dict]:
+        """2026-11-23 Gemini CLI: Read JSONL backwards from EOF in fixed chunks,
+        retaining only events in (min_ts, max_ts] and stopping once timestamps
+        fall past (min_ts - _OUT_OF_ORDER_GRACE_SECS).
+        """
+        stop_ts = min_ts - self._OUT_OF_ORDER_GRACE_SECS
+        collected_rev: List[Dict] = []
         try:
-            with open(self.log_path, 'r') as f:
-                for line in f:
-                    if line.strip():
+            with open(self.log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                remainder = b""
+                stop_reading = False
+                while pos > 0 and not stop_reading:
+                    read_size = min(self._TAIL_CHUNK_BYTES, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    buf = f.read(read_size) + remainder
+                    lines = buf.split(b"\n")
+                    if pos > 0:
+                        remainder = lines[0]
+                        complete_lines = lines[1:]
+                    else:
+                        remainder = b""
+                        complete_lines = lines
+                    for raw_line in reversed(complete_lines):
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
                         try:
-                            events.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
+                            event = json.loads(raw_line.decode("utf-8", errors="replace"))
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        event_ts = self._parse_ts(event.get("ts", ""))
+                        if event_ts is None:
+                            continue
+                        if event_ts <= stop_ts:
+                            stop_reading = True
+                            break
+                        if event_ts > min_ts and (max_ts is None or event_ts <= max_ts):
+                            collected_rev.append(event)
         except Exception:
             pass
+        collected_rev.reverse()
+        return collected_rev
+
+    def _load_events(
+        self,
+        min_ts: Optional[float] = None,
+        max_ts: Optional[float] = None,
+    ) -> List[Dict]:
+        """讀取並快取事件日誌（指定時間窗口時改採檔尾分塊倒讀，避免全檔載入）"""
+        if not os.path.exists(self.log_path):
+            self._event_cache = None
+            self._cache_mtime = None
+            self._cache_key = None
+            return []
+
+        # 檢查檔案是否更新與窗口參數是否一致
+        stat = os.stat(self.log_path)
+        current_mtime = stat.st_mtime
+        cache_key = (current_mtime, stat.st_size, min_ts, max_ts)
+        if self._event_cache is not None and self._cache_key == cache_key:
+            return self._event_cache
+
+        # 2026-11-23 Gemini CLI: Release previous cache before allocating the new window
+        # list so reloads never hold 2x parsed events simultaneously.
+        self._event_cache = None
+        self._cache_key = None
+
+        if min_ts is not None:
+            events = self._read_tail_window(min_ts=min_ts, max_ts=max_ts)
+        else:
+            events = []
+            try:
+                with open(self.log_path, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            try:
+                                events.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                pass
+            except Exception:
+                pass
 
         self._event_cache = events
         self._cache_mtime = current_mtime
+        self._cache_key = cache_key
         return events
 
     def estimate_oi(
@@ -100,15 +176,10 @@ class OIEstimator:
         Returns:
             OISnapshot 物件
         """
-        events = self._load_events()
-
-        # 2026-10-19 Hermes Agent: parse each timestamp once; keep the left-open/right-closed window.
+        # 2026-11-23 Gemini CLI: Load only the bounded (decision_ts - window_secs, decision_ts]
+        # tail window so memory & latency stay O(window) instead of O(entire file).
         window_start = decision_ts - window_secs
-        window_events = []
-        for event in events:
-            event_ts = self._parse_ts(event.get('ts', ''))
-            if event_ts is not None and window_start < event_ts <= decision_ts:
-                window_events.append(event)
+        window_events = self._load_events(min_ts=window_start, max_ts=decision_ts)
 
         # 分類訂單
         new_orders = self._deduplicate_orders(window_events, [
