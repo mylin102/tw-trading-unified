@@ -4693,7 +4693,9 @@ class TMFSpread(StrategyBase):
             # (_hvwap_baseline_clear_tick) and the baseline returned no signal
             # — the candidate can never replace or block stop-loss, Policy J,
             # emergency exit, timeout, baseline release, or reconciliation.
-            if _mgmt_result is None and getattr(self, "_hvwap_baseline_clear_tick", False):
+            # 2026-11-23 Gemini CLI: Do not run HVWAP paper release when independent_leg_bracket is enabled.
+            _ilb_on_bar = bool((self._params.get("independent_leg_bracket") or {}).get("enabled", False))
+            if _mgmt_result is None and not _ilb_on_bar and getattr(self, "_hvwap_baseline_clear_tick", False):
                 _hvwap_sig = self._hvwap_maybe_paper_release(bar, now, near_close, far_close)
                 if _hvwap_sig is not None:
                     return _hvwap_sig
@@ -5147,6 +5149,10 @@ class TMFSpread(StrategyBase):
         # ── ADR-009 v1.1 Task 4A: Build LifecycleContext + evaluate lifecycle ──
         _decision: LifecycleDecision | None = None
         _single_decision: SingleLegRiskDecision | None = None
+        # 2026-11-23 Gemini CLI: Resolve independent_leg_bracket flag up front so Policy J
+        # peak tracking and the legacy lifecycle adapter are completely bypassed when enabled.
+        _ilb_cfg = self._params.get("independent_leg_bracket") or {}
+        _ilb_enabled = bool(_ilb_cfg.get("enabled", False))
         try:
             _entry_age = (now - self._entry_ts).total_seconds() if self._entry_ts else 0.0
             _release_stop, _trail_dist, _single_decision = self._evaluate_risk(near_close, far_close, current_pnl, bar)
@@ -5196,7 +5202,8 @@ class TMFSpread(StrategyBase):
             # 2026-08-03 Policy J Peak Spike Validation hotfix (Hermes):
             # candidate-confirmed durable peak; entry gate; spike quarantine.
             _lc_phase = getattr(getattr(self, "_lifecycle_oca", None), "phase", None)
-            if _lc_phase in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
+            # 2026-11-23 Gemini CLI: Skip Policy J peak tracking when independent_leg_bracket is enabled.
+            if not _ilb_enabled and _lc_phase in (PositionPhase.SPREAD, PositionPhase.SINGLE_LEG):
                 # 2026-08-04 P0: canonical guard clock — receive-epoch ms via
                 # time.time()*1000 (same domain as entry settled / lifecycle).
                 # NEVER derive now from bar timestamp .timestamp() (mixed
@@ -5237,141 +5244,145 @@ class TMFSpread(StrategyBase):
                     self._lifecycle_oca.trail_group.status = TrailGroupStatus.ARMED
                     logger.warning("[MTS_REPAIR] has_position=True but phase was FLAT -> Repaired to SINGLE_LEG")
 
-            # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
-            from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
-            _trend_enabled, _trend_snap = self._build_trend_release_input()
-            _trend_reversal_snap = self._build_trend_reversal_input()
-            # 2026-08-26 Hermes Agent: paper-only ATR-release trend gate —
-            # computed here (monitor-injected mode + live flag + env) and
-            # surfaced into the adapter context as a pure boolean.
-            _atr_gate_on, _atr_gate_reason = self._mts_atr_release_trend_gate()
-            _adapter_input = LifecycleEvaluationInput(
-                strategy_state={
-                    "policy_j_guard_just_completed": bool(getattr(self, "_pj_guard_just_completed", False)),
-                    # 2026-09-29 Hermes Agent: mark freshness for the intercept
-                    # gate. Unknown provenance (paper/backtest) stays permissive.
-                    "marks_live": (
-                        str(bar.get("near_price_source") or "") != "BAR_CLOSE"
-                        and str(bar.get("far_price_source") or "") != "BAR_CLOSE"
-                    ),
-                    "near_pnl_pts": _n_pnl,
-                    "far_pnl_pts": _f_pnl,
-                    "floating_pnl_pts": current_pnl,
-                    "entry_age_secs": _entry_age,
-                    "release_stop_threshold": _release_stop,
-                    "trail_dist": _trail_dist,
-                    "manual_requested": getattr(self, "_manual_exit_requested", False),
-                    "max_hold_secs": self._params.get("max_hold_secs"),
-                    "max_loss_pts": self._params.get("max_loss_pts"),
-                    "trailing_side": _trailing_side,
-                    "peak": _peak,
-                    "nadir": _nadir,
-                    "rem_high": _rem_high,
-                    "rem_low": _rem_low,
-                    "enable_combined_upl_trail": self._params.get("enable_combined_upl_trail", False),
-                    "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
-                    "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
-                    "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
-                    "trend_release_enabled": (_trend_enabled, _trend_snap)[0],
-                    "trend_confirmed": (_trend_enabled, _trend_snap)[1],
-                    "trend_reversal_confirmed": _trend_reversal_snap,
-                    "release_trend_gate_enabled": _atr_gate_on,
-                    "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
-                    "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
-                },
-                market_event={
-                    "event_time": now.isoformat(),
-                    "timestamp": now.isoformat(),
-                    "ts": now.isoformat(),
-                },
-                lifecycle=self._lifecycle_oca,
-                execution_mode="BACKTEST" if _is_backtest else "LIVE",
-            )
-            self._ensure_lifecycle_adapter_initialized("LATE_INIT")
-            if getattr(self, "_pj_guard_just_completed", False):
-                self._pj_guard_just_completed = False  # consumed once
-            _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
-            _decision = _adapter_res.decision
-            # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
-            # baseline-clear marker: the candidate may act only when the
-            # baseline lifecycle evaluation produced NO exit decision (risk
-            # exits / Policy J / timeout / release all take precedence).
-            self._hvwap_baseline_clear_tick = (_decision is None)
-
-            # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
-            if getattr(self, "_soak_collector", None) is not None:
-                try:
-                    from strategies.futures.mts.policy_j_shadow_evaluator import (
-                        PolicyJShadowEvaluator,
-                        PolicyJShadowObservation,
-                    )
-                    from strategies.futures.mts.policy_j_shadow_state import PolicyJShadowState
-
-                    _is_spread_ph = (self._lifecycle_oca.phase == PositionPhase.SPREAD)
-                    _is_hedged = (self._near_side is not None and self._far_side is not None)
-                    _rg_st = self._lifecycle_oca.release_group.status
-                    _exit_inflight = (_rg_st not in (ReleaseGroupStatus.ARMED, ReleaseGroupStatus.INACTIVE))
-
-                    shadow_obs = PolicyJShadowObservation(
-                        trade_id=self._trade_id,
-                        is_spread_phase=_is_spread_ph,
-                        is_hedged_pair=_is_hedged,
-                        exit_inflight=_exit_inflight,
-                        gross_liquidation_pnl_twd=float(current_pnl * 10.0),  # TMF 1pt = 10 TWD
-                        commission_twd=60.0,
-                        exchange_fee_twd=32.0,
-                        near_quote_age_ms=0,
-                        far_quote_age_ms=0,
-                        event_time=now.isoformat(),
-                        processed_at=datetime.now().isoformat(),
-                        config_hash="j1.5br_shadow",
-                        event_key=f"{self._trade_id}-{now.isoformat()}"
-                    )
-                    shadow_config = {
-                        "observation_enabled": True,
-                        "execution_enabled": False,
-                        "policy_j_activation_threshold_twd": 500.0,
-                        "policy_j_giveback_ratio_threshold": 0.35,
-                    }
-                    assert shadow_config.get("execution_enabled", False) is False, "Policy J execution MUST BE HARD-LOCKED FALSE!"
-
-                    if not hasattr(self, "_policy_j_shadow_state") or self._policy_j_shadow_state is None:
-                        self._policy_j_shadow_state = PolicyJShadowState()
-
-                    shadow_snapshot, self._policy_j_shadow_state = PolicyJShadowEvaluator.evaluate(
-                        shadow_obs,
-                        self._policy_j_shadow_state,
-                        shadow_config
-                    )
-                    self._soak_collector.record_policy_j_evaluation(shadow_snapshot, obs=shadow_obs)
-                except Exception as _pj_err:
-                    import json as _json, sys as _sys
-                    print(_json.dumps({
-                        "stage": "POLICY_J_HOOK_EVAL_FAILED",
-                        "exception_type": type(_pj_err).__name__,
-                        "trade_id": getattr(self, "_trade_id", None),
-                        "lifecycle_phase": str(getattr(self._lifecycle_oca, "phase", "")),
-                        "generation_id": getattr(getattr(self, "_soak_collector", None), "generation_id", "UNKNOWN"),
-                        "error": str(_pj_err)
-                    }), file=_sys.stderr)
-
-            # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
-            # 2026-08-26 Hermes Agent: the paper-only ATR-release trend gate
-            # deliberately suppresses RELEASE when no valid/matching trend
-            # snapshot exists — decision=None on an ATR stop hit is then the
-            # expected gate outcome, not a regression.
-            if (
-                _decision is None
-                and self._lifecycle_oca.phase == PositionPhase.SPREAD
-                and self._lifecycle_oca.release_group.status == ReleaseGroupStatus.ARMED
-                and (_n_pnl <= -_release_stop or _f_pnl <= -_release_stop)
-                and not _atr_gate_on
-            ):
-                logger.error(
-                    "[MTS_RELEASE_DECISION_INVARIANT_VIOLATION] far_hit/near_hit is True but evaluate_lifecycle_actions returned None — P0"
+            # 2026-11-23 Gemini CLI: When independent_leg_bracket is enabled, bypass the
+            # legacy lifecycle adapter (Policy J / ATR release+trail / trend-release),
+            # Policy J shadow hook, and ATR release invariant check completely.
+            if not _ilb_enabled:
+                # 2026-07-20 Gemini CLI: PR 3B Production Decision Core Cutover (first evaluation block)
+                from strategies.plugins.futures.active.mts_lifecycle_adapter import LifecycleEvaluationInput
+                _trend_enabled, _trend_snap = self._build_trend_release_input()
+                _trend_reversal_snap = self._build_trend_reversal_input()
+                # 2026-08-26 Hermes Agent: paper-only ATR-release trend gate —
+                # computed here (monitor-injected mode + live flag + env) and
+                # surfaced into the adapter context as a pure boolean.
+                _atr_gate_on, _atr_gate_reason = self._mts_atr_release_trend_gate()
+                _adapter_input = LifecycleEvaluationInput(
+                    strategy_state={
+                        "policy_j_guard_just_completed": bool(getattr(self, "_pj_guard_just_completed", False)),
+                        # 2026-09-29 Hermes Agent: mark freshness for the intercept
+                        # gate. Unknown provenance (paper/backtest) stays permissive.
+                        "marks_live": (
+                            str(bar.get("near_price_source") or "") != "BAR_CLOSE"
+                            and str(bar.get("far_price_source") or "") != "BAR_CLOSE"
+                        ),
+                        "near_pnl_pts": _n_pnl,
+                        "far_pnl_pts": _f_pnl,
+                        "floating_pnl_pts": current_pnl,
+                        "entry_age_secs": _entry_age,
+                        "release_stop_threshold": _release_stop,
+                        "trail_dist": _trail_dist,
+                        "manual_requested": getattr(self, "_manual_exit_requested", False),
+                        "max_hold_secs": self._params.get("max_hold_secs"),
+                        "max_loss_pts": self._params.get("max_loss_pts"),
+                        "trailing_side": _trailing_side,
+                        "peak": _peak,
+                        "nadir": _nadir,
+                        "rem_high": _rem_high,
+                        "rem_low": _rem_low,
+                        "enable_combined_upl_trail": self._params.get("enable_combined_upl_trail", False),
+                        "combined_upl_activation_net_pnl_twd": float(self._params.get("combined_upl_activation_net_pnl_twd", 300.0)),
+                        "combined_upl_giveback_twd": float(self._params.get("combined_upl_giveback_twd", 100.0)),
+                        "peak_net_exit_pnl_twd": getattr(self, "_peak_net_exit_pnl_twd", 0.0),
+                        "trend_release_enabled": (_trend_enabled, _trend_snap)[0],
+                        "trend_confirmed": (_trend_enabled, _trend_snap)[1],
+                        "trend_reversal_confirmed": _trend_reversal_snap,
+                        "release_trend_gate_enabled": _atr_gate_on,
+                        "last_applied_event_time": self._last_applied_event_time.isoformat() if getattr(self, "_last_applied_event_time", None) else None,
+                        "single_leg_started_at": self._single_leg_started_at.isoformat() if getattr(self, "_single_leg_started_at", None) else None,
+                    },
+                    market_event={
+                        "event_time": now.isoformat(),
+                        "timestamp": now.isoformat(),
+                        "ts": now.isoformat(),
+                    },
+                    lifecycle=self._lifecycle_oca,
+                    execution_mode="BACKTEST" if _is_backtest else "LIVE",
                 )
-                if not _is_backtest:
-                    raise RuntimeError("MTS_RELEASE_DECISION_INVARIANT_VIOLATION in production")
+                self._ensure_lifecycle_adapter_initialized("LATE_INIT")
+                if getattr(self, "_pj_guard_just_completed", False):
+                    self._pj_guard_just_completed = False  # consumed once
+                _adapter_res = self._lifecycle_adapter.evaluate(_adapter_input)
+                _decision = _adapter_res.decision
+                # 2026-08-23 Hermes Agent: HVWAP candidate release wiring —
+                # baseline-clear marker: the candidate may act only when the
+                # baseline lifecycle evaluation produced NO exit decision (risk
+                # exits / Policy J / timeout / release all take precedence).
+                self._hvwap_baseline_clear_tick = (_decision is None)
+
+                # ── Wave J1.5-BR: Policy J Shadow Telemetry Integration Hook ──
+                if getattr(self, "_soak_collector", None) is not None:
+                    try:
+                        from strategies.futures.mts.policy_j_shadow_evaluator import (
+                            PolicyJShadowEvaluator,
+                            PolicyJShadowObservation,
+                        )
+                        from strategies.futures.mts.policy_j_shadow_state import PolicyJShadowState
+
+                        _is_spread_ph = (self._lifecycle_oca.phase == PositionPhase.SPREAD)
+                        _is_hedged = (self._near_side is not None and self._far_side is not None)
+                        _rg_st = self._lifecycle_oca.release_group.status
+                        _exit_inflight = (_rg_st not in (ReleaseGroupStatus.ARMED, ReleaseGroupStatus.INACTIVE))
+
+                        shadow_obs = PolicyJShadowObservation(
+                            trade_id=self._trade_id,
+                            is_spread_phase=_is_spread_ph,
+                            is_hedged_pair=_is_hedged,
+                            exit_inflight=_exit_inflight,
+                            gross_liquidation_pnl_twd=float(current_pnl * 10.0),  # TMF 1pt = 10 TWD
+                            commission_twd=60.0,
+                            exchange_fee_twd=32.0,
+                            near_quote_age_ms=0,
+                            far_quote_age_ms=0,
+                            event_time=now.isoformat(),
+                            processed_at=datetime.now().isoformat(),
+                            config_hash="j1.5br_shadow",
+                            event_key=f"{self._trade_id}-{now.isoformat()}"
+                        )
+                        shadow_config = {
+                            "observation_enabled": True,
+                            "execution_enabled": False,
+                            "policy_j_activation_threshold_twd": 500.0,
+                            "policy_j_giveback_ratio_threshold": 0.35,
+                        }
+                        assert shadow_config.get("execution_enabled", False) is False, "Policy J execution MUST BE HARD-LOCKED FALSE!"
+
+                        if not hasattr(self, "_policy_j_shadow_state") or self._policy_j_shadow_state is None:
+                            self._policy_j_shadow_state = PolicyJShadowState()
+
+                        shadow_snapshot, self._policy_j_shadow_state = PolicyJShadowEvaluator.evaluate(
+                            shadow_obs,
+                            self._policy_j_shadow_state,
+                            shadow_config
+                        )
+                        self._soak_collector.record_policy_j_evaluation(shadow_snapshot, obs=shadow_obs)
+                    except Exception as _pj_err:
+                        import json as _json, sys as _sys
+                        print(_json.dumps({
+                            "stage": "POLICY_J_HOOK_EVAL_FAILED",
+                            "exception_type": type(_pj_err).__name__,
+                            "trade_id": getattr(self, "_trade_id", None),
+                            "lifecycle_phase": str(getattr(self._lifecycle_oca, "phase", "")),
+                            "generation_id": getattr(getattr(self, "_soak_collector", None), "generation_id", "UNKNOWN"),
+                            "error": str(_pj_err)
+                        }), file=_sys.stderr)
+
+                # 2026-07-16 Gemini CLI: P0 Invariant Assertion to detect evaluate_lifecycle_actions regression (Phase 3a)
+                # 2026-08-26 Hermes Agent: the paper-only ATR-release trend gate
+                # deliberately suppresses RELEASE when no valid/matching trend
+                # snapshot exists — decision=None on an ATR stop hit is then the
+                # expected gate outcome, not a regression.
+                if (
+                    _decision is None
+                    and self._lifecycle_oca.phase == PositionPhase.SPREAD
+                    and self._lifecycle_oca.release_group.status == ReleaseGroupStatus.ARMED
+                    and (_n_pnl <= -_release_stop or _f_pnl <= -_release_stop)
+                    and not _atr_gate_on
+                ):
+                    logger.error(
+                        "[MTS_RELEASE_DECISION_INVARIANT_VIOLATION] far_hit/near_hit is True but evaluate_lifecycle_actions returned None — P0"
+                    )
+                    if not _is_backtest:
+                        raise RuntimeError("MTS_RELEASE_DECISION_INVARIANT_VIOLATION in production")
             # 2026-07-09 Hermes Agent: P0 lifecycle ordering — commit + write_state
             # moved below, after tick confirmation and BB filter pass.  The early write
             # at this location (removed) created state-file/broker divergence by writing
@@ -5383,8 +5394,8 @@ class TMFSpread(StrategyBase):
         # When enabled, this REPLACES the adapter's decision wholesale —
         # Policy J / ATR release+trail / trend-release never run for this
         # tick. See _check_independent_leg_bracket() docstring.
-        _ilb_cfg = self._params.get("independent_leg_bracket") or {}
-        if _ilb_cfg.get("enabled", False):
+        if _ilb_enabled:
+            self._hvwap_baseline_clear_tick = False
             _ilb_released_leg = self._lifecycle_oca.release_group.filled_leg
             if _ilb_released_leg is None and self._released_leg:
                 _ilb_released_leg = Leg.FAR if self._released_leg == "far" else Leg.NEAR
@@ -5539,7 +5550,8 @@ class TMFSpread(StrategyBase):
         # materialized a RELEASE decision for the current bar.  Do not let a
         # wide *other* leg suppress an already breached single-leg release.
         _candidate_release_leg = None
-        if _decision is None:
+        # 2026-11-23 Gemini CLI: Skip legacy ATR release-stop probe when independent_leg_bracket is enabled.
+        if _decision is None and not _ilb_enabled:
             try:
                 _release_stop_probe, _trail_probe, _ = self._evaluate_risk(
                     near_close, far_close, current_pnl, bar)
@@ -5880,7 +5892,12 @@ class TMFSpread(StrategyBase):
                         _ilog.create(getattr(self, "_trade_id", ""), "COMBINED_EXIT", leg=_rem_leg_s)
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
-                return Signal("PARTIAL_EXIT", _signal_reason, confidence=0.4)
+                # 2026-11-23 Gemini CLI: Propagate INDEPENDENT_LEG_BRACKET_* winner on PARTIAL_EXIT Signal.
+                _ilb_rel_winner = getattr(_decision, "winner", None) or ""
+                return Signal(
+                    "PARTIAL_EXIT", _signal_reason, confidence=0.4,
+                    winner=_ilb_rel_winner if _ilb_rel_winner.startswith("INDEPENDENT_LEG_BRACKET_") else "",
+                )
             elif _decision.action in (LifecycleAction.TRAIL, LifecycleAction.TREND_REVERSAL_EXIT, LifecycleAction.STOPLOSS, LifecycleAction.TIMEOUT):
                 # ── ADR-011 Phase 4: Post-fill warmup guard ──
                 # Blocks TRAIL if warmup (500ms / 2 ticks) hasn't completed.
@@ -6013,9 +6030,15 @@ class TMFSpread(StrategyBase):
                 _append_event("EXIT_REMAINING", reason=_exit_reason, remaining_leg=_rem_leg.value, exit_price=_exit_price, gross_points=_pnl_pts, cost=_cost, realized_pnl=_realized, **_risk_meta)
                 _write_mts_state(has_position=True, action=f"EXIT_{_exit_reason}", reason=_exit_reason, near_entry=self._near_entry, far_entry=self._far_entry, near_last=near_close, far_last=far_close, near_side=self._near_side, far_side=self._far_side, spread_z=spread_z, released_leg=self._released_leg, trade_id=self._trade_id, ticker=self._ticker, lifecycle=lifecycle_to_dict(self._lifecycle_oca), **_risk_meta)
                 self._log_shadow_trade_summary(_exit_price, _exit_reason, _pnl_pts, now, bar, near_close, far_close)
+                # 2026-11-23 Gemini CLI: Propagate INDEPENDENT_LEG_BRACKET_* winner on EXIT Signal.
+                _exit_winner = (
+                    "POLICY_J_SINGLE_LEG"
+                    if _pj_event
+                    else (_ilb_winner if _ilb_winner.startswith("INDEPENDENT_LEG_BRACKET_") else "")
+                )
                 return Signal("EXIT", f"TMF_{_exit_reason}", confidence=0.5, stop_loss=0,
                               event_id=_pj_event["event_id"] if _pj_event else "",
-                              winner="POLICY_J_SINGLE_LEG" if _pj_event else "")
+                              winner=_exit_winner)
             elif _decision.action == LifecycleAction.COMBINED_EXIT:
                 _exit_reason = "COMBINED_EXIT"
                 logger.info("[POLICY_J_LIVE_TRIGGERED] Executing COMBINED_EXIT (SPREAD -> FLAT)")
