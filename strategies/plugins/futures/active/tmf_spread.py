@@ -3195,6 +3195,11 @@ class TMFSpread(StrategyBase):
                     leg, self._side, price, self._release_price, _realized, self._lifecycle, self._trade_id)
 
         # ADR-009 Task 7: flush lifecycle to state file immediately on release fill callback
+        # 2026-11-24 Hermes Agent: near_last/far_last were omitted here, so
+        # _write_mts_state's realized-pnl branch (needs *_last > 0) never ran
+        # for the released leg -- near_realized_pnl/far_realized_pnl stayed
+        # 0.0 forever, so the dashboard never showed the "(已平倉)" badge for
+        # an already-released leg and kept rendering stale live UPL instead.
         _write_mts_state(
             has_position=self._has_position,
             action="RELEASE",
@@ -3205,6 +3210,8 @@ class TMFSpread(StrategyBase):
             far_side=self._far_side,
             released_leg=self._released_leg,
             release_price=self._release_price,
+            near_last=self._release_price if _rel == Leg.NEAR else price,
+            far_last=price if _rel == Leg.NEAR else self._release_price,
             trade_id=self._trade_id,
             ticker=self._ticker,
             atr=self._last_atr or 0.0,
