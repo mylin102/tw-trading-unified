@@ -14995,56 +14995,62 @@ class FuturesMonitor:
                 return "LONG"
             return None
 
-        # 1. broker canonical first (broker facts are the authority).
+        # 1. broker canonical first (broker facts are the authority) —
+        #    LIVE mode only. 2026-11-24 Hermes Agent: a PAPER position
+        #    never exists at the real broker, so the empty-canonical
+        #    "proves flat" rule below would always fire for paper trades
+        #    and silently no-op 緊急全平倉 on a real open paper leg. Paper
+        #    mode's authority is the local paper state (step 2 below).
         #    capture == OK is authoritative IMMEDIATELY — even an empty
         #    positions list proves flat and must never fall back to a
-        #    possibly-stale local state (ghost resurrection).
-        try:
-            _snap = self._capture_post_startup_snapshot()
-            if (_snap and (_snap.get("fetch_status") or {})
-                    .get("capture") == "OK"):
-                _canon_ok = True
-                _codes = {str(getattr(self.contract, "code", "")),
-                          str(getattr(self.far_contract, "code", ""))}
-                _rows = [p for p in (_snap.get("positions") or [])
-                         if p.get("account") == "futures"
-                         and str(p.get("code") or "") in _codes
-                         and int(p.get("quantity") or 0) > 0]
-                if not _rows:
-                    # broker flat, or no target MTS contracts -> flat,
-                    # zero close info, zero orders
-                    return (False, None, None, None,
-                            "mts-emergency", None)
-                if _rows:
-                    if len(_rows) != len({str(p.get("code")) for p in _rows}):
-                        # duplicate contract: fail closed
-                        return (False, None, None, None,
-                                "mts-emergency", None)
-                    _by_code = {str(p.get("code")): p for p in _rows}
-                    _near = _by_code.get(
-                        str(getattr(self.contract, "code", "")))
-                    _far = _by_code.get(
-                        str(getattr(self.far_contract, "code", "")))
-                    _near_side = _side(_near)
-                    _far_side = _side(_far)
-                    if _near_side is None and _far_side is None:
-                        # unknown directions: fail closed
-                        return (False, None, None, None,
-                                "mts-emergency", None)
-                    if len(_rows) == 1 and _near_side is not None:
-                        _released_leg = "far"
-                    elif len(_rows) == 1 and _far_side is not None:
-                        _released_leg = "near"
-                    _has_pos = True
-                    _trade_id = "mts-emergency-broker"
+        #    possibly-stale local state (ghost resurrection). LIVE ONLY.
+        if self.live_trading:
+            try:
+                _snap = self._capture_post_startup_snapshot()
+                if (_snap and (_snap.get("fetch_status") or {})
+                        .get("capture") == "OK"):
                     _canon_ok = True
-                    console.print(
-                        "[yellow]📝 [MANUAL_TRADE] close_all: "
-                        "sides from broker canonical[/yellow]")
-        except Exception as _bc_e:
-            console.print(
-                f"[red]⚠️ [MANUAL_TRADE] close_all: broker canonical "
-                f"fallback failed: {_bc_e}[/red]")
+                    _codes = {str(getattr(self.contract, "code", "")),
+                              str(getattr(self.far_contract, "code", ""))}
+                    _rows = [p for p in (_snap.get("positions") or [])
+                             if p.get("account") == "futures"
+                             and str(p.get("code") or "") in _codes
+                             and int(p.get("quantity") or 0) > 0]
+                    if not _rows:
+                        # broker flat, or no target MTS contracts -> flat,
+                        # zero close info, zero orders
+                        return (False, None, None, None,
+                                "mts-emergency", None)
+                    if _rows:
+                        if len(_rows) != len({str(p.get("code")) for p in _rows}):
+                            # duplicate contract: fail closed
+                            return (False, None, None, None,
+                                    "mts-emergency", None)
+                        _by_code = {str(p.get("code")): p for p in _rows}
+                        _near = _by_code.get(
+                            str(getattr(self.contract, "code", "")))
+                        _far = _by_code.get(
+                            str(getattr(self.far_contract, "code", "")))
+                        _near_side = _side(_near)
+                        _far_side = _side(_far)
+                        if _near_side is None and _far_side is None:
+                            # unknown directions: fail closed
+                            return (False, None, None, None,
+                                    "mts-emergency", None)
+                        if len(_rows) == 1 and _near_side is not None:
+                            _released_leg = "far"
+                        elif len(_rows) == 1 and _far_side is not None:
+                            _released_leg = "near"
+                        _has_pos = True
+                        _trade_id = "mts-emergency-broker"
+                        _canon_ok = True
+                        console.print(
+                            "[yellow]📝 [MANUAL_TRADE] close_all: "
+                            "sides from broker canonical[/yellow]")
+            except Exception as _bc_e:
+                console.print(
+                    f"[red]⚠️ [MANUAL_TRADE] close_all: broker canonical "
+                    f"fallback failed: {_bc_e}[/red]")
         # 2. local state fallback ONLY when the canonical is unavailable
         if not _canon_ok:
             try:
