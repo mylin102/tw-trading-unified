@@ -10350,9 +10350,10 @@ class FuturesMonitor:
             return
 
         if _action == "PARTIAL_EXIT":
-            _release_leg = ("near" if "RELEASE_NEAR" in str(_reason).upper()
-                            else "far" if "RELEASE_FAR" in str(_reason).upper()
-                            else None)
+            _release_telemetry_winner = getattr(signal, "winner", "")
+            _release_telemetry_reason = _release_telemetry_winner if _release_telemetry_winner.startswith("INDEPENDENT_LEG_BRACKET_") else _reason or "RELEASE_STOP"
+            _release_leg = ("near" if "RELEASE_NEAR" in str(_reason).upper() else
+                            "far" if "RELEASE_FAR" in str(_reason).upper() else None)
             if self.live_trading and _release_leg:
                 _release_symbol = (_near_code if _release_leg == "near"
                                    else _far_code)
@@ -10415,14 +10416,13 @@ class FuturesMonitor:
                     "ref_ohlc": _snap["near"],
                     "leg_role": "RELEASED",
                     "exit_stage": "FIRST_LEG_RELEASE",
-                    "release_reason": _reason or "RELEASE_STOP",
-                    "reason_source": "LIFECYCLE_DECISION",
+                    "release_reason": _release_telemetry_reason, "reason_source": "LIFECYCLE_DECISION",
                 })
                 self._append_mts_event(
                     "RELEASE_NEAR_SUBMITTED",
                     **{**_ev_meta(_order),
                        "released_leg": "near",
-                       "release_reason": _reason or "RELEASE_STOP"})
+                       "release_reason": _release_telemetry_reason})
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode
@@ -10482,14 +10482,13 @@ class FuturesMonitor:
                     "ref_ohlc": _snap["far"],
                     "leg_role": "RELEASED",
                     "exit_stage": "FIRST_LEG_RELEASE",
-                    "release_reason": _reason or "RELEASE_STOP",
-                    "reason_source": "LIFECYCLE_DECISION",
+                    "release_reason": _release_telemetry_reason, "reason_source": "LIFECYCLE_DECISION",
                 })
                 self._append_mts_event(
                     "RELEASE_FAR_SUBMITTED",
                     **{**_ev_meta(_order),
                        "released_leg": "far",
-                       "release_reason": _reason or "RELEASE_STOP"})
+                       "release_reason": _release_telemetry_reason})
                 if self.paper_fill_sim:
                     self.paper_fill_sim.register(_order)
                     # 💡 [Fixed 2026-05-27] Force immediate fill in paper mode

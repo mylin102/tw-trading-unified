@@ -5873,7 +5873,9 @@ class TMFSpread(StrategyBase):
                 # MFE/MAE
                 _mfe = (self._near_max - self._near_entry) if self._near_side == "LONG" else (self._near_entry - self._near_min)
                 _mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
-                self._log_exit_decision(exit_reason="RELEASE_STOP", pnl=_pnl_pts, bar=bar)
+                _ilb_rel_winner = getattr(_decision, "winner", None) or ""
+                _exit_reason = _ilb_rel_winner if _ilb_rel_winner.startswith("INDEPENDENT_LEG_BRACKET_") else "RELEASE_STOP"
+                self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
                 _risk_meta["mtf_score"] = self._mtf_score_at_release
                 # Broker-truth boundary: lifecycle/state and *_SUBMITTED
                 # telemetry are committed by monitor.py only after the
@@ -5893,7 +5895,6 @@ class TMFSpread(StrategyBase):
                 except Exception:
                     pass  # intent log unavailable → legacy behavior
                 # 2026-11-23 Gemini CLI: Propagate INDEPENDENT_LEG_BRACKET_* winner on PARTIAL_EXIT Signal.
-                _ilb_rel_winner = getattr(_decision, "winner", None) or ""
                 return Signal(
                     "PARTIAL_EXIT", _signal_reason, confidence=0.4,
                     winner=_ilb_rel_winner if _ilb_rel_winner.startswith("INDEPENDENT_LEG_BRACKET_") else "",
