@@ -5744,13 +5744,20 @@ class TMFSpread(StrategyBase):
 
         # 💡 Gemini CLI: Update position telemetry (near_last, far_last, UPL, _updated) on live ticks
         if self._has_position:
-            _total_upl = _n_pnl * _mult + _f_pnl * _mult
+            # 2026-11-24 Hermes Agent: near_upl/far_upl must carry the same
+            # point-value-multiplied TWD contract as total_upl and every
+            # other writer (monitor.py, context_builder.py) — this call was
+            # passing raw points, understating the dashboard UPL cards by
+            # the point multiplier (10x for TMF).
+            _near_upl_twd = _n_pnl * _mult
+            _far_upl_twd = _f_pnl * _mult
+            _total_upl = _near_upl_twd + _far_upl_twd
             _write_mts_telemetry(
                 ticker=self._ticker,
                 near_last=near_close,
                 far_last=far_close,
-                near_upl=_n_pnl,
-                far_upl=_f_pnl,
+                near_upl=_near_upl_twd,
+                far_upl=_far_upl_twd,
                 total_upl=_total_upl,
                 atr=float(bar.get("atr", 0.0) or 0.0),
                 quote_age_ms=quote_age_ms,
