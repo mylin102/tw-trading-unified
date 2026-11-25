@@ -855,6 +855,82 @@ def _fill_provenance_defaults(trade_id: str, fill_type: str) -> dict:
     }
 
 
+_SETTLED_TRADES: set[str] = set()
+
+
+def _maybe_emit_trade_settled(trade_id: str, ticker: str, fill_type: str,
+                              price: float, leg: str) -> None:
+    """Emit exactly one TRADE_SETTLED record once all opened legs have closed.
+
+    2026-11-25 Hermes Agent: the independent-leg-bracket path closes legs one at
+    a time and never emitted a trade-level settlement (COMBINED_EXIT_SETTLED
+    belongs to the combined-exit path; 2026-11-25 had 4 completed trades and 0
+    settlement events). Consumers therefore had to re-sum per-leg fills by hand,
+    which is where the trigger-vs-realised P&L confusion came from.
+
+    realised_pnl_twd is the SUM of the per-leg realized_pnl already written by
+    the fills path (authoritative). gross_points comes from entry/exit prices.
+    fees_twd is DERIVED (gross - realised) rather than re-implementing the fee
+    model, so there is exactly one fee implementation in the codebase.
+    """
+    _exit_types = ("EXIT", "RELEASE", "COMBINED_EXIT", "COMBINED_EXIT_SETTLED")
+    if str(fill_type).upper() not in _exit_types:
+        return
+    if not trade_id or trade_id == "?" or trade_id in _SETTLED_TRADES:
+        return
+    try:
+        rows = []
+        with open(_MTS_FILL_LOG) as fh:
+            for line in fh:
+                if trade_id not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("trade_id") == trade_id:
+                    rows.append(row)
+        entries = {str(r.get("leg", "")).upper(): r for r in rows
+                   if str(r.get("fill_type", "")).upper() == "ENTRY"}
+        closes = {}
+        for r in rows:
+            if str(r.get("fill_type", "")).upper() in _exit_types:
+                closes[str(r.get("leg", "")).upper()] = r
+        if not entries or set(closes) != set(entries):
+            return          # a leg is still open — settle later
+        mult = float(get_point_value(ticker))
+        legs, gross_pts, realized = [], 0.0, 0.0
+        for name, ent in entries.items():
+            clo = closes[name]
+            entry_px = float(ent.get("price") or 0.0)
+            exit_px = float(clo.get("price") or 0.0)
+            side = str(ent.get("side", "")).upper()
+            pts = (exit_px - entry_px) if side == "LONG" else (entry_px - exit_px)
+            leg_twd = float(clo.get("realized_pnl") or 0.0)
+            gross_pts += pts
+            realized += leg_twd
+            legs.append({
+                "leg": name, "side": side,
+                "entry_price": entry_px, "exit_price": exit_px,
+                "exit_type": str(clo.get("fill_type", "")).upper(),
+                "points": round(pts, 1), "realized_pnl_twd": round(leg_twd, 1),
+            })
+        _SETTLED_TRADES.add(trade_id)
+        _append_event(
+            "TRADE_SETTLED",
+            trade_id=trade_id,
+            ticker=ticker,
+            legs=legs,
+            gross_points=round(gross_pts, 1),
+            gross_twd=round(gross_pts * mult, 1),
+            realized_pnl_twd=round(realized, 1),
+            fees_twd=round(gross_pts * mult - realized, 1),
+            settlement_source="FILLS_SUM",
+        )
+    except Exception as exc:      # telemetry must never break order flow
+        logger.debug("[MTS_SETTLE] trade settlement skipped: %s", exc)
+
+
 def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
                  price: float, fill_type: str, trade_id: str,
                  spread_z: float | None = None,
@@ -982,6 +1058,14 @@ def _append_fill(ticker: str, contract: str, leg: str, side: str, qty: int,
         else:
             with open(_MTS_FILL_LOG, "a") as f:
                 f.write(json.dumps(fill, default=str) + "\n")
+
+        # 2026-11-25 Hermes Agent: trade-level settlement record.
+        # Per-leg fills each carry their own realized_pnl, but no authoritative
+        # "this trade netted X" record existed for the independent-leg-bracket
+        # path (COMBINED_EXIT_SETTLED only fires on the combined-exit path —
+        # zero settlement events on 2026-11-25 despite 4 completed trades).
+        # Emit one TRADE_SETTLED per trade once every opened leg has closed.
+        _maybe_emit_trade_settled(trade_id, ticker, fill_type, price, leg)
     except Exception:
         if durable:
             raise  # settlement-path writes must not be silently lost
