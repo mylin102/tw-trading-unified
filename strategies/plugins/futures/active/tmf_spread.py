@@ -4570,6 +4570,45 @@ class TMFSpread(StrategyBase):
             self._last_skip_reason = reason
             self._last_skip_ts = now
 
+    def _record_entry_gate_skip(self, skip_reason: str, bar: dict | None = None) -> None:
+        """Write rate-limited telemetry for an entry-gate skip; never gate trading."""
+        try:
+            if getattr(self, "_has_position", None) is not False:
+                return
+            if skip_reason == "MTS_BUSY" and self._lifecycle != "SUBMITTING":
+                return
+            now = time.monotonic()
+            last_reason = getattr(self, "_entry_gate_skip_last_reason", None)
+            last_ts = getattr(self, "_entry_gate_skip_last_ts", None)
+            if (skip_reason == last_reason and last_ts is not None
+                    and now - last_ts < 30.0):
+                return
+            _bar = bar if isinstance(bar, dict) else {}
+            _append_event(
+                "ENTRY_GATE_SKIP",
+                skip_reason=skip_reason,
+                lifecycle=getattr(self, "_lifecycle", None),
+                has_position=getattr(self, "_has_position", None),
+                spread_z=_bar.get("spread_z"),
+                entry_z=getattr(self, "_entry_z", None),
+                atr=_bar.get("atr"),
+                near_close=_bar.get("near_close"),
+                far_close=_bar.get("far_close"),
+                near_side=getattr(self, "_near_side", None),
+                far_side=getattr(self, "_far_side", None),
+                trade_id=getattr(self, "_trade_id", None),
+            )
+            self._entry_gate_skip_last_reason = skip_reason
+            self._entry_gate_skip_last_ts = now
+        except Exception:
+            pass  # best-effort observability must never affect trading
+
+    def _set_entry_gate_skip(self, skip_reason: str, *, bar: dict | None = None,
+                             **notes: object) -> None:
+        """Preserve last_eval semantics and add best-effort entry telemetry."""
+        self._set_eval(skip_reason=skip_reason, **notes)
+        self._record_entry_gate_skip(skip_reason, bar)
+
     def on_bar(self, context: StrategyContext) -> Signal | None:
         # 2026-05-27 Gemini CLI: Hot-reload params from context on every tick for real-time Dashboard tuning
         _params = context.config.get("params", {})
@@ -4598,7 +4637,7 @@ class TMFSpread(StrategyBase):
 
         bar = context.market.last_bar
         if not bar:
-            self._set_eval(skip_reason="NO_BAR")
+            self._set_entry_gate_skip("NO_BAR")
             return None
 
         # 2026-07-24 Gemini CLI: Record market callback for ShadowSoakCollector
@@ -4651,10 +4690,10 @@ class TMFSpread(StrategyBase):
                         return None
                     # Fall through to continue processing
                 else:
-                    self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
+                    self._set_entry_gate_skip("MTS_BUSY", bar=bar, lifecycle=self._lifecycle)
                     return None
             else:
-                self._set_eval(skip_reason="MTS_BUSY", lifecycle=self._lifecycle)
+                self._set_entry_gate_skip("MTS_BUSY", bar=bar, lifecycle=self._lifecycle)
                 return None
 
         # ── [Fix] Re-entry Cooldown ──
@@ -4662,7 +4701,7 @@ class TMFSpread(StrategyBase):
             # 2026-06-25 Gemini CLI: Use bar timestamp (now) instead of wall-clock datetime.now() for backtesting
             _elapsed = (now - self._last_exit_ts).total_seconds()
             if _elapsed < self._reentry_cooldown_secs:
-                self._set_eval(skip_reason="REENTRY_COOLDOWN", remaining=int(self._reentry_cooldown_secs - _elapsed))
+                self._set_entry_gate_skip("REENTRY_COOLDOWN", bar=bar, remaining=int(self._reentry_cooldown_secs - _elapsed))
                 return None
 
         # ── Hot-reload guard: restore position state if lost ──
@@ -4683,7 +4722,7 @@ class TMFSpread(StrategyBase):
         spread_z = bar.get("spread_z", None)
 
         if near_close <= 0 or far_close <= 0:
-            self._set_eval(skip_reason="NO_SPREAD_DATA", near=near_close, far=far_close)
+            self._set_entry_gate_skip("NO_SPREAD_DATA", bar=bar, near=near_close, far=far_close)
             return None
 
         # Cache ATR for management logic
@@ -4711,7 +4750,7 @@ class TMFSpread(StrategyBase):
         # ── Staleness gate (only for new entry) ──
         atr = bar.get("atr", 0.0)
         if atr < self._min_atr:
-            self._set_eval(skip_reason=f"ATR_TOO_LOW ({atr:.2f}<{self._min_atr:.1f})")
+            self._set_entry_gate_skip(f"ATR_TOO_LOW ({atr:.2f}<{self._min_atr:.1f})", bar=bar)
             return None
 
         # 💡 [Fixed 2026-05-27] Disabled SPREAD_DATA_STALE gate
@@ -4725,13 +4764,13 @@ class TMFSpread(StrategyBase):
 
         # ── Entry gate ──
         if spread_z is None or pd.isna(spread_z):
-            self._set_eval(skip_reason="NO_SPREAD_Z")
+            self._set_entry_gate_skip("NO_SPREAD_Z", bar=bar)
             return None
 
         try:
             spread_z_f = float(spread_z)
         except (TypeError, ValueError):
-            self._set_eval(skip_reason="SPREAD_Z_INVALID")
+            self._set_entry_gate_skip("SPREAD_Z_INVALID", bar=bar)
             return None
 
         # 2026-06-26 Gemini CLI: Parse dynamic entry Z based on ATR
@@ -4749,11 +4788,11 @@ class TMFSpread(StrategyBase):
             self._entry_z = float(self._entry_z_cfg)
 
         if abs(spread_z_f) < self._entry_z:
-            self._set_eval(skip_reason="SPREAD_Z_NOT_EXTREME", spread_z=round(spread_z_f, 2))
+            self._set_entry_gate_skip("SPREAD_Z_NOT_EXTREME", bar=bar, spread_z=round(spread_z_f, 2))
             return None
 
         if context.position.size != 0:
-            self._set_eval(skip_reason="POSITION_OPEN")
+            self._set_entry_gate_skip("POSITION_OPEN", bar=bar)
             return None
 
         # ── [PCF-1] Account channel degraded — block entry ──
@@ -4761,7 +4800,7 @@ class TMFSpread(StrategyBase):
             from core.channel_safety import get_safety_state
             _safety = get_safety_state()
             if not _safety.entry_allowed(self._ticker):
-                self._set_eval(skip_reason=f"SAFETY_GATE:{_safety.entry_blocked_reason}")
+                self._set_entry_gate_skip(f"SAFETY_GATE:{_safety.entry_blocked_reason}", bar=bar)
                 return None
         except Exception:
             pass
@@ -4776,12 +4815,12 @@ class TMFSpread(StrategyBase):
                 _append_event("MAINTENANCE_ENTRY_LOCK", trade_id=self._trade_id,
                               reason="maintenance_entry_lock_active",
                               phase=str(getattr(self, "_lifecycle", "")))
-            self._set_eval(skip_reason="MAINTENANCE_ENTRY_LOCK")
+            self._set_entry_gate_skip("MAINTENANCE_ENTRY_LOCK", bar=bar)
             return None
 
         # ── [Fix] Prevent duplicate submissions ──
         if self._lifecycle == "SUBMITTING":
-            self._set_eval(skip_reason="ENTRY_ALREADY_SUBMITTED")
+            self._set_entry_gate_skip("ENTRY_ALREADY_SUBMITTED", bar=bar)
             return None
 
         # ── Direction-aware entry ──
