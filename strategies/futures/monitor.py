@@ -15791,8 +15791,9 @@ class FuturesMonitor:
             # 2026-05-22 Gemini CLI: Removed mts_selftest block from here.
 
             if _action == "spread":
-                # Integrity check: only enter if flat
-                if self.trader.position != 0:
+                # Integrity check: only enter if flat (2026-11-25 Gemini CLI: fail-closed when strategy holds position)
+                _mts_strat = getattr(self, "_registry", {}).get("tmf_spread")
+                if self.trader.position != 0 or getattr(_mts_strat, "_has_position", False) is True:
                     self._manual_trade_status = "FAILED: POS_EXIST"
                     console.print("[red]⛔ [MANUAL_TRADE] Rejected: Position already exists[/red]")
                     # 2026-06-05 JVS Claw: terminal — delete .processing
