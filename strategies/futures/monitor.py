@@ -1993,8 +1993,22 @@ class FuturesMonitor:
         )
 
         # Check for expiry/rollover
-        today_str = datetime.now().strftime("%Y/%m/%d")
-        if self.contract and self.contract.delivery_date < today_str:
+        # 2026-11-25 Hermes Agent: contracts-v2 carries delivery_date as a
+        # datetime.date while the legacy object carries a "YYYY/MM/DD" string.
+        # Comparing the two raised
+        #   TypeError: '<' not supported between instances of 'datetime.date' and 'str'
+        # inside the light-recovery path, i.e. exactly when the feed went stale.
+        # On 2026-11-25 that crashed the monitor 16 times during a network
+        # outage. Normalise to date; unparseable values degrade to "not expired"
+        # (never raise, never trigger a spurious rollover).
+        _today_date = datetime.now().date()
+        _delivery = self.contract.delivery_date if self.contract else None
+        if isinstance(_delivery, str):
+            try:
+                _delivery = datetime.strptime(_delivery, "%Y/%m/%d").date()
+            except ValueError:
+                _delivery = None
+        if _delivery is not None and _delivery < _today_date:
             console.print(
                 f" [yellow][IngestionWatchdog] "
                 f"reason=contract_expired symbol={symbol} "
