@@ -4659,38 +4659,31 @@ class TMFSpread(StrategyBase):
         # cannot emit orders, cannot raise (fail-closed for the candidate).
         self._hvwap_candidate_tick(bar, now)
 
-        # ── [Fix] Prevent duplicate submissions ──
-        # 2026-06-11 JVS Claw: Add timeout for RELEASE lifecycle states
-        # If release is stuck >60s without fill confirmation, reset to OPEN
-        # so the next on_bar() can retry the release.
-        if self._lifecycle in ("SUBMITTING", "RELEASE_NEAR", "RELEASE_FAR", "EXITING"):
-            if self._lifecycle in ("RELEASE_NEAR", "RELEASE_FAR") and getattr(self, "_release_mono", 0.0) > 0.0:
-                _release_age = time.monotonic() - self._release_mono
-                if _release_age > 60:
-                    # Broker-truth guard: the watchdog may still protect a
-                    # live broker order/position.  Resetting to OPEN would
-                    # drop stop/trail protection and permit a resend, so it
-                    # is allowed ONLY when the broker proved flat.  While the
-                    # broker order/position is not terminal, keep the pending
-                    # lifecycle (EXIT_PENDING semantics) and never resend.
-                    if getattr(self, "_broker_truth_flat", False) is True:
-                        logger.warning("[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck for %.0fs. Resetting to OPEN for retry.", self._lifecycle, _release_age)
-                        self._lifecycle = "OPEN"
-                        self._release_ts = None
-                        self._release_mono = 0.0
-                    else:
-                        logger.warning(
-                            "[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck %.0fs "
-                            "but broker order/position still live — keeping "
-                            "pending (no reset, no resend)", self._lifecycle,
-                            _release_age)
-                        self._set_eval(
-                            skip_reason="MTS_RELEASE_PENDING_BROKER_LIVE",
-                            lifecycle=self._lifecycle)
-                        return None
-                    # Fall through to continue processing
+        # 2026-11-25 Gemini CLI: Allow position management if SUBMITTING contradicts confirmed _has_position=True.
+        if self._lifecycle == "SUBMITTING" and self._has_position is True:
+            try:
+                _now_m = time.monotonic()
+                _last_ts = getattr(self, "_submitting_pos_warn_ts", None)
+                if _last_ts is None or _now_m - _last_ts >= 30.0:
+                    _append_event(
+                        "SUBMITTING_WITH_POSITION", lifecycle=self._lifecycle, has_position=True,
+                        trade_id=getattr(self, "_trade_id", None),
+                        near_entry=getattr(self, "_near_entry", None),
+                        far_entry=getattr(self, "_far_entry", None),
+                    )
+                    self._submitting_pos_warn_ts = _now_m
+            except Exception:
+                pass
+        elif self._lifecycle in ("SUBMITTING", "RELEASE_NEAR", "RELEASE_FAR", "EXITING"):
+            _rel_mono = getattr(self, "_release_mono", 0.0)
+            _release_age = (time.monotonic() - _rel_mono) if self._lifecycle in ("RELEASE_NEAR", "RELEASE_FAR") and _rel_mono > 0.0 else 0.0
+            if _release_age > 60:
+                if getattr(self, "_broker_truth_flat", False) is True:
+                    logger.warning("[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck for %.0fs. Resetting to OPEN for retry.", self._lifecycle, _release_age)
+                    self._lifecycle, self._release_ts, self._release_mono = "OPEN", None, 0.0
                 else:
-                    self._set_entry_gate_skip("MTS_BUSY", bar=bar, lifecycle=self._lifecycle)
+                    logger.warning("[MTS_RELEASE_TIMEOUT] lifecycle=%s stuck %.0fs but broker order/position still live — keeping pending (no reset, no resend)", self._lifecycle, _release_age)
+                    self._set_eval(skip_reason="MTS_RELEASE_PENDING_BROKER_LIVE", lifecycle=self._lifecycle)
                     return None
             else:
                 self._set_entry_gate_skip("MTS_BUSY", bar=bar, lifecycle=self._lifecycle)
