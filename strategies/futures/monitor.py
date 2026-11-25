@@ -207,6 +207,12 @@ def _bbo_reject_reason(bar_dict: dict, max_age_ms: float):
     return None
 
 
+# 2026-11-25 Gemini CLI: Single-basis executable-BBO rolling Z constants (no config flags).
+EXECUTABLE_SPREAD_WINDOW = 20
+EXECUTABLE_SPREAD_MIN_SAMPLES = 20
+EXECUTABLE_SPREAD_MIN_STD = 1.0
+
+
 def _entry_bbo_from_bar_or_slots(monitor, bar_dict):
     """ONE source for the entry BBO (the fix for the starved entry path).
 
@@ -13664,6 +13670,50 @@ class FuturesMonitor:
         _value = getattr(_status, "value", _status)
         return str(_value or "").upper() == "FLAT"
 
+    def _update_executable_spread_z(self, bar_dict: dict) -> None:
+        """2026-11-25 Gemini CLI: Single-basis executable-BBO rolling spread_z + fail-closed std/warmup guard."""
+        def _reject(reason: str, **meta):
+            bar_dict["spread_z"], bar_dict["spread_basis"] = None, "EXECUTABLE_BBO"
+            _now_m, _last = time.monotonic(), getattr(self, "_spread_z_unavail_ts", {})
+            if _now_m - _last.get(reason, -30.0) >= 30.0:
+                _last[reason] = _now_m
+                self._spread_z_unavail_ts = _last
+                try:
+                    if hasattr(self, "_append_mts_event"):
+                        self._append_mts_event("SPREAD_Z_UNAVAILABLE", reason=reason, basis="EXECUTABLE_BBO", **meta)
+                except Exception:
+                    pass
+        _bbo = _entry_bbo_from_bar_or_slots(self, bar_dict)
+        try:
+            _nb, _na, _fb, _fa = (float(_bbo[k]) for k in ("near_bid", "near_ask", "far_bid", "far_ask"))
+        except (TypeError, ValueError):
+            return _reject("BBO_MISSING")
+        if not all(math.isfinite(v) and v > 0 for v in (_nb, _na, _fb, _fa)) or _na < _nb or _fa < _fb:
+            return _reject("BBO_INVALID")
+        _sell_exec, _buy_exec = _nb - _fa, _na - _fb
+        _sw, _bw = getattr(self, "_exec_sell_spread_window", None), getattr(self, "_exec_buy_spread_window", None)
+        if _sw is None or _bw is None:
+            _sw = self._exec_sell_spread_window = deque(maxlen=EXECUTABLE_SPREAD_WINDOW)
+            _bw = self._exec_buy_spread_window = deque(maxlen=EXECUTABLE_SPREAD_WINDOW)
+        _sw.append(_sell_exec); _bw.append(_buy_exec)
+        if len(_sw) < EXECUTABLE_SPREAD_MIN_SAMPLES:
+            bar_dict.update({"spread": _sell_exec, "spread_ma": None, "spread_std": None})
+            return _reject("WARMUP_INSUFFICIENT", sample_count=len(_sw), min_samples=EXECUTABLE_SPREAD_MIN_SAMPLES)
+        _sm, _bm = sum(_sw) / len(_sw), sum(_bw) / len(_bw)
+        _ss = math.sqrt(sum((x - _sm) ** 2 for x in _sw) / (len(_sw) - 1))
+        _bs = math.sqrt(sum((x - _bm) ** 2 for x in _bw) / (len(_bw) - 1))
+        if not (math.isfinite(_ss) and math.isfinite(_bs)) or min(_ss, _bs) < EXECUTABLE_SPREAD_MIN_STD:
+            bar_dict.update({"spread": _sell_exec, "spread_ma": _sm, "spread_std": min(_ss, _bs)})
+            return _reject("STD_DEGENERATE", spread_std=min(_ss, _bs), min_std=EXECUTABLE_SPREAD_MIN_STD, sample_count=len(_sw))
+        _z_sell, _z_buy = (_sell_exec - _sm) / _ss, (_buy_exec - _bm) / _bs
+        if _z_sell > 0 and (_z_buy >= 0 or _z_sell >= abs(_z_buy)):
+            _obs, _ma, _std, _z, _basis = _sell_exec, _sm, _ss, _z_sell, "EXECUTABLE_SELL_NEAR_BUY_FAR"
+        elif _z_buy < 0:
+            _obs, _ma, _std, _z, _basis = _buy_exec, _bm, _bs, _z_buy, "EXECUTABLE_BUY_NEAR_SELL_FAR"
+        else:
+            _obs, _ma, _std, _z, _basis = _sell_exec, _sm, _ss, 0.0, "EXECUTABLE_NEUTRAL"
+        bar_dict.update({"spread": _obs, "spread_ma": _ma, "spread_std": _std, "spread_z": _z, "spread_basis": _basis})
+
     def _mts_tick(self, enriched_bar: dict | None = None):
         # [P1] Periodic far snapshot refresh (60s cooldown) - inline
         _now = time.time()
@@ -13912,16 +13962,8 @@ class FuturesMonitor:
             _bar_dict["far_high"] = _bar_dict.get("far_high_rt", _bar_dict["far_close"])
             _bar_dict["far_low"] = _bar_dict.get("far_low_rt", _bar_dict["far_close"])
 
-        # 💡 [Fixed 2026-05-27] Dynamic Real-Time Spread Z Calculation
-        # The background CSV job runs only 3 times a day. To trade between cron jobs,
-        # we calculate spread_z dynamically using RT prices and the latest available MA/STD.
-        if _bar_dict.get("near_close", 0) > 0 and _bar_dict.get("far_close", 0) > 0:
-            _spread_ma = _bar_dict.get("spread_ma", 0.0)
-            _spread_std = _bar_dict.get("spread_std", 0.0)
-            if _spread_std > 0:
-                _rt_spread = _bar_dict["near_close"] - _bar_dict["far_close"]
-                _bar_dict["spread"] = _rt_spread
-                _bar_dict["spread_z"] = (_rt_spread - _spread_ma) / _spread_std
+        # 2026-11-25 Gemini CLI: Single-basis executable BBO rolling spread_z + degenerate std fail-closed.
+        self._update_executable_spread_z(_bar_dict)
 
         # Research wiring: dz / spread_slope / velocity_ema into the bar
         # (entry_observation payload reads these; previously always NULL).
