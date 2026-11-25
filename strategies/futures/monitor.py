@@ -11186,7 +11186,15 @@ class FuturesMonitor:
             _spread = float(_spread)
         except (TypeError, ValueError):
             _spread = float(near_price) - float(far_price)
+        # 2026-11-25 Gemini CLI: Clear speculative pre-submit marker on any local pre-order rejection.
+        def _clear_speculative_entry_marker(strat):
+            if strat is not None and getattr(strat, "_has_position", False) is not True:
+                strat._has_position, strat._lifecycle = False, "FLAT"
+                strat._entry_ts = None
+                strat._entry_time_monotonic = strat._entry_guard_start_ms = strat._entry_ts_ms = 0.0
+
         if not math.isfinite(_spread):
+            _clear_speculative_entry_marker(strategy)
             self._append_mts_event(
                 "ORDER_REJECTED_LOCAL", trade_id=trade_id,
                 strategy="MTS_ENTRY", reason="COMBO_PRICE_NONFINITE")
@@ -11207,6 +11215,7 @@ class FuturesMonitor:
         }
 
         def _reject_pricing(reason):
+            _clear_speculative_entry_marker(strategy)
             self._append_mts_event(
                 "ORDER_REJECTED_LOCAL", trade_id=trade_id,
                 strategy="MTS_ENTRY", reason=reason, **_pricing)
@@ -11300,17 +11309,7 @@ class FuturesMonitor:
                 f"mts-entry:{trade_id}:{near_code}:{far_code}:{action}"
             )
         except Exception as exc:
-            # No order object, broker receipt, or exposure exists when local
-            # construction fails.  Clear the speculative pre-submit marker so
-            # the next valid signal is evaluated instead of being rejected by
-            # TMFSpread.on_bar() as permanently MTS_BUSY.
-            if strategy is not None and getattr(strategy, "_has_position", False) is not True:
-                strategy._has_position = False
-                strategy._lifecycle = "FLAT"
-                strategy._entry_ts = None
-                strategy._entry_time_monotonic = 0.0
-                strategy._entry_guard_start_ms = 0.0
-                strategy._entry_ts_ms = 0.0
+            _clear_speculative_entry_marker(strategy)
             # The masked cause is part of the evidence: without it a live
             # rejection rate is unexplainable (2026-09-24: 1,154 rejections,
             # cause invisible).
