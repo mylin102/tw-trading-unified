@@ -3692,7 +3692,15 @@ class TMFSpread(StrategyBase):
             "trail_dist": _risk_meta.get("trail_dist"),
             "mfe": round(self._mfe_pts, 2),
             "mae": round(self._mae_pts, 2),
+            # 2026-11-25 Hermes Agent: `pnl` here is the TRIGGER-time P&L, not
+            # the realized fill. On 2026-11-25 a bracket TP logged pnl=100 and
+            # an SL logged -34 while the fills realised +126 and -32; reading
+            # this field as realized under-reported the trade by 28 points.
+            # The basis is now explicit so consumers cannot mistake it, and the
+            # authoritative realised figure stays in mts_trade_fills.jsonl
+            # (per-leg realized_pnl) / a trade-level settlement record.
             "pnl": round(pnl, 2),
+            "pnl_basis": "TRIGGER_PTS",
             # 2026-06-26 Hermes Agent: per-leg MFE/MAE in exit log
             "near_max": round(self._near_max, 2) if self._near_max is not None else None,
             "near_min": round(self._near_min, 2) if self._near_min is not None else None,
