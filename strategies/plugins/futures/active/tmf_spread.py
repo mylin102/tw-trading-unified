@@ -5102,6 +5102,28 @@ class TMFSpread(StrategyBase):
             
         return release_stop, trail_dist, single_decision
 
+    def _bracket_exit_price(self, leg: str, bar: dict, fallback_close: float) -> float:
+        """Price this leg would ACTUALLY exit at (2026-11-25 Hermes Agent).
+
+        A leg's bracket P&L must be measured against its own exit side, not
+        `close`: a SHORT leg buys back at the ASK, a LONG leg sells at the BID.
+        Trade mts-auto-171646-409 lost 70 points on a configured 30-point stop
+        because the far book was 21 points wide and `close` sits on the bid
+        side — the stop was effectively 30 + book width.
+        Falls back to `fallback_close` when the bar has no usable BBO for this
+        leg, so a missing quote can never block an exit.
+        """
+        _side = getattr(self, f"_{leg}_side", None)
+        _want_ask = str(_side or "").upper() == "SHORT"
+        _key = f"bbo_{leg}_" + ("ask" if _want_ask else "bid")
+        try:
+            _px = float(bar.get(_key)) if bar.get(_key) is not None else 0.0
+        except (TypeError, ValueError):
+            _px = 0.0
+        if _px > 0 and math.isfinite(_px):
+            return _px
+        return fallback_close
+
     def _check_independent_leg_bracket(
         self, near_pnl: float, far_pnl: float, released_leg,
     ):
@@ -5530,8 +5552,19 @@ class TMFSpread(StrategyBase):
             _ilb_released_leg = self._lifecycle_oca.release_group.filled_leg
             if _ilb_released_leg is None and self._released_leg:
                 _ilb_released_leg = Leg.FAR if self._released_leg == "far" else Leg.NEAR
+            # 2026-11-25 Hermes Agent: the bracket must be evaluated on the price
+            # this leg would ACTUALLY exit at, not on `close`. On trade
+            # mts-auto-171646-409 the far leg (SHORT) sat at far bid 37537 /
+            # ask 37558 with a 21-point book: close-implied PnL was -12 while the
+            # real exit cost was -33, so a 30-point stop silently behaved like
+            # 30 + book width (~51-56 points) and filled at -70.
+            # SHORT exits BUY at the ask; LONG exits SELL at the bid. Falls back
+            # to close when the bar carries no usable BBO for this leg (never
+            # blocks an exit on missing quote data).
+            _ilb_near_px = self._bracket_exit_price("near", bar, near_close)
+            _ilb_far_px = self._bracket_exit_price("far", bar, far_close)
             _decision = self._check_independent_leg_bracket(
-                self._pnl_near(near_close), self._pnl_far(far_close), _ilb_released_leg,
+                self._pnl_near(_ilb_near_px), self._pnl_far(_ilb_far_px), _ilb_released_leg,
             )
 
         # ── ADR-011 Phase 2: Action-scoped timeout timers (2026-07-16) ──
