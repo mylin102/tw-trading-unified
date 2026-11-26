@@ -8982,8 +8982,13 @@ class FuturesMonitor:
         self.paper_fill_sim.process_tick(self._make_synthetic_tick(price, ts, symbol=order.symbol))
         return order.order_id
 
-    def _make_synthetic_tick(self, price, ts, symbol=None):
-        """Create a synthetic tick object from price/timestamp for PaperFillSimulator."""
+    def _make_synthetic_tick(self, price, ts, symbol=None, bid=None, ask=None):
+        """Create a synthetic tick object from price/timestamp for PaperFillSimulator.
+
+        2026-11-25 Hermes Agent: carry bid/ask so paper fills can land on the
+        executable side. Filling at `close` booked entries better than
+        achievable and made a 30-point stop behave like 30 + book width.
+        """
         tick = type("Tick", (), {})()
         tick.code = symbol or self.ticker
         tick.datetime = ts if hasattr(ts, "strftime") else datetime.now()
@@ -8991,6 +8996,8 @@ class FuturesMonitor:
         tick.open = price
         tick.high = price
         tick.low = price
+        tick.bid = bid if (bid or 0) > 0 else price
+        tick.ask = ask if (ask or 0) > 0 else price
         tick.volume = 0
         return tick
 
@@ -9171,7 +9178,11 @@ class FuturesMonitor:
         if self.order_mgr:
             self.order_mgr.reindex_orders()
 
-    def _process_pending_paper_fills(self, near_price: float, far_price: float, ts) -> None:
+    def _process_pending_paper_fills(
+        self, near_price: float, far_price: float, ts,
+        near_bid: float = 0.0, near_ask: float = 0.0,
+        far_bid: float = 0.0, far_ask: float = 0.0,
+    ) -> None:
         """Poll paper fill simulator with live near/far prices during MTS tick.
         
         ADR-010 OCO release bracket orders are registered with paper_fill_sim
@@ -9203,8 +9214,10 @@ class FuturesMonitor:
         _far_symbol = self.far_contract.code if self.far_contract else f"{self.ticker}_FAR"
 
         ticks = [
-            self._make_synthetic_tick(near_price, ts, symbol=_near_symbol),
-            self._make_synthetic_tick(far_price, ts, symbol=_far_symbol),
+            self._make_synthetic_tick(near_price, ts, symbol=_near_symbol,
+                                      bid=near_bid, ask=near_ask),
+            self._make_synthetic_tick(far_price, ts, symbol=_far_symbol,
+                                      bid=far_bid, ask=far_ask),
         ]
 
         # Paper combo entries remain pending until both leg ticks are
@@ -14505,8 +14518,16 @@ class FuturesMonitor:
         _n_close = float(_bar_dict.get("near_close") or 0)
         _f_close = float(_bar_dict.get("far_close") or 0)
         if _n_close > 0 and _f_close > 0:
+            # 2026-11-25 Hermes Agent: pass BBO so paper fills land on the
+            # executable side (buys at ask, sells at bid). Without it a paper
+            # entry is booked at `close`, i.e. better than achievable, and a
+            # 30-point bracket stop measures the crossing cost instead of a
+            # real 30-point move.
+            _bbo = _entry_bbo_from_bar_or_slots(self, _bar_dict) or {}
             self._process_pending_paper_fills(
                 near_price=_n_close, far_price=_f_close, ts=datetime.now(),
+                near_bid=_bbo.get("near_bid") or 0, near_ask=_bbo.get("near_ask") or 0,
+                far_bid=_bbo.get("far_bid") or 0, far_ask=_bbo.get("far_ask") or 0,
             )
 
         if signal:

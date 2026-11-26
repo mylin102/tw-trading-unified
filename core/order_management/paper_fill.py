@@ -79,6 +79,21 @@ class PaperFillSimulator:
             "metadata": metadata if isinstance(metadata, dict) else {},
         }
 
+    def _leg_exec_price(self, tick, fallback_close: float, buy: bool) -> float:
+        """Price a leg order would actually trade at (2026-11-25 Hermes Agent).
+
+        Buys lift the ask, sells hit the bid. Falls back to `close` when the
+        tick carries no usable quote, so a missing book never blocks a fill.
+        """
+        _px = getattr(tick, "ask" if buy else "bid", None)
+        try:
+            _px = float(_px) if _px is not None else 0.0
+        except (TypeError, ValueError):
+            _px = 0.0
+        if _px > 0 and math.isfinite(_px):
+            return _px
+        return fallback_close
+
     def process_combo_ticks(self, near_tick, far_tick) -> None:
         """Fill a combo only when both legs have valid current prices."""
         from core.order_management.order import OrderStatus
@@ -96,13 +111,25 @@ class PaperFillSimulator:
             if near_symbol != record["near_symbol"] or far_symbol != record["far_symbol"]:
                 continue
             try:
-                near_price = float(near_tick.close)
-                far_price = float(far_tick.close)
+                near_close_px = float(near_tick.close)
+                far_close_px = float(far_tick.close)
             except (TypeError, ValueError, AttributeError):
                 continue
-            if not (math.isfinite(near_price) and math.isfinite(far_price)
-                    and near_price > 0 and far_price > 0):
+            if not (math.isfinite(near_close_px) and math.isfinite(far_close_px)
+                    and near_close_px > 0 and far_close_px > 0):
                 continue
+
+            # 2026-11-25 Hermes Agent: fill each leg on the side it would
+            # actually trade (buyer lifts the ask, seller hits the bid). A
+            # combo booked at `close` is booked better than achievable: on
+            # mts-auto-171646-409 the far book was 21 points wide and the
+            # entry price sat on the bid side, so a 30-point stop had already
+            # lost 33 points the moment it was armed.
+            metadata = record["metadata"]
+            _action_pre = str(metadata.get("spread_side") or metadata.get("action") or "")
+            _near_is_buy = _action_pre == "BUY_NEAR_SELL_FAR"
+            near_price = self._leg_exec_price(near_tick, near_close_px, buy=_near_is_buy)
+            far_price = self._leg_exec_price(far_tick, far_close_px, buy=not _near_is_buy)
 
             remaining = order.quantity - order.filled_quantity
             if remaining <= 0:
@@ -110,7 +137,6 @@ class PaperFillSimulator:
                 self.consumed_order_ids.add(order_id)
                 continue
             fill_qty = 1 if remaining >= 2 else remaining
-            metadata = record["metadata"]
             metadata["near_fill_price"] = near_price
             metadata["far_fill_price"] = far_price
             action = str(metadata.get("spread_side") or metadata.get("action") or "")
