@@ -243,7 +243,87 @@ def render_leg_bracket(leg: str, title: str, state: dict, tp: float, sl: float) 
     st.markdown(f":green[→停利 {_tp_txt}]　　:red[→停損 {_sl_txt}]")
 
 
-def render_mts_spread_exit_panel(state: dict, futures_cfg: dict) -> None:
+def check_mts_state_ledger_divergence(
+    state: Optional[dict],
+    fills: Optional[list] = None,
+) -> dict:
+    """2026-11-26 Gemini CLI (F3): Cross-check mts_position_state against
+    mts_trade_fills.jsonl via project_fills (fail-closed display contract).
+
+    When state reports has_position=False (FLAT) while the fills ledger shows
+    an open leg, an unclosed-leg anomaly, or an unreadable ledger, return
+    diverged=True and display_status="UNKNOWN" so the UI never displays FLAT.
+    """
+    state_has_pos = bool((state or {}).get("has_position", False))
+    if state_has_pos:
+        return {
+            "diverged": False,
+            "display_status": "OPEN",
+            "reason": "",
+            "ledger_status": "SKIPPED_STATE_OPEN",
+            "trade_id": (state or {}).get("trade_id"),
+            "near_qty": 0,
+            "far_qty": 0,
+            "anomalies": (),
+        }
+    try:
+        from strategies.futures.mts_ledger_authority import MtsAuthority, project_fills
+        if fills is None:
+            fills = _load_mts_trade_fills()
+        _auth = project_fills(fills, source="PAPER")
+        if _auth.status in (MtsAuthority.OPEN, MtsAuthority.SINGLE_LEG):
+            return {
+                "diverged": True,
+                "display_status": "UNKNOWN",
+                "reason": (
+                    f"LEDGER_OPEN_STATE_FLAT:{_auth.trade_id}:"
+                    f"near={_auth.near_qty},far={_auth.far_qty}"
+                ),
+                "ledger_status": _auth.status.value,
+                "trade_id": _auth.trade_id,
+                "near_qty": _auth.near_qty,
+                "far_qty": _auth.far_qty,
+                "anomalies": _auth.anomalies,
+            }
+        if _auth.status == MtsAuthority.UNKNOWN or _auth.anomalies:
+            _anom_str = ",".join(str(a) for a in _auth.anomalies[:3])
+            return {
+                "diverged": True,
+                "display_status": "UNKNOWN",
+                "reason": (
+                    f"LEDGER_ANOMALY_STATE_FLAT:{_anom_str}"
+                    if _auth.anomalies else "LEDGER_UNKNOWN"
+                ),
+                "ledger_status": _auth.status.value,
+                "trade_id": _auth.current_trade_id,
+                "near_qty": _auth.near_qty,
+                "far_qty": _auth.far_qty,
+                "anomalies": _auth.anomalies,
+            }
+        return {
+            "diverged": False,
+            "display_status": "FLAT",
+            "reason": "",
+            "ledger_status": _auth.status.value,
+            "trade_id": _auth.current_trade_id,
+            "near_qty": 0,
+            "far_qty": 0,
+            "anomalies": (),
+        }
+    except Exception as _exc:
+        return {
+            "diverged": True,
+            "display_status": "UNKNOWN",
+            "reason": f"LEDGER_CHECK_ERROR:{_exc}",
+            "ledger_status": "UNKNOWN",
+            "trade_id": None,
+            "near_qty": 0,
+            "far_qty": 0,
+            "anomalies": (),
+        }
+
+
+def render_mts_spread_exit_panel(state: dict, futures_cfg: dict, fills: Optional[list] = None) -> None:
     """Unified MTS spread exit panel: mode banner + KPI row + symmetric
     near/far leg cards + collapsed raw-state expander. Does NOT render the
     price chart (left in its existing position/caching mechanism)."""
@@ -261,6 +341,11 @@ def render_mts_spread_exit_panel(state: dict, futures_cfg: dict) -> None:
         st.info("🛡️ 出場模式：Policy J 組合停利 + ATR 拆腿追蹤 (legacy)")
 
     if not state.get("has_position"):
+        # 2026-11-26 Gemini CLI (F3): Fail closed — never show FLAT if fills ledger diverges.
+        _div = check_mts_state_ledger_divergence(state, fills=fills)
+        if _div["diverged"]:
+            st.warning(f"⚠️ 持倉階段：UNKNOWN / 待對帳（state=FLAT 但成交帳本不一致：{_div['reason']}）")
+            return
         st.caption(f"持倉階段：{_phase} · 目前無持倉 (FLAT)")
         return
 
@@ -1092,6 +1177,8 @@ def _hvwap_panel_payload(state: dict, events: list) -> dict:
         },
         "state": {
             "has_position": bool(state.get("has_position", False)),
+            # 2026-11-26 Gemini CLI (F3): Attach state-vs-ledger divergence for fail-closed display.
+            "ledger_divergence": check_mts_state_ledger_divergence(state),
             "near_side": state.get("near_side") or "—",
             "far_side": state.get("far_side") or "—",
             "released_leg": state.get("released_leg"),
@@ -1388,10 +1475,18 @@ def _hvwap_panel_markdown(p: dict) -> str:
             f"{_sl_trail}"
             f" &nbsp;|&nbsp; ATR: {_f(_st['atr'])}</div>")
     else:
-        _hl.append(
-            f"<div style='margin-top:2px;'>持倉: FLAT &nbsp;|&nbsp; "
-            f"狀態: {_st['lifecycle_state'] or '—'} · "
-            f"原因: {_st['reason'] or '—'}</div>")
+        # 2026-11-26 Gemini CLI (F3): Fail closed — display UNKNOWN / 待對帳 instead of FLAT on divergence.
+        _ldiv = _st.get("ledger_divergence") or {}
+        if _ldiv.get("diverged"):
+            _hl.append(
+                f"<div style='margin-top:2px;color:#b45309;font-weight:bold;'>"
+                f"持倉: UNKNOWN / 待對帳 &nbsp;|&nbsp; "
+                f"原因: {_ldiv.get('reason') or 'LEDGER_DIVERGENCE'}</div>")
+        else:
+            _hl.append(
+                f"<div style='margin-top:2px;'>持倉: FLAT &nbsp;|&nbsp; "
+                f"狀態: {_st['lifecycle_state'] or '—'} · "
+                f"原因: {_st['reason'] or '—'}</div>")
     _hl.append("</div>")
     return "".join(_hl)
 
@@ -5161,8 +5256,12 @@ elif _selected_product == "TMF":
                         _has_lifecycle = bool(_has_order_ref or _in_flight_status)
                     except: pass
 
+                _ledger_div = check_mts_state_ledger_divergence(_sd if os.path.exists(_state_file) and "_sd" in locals() else {})
                 if _has_pos:
                     st.error("⛔ 無法清空：目前仍有持倉。請先使用「緊急全平倉」平倉後再試。")
+                elif _ledger_div.get("diverged"):
+                    # 2026-11-26 Gemini CLI (F3): Block clear_records when state=FLAT diverges from fills ledger.
+                    st.error(f"⛔ 無法清空：持倉狀態 UNKNOWN / 待對帳（{_ledger_div.get('reason')}），請先完成對帳。")
                 elif _has_lifecycle:
                     st.error("⛔ 無法清空：目前有 active OCO lifecycle。請等待訂單完成或使用「緊急全平倉」。")
                 else:
@@ -5931,7 +6030,15 @@ elif _selected_product == "TMF":
                 _mts_panel_rendered = True
                 st.header("MTS 價差持倉 (tmf_spread)")
                 if not _has_pos:
-                    st.info("目前沒有已驗證的 MTS 未平倉部位（FLAT）。")
+                    # 2026-11-26 Gemini CLI (F3): Fail closed — never display FLAT when fills ledger diverges.
+                    _mts_div = check_mts_state_ledger_divergence(_mts_state)
+                    if _mts_div.get("diverged"):
+                        st.warning(
+                            f"⚠️ MTS 持倉狀態：UNKNOWN / 待對帳"
+                            f"（state=FLAT 但成交帳本不一致：{_mts_div.get('reason')}）"
+                        )
+                    else:
+                        st.info("目前沒有已驗證的 MTS 未平倉部位（FLAT）。")
             if _has_pos:
                 _pending_exit = _mts_state.get("_pending_exit_intent")
                 if isinstance(_pending_exit, dict):

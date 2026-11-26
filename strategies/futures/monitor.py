@@ -10266,9 +10266,10 @@ class FuturesMonitor:
             _far_close = _exit_marks.get("far", _far_close)
 
         # 💡 [Fixed 2026-05-27] Prioritize existing strategy trade_id for releases/exits
+        # 2026-11-26 Gemini CLI: Include YYYYMMDD date in mts-auto trade_id to prevent cross-day collisions.
         _trade_id = getattr(strategy, "_trade_id", None)
         if not _trade_id or _action in ("BUY_NEAR_SELL_FAR", "SELL_NEAR_BUY_FAR"):
-             _trade_id = f"mts-auto-{_ts.strftime('%H%M%S-%f')[:-3]}"
+             _trade_id = f"mts-auto-{_ts.strftime('%Y%m%d-%H%M%S-%f')[:-3]}"
 
         # Helper for common fields in event log
         def _ev_meta(order):
@@ -15060,6 +15061,8 @@ class FuturesMonitor:
         _trade_id = "mts-emergency"
         _disk = None
         _canon_ok = False
+        # 2026-11-26 Gemini CLI: Track state-vs-ledger divergence for fail-closed close_all.
+        self._close_all_ledger_divergence = None
 
         def _side(row):
             if row is None:
@@ -15142,6 +15145,65 @@ class FuturesMonitor:
             except Exception as _sf_e:
                 console.print(
                     f"[red]⚠️ [MANUAL_TRADE] close_all: disk read failed: {_sf_e}[/red]")
+            # 3. 2026-11-26 Gemini CLI (F2): Cross-check fills ledger when local state
+            #    says FLAT so premature state zeroing cannot hide an open leg or anomaly.
+            if not _has_pos:
+                try:
+                    from strategies.futures.mts_ledger_authority import project_fills
+                    _fills_path = (
+                        os.environ.get("MTS_FILL_LOG_PATH")
+                        or (mts_runtime_path("logs", "mts_trade_fills.jsonl")
+                            if callable(mts_runtime_path)
+                            else os.path.join(runtime_logs(), "mts_trade_fills.jsonl"))
+                    )
+                    if _fills_path and os.path.exists(_fills_path):
+                        _fills = []
+                        with open(_fills_path, encoding="utf-8") as _ff:
+                            for _line in _ff:
+                                _line = _line.strip()
+                                if not _line:
+                                    continue
+                                try:
+                                    _fills.append(json.loads(_line))
+                                except Exception:
+                                    continue
+                        _src = "LIVE" if getattr(self, "live_trading", False) else "PAPER"
+                        _auth = project_fills(_fills, source=_src)
+                        if _auth.status in (MtsAuthority.OPEN, MtsAuthority.SINGLE_LEG):
+                            _has_pos = True
+                            _near_side = _auth.near_side
+                            _far_side = _auth.far_side
+                            if _near_side is None and _far_side is not None:
+                                _released_leg = "near"
+                            elif _far_side is None and _near_side is not None:
+                                _released_leg = "far"
+                            else:
+                                _released_leg = None
+                            _trade_id = _auth.trade_id or "mts-emergency-ledger"
+                            _disk = dict(_disk or {})
+                            if not _disk.get("near_entry") and _auth.near_entry:
+                                _disk["near_entry"] = _auth.near_entry
+                            if not _disk.get("far_entry") and _auth.far_entry:
+                                _disk["far_entry"] = _auth.far_entry
+                            console.print(
+                                f"[bold yellow]⚠️ [MANUAL_TRADE] close_all: state=FLAT but fills ledger "
+                                f"has open leg(s) tid={_trade_id} near={_near_side} far={_far_side} — "
+                                f"deriving close from ledger[/bold yellow]"
+                            )
+                        elif _auth.status == MtsAuthority.UNKNOWN or _auth.anomalies:
+                            self._close_all_ledger_divergence = {
+                                "status": _auth.status.value,
+                                "current_trade_id": _auth.current_trade_id,
+                                "anomalies": list(_auth.anomalies),
+                            }
+                except Exception as _lf_e:
+                    self._close_all_ledger_divergence = {
+                        "status": "UNKNOWN",
+                        "error": str(_lf_e),
+                    }
+                    console.print(
+                        f"[red]⚠️ [MANUAL_TRADE] close_all: fills ledger check failed: {_lf_e}[/red]"
+                    )
         return (_has_pos, _near_side, _far_side, _released_leg,
                 _trade_id, _disk)
 
@@ -15589,157 +15651,129 @@ class FuturesMonitor:
                     _side = "BOTH"
                     _price = max(float(_near_last or 0), float(_far_last or 0))
 
-                    if _released_leg is None:
-                        # Both legs held
-                        _n_side = OrderSide.SELL if _near_side == "LONG" else OrderSide.BUY
-                        # 2026-07-07 Hermes Agent: Emergency flatten uses MKP+IOC.
-                        # LMT+ROD is wrong for emergencies — it can sit unfilled
-                        # when the user expects immediate risk reduction.
-                        # If market is closed, log clearly and proceed anyway
-                        # (emergency overrides market-hours guard).
-                        if not is_taifex_futures_market_open():
-                            console.print(
-                                "[bold red]⚠️ [EMERGENCY] Market closed — "
-                                "MKP order will be rejected or queued by broker[/bold red]"
-                            )
-                        _o_near = self.order_mgr.create_order(
-                            symbol=_emerg_near_code, side=_n_side,
-                            order_type=OrderType.MKP, quantity=1,
-                            strategy="MTS_EMERGENCY",
-                        )
-                        self._register_emergency_command_order(_o_near.order_id)
-                        self.order_mgr.submit(_o_near)
-                        if self.paper_fill_sim:
-                            self.paper_fill_sim.register(_o_near)
-                        self._pending_lifecycle_orders[_o_near.order_id] = {
-                            "intent_id": _o_near.intent_id, "signal": "EXIT", "reason": "EMERGENCY_CLOSE",
-                            "ts": _ts, "lots": 1, "price": 0, "ref_ohlc": {},
-                            "strategy": "MTS_EMERGENCY",
-                        }
-
-                        _f_side = OrderSide.SELL if _far_side == "LONG" else OrderSide.BUY
-                        _o_far = self.order_mgr.create_order(
-                            symbol=_emerg_far_code, side=_f_side,
-                            order_type=OrderType.MKP, quantity=1,
-                            strategy="MTS_EMERGENCY",
-                        )
-                        self._register_emergency_command_order(_o_far.order_id)
-                        self.order_mgr.submit(_o_far)
-                        if self.paper_fill_sim:
-                            self.paper_fill_sim.register(_o_far)
-                        self._pending_lifecycle_orders[_o_far.order_id] = {
-                            "intent_id": _o_far.intent_id, "signal": "EXIT", "reason": "EMERGENCY_CLOSE",
-                            "ts": _ts, "lots": 1, "price": 0, "ref_ohlc": {},
-                            "strategy": "MTS_EMERGENCY",
-                        }
-
-                        # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
-                    else:
-                        # Single leg remaining
-                        _rem_leg = "far" if _released_leg == "near" else "near"
-                        _rem_side = _far_side if _rem_leg == "far" else _near_side
-                        _rem_last = _far_last if _rem_leg == "far" else _near_last
-                        _side = OrderSide.SELL if _rem_side == "LONG" else OrderSide.BUY
-                        _price = _rem_last + _EXIT_BUFFER * _TICK if _side == OrderSide.BUY else _rem_last - _EXIT_BUFFER * _TICK
-                        _rem_code = _emerg_far_code if _rem_leg == "far" else _emerg_near_code
-                        _order = self.order_mgr.create_order(
-                            symbol=_rem_code, side=_side,
-                            order_type=OrderType.MKP, quantity=1,
-                            strategy="MTS_EMERGENCY",
-                        )
-                        self._register_emergency_command_order(_order.order_id)
-                        self.order_mgr.submit(_order)
-                        if self.paper_fill_sim:
-                            self.paper_fill_sim.register(_order)
-                        # 2026-06-23 Gemini CLI: Register emergency order in pending_lifecycle_orders so fill updates position
-                        self._pending_lifecycle_orders[_order.order_id] = {
-                            "intent_id": _order.intent_id, "signal": "EXIT", "reason": "EMERGENCY_CLOSE",
-                            "ts": _ts, "lots": 1, "price": _price, "ref_ohlc": {},
-                            "strategy": "MTS_EMERGENCY",
-                        }
-
-                        # 2026-05-27 Gemini CLI: Removed redundant process_tick to prevent double-ordering loops
-                    console.print("[bold green]✅ [MANUAL_TRADE] Emergency exit orders submitted[/bold green]")
-                    
-                    # 2026-05-27 Gemini CLI: Force strategy reset and log fill using correctly defined _strategy_obj
-                    if _strategy_obj:
-                        _strategy_obj._reset(reason="EMERGENCY_CLOSE")
-                        # 2026-07-24 Hermes Agent: Use unified settlement pipeline for PnL computation
-                        from strategies.plugins.futures.active.tmf_spread import settle_mts_trade
-                        _near_entry_disk = float(_disk.get("near_entry", 0)) if _disk else 0
-                        _far_entry_disk = float(_disk.get("far_entry", 0)) if _disk else 0
-                        _near_side_disk = _disk.get("near_side") if _disk else None
-                        _far_side_disk = _disk.get("far_side") if _disk else None
-                        settle_mts_trade(
-                            ticker=self.ticker,
-                            trade_id=_trade_id,
-                            exit_type="EMERGENCY_CLOSE_ALL",
-                            near_entry=_near_entry_disk,
-                            far_entry=_far_entry_disk,
-                            near_side=_near_side_disk,
-                            far_side=_far_side_disk,
-                            near_exit_price=_near_last,
-                            far_exit_price=_far_last,
-                            settlement_source="BROKER_FILLS",
-                        )
-
-                    # Reset state file
-                    try:
-                        from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict
-                        # [Fix 2026-07-06] Include lifecycle=FLAT to prevent state overwrite gap
-                        _lc_dict = lifecycle_to_dict(_strategy_obj._lifecycle_oca) if (
-                            _strategy_obj and hasattr(_strategy_obj, '_lifecycle_oca')
-                        ) else {
-                            "phase": "FLAT",
-                            "release_group": {"status": "INACTIVE"},
-                            "trail_group": {"status": "INACTIVE"},
-                        }
-                        # 2026-07-07 Hermes Agent: set manual_trade_status to READY
-                        # BEFORE writing state so the dashboard sees it immediately
-                        # instead of waiting for the next tick heartbeat.
-                        self._manual_trade_status = "READY"
-                        _write_mts_state(has_position=False, action="FLAT", reason="EMERGENCY_CLOSE",
-                                         ticker=self.ticker, lifecycle=_lc_dict,
-                                         manual_trade_status="READY")
-                    except Exception as exc:
-                        import logging
-                        _log = logging.getLogger("FuturesMonitor")
-                        _log.exception("[MTS][EMERGENCY_CLOSE] failed to write FLAT state: %s", exc)
-                        console.print(f"[red]⚠️ [EMERGENCY_CLOSE] state write failed: {exc}[/red]")
-
-                    # 2026-06-23 Gemini CLI: Reset trader position immediately on emergency close to allow subsequent manual trades without getting stuck
-                    if self.trader.position != 0:
-                        self.trader.execute_signal("EXIT", _near_last or 0.0, _ts)
-                elif not _has_pos:
-                    self._manual_trade_status = "READY"
-                    console.print("[yellow]⚠️ [MANUAL_TRADE] close_all: no position to close[/yellow]")
-                    self._write_manual_command_status(
-                        _command_id, "COMPLETED",
-                        "無持倉可平；已清理 stale lifecycle",
-                        position_after={"near_qty": 0, "far_qty": 0}, order_ids=[],
+                    # 2026-11-26 Gemini CLI: Close every open leg independently; only reset/write FLAT when ALL legs confirm filled.
+                    from core.order_management.order import OrderStatus
+                    if _released_leg is None and not is_taifex_futures_market_open():
+                        console.print("[bold red]⚠️ [EMERGENCY] Market closed — MKP order will be rejected or queued by broker[/bold red]")
+                    _close_specs = (
+                        [("near", _emerg_near_code, _near_side, _near_last), ("far", _emerg_far_code, _far_side, _far_last)]
+                        if _released_leg is None else
+                        [(("far" if _released_leg == "near" else "near"),
+                          (_emerg_far_code if _released_leg == "near" else _emerg_near_code),
+                          (_far_side if _released_leg == "near" else _near_side),
+                          (_far_last if _released_leg == "near" else _near_last))]
                     )
-                    # 2026-07-31 Hermes Agent: also clean stale lifecycle residue
-                    # (release_group.status=ARMED with no orders) so the dashboard
-                    # clear-records guard can pass. Emergency flatten must leave
-                    # the state clean, not just log "nothing to close".
-                    try:
-                        from strategies.plugins.futures.active.tmf_spread import _write_mts_state
-                        _write_mts_state(
-                            has_position=False, action="FLAT", reason="EMERGENCY_CLOSE_NO_POS",
-                            ticker=self.ticker,
-                            lifecycle={
-                                "phase": "FLAT",
-                                "release_group": {"status": "INACTIVE"},
-                                "trail_group": {"status": "INACTIVE"},
-                            },
-                            manual_trade_status="READY",
+                    _submitted_legs = []
+                    for _leg_name, _leg_code, _leg_pos_side, _leg_px in _close_specs:
+                        _leg_side = OrderSide.SELL if _leg_pos_side == "LONG" else OrderSide.BUY
+                        _ord = self.order_mgr.create_order(
+                            symbol=_leg_code, side=_leg_side, order_type=OrderType.MKP, quantity=1, strategy="MTS_EMERGENCY",
                         )
-                        console.print("[dim]✅ [MANUAL_TRADE] close_all: stale lifecycle cleaned (FLAT/INACTIVE)[/dim]")
-                    except Exception as _ce:
-                        import logging
-                        logging.getLogger("FuturesMonitor").warning(
-                            "[EMERGENCY_CLOSE] no-pos state cleanup failed: %s", _ce
+                        self._register_emergency_command_order(_ord.order_id)
+                        self.order_mgr.submit(_ord)
+                        self._pending_lifecycle_orders[_ord.order_id] = {
+                            "intent_id": _ord.intent_id, "signal": "EXIT", "reason": "EMERGENCY_CLOSE",
+                            "ts": _ts, "lots": 1, "price": _leg_px, "ref_ohlc": {}, "strategy": "MTS_EMERGENCY",
+                        }
+                        if self.paper_fill_sim:
+                            self.paper_fill_sim.register(_ord)
+                            if not getattr(self, "live_trading", False) and hasattr(self, "_make_synthetic_tick") and _leg_px > 0:
+                                self.paper_fill_sim.process_tick(self._make_synthetic_tick(_leg_px, _ts, symbol=_leg_code))
+                        _submitted_legs.append((_leg_name, _ord))
+                    console.print("[bold green]✅ [MANUAL_TRADE] Emergency exit orders submitted[/bold green]")
+
+                    _filled_ids = self._emergency_cmd.get("filled_ids", set())
+                    _is_filled = lambda o: getattr(o, "status", None) == OrderStatus.FILLED or str(getattr(o, "status", "")).lower() in ("filled", "orderstatus.filled") or o.order_id in _filled_ids
+                    _filled_legs = [ln for ln, o in _submitted_legs if _is_filled(o)]
+                    _unfilled_legs = [ln for ln, o in _submitted_legs if not _is_filled(o)]
+                    if _unfilled_legs:
+                        self._manual_trade_status = "PARTIAL: UNFILLED_LEGS"
+                        self._write_manual_command_status(
+                            _command_id, "PARTIAL",
+                            f"部分腿未成交（filled={_filled_legs} unfilled={_unfilled_legs}），維持非 FLAT 狀態",
+                            order_ids=[o.order_id for _, o in _submitted_legs],
                         )
+                        if hasattr(self, "_append_mts_event"):
+                            self._append_mts_event(
+                                "MANUAL_CLOSE_ALL_PARTIAL", command_id=_command_id, trade_id=_trade_id,
+                                filled_legs=_filled_legs, unfilled_legs=_unfilled_legs,
+                                order_ids=[o.order_id for _, o in _submitted_legs],
+                            )
+                        console.print(f"[bold red]⚠️ [MANUAL_TRADE] close_all PARTIAL: filled={_filled_legs} unfilled={_unfilled_legs} — keeping non-FLAT state[/bold red]")
+                    else:
+                        if _strategy_obj:
+                            _strategy_obj._reset(reason="EMERGENCY_CLOSE")
+                            from strategies.plugins.futures.active.tmf_spread import settle_mts_trade
+                            settle_mts_trade(
+                                ticker=self.ticker, trade_id=_trade_id, exit_type="EMERGENCY_CLOSE_ALL",
+                                near_entry=float(_disk.get("near_entry", 0)) if _disk else 0,
+                                far_entry=float(_disk.get("far_entry", 0)) if _disk else 0,
+                                near_side=_disk.get("near_side") if _disk else None,
+                                far_side=_disk.get("far_side") if _disk else None,
+                                near_exit_price=_near_last, far_exit_price=_far_last,
+                                settlement_source="BROKER_FILLS",
+                            )
+                        try:
+                            from strategies.plugins.futures.active.tmf_spread import _write_mts_state, lifecycle_to_dict
+                            _lc_dict = lifecycle_to_dict(_strategy_obj._lifecycle_oca) if (_strategy_obj and hasattr(_strategy_obj, "_lifecycle_oca")) else {"phase": "FLAT", "release_group": {"status": "INACTIVE"}, "trail_group": {"status": "INACTIVE"}}
+                            self._manual_trade_status = "READY"
+                            _write_mts_state(has_position=False, action="FLAT", reason="EMERGENCY_CLOSE",
+                                             ticker=self.ticker, lifecycle=_lc_dict, manual_trade_status="READY")
+                        except Exception as exc:
+                            import logging
+                            logging.getLogger("FuturesMonitor").exception("[MTS][EMERGENCY_CLOSE] failed to write FLAT state: %s", exc)
+                            console.print(f"[red]⚠️ [EMERGENCY_CLOSE] state write failed: {exc}[/red]")
+                        if self.trader.position != 0:
+                            self.trader.execute_signal("EXIT", _near_last or 0.0, _ts)
+                elif not _has_pos:
+                    # 2026-11-26 Gemini CLI (F2): Fail closed when state=FLAT diverges from fills ledger.
+                    _ledger_div = getattr(self, "_close_all_ledger_divergence", None)
+                    if _ledger_div:
+                        self._manual_trade_status = "UNKNOWN: LEDGER_DIVERGENCE"
+                        console.print(
+                            f"[bold red]⚠️ [MANUAL_TRADE] close_all BLOCKED (UNKNOWN/待對帳): "
+                            f"state=FLAT diverges from fills ledger: {_ledger_div}[/bold red]"
+                        )
+                        self._write_manual_command_status(
+                            _command_id, "FAILED",
+                            f"UNKNOWN / 待對帳：state=FLAT 但成交帳本不一致 ({_ledger_div})",
+                            order_ids=[], ledger_divergence=_ledger_div,
+                        )
+                        if hasattr(self, "_append_mts_event"):
+                            self._append_mts_event(
+                                "MANUAL_CLOSE_ALL_LEDGER_DIVERGENCE",
+                                command_id=_command_id, divergence=_ledger_div,
+                            )
+                    else:
+                        self._manual_trade_status = "READY"
+                        console.print("[yellow]⚠️ [MANUAL_TRADE] close_all: no position to close[/yellow]")
+                        self._write_manual_command_status(
+                            _command_id, "COMPLETED",
+                            "無持倉可平；已清理 stale lifecycle",
+                            position_after={"near_qty": 0, "far_qty": 0}, order_ids=[],
+                        )
+                        # 2026-07-31 Hermes Agent: also clean stale lifecycle residue
+                        # (release_group.status=ARMED with no orders) so the dashboard
+                        # clear-records guard can pass. Emergency flatten must leave
+                        # the state clean, not just log "nothing to close".
+                        try:
+                            from strategies.plugins.futures.active.tmf_spread import _write_mts_state
+                            _write_mts_state(
+                                has_position=False, action="FLAT", reason="EMERGENCY_CLOSE_NO_POS",
+                                ticker=self.ticker,
+                                lifecycle={
+                                    "phase": "FLAT",
+                                    "release_group": {"status": "INACTIVE"},
+                                    "trail_group": {"status": "INACTIVE"},
+                                },
+                                manual_trade_status="READY",
+                            )
+                            console.print("[dim]✅ [MANUAL_TRADE] close_all: stale lifecycle cleaned (FLAT/INACTIVE)[/dim]")
+                        except Exception as _ce:
+                            import logging
+                            logging.getLogger("FuturesMonitor").warning(
+                                "[EMERGENCY_CLOSE] no-pos state cleanup failed: %s", _ce
+                            )
                 else:
                     self._manual_trade_status = "FAILED: NO_ORDER_MGR"
                     self._write_manual_command_status(
