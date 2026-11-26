@@ -2983,6 +2983,10 @@ class TMFSpread(StrategyBase):
         self._lifecycle = "OPEN"
         self._ensure_lifecycle_adapter_initialized("SYNC_POSITION")
         self._trade_id = trade_id
+        # 2026-11-26 Gemini CLI: Reset per-trade near trailing TP peak on entry sync.
+        self._ilb_near_trail_peak = None
+        self._ilb_near_trail_trade_id = trade_id
+        self._ilb_near_trail_invalid_logged = None
         self._side = None  # None until release as per contract tests
         self._near_entry = near_entry
         self._far_entry = far_entry
@@ -4948,6 +4952,10 @@ class TMFSpread(StrategyBase):
         self._release_ts = None
         # trade_id will be overwritten by sync_position when fills are confirmed
         self._trade_id = f"mts-auto-{now.strftime('%Y%m%d-%H%M%S-%f')[:-3]}"
+        # 2026-11-26 Gemini CLI: Reset per-trade near trailing TP peak on auto entry.
+        self._ilb_near_trail_peak = None
+        self._ilb_near_trail_trade_id = self._trade_id
+        self._ilb_near_trail_invalid_logged = None
 
         # Calculate initial thresholds for state logging
         _init_stop, _init_trail = self._get_thresholds(bar)
@@ -5139,15 +5147,71 @@ class TMFSpread(StrategyBase):
         _tp = float(_cfg.get("take_profit_pts", 100.0))
         _sl = float(_cfg.get("stop_loss_pts", 30.0))
 
+        # 2026-11-26 Gemini CLI: Per-trade near-leg trailing TP (FAR stays fixed TP=_tp).
+        _cur_tid = getattr(self, "_trade_id", None)
+        if getattr(self, "_ilb_near_trail_trade_id", None) != _cur_tid:
+            self._ilb_near_trail_peak = None
+            self._ilb_near_trail_trade_id = _cur_tid
+            self._ilb_near_trail_invalid_logged = None
+
+        _nt_cfg = _cfg.get("near_trailing_tp")
+        _nt_active = False
+        _nt_act = 0.0
+        _nt_gb = 0.0
+        if isinstance(_nt_cfg, dict) and bool(_nt_cfg.get("enabled", False)):
+            _raw_act = _nt_cfg.get("activate_pts")
+            _raw_gb = _nt_cfg.get("giveback_pts")
+            try:
+                _nt_act = float(_raw_act)
+                _nt_gb = float(_raw_gb)
+                _valid_nt = (
+                    math.isfinite(_nt_act) and math.isfinite(_nt_gb)
+                    and _nt_act > 0.0 and _nt_gb > 0.0
+                )
+            except (TypeError, ValueError):
+                _valid_nt = False
+            if _valid_nt:
+                _nt_active = True
+            else:
+                _sig_key = (_cur_tid, _raw_act, _raw_gb)
+                if getattr(self, "_ilb_near_trail_invalid_logged", None) != _sig_key:
+                    self._ilb_near_trail_invalid_logged = _sig_key
+                    _append_event(
+                        "ILB_NEAR_TRAILING_TP_CONFIG_INVALID",
+                        trade_id=_cur_tid,
+                        activate_pts=_raw_act,
+                        giveback_pts=_raw_gb,
+                        fallback="FIXED_TP",
+                    )
+
+        def _eval_near(pnl_pts: float) -> str | None:
+            if pnl_pts <= -_sl:
+                return "STOP_LOSS"
+            if _nt_active:
+                _pk = getattr(self, "_ilb_near_trail_peak", None)
+                if _pk is None:
+                    if pnl_pts >= _nt_act:
+                        self._ilb_near_trail_peak = pnl_pts
+                    return None
+                if pnl_pts > _pk:
+                    _pk = pnl_pts
+                    self._ilb_near_trail_peak = _pk
+                if (_pk - pnl_pts) >= _nt_gb:
+                    return "TRAILING_TP"
+                return None
+            if pnl_pts >= _tp:
+                return "TAKE_PROFIT"
+            return None
+
         if released_leg is None:
             # SPREAD phase: both legs still held — check each leg's own
             # entry independently; NEAR checked first for a deterministic
             # tie-break on a same-tick double breach.
-            if near_pnl <= -_sl or near_pnl >= _tp:
-                _reason = "STOP_LOSS" if near_pnl <= -_sl else "TAKE_PROFIT"
+            _near_reason = _eval_near(near_pnl)
+            if _near_reason is not None:
                 return LifecycleDecision(
                     action=LifecycleAction.RELEASE, release_leg=Leg.NEAR,
-                    winner=f"INDEPENDENT_LEG_BRACKET_{_reason}",
+                    winner=f"INDEPENDENT_LEG_BRACKET_{_near_reason}",
                 )
             if far_pnl <= -_sl or far_pnl >= _tp:
                 _reason = "STOP_LOSS" if far_pnl <= -_sl else "TAKE_PROFIT"
@@ -5161,9 +5225,16 @@ class TMFSpread(StrategyBase):
         # REMAINING leg only, against its OWN entry (never the combined
         # trade PnL, which would mix in the already-closed leg's realized
         # PnL and violate the "each leg independent" contract).
-        _rem_pnl = far_pnl if released_leg == Leg.NEAR else near_pnl
-        if _rem_pnl <= -_sl or _rem_pnl >= _tp:
-            _reason = "STOP_LOSS" if _rem_pnl <= -_sl else "TAKE_PROFIT"
+        if released_leg == Leg.FAR:
+            _near_reason = _eval_near(near_pnl)
+            if _near_reason is not None:
+                return LifecycleDecision(
+                    action=LifecycleAction.STOPLOSS,
+                    winner=f"INDEPENDENT_LEG_BRACKET_{_near_reason}",
+                )
+            return None
+        if far_pnl <= -_sl or far_pnl >= _tp:
+            _reason = "STOP_LOSS" if far_pnl <= -_sl else "TAKE_PROFIT"
             return LifecycleDecision(
                 action=LifecycleAction.STOPLOSS,
                 winner=f"INDEPENDENT_LEG_BRACKET_{_reason}",
@@ -6754,7 +6825,9 @@ class TMFSpread(StrategyBase):
         self._peak_net_exit_pnl_twd = 0.0
         for _a in ("_pj_trade_id", "_pj_durable_peak", "_pj_candidate_peak",
                    "_pj_candidate_ts", "_pj_candidate_count", "_pj_last_mark_pair",
-                   "_pj_last_upl", "_pj_exit_event_id", "_pj_exit_winner"):
+                   "_pj_last_upl", "_pj_exit_event_id", "_pj_exit_winner",
+                   "_ilb_near_trail_peak", "_ilb_near_trail_trade_id",
+                   "_ilb_near_trail_invalid_logged"):
             if hasattr(self, _a):
                 setattr(self, _a, None)
         # ADR-009 Phase 2 / Task 7: sync lifecycle to FLAT after exit fill

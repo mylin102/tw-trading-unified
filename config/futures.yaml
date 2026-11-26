@@ -211,6 +211,11 @@ mts:
       enabled: true
       take_profit_pts: 100.0
       stop_loss_pts: 30.0
+      # 2026-11-26 Gemini CLI: Near-leg trailing TP (FAR stays fixed take_profit_pts=100).
+      near_trailing_tp:
+        enabled: true
+        activate_pts: 100.0
+        giveback_pts: 20.0
   paper:
     allow_synthetic_price: true
     synthetic_near_price: 41000.0
