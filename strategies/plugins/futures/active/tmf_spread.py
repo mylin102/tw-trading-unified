@@ -3762,36 +3762,29 @@ class TMFSpread(StrategyBase):
             "mae_pts": round(float(getattr(self, "_mae_pts", 0.0)), 4),
         }
 
-    def _log_exit_decision(self, exit_reason: str, pnl: float, bar: dict) -> dict:
-        """Helper to generate, print, and log the structured exit decision.
-        2026-06-26 Gemini CLI: exit logging implementation.
-        """
+    def _log_exit_decision(self, exit_reason: str, pnl: float, bar: dict, *, trigger_leg: str | None = None, trigger_price: float | None = None) -> dict:
+        """2026-11-26 Gemini CLI: Log EXIT_LOG preserving close-ref pnl/pnl_basis while exposing BBO trigger_pnl/trigger_price/trigger_basis."""
         _risk_meta = self._get_risk_meta(bar)
+        _trig_pnl, _trig_basis = pnl, "CLOSE_REF"
+        if trigger_leg in ("near", "far") and trigger_price is not None:
+            _trig_pnl = self._pnl_near(trigger_price) if trigger_leg == "near" else self._pnl_far(trigger_price)
+            _want_ask = str(getattr(self, f"_{trigger_leg}_side", "") or "").upper() == "SHORT"
+            _bbo_v = bar.get(f"bbo_{trigger_leg}_" + ("ask" if _want_ask else "bid"))
+            _trig_basis = ("BBO_ASK" if _want_ask else "BBO_BID") if (_bbo_v is not None and float(_bbo_v) > 0) else "CLOSE_REF"
         exit_data = {
-            "exit_reason": exit_reason,
-            "risk_mode": _risk_meta.get("risk_mode"),
-            "session": _risk_meta.get("session"),
-            "atr": _risk_meta.get("atr"),
-            "release_stop": _risk_meta.get("release_stop"),
-            "trail_dist": _risk_meta.get("trail_dist"),
-            "mfe": round(self._mfe_pts, 2),
-            "mae": round(self._mae_pts, 2),
-            # 2026-11-25 Hermes Agent: `pnl` here is the TRIGGER-time P&L, not
-            # the realized fill. On 2026-11-25 a bracket TP logged pnl=100 and
-            # an SL logged -34 while the fills realised +126 and -32; reading
-            # this field as realized under-reported the trade by 28 points.
-            # The basis is now explicit so consumers cannot mistake it, and the
-            # authoritative realised figure stays in mts_trade_fills.jsonl
-            # (per-leg realized_pnl) / a trade-level settlement record.
-            "pnl": round(pnl, 2),
-            "pnl_basis": "TRIGGER_PTS",
-            # 2026-06-26 Hermes Agent: per-leg MFE/MAE in exit log
+            "exit_reason": exit_reason, "risk_mode": _risk_meta.get("risk_mode"),
+            "session": _risk_meta.get("session"), "atr": _risk_meta.get("atr"),
+            "release_stop": _risk_meta.get("release_stop"), "trail_dist": _risk_meta.get("trail_dist"),
+            "mfe": round(self._mfe_pts, 2), "mae": round(self._mae_pts, 2),
+            "pnl": round(pnl, 2), "pnl_basis": "TRIGGER_PTS",
+            "trigger_pnl": round(_trig_pnl, 2),
+            "trigger_price": round(float(trigger_price), 2) if trigger_price is not None else None,
+            "trigger_basis": _trig_basis,
             "near_max": round(self._near_max, 2) if self._near_max is not None else None,
             "near_min": round(self._near_min, 2) if self._near_min is not None else None,
             "far_max": round(self._far_max, 2) if self._far_max is not None else None,
             "far_min": round(self._far_min, 2) if self._far_min is not None else None,
             "post_release_anchor": round(self._post_release_anchor_price, 2) if self._post_release_anchor_price is not None else None,
-            # 2026-07-16 Hermes Agent: MTF score at exit time
             "mtf_score": self._mtf_score_at_release,
             "decision_evidence": self._build_decision_evidence(exit_reason, pnl, bar),
         }
@@ -6046,7 +6039,13 @@ class TMFSpread(StrategyBase):
                 _mae = (self._near_entry - self._near_min) if self._near_side == "LONG" else (self._near_max - self._near_entry)
                 _ilb_rel_winner = getattr(_decision, "winner", None) or ""
                 _exit_reason = _ilb_rel_winner if _ilb_rel_winner.startswith("INDEPENDENT_LEG_BRACKET_") else "RELEASE_STOP"
-                self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
+                # 2026-11-26 Gemini CLI: Pass BBO trigger leg/price for bracket exits so EXIT_LOG exposes actual trigger PnL.
+                _is_ilb_rel = _ilb_rel_winner.startswith("INDEPENDENT_LEG_BRACKET_")
+                self._log_exit_decision(
+                    exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar,
+                    trigger_leg=("near" if _release_leg == Leg.NEAR else "far") if _is_ilb_rel else None,
+                    trigger_price=(_ilb_near_px if _release_leg == Leg.NEAR else _ilb_far_px) if _is_ilb_rel else None,
+                )
                 _risk_meta["mtf_score"] = self._mtf_score_at_release
                 # Broker-truth boundary: lifecycle/state and *_SUBMITTED
                 # telemetry are committed by monitor.py only after the
@@ -6181,7 +6180,8 @@ class TMFSpread(StrategyBase):
                         logger.error("[P1B_POLICY_J_EVENT_FAILED] fail-closed — suppressing emission", exc_info=True)
                         return None
                 self._lifecycle = "EXITING"
-                self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar)
+                # 2026-11-26 Gemini CLI: Pass BBO trigger leg/price for single-leg bracket exits.
+                self._log_exit_decision(exit_reason=_exit_reason, pnl=_pnl_pts, bar=bar, trigger_leg=("far" if _rem_leg == Leg.FAR else "near") if _ilb_winner.startswith("INDEPENDENT_LEG_BRACKET_") else None, trigger_price=(_ilb_far_px if _rem_leg == Leg.FAR else _ilb_near_px) if _ilb_winner.startswith("INDEPENDENT_LEG_BRACKET_") else None)
 
                 # 2026-07-23 Gemini CLI: Work Package A - Instrumentation & Provenance Metadata
                 _peak_or_nadir = self._peak if _rem_side == "LONG" else self._nadir
