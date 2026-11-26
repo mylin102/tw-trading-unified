@@ -251,3 +251,28 @@ def test_t7_peak_resets_across_consecutive_trades(tmp_path):
     sig2 = _drive(s, cfg, _make_bar(39210.0, 39300.0, bbo_near_bid=39210.0, bbo_near_ask=39212.0), events2)
     assert sig2 is None
     assert not any(ev == "EXIT_LOG" for ev, _ in events2)
+
+
+def test_t7b_trade_id_change_without_reset_clears_peak(tmp_path):
+    """T7b: Directly switching _trade_id WITHOUT calling _reset()/sync_position() must still clear _ilb_near_trail_peak."""
+    s, cfg = _make_strategy(
+        tmp_path,
+        near_trailing_cfg={"enabled": True, "activate_pts": 100.0, "giveback_pts": 20.0},
+        near_side="LONG", far_side="SHORT", near_entry=39000.0, far_entry=39100.0,
+        trade_id="mts-auto-20261126-170000-001",
+    )
+    events1 = []
+    assert _drive(s, cfg, _make_bar(39150.0, 39100.0, bbo_near_bid=39150.0), events1) is None
+    assert s._ilb_near_trail_peak == 150.0
+
+    # Bypass _reset() and sync_position() entirely — switch _trade_id & entries directly
+    s._trade_id = "mts-auto-20261126-171000-002"
+    s._near_entry = 39200.0
+    s._far_entry = 39300.0
+
+    events2 = []
+    sig2 = _drive(s, cfg, _make_bar(39210.0, 39300.0, bbo_near_bid=39210.0, bbo_near_ask=39212.0), events2)
+    assert sig2 is None
+    assert s._ilb_near_trail_peak is None
+    assert s._ilb_near_trail_trade_id == "mts-auto-20261126-171000-002"
+    assert not any(ev == "EXIT_LOG" for ev, _ in events2)
